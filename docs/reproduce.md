@@ -124,7 +124,7 @@ the fixture's pins.
 A calibration file is the box's health band for the serial-control leg.
 
 1. Stage the reference tree at the fixture's `baseline_reference_commit`
-   (`5be35aa395283b14d1887cec70a37d6e6bdeac9c`), from a local bundle or mirror
+   (`fb5c48b8977409ebeb789315c7c1171c9726fa16`), from a local bundle or mirror
    (the ranked job holds no credential):
 
    ```bash

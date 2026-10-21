@@ -108,8 +108,10 @@ State on 2026-10-20 (section 7.14 has the record).
    the prompt texts in the organizer archive (see
    docs/pool-refresh-and-final-rescore.md, "Where the goldens live").
 3. **`baseline_reference_commit` — pinned** at
-   `5be35aa395283b14d1887cec70a37d6e6bdeac9c` (2026-10-07, the resident
-   phase-close fix), in this repository.
+   `fb5c48b8977409ebeb789315c7c1171c9726fa16`, the import commit of this
+   repository (the same tree as the development repository main `434596b`;
+   the development reference was `5be35aa`, 2026-10-07, the resident
+   phase-close fix).
 4. **Timing noise — addressed.** The prefill phase is one warm-up pass followed
    by the median of five timed passes, and the gate is 60 °C (section 7.7).
    Every box is calibrated with a CV limit of 2% (`calibration_max_cv_percent`,

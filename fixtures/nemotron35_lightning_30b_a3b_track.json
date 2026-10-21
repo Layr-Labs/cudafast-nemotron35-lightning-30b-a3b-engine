@@ -50,7 +50,7 @@
     "pool-10",
     "pool-11"
   ],
-  "baseline_reference_commit": "5be35aa395283b14d1887cec70a37d6e6bdeac9c",
+  "baseline_reference_commit": "fb5c48b8977409ebeb789315c7c1171c9726fa16",
   "timed_prompt_pool": [
     {
       "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-9.golden.json",

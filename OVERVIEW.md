@@ -185,7 +185,7 @@ Details are in the [engineering log](docs/nemotron35-port-notes.md), sections
   goldens staged, a version-3 calibration under 2%, the reference tree
   `5be35aa` and benchd `b65af98`.
 - **Branches.** `main` is the armed contest base
-  (`official_scoring_enabled: true`, reference tree `5be35aa`).
+  (`official_scoring_enabled: true`, reference tree `fb5c48b`).
 - **Where the goldens live.** Scoring reads only each Spark's local copy
   (`/srv/nemotron35/goldens`, unreadable by the sandbox user); a ranked job
   never fetches goldens. The live pool is also kept in an

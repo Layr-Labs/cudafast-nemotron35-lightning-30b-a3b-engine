@@ -1,0 +1,283 @@
+# Engine CI -- build and test only, hosted, with no credential.
+#
+#   - no credential of any kind, and a step below trips if a workflow in this
+#     tree starts referencing one, inheriting the caller's, or asking for a
+#     write permission;
+#   - no artifact upload (tools/ci-workflow-egress-scan.sh fails on any, and
+#     on anything but one narrow score.json upload in the ranked pipeline);
+#   - no submodule: the vLLM engine is VENDORED as plain files and benchd is a
+#     channel prebuilt (tools/fetch-benchd.sh);
+#   - no model weights, no R2, no ranked box.
+#
+# THREE JOBS:
+#   `lint`            hosted x86 ubuntu: hygiene, manifest lint, the adapter's
+#                     mock-backend tests, and every GPU-free tool test.
+#   `resident`        hosted x86 ubuntu: the Python resident's unit and wire
+#                     tests, and the real cuda-engine adapter driving the
+#                     resident (fake backend) end to end at every depth.
+#   `engine-overlay`  hosted aarch64 ubuntu: pulls the pinned engine image BY
+#                     DIGEST, stages the vLLM overlay the box would run
+#                     (tools/stage-vllm-overlay.sh) and imports the Nemotron
+#                     model code through it. No GPU: this proves the tree's
+#                     vLLM source layers onto the pinned build and imports,
+#                     nothing about execution.
+#
+# The ranked pipeline is .github/workflows/benchmark.yml (workflow_dispatch
+# only, self-hosted, no credential), which benchmark.json's runner.workflow
+# names. It is never in this file.
+
+# MANUAL ONLY. This repository uses no paid GitHub feature, and
+# these jobs need GitHub-hosted runners, so they run only when dispatched by
+# hand. Run the same checks locally before a push (AGENTS.md, "Checks before
+# you submit").
+
+name: ci
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint (repo hygiene, hosted)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          submodules: false
+          persist-credentials: false
+          # FULL HISTORY, for one reason: the ranked preflight's paired-baseline
+          # cases build their scaffold by cloning this checkout at the fixture's
+          # baseline_reference_commit. On the default shallow fetch that commit
+          # is absent and the whole section 8 suite SKIPS -- green, and testing
+          # nothing.
+          fetch-depth: 0
+
+      - name: No workflow takes a credential or ships a file out
+        # The tripwire under the constraint that keeps organizer material
+        # inside the runner. The scan lives in tools/ so its patterns are not
+        # inside the directory it scans.
+        run: tools/ci-workflow-egress-scan.sh
+
+      - name: actionlint
+        # A pinned release BINARY, hash-verified before it is allowed to run.
+        # This step used to be `docker://rhysd/actionlint@sha256:b1934ee5...`,
+        # and could not stay one: the org's Actions policy admits GitHub-owned
+        # actions by 40-hex SHA plus an explicit pattern allow-list, and a
+        # `docker://` reference is on neither list. The SOURCE is what is
+        # disallowed, so digest-pinning it does not rescue it -- a container
+        # reference here makes the ENTIRE workflow a startup_failure, with zero
+        # jobs created, before any of the gates below get to run.
+        #
+        # The property the digest pin bought is kept, by the same means in a
+        # different shape. A mutable reference would be a remote party's
+        # ability to change what executes in this job, so: the version is
+        # fixed, the release tarball's sha256 is hardcoded here, and the binary
+        # runs ONLY if the hash it actually has matches. A swapped, tampered,
+        # or truncated asset fails the step instead of executing. The version
+        # below is 1.7.12 -- the same one the retired digest resolved to, so
+        # this is a mechanism change and not a version change.
+        #
+        # Kept at 1.7.12 (it once had to be >= a version that knows the macos-26
+        # label the retired swift job used; that job is gone, but there is no
+        # reason to move off a known-good pin). Bump the version and the checksum
+        # together; the checksum is the matching line from that release's
+        # actionlint_<version>_checksums.txt.
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          # linux amd64 because this job is `runs-on: ubuntu-latest`. Pick the
+          # asset that matches the runner if that ever changes.
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+
+          workdir="$(mktemp -d)"
+          tarball="${workdir}/actionlint.tar.gz"
+          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+
+          curl --fail --silent --show-error --location --retry 3 -o "${tarball}" "${url}"
+
+          # Fail closed, and verify BEFORE extracting or executing anything:
+          # an unverified binary must never get a chance to run.
+          if ! printf '%s  %s\n' "${ACTIONLINT_SHA256}" "${tarball}" | sha256sum --check --status; then
+            echo "::error::actionlint ${ACTIONLINT_VERSION} tarball does not match its pinned sha256; refusing to execute it" >&2
+            echo "  expected ${ACTIONLINT_SHA256}" >&2
+            echo "  actual   $(sha256sum "${tarball}" | cut -d ' ' -f 1)" >&2
+            exit 1
+          fi
+          echo "ok: actionlint ${ACTIONLINT_VERSION} matches its pinned sha256"
+
+          tar -xzf "${tarball}" -C "${workdir}" actionlint
+          chmod +x "${workdir}/actionlint"
+
+          # The same invocation the container ran: the image's entrypoint IS
+          # actionlint, and `-color` was the whole of its `args:`.
+          "${workdir}/actionlint" -color
+
+      - name: Shell syntax and shellcheck
+        # Every tracked *.sh is bash or sh. A zsh or other shebang hits the
+        # `*)` arm and fails the run loudly rather than going unchecked.
+        #
+        # THE VENDORED ENGINE IS EXCLUDED. vllm/ is upstream code carried in
+        # this repository, not code this repository writes; the gate is about
+        # OUR scripts. The engine is gated by whether it imports (the
+        # engine-overlay job) and by the correctness goldens on the box.
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' script; do
+            case "$(head -n 1 "${script}")" in
+              '#!/usr/bin/env bash'|'#!/bin/bash')
+                bash -n "${script}"
+                ;;
+              '#!/usr/bin/env sh'|'#!/bin/sh')
+                sh -n "${script}"
+                ;;
+              *)
+                echo "unsupported shell script interpreter: ${script}" >&2
+                exit 1
+                ;;
+            esac
+          done < <(git ls-files -z '*.sh' ':!:vllm/**')
+
+          # The sweep. Its tool ships in the hosted image, so this adds no
+          # download and no egress. The whole tree passes at warning severity
+          # today; the gate keeps it that way. A script that needs an exception
+          # carries an inline suppression with the reason next to it.
+          #
+          # No comment in this block may start with the tool's own name: the
+          # workflow linter shellchecks these run blocks, and a comment that
+          # opens that way is read as a malformed directive.
+          shellcheck --version
+          git ls-files -z '*.sh' ':!:vllm/**' | xargs -0 shellcheck -S warning
+
+      - name: Benchmark manifest lint
+        run: |
+          set -euo pipefail
+          # --gitlink-targets report downgrades a command target missing ONLY
+          # because its submodule is not checked out. Since benchd became a
+          # pinned PREBUILT there is no submodule and every command target lives
+          # in this repository, so nothing is downgraded and all three commands
+          # are fully verified here. See docs/ci-coverage.md.
+          python3 tools/lint-benchmark-manifest.py --gitlink-targets report
+
+      - name: benchd platform gate
+        run: tools/test-fetch-benchd-platform.sh
+
+      - name: benchd channel second binary (record-correctness-golden)
+        run: tools/test-fetch-benchd-recorder.sh
+
+      - name: Engine Protocol adapter (cargo test + clippy + fmt)
+        # Proven against its deterministic mock backend and a scripted engine
+        # session, so this needs no GPU. The one step that resolves crates.io,
+        # against the committed Cargo.lock.
+        run: |
+          set -euo pipefail
+          cargo fmt --manifest-path harness/protocol-adapter/Cargo.toml -- --check
+          cargo clippy --manifest-path harness/protocol-adapter/Cargo.toml \
+            --all-targets -- -D warnings
+          cargo test --manifest-path harness/protocol-adapter/Cargo.toml
+
+      - name: Docs agree with the manifest
+        # TASK.md, README.md, AGENTS.md and the contract must state the same
+        # editable paths, depth envelope and scoring constants as
+        # benchmark.json and the track fixture.
+        run: python3 tools/check-doc-consistency.py
+
+      - name: Participant may edit the engine (manifest and static review)
+        run: tools/test-participant-engine-edit.sh
+
+      - name: Resident boot/stop verbs (per-leg serve convention)
+        run: tools/test-serve-up-boot-stop.sh
+
+      - name: Serve memory plan
+        run: tools/test-serve-up-plan-memory.sh
+
+      - name: Benchmark facade exports the track id
+        run: tools/test-benchmark-facade-env.sh
+
+      - name: Setup fills and verifies the target snapshot, and reruns read no shard
+        run: tools/test-setup-onboarding.sh
+
+      - name: Local baseline entry point reaches benchd
+        run: tools/test-local-baseline.sh
+
+      - name: yukon run selects the ranked or the local path
+        run: tools/test-yukon-run.sh
+
+      - name: Speculative declaration envelope
+        run: tools/test-spec-declaration.sh
+
+      - name: Ranked preflight refusals (environment + paired baseline)
+        run: tools/test-ranked-box-preflight-env.sh
+
+      - name: Per-box baseline calibrator mechanics
+        run: tools/test-calibrate-box.sh
+
+      - name: Reference-workspace stager plan
+        run: tools/test-stage-baseline-workspace.sh
+
+      - name: Golden fetcher
+        run: tools/test-fetch-goldens.sh
+
+      - name: Scored-prompt draw and rotation
+        run: tools/test-live-golden-rotation.sh
+
+      - name: Pool refresh and stitched prompts
+        run: tools/test-pool-refresh.sh && python3 tools/test_stitch_prompts.py
+
+      - name: Box runner supervisor
+        run: tools/box-runner/test/test-box-runner.sh
+
+  resident:
+    name: resident (Python, fake backend, hosted)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          submodules: false
+          persist-credentials: false
+
+      - name: Build the adapter
+        run: cargo build --release --locked --manifest-path harness/protocol-adapter/Cargo.toml
+
+      - name: Resident unit, wire and end-to-end tests
+        # test_adapter_e2e drives the REAL cuda-engine binary against the REAL
+        # resident process (fake backend) over Engine Protocol v1 at depths
+        # 0..6 and requires the committed stream to equal the serial stream.
+        run: python3 -m unittest discover -s harness/vllm_resident -v
+
+  engine-overlay:
+    name: engine overlay (pinned vLLM image, hosted aarch64, no GPU)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          submodules: false
+          persist-credentials: false
+
+      - name: Stage the overlay and import the Nemotron model code through it
+        run: |
+          set -euo pipefail
+          image="$(jq -r '.serve_configuration.container_image' fixtures/nemotron35_lightning_30b_a3b_track.json)"
+          digest="$(jq -r '.serve_configuration.container_digest' fixtures/nemotron35_lightning_30b_a3b_track.json)"
+          docker pull "${image%%:*}@${digest}"
+          tools/stage-vllm-overlay.sh
+          docker run --rm --network none --user "$(id -u):$(id -g)" \
+            --mount "type=bind,src=${GITHUB_WORKSPACE},dst=${GITHUB_WORKSPACE},readonly" \
+            --env HOME=/tmp --env "PYTHONPATH=${GITHUB_WORKSPACE}/.build/vllm-overlay" \
+            --entrypoint python3 "${image%%:*}@${digest}" -c '
+          import os, vllm
+          from vllm.model_executor.models import nemotron_h, nemotron_h_mtp  # noqa: F401
+          here = os.path.dirname(vllm.__file__)
+          assert here.startswith(os.environ["PYTHONPATH"]), here
+          print("vllm", vllm.__version__, "from", here)
+          '

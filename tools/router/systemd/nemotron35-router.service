@@ -1,0 +1,15 @@
+[Unit]
+Description=Nemotron 3.5 submission router
+
+[Service]
+Type=simple
+WorkingDirectory=@REPO@
+Environment="PATH=@PATH@"
+ExecStart=/usr/bin/systemd-inhibit --what=sleep:idle --who=nemotron35-router "--why=Submission routing" /usr/bin/python3 -u "@EXEC_REPO@/tools/router/router.py" run
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

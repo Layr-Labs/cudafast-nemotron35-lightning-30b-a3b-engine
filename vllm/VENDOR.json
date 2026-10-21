@@ -1,0 +1,27 @@
+{
+  "upstream": "https://github.com/vllm-project/vllm",
+  "tag": "v0.27.1",
+  "commit": "6e448d0ea9bf3d88d898b65449ca6dc2aec170ac",
+  "subtree": "vllm",
+  "container_image": "docker.io/vllm/vllm-openai:v0.27.1",
+  "container_digest_arm64": "sha256:1c8e60a0841b333c700488cb029d3664807249da0c071e862191b00fe34b228c",
+  "note": "Upstream Python package at the tag. The compiled extensions (csrc) come from the pinned container's install of the same tag; tools/stage-vllm-overlay.sh layers this tree over that install. vllm/vllm/config/fault_tolerance.py is stored LF-normalized (upstream has CRLF).",
+  "local_patches": [
+    {
+      "file": "vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py",
+      "why": "GB10 exposes no NVML memory clock; fall back to 273 GB/s for humming's tuning heuristic"
+    },
+    {
+      "file": "vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py",
+      "why": "VLLM_HUMMING_BATCH_INVARIANT=1 turns on humming's deterministic MoE kernels without the global batch-invariant mode (which forces CUTLASS W4A4 on W4A16 linears)"
+    },
+    {
+      "file": "vllm/model_executor/layers/mamba/ops/ssd_pinned_configs.py (+ pins in ssd_state_passing.py, ssd_bmm.py, ssd_chunk_scan.py, ssd_chunk_state.py)",
+      "why": "Triton autotune picked different SSD tile configs per boot on GB10, making the same prompt yield one of two token streams; each kernel is pinned to one config (VLLM_MAMBA_SSD_AUTOTUNE=1 restores autotuning)"
+    },
+    {
+      "file": "vllm/v1/worker/gpu_model_runner.py",
+      "why": "skip the MTP drafter when every request in the batch has max_tokens == 1: its drafts are never verified, and the drafter's pass over the prompt delayed the sampled token (the timed prefill)"
+    }
+  ]
+}

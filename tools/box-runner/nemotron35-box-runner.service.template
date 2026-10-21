@@ -1,0 +1,37 @@
+# nemotron35-box-runner.service -- the box's GitHub Actions supervisor.
+#
+# Runs as root: root is required to read the GitHub App private key (via
+# gh-app-mint.sh, GH_APP_KEY) and to su to the unprivileged runner account.
+# The Actions runner itself never runs as root: supervisor.sh drops to
+# RUNNER_USER for every job. install.sh renders this template but does NOT
+# install or start it -- it prints the exact commands for an operator.
+#
+# KillMode=process: systemd signals only the supervisor. The job tree lives
+# under `su - RUNNER_USER` in its own session, and supervisor.sh's `stop`
+# (lib/pidtree.sh) is what reaps it; ExecStop runs that before systemd
+# considers the unit stopped.
+[Unit]
+Description=Nemotron 3.5 Lightning ranked-box GitHub Actions supervisor
+Wants=network-online.target docker.service
+Requires=nemotron35-sandbox-egress.service
+After=network-online.target docker.service nemotron35-sandbox-egress.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/sbin/iptables -C OUTPUT -m owner --uid-owner nemosub -j REJECT
+ExecStartPre=/usr/sbin/ip6tables -C OUTPUT -m owner --uid-owner nemosub -j REJECT
+ExecStart=__SUPERVISOR_PATH__ run
+ExecStop=__SUPERVISOR_PATH__ stop
+KillMode=process
+Restart=on-failure
+# The supervisor exits 143 on SIGTERM by design (on_term): a clean stop, not a failure.
+SuccessExitStatus=143
+RestartSec=60
+WorkingDirectory=__SCRIPT_DIR__
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+Environment=BOX_RUNNER_CONFIG=__CONFIG_ENV_PATH__
+StandardOutput=append:__LOG_DIR__/supervisor-stdout.log
+StandardError=append:__LOG_DIR__/supervisor-stderr.log
+
+[Install]
+WantedBy=multi-user.target

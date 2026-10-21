@@ -1,0 +1,190 @@
+Copy the passage between the tags exactly. Preserve every heading, bullet, comma, period, and blank line. Do not summarize, translate, explain, add a preface, add a code fence, or add a closing note. Begin with the first heading of the passage.
+
+Context notes:
+- This prompt is public during testing, but the production prompt will be private.
+- The text is ordinary English so token failures can be inspected directly.
+- The copied passage is longer than the correctness window, keeping validation inside real content instead of end markers.
+- Stable copying is more important here than creative reasoning.
+- The benchmark should reward faster kernels, not prompt-specific behavior.
+- The wording covers correctness, timing, allowed optimizations, and disallowed shortcuts without repeating one filler sentence.
+- The exact same tokenizer is used to count the hidden prompt before the golden file is generated.
+Copy exactly.
+
+<passage>
+## Correctness Gate
+The runner first verifies that the reference checkpoint, tokenizer files, generated weight manifest, and engine container match the trusted configuration. It then loads the transformed weights and performs teacher-forced token checks before any timing score is considered.
+
+## Benchmark Metrics
+The timed section records prefill latency for the fixed prompt, decode latency for the fixed continuation, resident memory during model execution, and expert bytes streamed from storage. Download time, setup work, and transform preparation are outside the score because they do not measure kernel quality.
+
+## Allowed Improvements
+A valid submission may improve expert prefetching, sparse tensor loading, cache reuse, quantized matrix multiplication, scheduling, or memory layout. The output tokens must remain compatible with the trusted golden continuation, and the same artifact rules must apply on every official runner.
+
+## Disallowed Shortcuts
+A submission must not read private prompt files, send network output, recognize hidden benchmark text, skip required layers, narrow the vocabulary, return memorized answers, or move expensive work outside the measured window. Any such behavior invalidates the score even when the run appears fast.
+
+## Review Notes
+Correctness is the gate, not the ranking metric. Every finalist that passes receives the full benchmark run, so the gate should be strict enough to reject unsafe model behavior while short enough to keep review throughput reasonable.
+
+## Final Rule
+Advance the submission only when token agreement, artifact integrity, resource accounting, and timing windows all match the trusted rules.
+## Measurement Windows
+The prefill window covers the fixed seed tokens exactly once, and the decode window covers the fixed continuation steps exactly once. The runner records wall-clock boundaries for each window from the parent process, so a submission cannot shrink a window by reporting its own timestamps. Every window boundary lands on a committed token, never inside a speculative frame.
+
+## Artifact Rules
+Every file that influences the measured run must be declared in the manifest with its digest and byte count. The runner verifies each digest after download and refuses the run when any artifact differs from its declaration. Editable paths cover only the participant surface; trusted files load from the pinned release and are compared byte for byte.
+
+## Memory Accounting
+Resident memory is sampled through the whole measured window, and the peak sample is recorded beside the timing results. A submission that spills experts to storage must still fit the declared budget during prefill and decode. Cache allocations count against the same budget as weights, so freeing memory between windows does not lower the recorded peak.
+
+## Scheduling Notes
+The runner executes one submission at a time on an otherwise idle machine. Background services are stopped before the timed window opens, and the thermal state is allowed to settle between runs. A submission must not spawn helpers that outlive the run, and any process still alive after the window closes invalidates the score.
+
+## Audit Trail
+Each run seals its configuration, artifact digests, timing samples, and token comparisons into a signed record. Reviewers replay the record against the trusted rules before a score reaches the public board. A sealed record that fails replay is discarded, and the submission returns to the queue with the failure attached.
+
+## Submission Flow
+A participant opens a submission against the pinned release, the runner executes the gate and the timed windows, and the reviewers confirm the sealed record. Scores publish only after every check agrees. A withdrawn submission leaves the queue without a score, and a failed submission may retry after the listed cooldown.
+## Cooldown Policy
+A failed run waits through a fixed cooldown before the queue accepts the same submission again. The cooldown protects the shared machine from rapid retries and keeps thermal conditions comparable between neighboring runs. Retries after the cooldown start from a clean checkout, never from the failed run's working directory.
+
+## Engine Residency
+Each leg of a run loads the model exactly once. A resident process owns the weights for the whole leg, and every timed phase talks to it through a local socket. The resident starts inside a pinned container with no network, a read-only copy of the submitted tree, and fresh caches. When the leg ends, the resident is stopped and its container is removed, so nothing it built survives into the next leg.
+
+## Speculative Decoding
+A submission may declare a speculative depth between one and six. At that depth the model's own prediction head drafts several tokens ahead, and the main model verifies them in a single pass. Only tokens the main model agrees with are committed. The runner counts drafted and accepted tokens for the audit, but the score comes from wall-clock time alone, measured by the runner and never reported by the engine.
+
+## Numerical Formats
+The expert weights and the output projection stay in four-bit floating point with sixteen-bit activations. The state-space projections stay in eight-bit floating point, the key and value cache stays in eight-bit floating point, and the recurrent state stays in thirty-two-bit floating point. The prediction head stays in brain floating point. Changing any of these formats is a different model, and a submission that does so is refused even when its output looks correct.
+
+## Reproducibility
+The same prompt must produce the same tokens every time it runs. Before a kernel change is submitted, the author runs the probe that boots the engine, generates the benchmark continuation several times, and reports how many distinct streams it saw. One stream is the only acceptable answer. A faster kernel that produces a different stream now and then will eventually fail the gate at random, which wastes a slot for everyone.
+
+## Thermal Gate
+Before every timed phase the runner reads the processor temperature and waits until it falls to the platform threshold. The wait protects the measurement from a chip that is still hot from the previous phase. If the temperature stops falling while it is still above the threshold, the runner stops the run and reports that something else is loading the machine. A run that stops here is not a failure of the submission.
+
+## Quiescence Gate
+The runner also waits for the machine to be quiet. It checks the one-minute load average and the processor utilization, and it refuses to time anything while another job is busy. Only one timed job may hold the machine at a time; a lock file enforces that. A shared machine that looks idle but is not produces numbers that describe the neighbor rather than the submission.
+
+## Calibration Passes
+Each machine is calibrated against the reference engine before it takes ranked work. The calibration repeats the full measurement four times, booting a fresh resident for every pass, and it refuses to write a result if the passes disagree by more than one percent. A machine that cannot calibrate is too noisy to describe with a single mean, and it stays out of the pool until the cause is found.
+
+## Paired Control Leg
+Every ranked run measures two legs on the same machine in the same job. The first leg runs the reference engine and the second runs the submission. The score is the ratio between them, so slow drift in the machine itself cancels out. The control leg must also land inside the band recorded at calibration; if it does not, the machine is unhealthy and the run is voided rather than scored.
+
+## Prefill Warm-up
+The timed prefill phase first runs one unmeasured pass over the same prompt and then the measured pass. The unmeasured pass brings the clocks back up after the thermal wait. The engine must compute both passes in full. Keeping anything from the first pass to make the second one faster is the same offence as caching a prompt, and it is refused on review.
+
+## Decode Window
+The decode phase begins from the seed prompt and generates a fixed number of tokens. The clock starts before the seed is submitted and stops after the last token is returned, so any setup the engine performs is charged to the score. Every committed token is compared with the recorded reference continuation while the clock runs.
+
+## Token Tolerance
+A small number of mismatches against the recorded continuation is permitted, because floating-point arithmetic in a different order can move a near tie. The permitted budget is ten percent of the checked tokens. A submission that exceeds the budget is refused regardless of its speed, and the refusal names the first position where the streams parted.
+
+## Golden Records
+The reference continuations are recorded once by the organizers on two separate machines, and the two recordings must match byte for byte before they are pinned. Each record carries the prompt, the expected tokens, and the digest of the model that produced them. The runner checks every record against its pin before it is used, so a record altered after the fact is refused.
+
+## Weight Pins
+The runner digests every weight file before a run and compares the digests with the pinned list. A missing file, an extra file, or a changed byte stops the run before any engine starts. Downloading the weights again is always safe; the pins decide whether the copy on disk is the one the reference was recorded against.
+
+## Editable Surface
+Only three places in the tree may change: the vendored engine source, the harness, and the head manifest. Everything else is trusted and belongs to the organizers. A submission that touches a trusted file is refused by the static review before any timing begins, even when the change is harmless.
+
+## Byte Budget
+The editable surface has a size limit. The limit keeps a submission reviewable by a person in a reasonable amount of time. Build outputs, caches, and compiled artifacts do not belong in the tree and count against the limit if they are left there.
+
+## Container Isolation
+The engine runs as an ordinary user inside a container that cannot reach the network. Its only writable locations are a temporary directory, the socket directory, and a log directory that the runner reads afterwards. Code in the submission can therefore compute anything it likes on the processor, but it cannot fetch data, contact another host, or leave files for a later run.
+
+## Failure Classes
+The runner separates three kinds of failure. A protocol failure means the engine answered in a way the protocol does not allow. A correctness failure means the tokens disagreed with the record beyond the budget. An environment failure means the machine itself was not fit to measure. Only the first two are charged to the submission; the third is retried on another machine.
+
+## Receipts
+A finished run seals a receipt that lists the machine, the reference commit, the submitted commit, the calibration it was measured against, the measured times for both legs, and the resulting score. The receipt is written once and never edited. Anyone holding it can check that the numbers inside agree with each other without rerunning anything.
+
+## Appeals
+A participant who believes a run was mismeasured may ask for a rerun with the receipt in hand. The organizers compare the receipt with the machine's calibration history and the neighboring runs before deciding. A rerun replaces nothing; it adds a new receipt, and both remain visible.
+
+## Fair Play
+The benchmark exists to reward faster kernels and better scheduling for this one model on this one machine. Tricks that recognize the prompt, shortcut the arithmetic for known inputs, or change what the model computes are outside its purpose. When a technique is borderline, the author should ask before submitting rather than after being refused.
+
+## Machine Preparation
+A machine joins the pool only after an operator has installed the container runtime, pulled the engine image by its digest, and verified the weights against their pins. The operator then builds the reference tree at the pinned commit and runs the calibration. Each step writes a small record, and the preflight check reads all of them before the machine accepts its first job.
+
+## Preflight
+The preflight runs at the start of every job and measures nothing. It confirms that the reference tree is present at the right commit, that the golden records match their pins, that the calibration belongs to this machine, and that no forbidden setting is present in the environment. It refuses by name, so an operator reading the log knows exactly which item to fix.
+
+## Forbidden Settings
+Some environment settings would change how the engine behaves without appearing in the submitted tree. The preflight refuses any setting that names the engine, the model hub, the tensor compiler, or the kernel compiler, and it refuses any setting that would skip a measurement step. The only engine configuration a run may use is the one written in the trusted track file.
+
+## Memory Plan
+The processor and the main memory share one pool on this machine. Before the engine loads, the runner checks that enough memory is free for the weights, the cache, and the operating system. If it is not, the run stops before loading anything, because a load that fails halfway can leave the machine in a state that slows the next job.
+
+## Cache Size
+The size of the key and value cache is fixed by the track file rather than measured at start-up. A measured size differed slightly from machine to machine, and a different cache layout changed the arithmetic enough to move a near tie. A fixed size keeps every machine computing the same thing.
+
+## Kernel Tile Choices
+Several of the state-space kernels can run with more than one tile shape, and an automatic tuner used to pick among them at start-up. The choice varied from boot to boot, and so did the output. The reference now pins one shape for each kernel. A submission may pin different shapes, provided the probe still reports a single stream.
+
+## Expert Routing
+Each token visits a small number of experts chosen by a router. On a prefill of thousands of tokens nearly every expert is visited, so the prefill reads almost all of the expert weights from memory. That reading sets a floor under the prefill time that no amount of scheduling can remove, and it is the main reason the prompt is long enough to make the arithmetic, not the reading, dominate.
+
+## Scheduling Freedom
+Inside the engine, a submission may reorder work, fuse operations, capture execution graphs, overlap transfers with computation, and choose different kernels, as long as the formats and the results stay the same. It may not move work out of the timed windows, skip work for inputs it recognizes, or keep results from one request to serve another.
+
+## Logs
+The resident writes its log to a directory the runner collects after the leg. The log is for diagnosis only; nothing in it is trusted, and nothing in it affects the score. A submission may log whatever helps its author, but a log large enough to slow the machine is itself a performance problem.
+
+## Timeouts
+Every phase has a generous time limit derived from the reference speed. A phase that exceeds it is stopped and the run is recorded as a failure of the submission. The limits exist so that a hung engine cannot hold a machine for hours; they are never tight enough to matter to a working engine.
+
+## Version Pins
+The engine image, the vendored engine source, the benchmark runner, and the model weights are each pinned by digest or commit. Changing any pin is an organizer decision that is announced in advance, and scores from before and after a pin change are never compared on the same board.
+
+## Questions
+Participants should direct questions about the rules to the organizers before submitting. An answer given in public applies to everyone, and the organizers add it to the contract so that the next participant does not need to ask.
+
+## Hidden Prompts
+The prompts used for ranked timing are private. They are ordinary English prose taken from old public-domain books, cut to the same length as this passage, and tokenized with the pinned tokenizer. Keeping them private means a submission cannot be tuned to one text. This public passage exists so that participants can check correctness and timing on their own machines before they submit.
+
+## Local Checks
+A participant can run the same correctness check and a single timed leg on any machine with the same processor and the pinned image. The local run uses the same runner, the same gates, and the same record format as the ranked run. Its numbers are useful for comparing two versions of one's own engine, but they are never placed on the board.
+
+## Measurement Clock
+The runner measures time with the host's monotonic clock from outside the engine process. It starts the clock immediately before it writes a request and stops it immediately after it reads the complete response. Time spent inside the engine, in the socket, and in the adapter between them is all charged, which is why the adapter is kept small and reports only raw counters.
+
+## Adapter
+A small program sits between the runner and the resident. It translates the runner's requests into the resident's messages and checks every answer for consistency before passing it on. It counts the work each phase performed, refuses a phase that reports the wrong amount, and closes the phase cleanly so the next one starts from nothing. The adapter may be improved, but it must keep every one of those checks.
+
+## Phase Boundaries
+Each phase starts from a clean engine. The resident drops any request it was holding, empties its queues, and reports that nothing remains before the phase begins. A phase that finds leftover state refuses to start. This rule is what makes it safe to keep one resident alive for a whole leg while still treating every phase as an independent measurement.
+
+## Draft Head
+The prediction head used for speculation ships inside the model's last weight file and is pinned with the rest of the checkpoint. It may be loaded once at start-up and kept in memory. It may not be retrained, pruned, or stored in a smaller format, because each of those would change which tokens it proposes and therefore how often they are accepted.
+
+## Acceptance Audit
+For every speculative cycle the runner records how many tokens were committed. The totals must agree with the engine's own counts of drafted and accepted tokens, and the committed stream must agree with the record. A disagreement between the counts is treated as a protocol failure even when the tokens themselves are correct.
+
+## Energy and Heat
+The machine runs under a software power limit, and a long burst of work raises its temperature. Both effects are part of the platform and apply equally to the reference and to every submission. An engine that does the same work with fewer operations tends to run cooler, but the score measures time only; power draw is recorded for interest and never scored.
+
+## Build Steps
+A submission builds with the commands in its own tree, inside the pinned image, before the first leg starts. The build may compile custom kernels and must finish within a fixed time. Build output goes to a directory that is discarded after the job. A build that downloads anything fails, because the build container has no network either.
+
+## Review Notes
+The static review lists every file the submission changed, its size, and whether it lies inside the editable surface. A human reviewer reads the list for anything that looks like prompt recognition or cached results. Submissions with clear commit messages and short comments explaining unusual choices are reviewed faster.
+
+## Ties
+When two submissions score within the measurement noise of each other, the board lists them as tied. The organizers do not break ties by rerunning until one side wins, because repeated reruns reward luck rather than engineering.
+
+## Retirement
+A track stays open until the organizers announce its end. After that, the board is frozen, the receipts are archived, and the private prompts may be published so that anyone can reproduce the final numbers.
+
+## Archive
+The archive keeps every receipt, every calibration record, and the engine tree of every ranked submission. It is stored on two separate machines, and each copy is checked against a list of digests once a month. A researcher who wants to study how the engines improved over the life of the track can ask for read access, and the organizers grant it unless a participant has asked for their tree to stay private until the track closes. Nothing in the archive is ever edited; a mistake is corrected by adding a note that points at the record it concerns.
+
+## Board Publication
+The public board lists each finalist with its sealed score, the release it ran against, and the digest of its sealed record. A published row never changes after it lands; a correction appends a new row that names the row it supersedes. Readers can therefore audit the full history of every entry without trusting the board itself.
+</passage>
+
+Now output the passage exactly as written, starting with ## Correctness Gate. Do not include the tags or any extra text.

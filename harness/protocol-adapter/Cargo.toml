@@ -1,0 +1,21 @@
+# Engine Protocol v1 adapter for this track's CUDA engine.
+#
+# A STANDALONE crate, deliberately: building and testing the protocol plumbing
+# must not require a GPU, CUDA or vLLM. The adapter drives the engine through
+# the `Engine` trait (src/engine.rs); a deterministic `mock` backend proves the
+# protocol behaviour with no GPU, and the scored path attaches to the leg's
+# vLLM resident (harness/vllm_resident) over a Unix socket (src/resident.rs).
+[package]
+name = "protocol-adapter"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Engine Protocol v1 NDJSON-over-stdio adapter for the Nemotron 3.5 Lightning 30B-A3B NVFP4 CUDA track."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bin]]
+name = "cuda-engine"
+path = "src/bin/cuda-engine.rs"

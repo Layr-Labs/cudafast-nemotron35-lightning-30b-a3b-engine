@@ -1,0 +1,64 @@
+{
+  "schemaVersion": 1,
+  "name": "cudafast-nemotron35-lightning-30b-a3b",
+  "trackId": "nemotron3.5-lightning-30b-a3b-cuda-v1",
+  "description": "Nemotron 3.5 Lightning 30B-A3B CUDA text inference speedup track on DGX Spark (GB10, sm_121). Target: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4 @ bee7596271d1495f6992ae224aefde4410e816b8, a ModelOpt mixed-precision checkpoint (NVFP4 W4A16 experts and lm_head, FP8 Mamba in/out projections, FP8 KV cache) of a 52-layer hybrid: 23 Mamba-2 layers, 23 MoE layers (128 routed experts, 6 per token, plus a shared expert) and 6 attention layers. The engine is vLLM v0.27.1, its Python package VENDORED at vllm/ and layered over the pinned container's compiled extensions; the scored binary is the Engine Protocol v1 adapter (harness/protocol-adapter) attached to one vLLM resident per leg (harness/vllm_resident). There is exactly ONE speculative arm: the NATIVE MTP layer embedded in the pinned checkpoint (mtp.* tensors, BF16), run by vLLM's mtp method at a participant-selected depth 1 to 6. No submission carries head weights. The target quantization is frozen. Scoring is single-stream and paired with a per-box baseline: 3 pairs of one serial-control leg on the reference tree and one candidate leg, one pair per prompt of the fixture's live_goldens (three chat-template coding prompts of 496 tokens, one unmeasured prefill warm-up pass, 128-step decode); composite = prefill_gain^0.25 * decode_gain^0.75 for each pair, where decode is the decode window (decode-run time / N, no seed prefill); the score is the mean of the 3 per-pair composites, floors 0.95 on every pair, ceiling 5.0. fixtures/nemotron35_lightning_30b_a3b_track.json is the authority; editablePaths is the authority for what a submission may change.",
+  "category": "cuda",
+  "direction": "+",
+  "editablePaths": [
+    "vllm",
+    "harness",
+    "mtp-head.manifest.json"
+  ],
+  "optionalEditablePaths": [
+    "mtp-head.manifest.json"
+  ],
+  "editableSurfaceByteBudget": {
+    "exemptPathMaxBytes": 512000000,
+    "exemptPathMaxFileBytes": 100000000,
+    "maxTotalBytes": 36047190,
+    "maxFileBytes": 2558837,
+    "maxGrowthBytes": 36047190
+  },
+  "contractPath": "fixtures/nemotron35_lightning_30b_a3b_track.json",
+  "setupCommand": [
+    "bash",
+    "-c",
+    "./tools/fetch-benchd.sh && ./setup.sh"
+  ],
+  "preSubmitCommand": [
+    "bash",
+    "-c",
+    "./tools/nemotron35-measure-and-score.sh --preflight-only"
+  ],
+  "benchmarkCommand": [
+    "bash",
+    "-c",
+    "MLXFAST_SCORE_PATH=score.json ./tools/nemotron35-yukon-run.sh"
+  ],
+  "runner": {
+    "provider": "github-actions",
+    "workflow": "benchmark.yml"
+  },
+  "scoreArtifact": "benchmark-results-<run_id>/score.json",
+  "scorePath": "score.json",
+  "scoring": {
+    "mode": "nemotron-native-mtp-paired-decode-only",
+    "formula": "composite = prefill_gain^0.25 * decode_gain^0.75",
+    "scoredExponents": {
+      "prefillGainExponent": 0.25,
+      "decodeGainExponent": 0.75
+    },
+    "scoredBatchSize": 1,
+    "kvBackend": "vllm-paged",
+    "pairsPerCohort": 3,
+    "minPairsPerCohort": 3,
+    "decodeSpeedupFloor": 0.95,
+    "prefillSpeedupFloor": 0.95,
+    "decodeSpeedupCeiling": 5.0
+  },
+  "leaderboard": {
+    "namespace": "nemotron3.5-lightning-30b-a3b-cuda-v1"
+  },
+  "staticReviewTrackId": "nemotron3.5-lightning-30b-a3b-cuda-v1"
+}

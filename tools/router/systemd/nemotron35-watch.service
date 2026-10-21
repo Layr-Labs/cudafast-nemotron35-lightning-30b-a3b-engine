@@ -1,0 +1,15 @@
+[Unit]
+Description=Nemotron 3.5 router fleet watcher
+
+[Service]
+Type=simple
+WorkingDirectory=@REPO@
+Environment="PATH=@PATH@"
+ExecStart=/usr/bin/systemd-inhibit --what=sleep:idle --who=nemotron35-watch "--why=Fleet monitoring" /usr/bin/bash "@EXEC_REPO@/tools/router/watch.sh"
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

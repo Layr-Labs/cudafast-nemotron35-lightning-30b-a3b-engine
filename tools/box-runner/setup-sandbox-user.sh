@@ -56,6 +56,9 @@
 #   EGRESS_UNIT   nemotron35-sandbox-egress.service
 #   ACL_UNIT      nemotron35-sandbox-acl.service
 #   RUST_DIR      /opt/rust                     the sandbox user's Rust toolchain
+#   RUNNER_DIR    <runner home>/actions-runner  the runner install, directly under
+#                                               the runner home (a second runner of
+#                                               the same account has its own)
 # --check reads the same names, so the runner's jobs must have them too
 # (actions-runner/.env).
 #
@@ -140,12 +143,22 @@ sudoers_ok() { stat_is "${SUDOERS_FILE}" "440 root root" && grep -qxF "${SUDOERS
 # shellcheck disable=SC2016  # $0 expands in the inner bash, not here
 UDP_SEND=(timeout 5 bash -c 'exec 3>"/dev/udp/$0/53" && printf x >&3')
 runner_home() { getent passwd "${RUNNER_USER}" | cut -d: -f6; }
-runner_work() { echo "$(runner_home)/actions-runner/_work"; }
+# runner_dir -- the runner install: RUNNER_DIR, else <runner home>/actions-runner.
+# It must sit directly under the runner home (setup_work_traverse denies every
+# other entry there).
+runner_dir() {
+  local d="${RUNNER_DIR:-$(runner_home)/actions-runner}"
+  [[ "$(basename -- "${d}")" != "." && "$(basename -- "${d}")" != ".." \
+     && "$(dirname -- "${d}")" == "$(runner_home)" ]] \
+    || fail "RUNNER_DIR ${d} is not directly under ${RUNNER_USER}'s home $(runner_home)"
+  echo "${d}"
+}
+runner_work() { echo "$(runner_dir)/_work"; }
 # serve_log_dir -- the resident log dir runner's jobs use: SERVE_UP_LOG_DIR from
 # the runner's .env (the environment every job inherits), else the default.
 serve_log_dir() {
   local v
-  v="$(sed -n 's/^SERVE_UP_LOG_DIR=//p' "$(runner_home)/actions-runner/.env" 2>/dev/null | tail -1)"
+  v="$(sed -n 's/^SERVE_UP_LOG_DIR=//p' "$(runner_dir)/.env" 2>/dev/null | tail -1)"
   v="${v%\"}"; v="${v#\"}"
   echo "${v:-${DEFAULT_SERVE_LOG}}"
 }
@@ -289,7 +302,7 @@ run_check() {
     warn "${work} does not exist yet (no job has run); the workflow grants ${SANDBOX_USER} its ACLs per job"
   fi
   check "runner home ${home} has default ACL default:user:${SANDBOX_USER}:--- (new entries inherit deny)" runner_home_default_deny
-  for p in "${home}/actions-runner/.env" "${home}/actions-runner/_diag" "${home}/.cache"; do
+  for p in "$(runner_dir)/.env" "$(runner_dir)/_diag" "${home}/.cache"; do
     [[ -e "${p}" ]] && check "${SANDBOX_USER} cannot read ${p}" sandbox_cannot_read "${p}"
   done
 
@@ -523,17 +536,18 @@ setup_no_persistence() {
 # entries if the home grants the group read. This script does not set the home's
 # mode.
 setup_work_traverse() {
-  local home d
+  local home dir d
   home="$(runner_home)"
-  for d in "${home}" "${home}/actions-runner" "${home}/actions-runner/_work"; do
+  dir="$(runner_dir)"
+  for d in "${home}" "${dir}" "${dir}/_work"; do
     [[ -d "${d}" ]] && setfacl -m "u:${SANDBOX_USER}:--x" "${d}"
   done
   # -n: keep any existing default mask (setfacl -m recalculates it, which can widen
   # access for other named entries in an existing default ACL).
   setfacl -n -d -m "u:${SANDBOX_USER}:---" "${home}"
-  deny_entries "${home}" ! -name actions-runner
-  deny_entries "${home}/actions-runner" ! -name _work
-  deny_entries "${home}/actions-runner/_work" -name '_*'
+  deny_entries "${home}" ! -name "$(basename -- "${dir}")"
+  deny_entries "${dir}" ! -name _work
+  deny_entries "${dir}/_work" -name '_*'
 }
 
 # deny_entries DIR FIND-TESTS... -- u:nemosub:--- on each entry directly under
@@ -576,7 +590,7 @@ setup_wipe_list() {
 setup_serve_log() {
   local d
   d="$(serve_log_dir)"
-  [[ "${d}" == /* ]] || fail "SERVE_UP_LOG_DIR '${d}' in $(runner_home)/actions-runner/.env is not an absolute path"
+  [[ "${d}" == /* ]] || fail "SERVE_UP_LOG_DIR '${d}' in $(runner_dir)/.env is not an absolute path"
   mkdir -p "${d}"
   chown "${RUNNER_USER}:${RUNNER_USER}" "${d}"
   chmod 0750 "${d}"
@@ -585,10 +599,11 @@ setup_serve_log() {
 }
 
 case "${1:-}" in
-  --check) run_check ;;
+  --check) runner_dir >/dev/null; run_check ;;
   "")
     [[ "${IS_ROOT}" -eq 1 ]] || fail "setup runs as root (use --check to verify as ${RUNNER_USER})"
     id "${RUNNER_USER}" >/dev/null 2>&1 || fail "user ${RUNNER_USER} does not exist; set up the box runner first"
+    runner_dir >/dev/null
     for tool in useradd usermod groupadd gpasswd visudo runuser iptables ip6tables curl sha256sum systemctl loginctl python3 install findmnt; do
       command -v "${tool}" >/dev/null 2>&1 || fail "${tool} is required"
     done

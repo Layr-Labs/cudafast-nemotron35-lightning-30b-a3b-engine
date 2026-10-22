@@ -148,7 +148,8 @@ runner_home() { getent passwd "${RUNNER_USER}" | cut -d: -f6; }
 # other entry there).
 runner_dir() {
   local d="${RUNNER_DIR:-$(runner_home)/actions-runner}"
-  [[ "$(dirname -- "${d}")" == "$(runner_home)" ]] \
+  [[ "$(basename -- "${d}")" != "." && "$(basename -- "${d}")" != ".." \
+     && "$(dirname -- "${d}")" == "$(runner_home)" ]] \
     || fail "RUNNER_DIR ${d} is not directly under ${RUNNER_USER}'s home $(runner_home)"
   echo "${d}"
 }

@@ -93,6 +93,7 @@ for n in "${NAMES[@]}"; do
   : > "${GOLDENS}/${n}.golden.json"
   : > "${GOLDENS}/${n}.mtp3.golden.json"
 done
+chmod 0440 "${GOLDENS}"/*.golden.json
 : > "${WORK}/cal.json"
 printf '#!/usr/bin/env bash\nexit 0\n' > "${WORK}/engine"
 chmod +x "${WORK}/engine"
@@ -200,6 +201,27 @@ if [[ "$(argv_after --warmup-golden)" == "${private_dir}/public-longcopy-gate-en
 else
   fail "measure: private golden staging is wrong: $(tr '\n' ' ' < "${WORK}/private.log" 2>/dev/null); argv: $(tr '\n' ' ' < "${WORK}/argv" 2>/dev/null)"
 fi
+
+mkdir "${WORK}/bin"
+cat > "${WORK}/bin/cp" <<'EOF'
+#!/usr/bin/env bash
+/bin/cp "$@" || exit
+if [[ -n "${STUB_CP_CHANGE_SOURCE:-}" && "$3" == */nemotron35-private.*/* && "$2" == *pool-9.golden.json ]]; then
+  chmod u+w "$2"
+  printf different >> "$2"
+fi
+EOF
+chmod +x "${WORK}/bin/cp"
+out="$(measure "${WORK}/full.json" PATH="${WORK}/bin:${PATH}" STUB_CP_CHANGE_SOURCE=1)"
+if [[ ! -f "${WORK}/argv" ]] \
+  && grep -q "private golden 'pool-9.golden.json' has different bytes" <<<"${out}"; then
+  ok "measure: a same-named control golden with different bytes is refused by basename"
+else
+  fail "measure: a same-named control golden with different bytes was not refused: $(tail -2 <<<"${out}")"
+fi
+chmod u+w "${GOLDENS}/${NAMES[0]}.golden.json"
+printf '' > "${GOLDENS}/${NAMES[0]}.golden.json"
+chmod 0440 "${GOLDENS}/${NAMES[0]}.golden.json"
 
 jq 'del(.warmup_golden, .require_private_dir)' "${WORK}/full.json" > "${WORK}/no-private.json"
 out="$(measure "${WORK}/no-private.json")"

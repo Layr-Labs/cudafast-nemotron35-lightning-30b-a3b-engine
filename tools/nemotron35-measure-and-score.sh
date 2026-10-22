@@ -509,7 +509,14 @@ if [[ "$(jq -r '.require_private_dir // false' "${CONTRACT}")" == "true" ]]; the
 
   for i in "${!CONTROL_PATHS[@]}"; do
     dest="${PRIVATE_DIR}/${SERIAL_GOLDEN_BASENAMES[$i]}"
-    cp -- "${CONTROL_PATHS[$i]}" "${dest}"
+    if [[ -e "${dest}" ]]; then
+      if ! cmp -s -- "${CONTROL_PATHS[$i]}" "${dest}"; then
+        echo "nemotron35-measure-and-score.sh: private golden '${SERIAL_GOLDEN_BASENAMES[$i]}' has different bytes in candidate and serial-control inputs." >&2
+        exit 1
+      fi
+    else
+      cp -- "${CONTROL_PATHS[$i]}" "${dest}"
+    fi
     CONTROL_PATHS[$i]="${dest}"
   done
   CONTROL_ARGS=()

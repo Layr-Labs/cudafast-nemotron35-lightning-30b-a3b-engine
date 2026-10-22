@@ -580,7 +580,7 @@ The rest of the command surface:
 | Engine source | vLLM `v0.27.1` @ `6e448d0ea9bf3d88d898b65449ca6dc2aec170ac` (`vllm/VENDOR.json`) |
 | Engine image | `docker.io/vllm/vllm-openai:v0.27.1` @ `sha256:1c8e60a0841b333c700488cb029d3664807249da0c071e862191b00fe34b228c` |
 | Driver floor | `580.159.03` |
-| benchd | `Layr-Labs/mlxfast-bench-dev` dist commit `43a9a1642cc22c3fb2f71b9c707699cd3a9602c7`, built from source `b65af98c2a060df12f2ced849c68528b825fecdb`; `dist/linux-aarch64/benchd.manifest.json` there gives each binary's sha256 and bytes. `tools/fetch-benchd.sh` (`PINNED_SOURCE_COMMIT`) is the authority. |
+| benchd | `Layr-Labs/benchd` dist commit `7045ed65635049c32fd378e579448ac66fb12152`, built from source `b65af98c2a060df12f2ced849c68528b825fecdb` (public snapshot `81a7d45b940d3501e52d7774bb2e8b9abd2c0372`); `dist/linux-aarch64/benchd.manifest.json` there gives each binary's sha256 and bytes. `tools/fetch-benchd.sh` (`PINNED_SOURCE_COMMIT` / `PINNED_PUBLIC_SOURCE_COMMIT`) is the authority. |
 
 ## 8. Prohibited techniques
 

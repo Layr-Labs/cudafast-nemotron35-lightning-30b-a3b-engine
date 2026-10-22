@@ -67,9 +67,9 @@ A DGX Spark has all of them after the standard DGX OS setup plus rustup.
 
 This command resolves the pinned benchd from its release channel and verifies
 the bytes against the channel manifest. The channel is the `main` branch of the
-DEVELOPMENT bench repository while the track is internal. That repository is
-private, so the fetch needs `GITHUB_TOKEN` (or `BENCHD_DIST_TOKEN`). A verified
-pair in `benchd-bin/` or in `BENCHD_DIST_LOCAL` needs no token.
+public `Layr-Labs/benchd` repository; the fetch needs no token. The organizer's
+development channel publishes the same bytes. A verified pair in `benchd-bin/`
+or in `BENCHD_DIST_LOCAL` needs no network.
 
 ```bash
 ./setup.sh
@@ -223,7 +223,7 @@ run blocks the upload. Run `yukon run` yourself before you submit.
 | MTP head | the `mtp.*` tensors inside `model-00052-of-00052.safetensors` (BF16, 2,670,652,160 bytes) |
 | Engine source | vLLM `v0.27.1` @ `6e448d0ea9bf3d88d898b65449ca6dc2aec170ac` |
 | Engine image | `docker.io/vllm/vllm-openai:v0.27.1` @ `sha256:1c8e60a0841b333c700488cb029d3664807249da0c071e862191b00fe34b228c` (arm64) |
-| benchd | `Layr-Labs/mlxfast-bench-dev` dist `43a9a1642cc22c3fb2f71b9c707699cd3a9602c7`, built from source `b65af98c2a060df12f2ced849c68528b825fecdb` (`PINNED_COMMIT` and `PINNED_SOURCE_COMMIT` in `tools/fetch-benchd.sh`); the dist's `dist/linux-aarch64/benchd.manifest.json` pins each binary's sha256 and bytes |
+| benchd | `Layr-Labs/benchd` dist `7045ed65635049c32fd378e579448ac66fb12152`, built from source `b65af98c2a060df12f2ced849c68528b825fecdb` (public snapshot `81a7d45b940d3501e52d7774bb2e8b9abd2c0372`; `PINNED_COMMIT`, `PINNED_SOURCE_COMMIT` and `PINNED_PUBLIC_SOURCE_COMMIT` in `tools/fetch-benchd.sh`); the dist's `dist/linux-aarch64/benchd.manifest.json` pins each binary's sha256 and bytes |
 | Goldens | `timed_prompt_pool[]` (the 3 serial goldens that `live_goldens` names: `pool-9`, `pool-10`, `pool-11`, three 496-token chat-template coding prompts), `speculative_oracles` (18 per-depth oracles) and `hidden_correctness_golden` (the `pool-9` serial pin) in the fixture: 21 files pinned by sha256 and bytes (staged on each box, never committed; see [OVERVIEW.md](OVERVIEW.md)) |
 
 ## The ranked run

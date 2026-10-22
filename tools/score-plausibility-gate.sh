@@ -4,6 +4,8 @@ set -euo pipefail
 # Real prefill work on this engine scores near 1.0; gain above this ceiling means
 # the timed passes reused earlier work (participant contract sections 5.3 and 8).
 PREFILL_GAIN_CEILING=1.5
+# The contract's decodeSpeedupCeiling; this benchd does not enforce it on the official path.
+DECODE_GAIN_CEILING=5.0
 
 # Seed-prefill window ratios: decode work moved into free_decode_begin, or seed
 # prefill reusing earlier work (participant contract sections 5.1.1 and 8).
@@ -22,7 +24,7 @@ if [[ ! -f "${score_path}" ]]; then
   exit 0
 fi
 
-exec python3 -I - "${score_path}" "${PREFILL_GAIN_CEILING}" "${SEED_WINDOW_SLOW_CEILING}" "${SEED_WINDOW_GAIN_CEILING}" "${audit_path}" <<'PY'
+DECODE_GAIN_CEILING="${DECODE_GAIN_CEILING}" exec python3 -I - "${score_path}" "${PREFILL_GAIN_CEILING}" "${SEED_WINDOW_SLOW_CEILING}" "${SEED_WINDOW_GAIN_CEILING}" "${audit_path}" <<'PY'
 import json
 import math
 import os
@@ -91,6 +93,16 @@ for entry in legs:
         )
         sys.exit(1)
     max_gain = max(max_gain, gain)
+    dctrl = entry.get("control_decode_seconds_per_token")
+    dcand = entry.get("candidate_decode_seconds_per_token")
+    if isinstance(dctrl, bool) or isinstance(dcand, bool) or not isinstance(dctrl, (int, float)) or not isinstance(dcand, (int, float)) \
+            or not (math.isfinite(dctrl) and math.isfinite(dcand)) or dctrl <= 0 or dcand <= 0:
+        print(f"{prefix} REFUSED pair {pair}: decode seconds-per-token values must be finite numbers > 0")
+        sys.exit(1)
+    dgain = dctrl / dcand
+    if dgain > float(os.environ["DECODE_GAIN_CEILING"]):
+        print(f"{prefix} REFUSED pair {pair}: decode gain {dgain:.4f} exceeds the ceiling {float(os.environ['DECODE_GAIN_CEILING']):g} (participant contract 5.3)")
+        sys.exit(1)
 
 n = len(legs)
 

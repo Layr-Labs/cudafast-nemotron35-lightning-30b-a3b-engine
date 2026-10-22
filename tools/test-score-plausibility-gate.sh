@@ -51,9 +51,9 @@ write_audit_three_ok() {
 
 # (a) passed true, three pairs, gain ~0.97 -> exit 0
 write_score '{"passed": true, "score": 1.0, "metrics": {"paired_legs": [
-  {"pair": 1, "control_prefill_seconds_per_token": 0.000271, "candidate_prefill_seconds_per_token": 0.000280},
-  {"pair": 2, "control_prefill_seconds_per_token": 0.000271, "candidate_prefill_seconds_per_token": 0.000280},
-  {"pair": 3, "control_prefill_seconds_per_token": 0.000271, "candidate_prefill_seconds_per_token": 0.000280}
+  {"pair": 1, "control_prefill_seconds_per_token": 0.000271, "candidate_prefill_seconds_per_token": 0.000280, "control_decode_seconds_per_token": 0.0134, "candidate_decode_seconds_per_token": 0.0113},
+  {"pair": 2, "control_prefill_seconds_per_token": 0.000271, "candidate_prefill_seconds_per_token": 0.000280, "control_decode_seconds_per_token": 0.0134, "candidate_decode_seconds_per_token": 0.0113},
+  {"pair": 3, "control_prefill_seconds_per_token": 0.000271, "candidate_prefill_seconds_per_token": 0.000280, "control_decode_seconds_per_token": 0.0134, "candidate_decode_seconds_per_token": 0.0113}
 ]}}'
 write_audit_three_ok
 out="$(run_gate)"
@@ -66,7 +66,7 @@ fi
 
 # (b) passed true, one pair at gain 2.0 -> exit 1, REFUSED names pair
 write_score '{"passed": true, "score": 9.0, "metrics": {"paired_legs": [
-  {"pair": 7, "control_prefill_seconds_per_token": 2.0, "candidate_prefill_seconds_per_token": 1.0}
+  {"pair": 7, "control_prefill_seconds_per_token": 2.0, "candidate_prefill_seconds_per_token": 1.0, "control_decode_seconds_per_token": 0.0134, "candidate_decode_seconds_per_token": 0.0113}
 ]}}'
 write_audit '{"score": 9.0, "metrics": {"paired_legs": [
   {"pair": 7, "control_seed_prefill_window_seconds_per_token": 0.001, "candidate_seed_prefill_window_seconds_per_token": 0.001}
@@ -82,7 +82,7 @@ fi
 # (c) passed false with huge gain -> exit 0
 rm -f "${WORK}/audit.json"
 write_score '{"passed": false, "score": null, "metrics": {"paired_legs": [
-  {"pair": 1, "control_prefill_seconds_per_token": 10.0, "candidate_prefill_seconds_per_token": 0.001}
+  {"pair": 1, "control_prefill_seconds_per_token": 10.0, "candidate_prefill_seconds_per_token": 0.001, "control_decode_seconds_per_token": 0.0134, "candidate_decode_seconds_per_token": 0.0113}
 ]}}'
 out="$(run_gate)"
 rc=$?
@@ -115,7 +115,7 @@ fi
 
 # (f) candidate_prefill_seconds_per_token 0 -> exit 1
 write_score '{"passed": true, "score": 1.0, "metrics": {"paired_legs": [
-  {"pair": 2, "control_prefill_seconds_per_token": 0.001, "candidate_prefill_seconds_per_token": 0}
+  {"pair": 2, "control_prefill_seconds_per_token": 0.001, "candidate_prefill_seconds_per_token": 0, "control_decode_seconds_per_token": 0.0134, "candidate_decode_seconds_per_token": 0.0113}
 ]}}'
 write_audit '{"score": 1.0, "metrics": {"paired_legs": [
   {"pair": 2, "control_seed_prefill_window_seconds_per_token": 0.001, "candidate_seed_prefill_window_seconds_per_token": 0.001}
@@ -141,7 +141,7 @@ fi
 
 # (h) gain exactly 1.5 -> exit 0
 write_score '{"passed": true, "score": 1.0, "metrics": {"paired_legs": [
-  {"pair": 1, "control_prefill_seconds_per_token": 1.5, "candidate_prefill_seconds_per_token": 1.0}
+  {"pair": 1, "control_prefill_seconds_per_token": 1.5, "candidate_prefill_seconds_per_token": 1.0, "control_decode_seconds_per_token": 0.0134, "candidate_decode_seconds_per_token": 0.0113}
 ]}}'
 write_audit '{"score": 1.0, "metrics": {"paired_legs": [
   {"pair": 1, "control_seed_prefill_window_seconds_per_token": 0.001, "candidate_seed_prefill_window_seconds_per_token": 0.001}
@@ -156,8 +156,8 @@ fi
 
 # (i) honest audit, seed ratios 1.0 and 1.1 -> ok
 write_score '{"passed": true, "score": 2.5, "metrics": {"paired_legs": [
-  {"pair": 1, "control_prefill_seconds_per_token": 1.0, "candidate_prefill_seconds_per_token": 1.0},
-  {"pair": 2, "control_prefill_seconds_per_token": 1.1, "candidate_prefill_seconds_per_token": 1.0}
+  {"pair": 1, "control_prefill_seconds_per_token": 1.0, "candidate_prefill_seconds_per_token": 1.0, "control_decode_seconds_per_token": 0.0134, "candidate_decode_seconds_per_token": 0.0113},
+  {"pair": 2, "control_prefill_seconds_per_token": 1.1, "candidate_prefill_seconds_per_token": 1.0, "control_decode_seconds_per_token": 0.0134, "candidate_decode_seconds_per_token": 0.0113}
 ]}}'
 write_audit '{"score": 2.5, "metrics": {"paired_legs": [
   {"pair": 1, "control_seed_prefill_window_seconds_per_token": 0.002, "candidate_seed_prefill_window_seconds_per_token": 0.002},
@@ -173,7 +173,7 @@ fi
 
 # (j) candidate seed 3x control -> REFUSED, no seed digits in output
 write_score '{"passed": true, "score": 1.0, "metrics": {"paired_legs": [
-  {"pair": 4, "control_prefill_seconds_per_token": 1.0, "candidate_prefill_seconds_per_token": 1.0}
+  {"pair": 4, "control_prefill_seconds_per_token": 1.0, "candidate_prefill_seconds_per_token": 1.0, "control_decode_seconds_per_token": 0.0134, "candidate_decode_seconds_per_token": 0.0113}
 ]}}'
 write_audit '{"score": 1.0, "metrics": {"paired_legs": [
   {"pair": 4, "control_seed_prefill_window_seconds_per_token": 0.003, "candidate_seed_prefill_window_seconds_per_token": 0.009}
@@ -192,7 +192,7 @@ fi
 
 # (k) candidate seed control/3 -> REFUSED (reused seed prefill)
 write_score '{"passed": true, "score": 1.0, "metrics": {"paired_legs": [
-  {"pair": 5, "control_prefill_seconds_per_token": 1.0, "candidate_prefill_seconds_per_token": 1.0}
+  {"pair": 5, "control_prefill_seconds_per_token": 1.0, "candidate_prefill_seconds_per_token": 1.0, "control_decode_seconds_per_token": 0.0134, "candidate_decode_seconds_per_token": 0.0113}
 ]}}'
 write_audit '{"score": 1.0, "metrics": {"paired_legs": [
   {"pair": 5, "control_seed_prefill_window_seconds_per_token": 0.003, "candidate_seed_prefill_window_seconds_per_token": 0.001}
@@ -207,7 +207,7 @@ fi
 
 # (l) passed true with no audit argument -> REFUSED
 write_score '{"passed": true, "score": 1.0, "metrics": {"paired_legs": [
-  {"pair": 1, "control_prefill_seconds_per_token": 1.0, "candidate_prefill_seconds_per_token": 1.0}
+  {"pair": 1, "control_prefill_seconds_per_token": 1.0, "candidate_prefill_seconds_per_token": 1.0, "control_decode_seconds_per_token": 0.0134, "candidate_decode_seconds_per_token": 0.0113}
 ]}}'
 rm -f "${WORK}/audit.json"
 out="$("${GATE}" "${WORK}/score.json" 2>&1)"
@@ -220,7 +220,7 @@ fi
 
 # (m) audit score differs from score.json -> REFUSED
 write_score '{"passed": true, "score": 1.0, "metrics": {"paired_legs": [
-  {"pair": 1, "control_prefill_seconds_per_token": 1.0, "candidate_prefill_seconds_per_token": 1.0}
+  {"pair": 1, "control_prefill_seconds_per_token": 1.0, "candidate_prefill_seconds_per_token": 1.0, "control_decode_seconds_per_token": 0.0134, "candidate_decode_seconds_per_token": 0.0113}
 ]}}'
 write_audit '{"score": 2.0, "metrics": {"paired_legs": [
   {"pair": 1, "control_seed_prefill_window_seconds_per_token": 0.001, "candidate_seed_prefill_window_seconds_per_token": 0.001}
@@ -235,7 +235,7 @@ fi
 
 # (n) audit missing seed fields -> REFUSED
 write_score '{"passed": true, "score": 1.0, "metrics": {"paired_legs": [
-  {"pair": 1, "control_prefill_seconds_per_token": 1.0, "candidate_prefill_seconds_per_token": 1.0}
+  {"pair": 1, "control_prefill_seconds_per_token": 1.0, "candidate_prefill_seconds_per_token": 1.0, "control_decode_seconds_per_token": 0.0134, "candidate_decode_seconds_per_token": 0.0113}
 ]}}'
 write_audit '{"score": 1.0, "metrics": {"paired_legs": [
   {"pair": 1}
@@ -250,8 +250,8 @@ fi
 
 # (o) audit pair order differs -> REFUSED
 write_score '{"passed": true, "score": 1.0, "metrics": {"paired_legs": [
-  {"pair": 1, "control_prefill_seconds_per_token": 1.0, "candidate_prefill_seconds_per_token": 1.0},
-  {"pair": 2, "control_prefill_seconds_per_token": 1.0, "candidate_prefill_seconds_per_token": 1.0}
+  {"pair": 1, "control_prefill_seconds_per_token": 1.0, "candidate_prefill_seconds_per_token": 1.0, "control_decode_seconds_per_token": 0.0134, "candidate_decode_seconds_per_token": 0.0113},
+  {"pair": 2, "control_prefill_seconds_per_token": 1.0, "candidate_prefill_seconds_per_token": 1.0, "control_decode_seconds_per_token": 0.0134, "candidate_decode_seconds_per_token": 0.0113}
 ]}}'
 write_audit '{"score": 1.0, "metrics": {"paired_legs": [
   {"pair": 2, "control_seed_prefill_window_seconds_per_token": 0.001, "candidate_seed_prefill_window_seconds_per_token": 0.001},
@@ -264,6 +264,23 @@ if [[ "${rc}" -eq 1 && "${out}" == *"paired_legs does not match score.json"* ]];
 else
   bad "(o) audit pair order mismatch refused" "rc=${rc} out=${out}"
 fi
+
+# (p) decode gain 6.0 -> refused (the contract's 5.0 decode ceiling)
+write_score '{"passed": true, "score": 2.0, "metrics": {"paired_legs": [
+  {"pair": 1, "control_prefill_seconds_per_token": 0.000271, "candidate_prefill_seconds_per_token": 0.000280, "control_decode_seconds_per_token": 0.012, "candidate_decode_seconds_per_token": 0.002}
+]}}'
+write_audit '{"score": 2.0, "metrics": {"paired_legs": [
+  {"pair": 1, "control_seed_prefill_window_seconds_per_token": 0.001, "candidate_seed_prefill_window_seconds_per_token": 0.001}
+]}}'
+out="$(run_gate)"; rc=$?
+if [[ "${rc}" -eq 1 && "${out}" == *"decode gain 6.0000 exceeds the ceiling 5"* ]]; then ok "(p) decode gain above 5.0 refused"; else bad "(p) decode gain above 5.0 refused" "rc=${rc} out=${out}"; fi
+
+# (q) decode gain exactly 5.0 -> ok
+write_score '{"passed": true, "score": 2.0, "metrics": {"paired_legs": [
+  {"pair": 1, "control_prefill_seconds_per_token": 0.000271, "candidate_prefill_seconds_per_token": 0.000280, "control_decode_seconds_per_token": 0.01, "candidate_decode_seconds_per_token": 0.002}
+]}}'
+out="$(run_gate)"; rc=$?
+if [[ "${rc}" -eq 0 ]]; then ok "(q) decode gain exactly 5.0 passes"; else bad "(q) decode gain exactly 5.0 passes" "rc=${rc} out=${out}"; fi
 
 echo "score-plausibility-gate: ${passed} passed, ${failed} failed"
 [[ "${failed}" -eq 0 ]]

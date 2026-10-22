@@ -621,8 +621,10 @@ fi
 #       paired_legs and is never retried; a candidate could provoke it after
 #       its own leg ran).
 # Any of these re-runs the whole measurement once from scratch after the
-# teardown below. The second attempt's seal is the result; the first attempt's
-# timings are discarded, never compared. Every other failure is final,
+# teardown below, but only if the private audit has no candidate pair timing.
+# A missing or unreadable private audit withholds the retry. The second
+# attempt's seal is the result; the first attempt's timings are discarded,
+# never compared. Every other failure is final,
 # INCLUDING the other control-leg failures (spawn, session, protocol, cool
 # gate, memory): pair 2's control leg runs after the candidate's leg, so a
 # candidate could provoke those on purpose to buy a second draw. A second
@@ -693,11 +695,54 @@ pair1_serial_control_boot_failed() {
 measurement_retry_warranted() {
   control_leg_diverged || pair1_candidate_boot_failed || pair1_serial_control_boot_failed
 }
-remove_seal() { rm -f -- "${SCORE_PATH}" "${SCORE_PATH}.sha256" "${INTEGRITY_PATH}"; }
+
+retry_has_no_candidate_pair() {
+  local audit="${BENCHD_PRIVATE_AUDIT_PATH:-}" has_candidate
+  if [[ -z "${audit}" || ! -r "${audit}" ]] || ! has_candidate="$(jq -r '
+      if type == "object"
+         and (.metrics | type == "object")
+         and (.metrics | has("paired_legs"))
+         and ((.metrics.paired_legs | type) == "array")
+         and (all(.metrics.paired_legs[]; type == "object"))
+      then any(.metrics.paired_legs[];
+          has("candidate_prefill_seconds_per_token")
+          or has("candidate_decode_seconds_per_token"))
+      else error("invalid private audit")
+      end' "${audit}" 2>/dev/null)"; then
+    RETRY_WITHHELD_REASON="the private audit was missing or unreadable"
+    return 1
+  fi
+  if [[ "${has_candidate}" == true ]]; then
+    RETRY_WITHHELD_REASON="candidate pairs were already measured"
+    return 1
+  fi
+  [[ "${has_candidate}" == false ]] || {
+    RETRY_WITHHELD_REASON="the private audit was missing or unreadable"
+    return 1
+  }
+}
+
+leg_teardown_failed() {
+  [[ -f "${HELD}/marker" ]] || return 1
+  jq -e '.passed == false and ((.metrics.error // "") | startswith("LEG-TEARDOWN-FAILED"))' \
+    "${SCORE_PATH}" >/dev/null 2>&1
+}
+
+mark_teardown_failed() {
+  [[ -z "${TEARDOWN_FAILED_MARKER:-}" ]] || (
+    umask 077
+    : > "${TEARDOWN_FAILED_MARKER}"
+  )
+}
+
+remove_seal() {
+  rm -f -- "${SCORE_PATH}" "${SCORE_PATH}.sha256" "${INTEGRITY_PATH}"
+  [[ -z "${BENCHD_PRIVATE_AUDIT_PATH:-}" ]] || rm -f -- "${BENCHD_PRIVATE_AUDIT_PATH}"
+}
 
 # Nothing from attempt 1 may reach attempt 2 (contract: no reuse across runs):
-# its seal is deleted, every sandbox process is killed, everything the sandbox
-# user left in the shared temp dirs and its home is removed, and so is all of
+# its seal is deleted, every sandbox process is killed, and shared temp state is
+# removed. Owned files below the fixed passwd home are also removed. So is all of
 # this job's per-job directory the sandbox user can write -- the same five the
 # workflow's cleanup step empties. None is read at run time: tools/engine/build.sh
 # copies the adapter and the kernels into .build/ before measurement. Memory
@@ -742,11 +787,37 @@ clear_sandbox_job_dirs() {
   done
 }
 
+verify_sandbox_measurement_state() {
+  [[ -n "${SANDBOX_ROOT:-}" && -n "${SANDBOX_JOB:-}" ]] || return 1
+  local job_dir="${SANDBOX_ROOT}/${SANDBOX_JOB}"
+  local name path count bad
+  for name in adapter-home sock; do
+    path="${job_dir}/${name}"
+    [[ -d "${path}" && ! -L "${path}" ]] || return 1
+    count="$(find -P "${path}" -mindepth 1 -printf . 2>/dev/null | wc -c)" || return 1
+    if (( count != 0 )); then
+      echo "nemotron35-measure-and-score.sh: sandbox state directory ${name} is not empty before measurement (${count} entries)" >&2
+      return 1
+    fi
+  done
+
+  local outputs=("$(dirname -- "${ENGINE_BIN}")" "${ENGINE_BIN}" "${real_engine}")
+  for path in "${SCRIPT_DIR}/.build/vllm-overlay" "${SCRIPT_DIR}/.build/kernels"; do
+    [[ ! -e "${path}" ]] || outputs+=("${path}")
+  done
+  bad="$(find -P "${outputs[@]}" \( ! -user "$(id -u)" -o -perm /022 \) -print -quit 2>/dev/null)" \
+    || return 1
+  if [[ -n "${bad}" ]]; then
+    echo "nemotron35-measure-and-score.sh: a staged build output is not runner-owned or is group-writable" >&2
+    return 1
+  fi
+}
+
 between_attempts() {
   remove_seal
   if [[ -n "${SANDBOX_USER:-}" ]]; then
-    sandbox_reset_shared || return 1
     clear_sandbox_job_dirs || return 1
+    sandbox_reset_shared || return 1
   else
     bash "${SCRIPT_DIR}/tools/wait-for-memory.sh"
   fi
@@ -754,34 +825,53 @@ between_attempts() {
 
 attempts=1
 rc=0
+retry_withheld=0
 remove_seal
 if [[ -n "${SANDBOX_USER:-}" ]]; then
   if ! sandbox_reset_shared; then
     echo "::error title=Pre-measurement sandbox reset failed::no score sealed: sandbox leftovers from the submission could not be removed" >&2
     exit 75
   fi
+  if ! verify_sandbox_measurement_state; then
+    echo "::error title=Pre-measurement sandbox state check failed::no score sealed: per-leg state is stale or a build output is writable" >&2
+    exit 75
+  fi
 fi
 run_attempt || rc=$?
 if [[ "${rc}" -ne 0 ]] && measurement_retry_warranted; then
-  if control_leg_diverged; then
-    echo "nemotron35-measure-and-score.sh: attempt 1 DISCARDED, the serial control leg diverged: $(jq -r '.metrics.error' "${SCORE_PATH}")" >&2
-  elif pair1_serial_control_boot_failed; then
-    echo "nemotron35-measure-and-score.sh: attempt 1 DISCARDED, the pair-1 serial-control resident did not boot (no pair timing sealed): $(jq -r '.metrics.error' "${SCORE_PATH}")" >&2
+  if ! retry_has_no_candidate_pair; then
+    echo "nemotron35-measure-and-score.sh: retry was withheld because ${RETRY_WITHHELD_REASON}" >&2
+    retry_withheld=1
   else
-    echo "nemotron35-measure-and-score.sh: attempt 1 DISCARDED, the pair-1 candidate resident did not boot (no candidate timing sealed): $(jq -r '.metrics.error' "${SCORE_PATH}")" >&2
+    if control_leg_diverged; then
+      echo "nemotron35-measure-and-score.sh: attempt 1 DISCARDED, the serial control leg diverged: $(jq -r '.metrics.error' "${SCORE_PATH}")" >&2
+    elif pair1_serial_control_boot_failed; then
+      echo "nemotron35-measure-and-score.sh: attempt 1 DISCARDED, the pair-1 serial-control resident did not boot (no pair timing sealed): $(jq -r '.metrics.error' "${SCORE_PATH}")" >&2
+    else
+      echo "nemotron35-measure-and-score.sh: attempt 1 DISCARDED, the pair-1 candidate resident did not boot (no candidate timing sealed): $(jq -r '.metrics.error' "${SCORE_PATH}")" >&2
+    fi
+    if ! between_attempts; then
+      echo "::error title=Measurement retry teardown failed::the box could not be reset after a retriable infrastructure failure; infrastructure outcome, not a submission failure" >&2
+      mark_teardown_failed
+      exit 75
+    fi
+    echo "nemotron35-measure-and-score.sh: re-running the whole measurement once (attempt 2 of 2)" >&2
+    attempts=2
+    rc=0
+    run_attempt || rc=$?
   fi
-  if ! between_attempts; then
-    echo "::error title=Measurement retry teardown failed::the box could not be reset after a retriable infrastructure failure; infrastructure outcome, not a submission failure" >&2
-    exit 75
-  fi
-  echo "nemotron35-measure-and-score.sh: re-running the whole measurement once (attempt 2 of 2)" >&2
-  attempts=2
-  rc=0
-  run_attempt || rc=$?
 fi
 cat -- "${HELD}/stdout"
 if [[ -f "${HELD}/marker" ]]; then cat -- "${HELD}/marker" >&2; fi
 echo "nemotron35-measure-and-score.sh: control_leg_attempts=${attempts}" >&2
+if [[ "${retry_withheld}" -eq 1 ]]; then
+  exit 75
+fi
+if [[ "${rc}" -ne 0 ]] && leg_teardown_failed; then
+  echo "::error title=Leg teardown failed::the box could not clear sandbox state; infrastructure outcome, not a submission failure" >&2
+  mark_teardown_failed
+  exit 75
+fi
 if [[ "${rc}" -ne 0 && "${attempts}" -eq 2 ]] && control_leg_diverged; then
   echo "::error title=Serial control leg diverged twice::infrastructure outcome, not a submission failure; re-dispatch this job" >&2
   exit 75

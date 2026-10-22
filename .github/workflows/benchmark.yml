@@ -263,6 +263,7 @@ jobs:
           {
             printf 'SANDBOX_USER=%s\n' "${SANDBOX_USER:-nemosub}"
             printf 'SANDBOX_ROOT=%s\n' "${SANDBOX_ROOT:-/var/lib/nemotron35/sandbox}"
+            printf 'SANDBOX_JOB=%s\n' "${{ github.run_id }}-${{ github.run_attempt }}"
           } >> "${GITHUB_ENV}"
 
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -379,7 +380,8 @@ jobs:
       - name: Sandbox start (wipe nemosub leftovers, nemosub reads this checkout only)
         # docs/sandbox-design.md 6a. First, nothing a previous job's nemosub
         # left in any directory it can write (the box's wipe list: /tmp,
-        # /var/tmp, /dev/shm, /run/lock, /var/crash, ...), its home or SysV IPC
+        # /var/tmp, /dev/shm, /run/lock, /var/crash, ...), below its fixed
+        # passwd home, in the per-job directory or in SysV IPC
         # may reach this job. Then nemosub gets read on exactly this checkout
         # (the build and the resident read it as nemosub) and traverse-only on
         # the directories above it up to runner's home, which is not
@@ -396,6 +398,7 @@ jobs:
         # from the "Sandbox names" step.
         run: |
           set -euo pipefail
+          ./tools/sandbox-clear-job-dirs.sh "${SANDBOX_ROOT}" --except "${SANDBOX_JOB}"
           ./tools/sandbox-wipe.sh
           ws="$(realpath "${GITHUB_WORKSPACE}")"
           home="$(realpath "${HOME}")"
@@ -477,10 +480,9 @@ jobs:
         run: |
           set -euo pipefail
           lock=/tmp/mtplx-gpu-exclusive.lock
-          if [[ ! -e "${lock}" ]]; then
-            ( umask 0000; : > "${lock}" ) || { echo "::error::cannot create ${lock}" >&2; exit 1; }
-          fi
-          exec 9<> "${lock}"
+          [[ -f "${lock}" && ! -L "${lock}" ]] \
+            || { echo "::error::${lock} is missing or is not a regular file; run the cuda-setup-scripts gpu-lock unit, which creates it as root:bench 0660" >&2; exit 1; }
+          exec 9<"${lock}"
           flock 9
           ./setup.sh
 
@@ -614,10 +616,9 @@ jobs:
 
           # -- box-wide GPU lock (shared with spark-gate) --------------------
           lock=/tmp/mtplx-gpu-exclusive.lock
-          if [[ ! -e "${lock}" ]]; then
-            ( umask 0000; : > "${lock}" ) || { echo "::error::cannot create ${lock}" >&2; exit 1; }
-          fi
-          exec 9<> "${lock}"
+          [[ -f "${lock}" && ! -L "${lock}" ]] \
+            || { echo "::error::${lock} is missing or is not a regular file; run the cuda-setup-scripts gpu-lock unit, which creates it as root:bench 0660" >&2; exit 1; }
+          exec 9<"${lock}"
           echo "waiting for the box GPU lock (${lock}); a spark-gate or another GPU window may hold it"
           flock 9
           echo "box GPU lock held"
@@ -704,9 +705,18 @@ jobs:
           # --baseline-workspace and --baseline-calibration, and refuses by name
           # when either is unset.
           # Runner-private; nemosub is denied RUNNER_TEMP; read by the plausibility gate.
-          rm -f "${RUNNER_TEMP}/benchd-private-audit.json"
+          rm -f "${RUNNER_TEMP}/benchd-private-audit.json" "${RUNNER_TEMP}/teardown-failed"
           export BENCHD_PRIVATE_AUDIT_PATH="${RUNNER_TEMP}/benchd-private-audit.json"
+          export TEARDOWN_FAILED_MARKER="${RUNNER_TEMP}/teardown-failed"
+          set +e
           MLXFAST_SCORE_PATH=score.json ./tools/nemotron35-measure-and-score.sh
+          measure_rc=$?
+          set -e
+          if [[ "${measure_rc}" -eq 75 ]] \
+              && jq -e '.passed == false and ((.metrics.error // "") | startswith("LEG-TEARDOWN-FAILED"))' score.json >/dev/null 2>&1; then
+            ( umask 077; : > "${RUNNER_TEMP}/teardown-failed" )
+          fi
+          exit "${measure_rc}"
 
       - name: Sandbox cleanup (kill nemosub processes, remove per-job dirs)
         if: always()
@@ -718,38 +728,13 @@ jobs:
             echo "::error::SANDBOX_ROOT or SANDBOX_JOB is unset; refusing to remove sandbox paths" >&2
             exit 1
           fi
-          job_dir="${SANDBOX_ROOT}/${SANDBOX_JOB}"
           rc=0
           if command -v sudo >/dev/null 2>&1; then
-            sudo -n -u "${SANDBOX_USER}" -- kill -KILL -1 >/dev/null 2>&1 || true
-            for sub in cargo-home target kernels-out sock adapter-home; do
-              subpath="${job_dir}/${sub}"
-              if [[ -d "${subpath}" ]]; then
-                # nemosub may have made its own dirs unreadable; it reopens
-                # them, then deletes what it wrote. The runner-owned dirs go below.
-                sudo -n -u "${SANDBOX_USER}" -- chmod -R u+rwX "${subpath}" >/dev/null 2>&1 || true
-                sudo -n -u "${SANDBOX_USER}" -- find "${subpath}" -mindepth 1 -delete >/dev/null 2>&1 || true
-              fi
-            done
-            # Same kill-and-verify as tools/run-engine-sandboxed.sh.
-            left="x"
-            for _ in 1 2 3 4 5 6 7 8 9 10; do
-              sudo -n -u "${SANDBOX_USER}" -- kill -KILL -1 >/dev/null 2>&1 || true
-              left="$(pgrep -u "${SANDBOX_USER}" 2>/dev/null | tr '\n' ' ' || true)"
-              [[ -z "${left// /}" ]] && break
-              sleep 0.5
-            done
-            if [[ -n "${left// /}" ]]; then
-              echo "::error::${SANDBOX_USER} processes survived kill -KILL -1: ${left}" >&2
-              rc=1
-            fi
+            ./tools/sandbox-clear-job-dirs.sh "${SANDBOX_ROOT}" || rc=1
             ./tools/sandbox-wipe.sh || rc=1
           else
             echo "::error::sudo is required for sandbox cleanup (kill nemosub, pgrep check, sandbox-wipe.sh)" >&2
             rc=1
-          fi
-          if [[ -d "${job_dir}" ]]; then
-            rm -rf "${job_dir}" || rc=1
           fi
           if [[ "${rc}" -eq 0 ]]; then
             ( umask 077; : > "${RUNNER_TEMP}/cleanup-ok" )
@@ -798,7 +783,10 @@ jobs:
           set -euo pipefail
           nonce="$(cat "${RUNNER_TEMP}/score-nonce")"
           echo "NEMOTRON35-SCORE-BEGIN ${nonce}"
-          if [[ -f "${RUNNER_TEMP}/cleanup-ok" && -f "${RUNNER_TEMP}/plausibility-ok" ]]; then
+          if [[ ! -f "${RUNNER_TEMP}/cleanup-ok" || -f "${RUNNER_TEMP}/teardown-failed" ]]; then
+            echo "NEMOTRON35-TEARDOWN-FAILED ${nonce}"
+            echo "NEMOTRON35-SCORE-END ${nonce} none"
+          elif [[ -f "${RUNNER_TEMP}/plausibility-ok" ]]; then
             if [[ -f score.json ]]; then
               cat score.json
               if [[ -s score.json ]] && [[ "$(tail -c1 score.json)" != $'\n' ]]; then

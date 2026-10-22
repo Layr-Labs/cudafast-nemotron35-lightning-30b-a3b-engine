@@ -459,7 +459,9 @@ candidate resident fails to boot before any candidate timing is sealed
 fails to boot (`LEG-SERVE-BOOT-FAILED: the serial-control leg's ...`, with an
 empty or absent `metrics.paired_legs`). A boot failure in a later pair is never
 retried: pair 1 is already in `paired_legs`, so a second attempt would be a
-best-of-two on your engine. Whichever cause fires first consumes the budget;
+best-of-two on your engine. The driver retries only when the private audit shows
+no completed candidate pair. If the audit is missing or unreadable, the driver
+does not retry and exits 75. Whichever cause fires first consumes the budget;
 for example, a control divergence on attempt 1 followed by a pair-1 boot
 failure on attempt 2 is final. In every retriable case the driver wipes the
 sandbox, including all five per-job directories, before the second run. The
@@ -530,7 +532,8 @@ file's byte count and sha256 against its pin before a ranked run. The fixture's
   mean contest score counts every contest run of that submission that scored or
   failed because of the submission (a team failure counts as 0.0; a
   post-setup reference-leg or band failure counts as 0.0; other infrastructure
-  runs are excluded). Ties go to the most recent submission. The top N teams
+  runs are excluded). A teardown failure counts as 0.0 and is not re-dispatched.
+  Ties go to the most recent submission. The top N teams
   (default 10) are selected. Each selected submission is re-measured K times
   (default 5), one run per slot, across different boxes on a held-out pool
   that was never staged during the contest. Each slot is its first run that

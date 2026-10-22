@@ -48,7 +48,9 @@ cp "${files[@]}"
 EOF
 cat > "${STUB}/flock" <<'EOF'
 #!/usr/bin/env bash
-shift 3; exec "$@"
+shift 3
+[[ "$#" -eq 0 ]] && exit 0
+exec "$@"
 EOF
 # record-goldens stub: deterministic content per (name, step); a box named in
 # ${FAKE}/mismatch writes different bytes; ${FAKE}/fail-<box>-<steps> makes one job fail.
@@ -126,9 +128,11 @@ FX="${ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json"
 jq '.official_pairs = 3 | .live_goldens = ["pool-9", "pool-10", "pool-11"]' "${FX}" > "${WORK}/fx" && mv "${WORK}/fx" "${FX}"
 SHIPPED_POOL="$(jq '.timed_prompt_pool | length' "${FX}")"
 SHIPPED_LIVE="$(jq -c '.live_goldens' "${FX}")"
+GPU_LOCK="${WORK}/gpu.lock"
+: > "${GPU_LOCK}"
 refresh_raw() {
   env PATH="${STUB}:${PATH}" REFRESH_BOXES="${BOXES}" REFRESH_PRIVATE="${PRIV}" \
-    REFRESH_BOX_GOLDENS='$HOME/goldens' REFRESH_PYTHON="${WORK}/fake-stitch" \
+    REFRESH_BOX_GOLDENS='$HOME/goldens' REFRESH_GPU_LOCK="${GPU_LOCK}" REFRESH_PYTHON="${WORK}/fake-stitch" \
     "${ROOT}/tools/pool-refresh.sh" "$@" 2>&1
 }
 refresh() {

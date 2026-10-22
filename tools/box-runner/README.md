@@ -198,7 +198,8 @@ sudo tools/box-runner/setup-sandbox-user.sh
 
 It is idempotent. It creates group `nemoshare` (adds `runner` to it, leaving
 `runner`'s other groups alone), system user `nemosub` (`/usr/sbin/nologin`,
-home `/var/lib/nemosub` 0700, not in `docker`/`bench`/`sudo`),
+passwd home `/var/lib/nemosub` as `root:root` 0755 with no ACL or xattr,
+not in `docker`/`bench`/`sudo`),
 `/var/lib/nemotron35/sandbox` (`runner:nemoshare` 2750),
 `/etc/sudoers.d/nemotron35-sandbox` (`runner ALL=(nemosub) NOPASSWD:SETENV: ALL`,
 checked with `visudo` before it is installed), a Rust toolchain in `/opt/rust`

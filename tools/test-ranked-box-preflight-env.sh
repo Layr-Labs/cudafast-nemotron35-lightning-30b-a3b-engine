@@ -32,6 +32,8 @@ CREDENTIALS=(R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY MLXFAST_NEMOTRON35_R2_DOWNLOA
 OVERRIDES=(BENCHD MLXFAST_SKIP_WEIGHTS_DOWNLOAD SKIP_MODEL_DOWNLOAD MLXFAST_LOCAL_COOL_GATE
            MLXFAST_LOCAL_ALLOW_GOLDEN_DRIFT MLXFAST_SKIP_ENGINE_BUILD MLXFAST_SKIP_WEIGHTS_SHA256
            SERVE_UP_LAUNCHER SERVE_UP_NO_CAP_DROP SERVE_UP_ALLOW_NEW_PRIVS
+           SANDBOX_ENGINE_PATH SANDBOX_WIPE_LIST SANDBOX_WIPE_HOME SANDBOX_SYSVIPC_DIR
+           SANDBOX_DEV_SHM SANDBOX_DEV_MQUEUE
            STAGE_VLLM_OVERLAY_BASE ENGINE_EOS_IDS
            DS4_RESIDENT_SOCKET BENCH_WORKER_RESIDENT_SOCKET)
 # Engine-configuration prefixes the preflight refuses as a family; one sample
@@ -177,6 +179,13 @@ fi
 echo "setup-sandbox-user.sh --check: all checks passed"
 EOF
   chmod 755 "${ROOT}/tools/box-runner/setup-sandbox-user.sh"
+  # Use a scratch GPU lock. The production path stays fixed at /tmp.
+  rm -f "${ROOT}/tools/ranked-box-preflight.sh"
+  cp "${REPO_ROOT}/tools/ranked-box-preflight.sh" "${ROOT}/tools/ranked-box-preflight.sh"
+  GPU_LOCK_TEST="${WORK}/mtplx-gpu-exclusive.lock"
+  sed -i "s#/tmp/mtplx-gpu-exclusive.lock#${GPU_LOCK_TEST}#g" "${ROOT}/tools/ranked-box-preflight.sh"
+  : > "${GPU_LOCK_TEST}"
+  chmod 0444 "${GPU_LOCK_TEST}"
   for entry in "${REPO_ROOT}"/*; do
     case "$(basename "${entry}")" in
       tools|fixtures|correctness_prompts) continue ;;
@@ -251,6 +260,16 @@ EOF
   cat > "${STUB}/nvidia-smi" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "${DRIVER_PIN}"
+EOF
+  cat > "${STUB}/sudo" <<EOF
+#!/usr/bin/env bash
+if [[ " \$* " == *" -- true "* ]]; then exit 0; fi
+if [[ " \$* " == *" test -w ${GPU_LOCK_TEST} "* ]]; then
+  [[ "\${STUB_GPU_LOCK_WRITABLE:-0}" == 1 ]]
+  exit
+fi
+echo "sudo stub: unexpected \$*" >&2
+exit 97
 EOF
   chmod 755 "${STUB}"/*
 
@@ -571,6 +590,13 @@ ROTEOF
   # ...and a box with open loopback or a usable cron (F1/F3) names both.
   expect_refusal "sandbox loopback and cron open" \
     "live listener on 127.0.0.1;FAIL  cron refuses nemosub" SANDBOX_CHECK_STUB=open
+
+  mv "${GPU_LOCK_TEST}" "${GPU_LOCK_TEST}.off"
+  expect_refusal "GPU lock missing" \
+    "cuda-setup-scripts gpu-lock unit"
+  mv "${GPU_LOCK_TEST}.off" "${GPU_LOCK_TEST}"
+  expect_refusal "GPU lock writable by sandbox user" \
+    "is writable by nemosub" STUB_GPU_LOCK_WRITABLE=1
 
   if [[ "${failures}" -eq "${scaffold_failures_before}" ]]; then
     echo "test-ranked-box-preflight-env.sh: the section 8 paired-baseline cases and the control passed"

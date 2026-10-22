@@ -215,6 +215,7 @@ grep -qF -- "${WS}/tools/serve-up.sh --boot --spec serial --draft-len 0" "${DRY}
 ok "case 1: --dry-run took no lock, booted nothing and wrote nothing"
 
 # --- case 2: a full mechanics run -------------------------------------------
+: > "${LOCK}"
 : > "${WORK}/serve.log"; : > "${WORK}/benchd.log"; : > "${WORK}/private.log"
 OUT="${WORK}/run/baseline-calibration.json"
 RUN_OUT="${WORK}/run.out"

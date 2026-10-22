@@ -457,6 +457,14 @@ class ResolveRescoreSlotTest(unittest.TestCase):
         self.assertEqual(resolved["value"], 0.0)
         self.assertEqual(resolved["outcome"], "replay_rejected")
 
+    def test_teardown_failed_is_not_redispatched(self):
+        row = self._done("teardown_failed", 1.0, "a")
+        self.assertEqual(router.rescore_run_kind(row, False), "team_failure")
+        self.assertEqual(router.rescore_run_kind(row, True), "team_failure")
+        resolved = router.resolve_rescore_slot([row], 2)
+        self.assertEqual(resolved["status"], "team_failure")
+        self.assertEqual(resolved["value"], 0.0)
+
 
 def uuid_hex():
     return __import__("uuid").uuid4().hex[:8]
@@ -483,6 +491,8 @@ class ClassifyTest(unittest.TestCase):
                          "correctness_failed")
         self.assertEqual(c("failure", 0, "TIMED-REPLAY-REJECTED: pair 1 ...", "", True), "replay_rejected")
         self.assertEqual(c("failure", 0, "performance floor failed: decode_speedup=0.9", "", True), "floor_failed")
+        self.assertEqual(c("failure", 0, "LEG-TEARDOWN-FAILED: the candidate leg stop failed", "", True),
+                         "teardown_failed")
         self.assertEqual(c("failure", None, "", "editable-surface + static review / Submission static review", False),
                          "surface_refused")
         self.assertEqual(c("failure", None, "", "ranked measurement / Ranked box preflight (staged assets)", False),
@@ -497,6 +507,7 @@ class ClassifyTest(unittest.TestCase):
         self.assertTrue(router.meets("refused", "preflight_refused"))
         self.assertTrue(router.meets("refused", "unsealed"))
         self.assertTrue(router.meets("refused", "watchdog_timeout"))
+        self.assertTrue(router.meets("refused", "teardown_failed"))
         self.assertFalse(router.meets("pass", "floor_failed"))
         self.assertTrue(router.meets("measure", "floor_failed"))
         self.assertIsNone(router.meets("pass", None))
@@ -579,6 +590,24 @@ class ScoreFromLogTest(unittest.TestCase):
         nonce = "0" * 64
         log = "\n".join([
             self._gh(f"NEMOTRON35-SCORE-BEGIN {nonce}"),
+            self._gh(f"NEMOTRON35-SCORE-END {nonce} none"),
+        ])
+        self.assertEqual(router.score_from_log(log), {})
+
+    def test_teardown_failed_with_matching_nonce(self):
+        nonce = "1" * 64
+        log = "\n".join([
+            self._gh(f"NEMOTRON35-SCORE-BEGIN {nonce}"),
+            self._gh(f"NEMOTRON35-TEARDOWN-FAILED {nonce}"),
+            self._gh(f"NEMOTRON35-SCORE-END {nonce} none"),
+        ])
+        self.assertEqual(router.score_from_log(log), "teardown_failed")
+
+    def test_teardown_failed_with_wrong_nonce_is_ignored(self):
+        nonce = "2" * 64
+        log = "\n".join([
+            self._gh(f"NEMOTRON35-SCORE-BEGIN {nonce}"),
+            self._gh(f"NEMOTRON35-TEARDOWN-FAILED {'3' * 64}"),
             self._gh(f"NEMOTRON35-SCORE-END {nonce} none"),
         ])
         self.assertEqual(router.score_from_log(log), {})

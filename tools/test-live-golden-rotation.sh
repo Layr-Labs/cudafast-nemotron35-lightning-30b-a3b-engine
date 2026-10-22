@@ -77,6 +77,10 @@ jq '.live_golden_rotation.mode = "round_robin"' "${WORK}/rot.json" > "${WORK}/mo
 ROOT="${WORK}/root"
 mkdir -p "${ROOT}/tools" "${ROOT}/fixtures" "${ROOT}/correctness_prompts"
 for entry in "${REPO_ROOT}"/tools/*; do ln -s "${entry}" "${ROOT}/tools/$(basename "${entry}")"; done
+if [[ -n "${MEASURE_SCRIPT_UNDER_TEST:-}" ]]; then
+  rm "${ROOT}/tools/nemotron35-measure-and-score.sh"
+  ln -s "${MEASURE_SCRIPT_UNDER_TEST}" "${ROOT}/tools/nemotron35-measure-and-score.sh"
+fi
 ln -s "${REPO_ROOT}/benchmark.json" "${ROOT}/benchmark.json"
 cp "${REPO_ROOT}/correctness_prompts/public-longcopy-gate-english-496.golden.json" "${ROOT}/correctness_prompts/"
 jq '.spec = {enabled: false, num_speculative_tokens: 0}' "${REPO_ROOT}/mtp-head.manifest.json" > "${ROOT}/mtp-head.manifest.json"
@@ -95,7 +99,9 @@ chmod +x "${WORK}/engine"
 
 # benchd stub: `iterate --help` advertises the flags (STUB_FLAGS), a real run
 # records its argv. With STUB_PLAN (a file of outcomes, one per run: pass,
-# control, prefill, spawn, floor) it also seals score.json like benchd: the
+# control, control2, control_noaudit, control_false, control_object,
+# control_string, prefill, spawn, floor, teardown) it also seals
+# score.json like benchd: the
 # JSON on stdout, the marker on stderr, exit 1 unless it passed. Run n appends
 # its outcome to STUB_RUNS and keeps its argv as STUB_RUNS.argv.n. With
 # STUB_JOBDIR it logs how many files the per-job sandbox dirs hold
@@ -119,19 +125,34 @@ cp "${STUB_ARGV}" "${STUB_RUNS}.argv.${n}"
 if [[ -n "${STUB_JOBDIR:-}" ]]; then
   find "${STUB_JOBDIR}" -mindepth 2 | wc -l >> "${STUB_RUNS}.seen"
   for d in cargo-home target kernels-out sock adapter-home; do echo memo > "${STUB_JOBDIR}/${d}/memo-${n}"; done
+  [[ -z "${STUB_RUNNER_SOCK:-}" || "${n}" -ne 1 ]] || echo runner > "${STUB_JOBDIR}/sock/runner-sock-leftover"
 fi
 score="$(grep -A1 -xF -- --score-path <<<"$(printf '%s\n' "$@")" | tail -1)"
 case "${what}" in
   pass) json="{\"passed\": true, \"score\": 1.${n}, \"metrics\": {\"error\": \"\"}}" ;;
   control) json="{\"passed\": false, \"score\": null, \"metrics\": {\"error\": \"SERIAL-CONTROL-LEG-FAILED: benchmark free-run decode token mismatch at step 47: expected oracle token 1278, engine returned 1799\"}}" ;;
+  control2|control_noaudit|control_false|control_object|control_string) json="{\"passed\": false, \"score\": null, \"metrics\": {\"error\": \"SERIAL-CONTROL-LEG-FAILED: benchmark free-run decode token mismatch at step 47: expected oracle token 1278, engine returned 1799\"}}" ;;
   prefill) json="{\"passed\": false, \"score\": null, \"metrics\": {\"error\": \"SERIAL-CONTROL-LEG-FAILED: reference warmup leg failed: benchmark prefill token mismatch at step 0: expected oracle token 1, engine returned 2\"}}" ;;
   spawn) json="{\"passed\": false, \"score\": null, \"metrics\": {\"error\": \"SERIAL-CONTROL-LEG-FAILED: worker spawn failed\"}}" ;;
   floor) json="{\"passed\": false, \"score\": null, \"metrics\": {\"error\": \"performance floor failed: decode_speedup=0.9\"}}" ;;
+  teardown) json="{\"passed\": false, \"score\": null, \"metrics\": {\"error\": \"LEG-TEARDOWN-FAILED: the candidate leg stop failed\"}}" ;;
   boot) json="{\"passed\": false, \"score\": null, \"metrics\": {\"error\": \"LEG-SERVE-BOOT-FAILED: the candidate leg's resident did not boot (1): abcd1234\", \"paired_legs\": []}}" ;;
   boot2) json="{\"passed\": false, \"score\": null, \"metrics\": {\"error\": \"LEG-SERVE-BOOT-FAILED: the candidate leg's resident did not boot (1): abcd1234\", \"paired_legs\": [{\"pair\": 1, \"prompt_sha256\": \"deadbeef\", \"control_prefill_seconds_per_token\": 1.0, \"control_decode_seconds_per_token\": 2.0, \"candidate_prefill_seconds_per_token\": 1.1, \"candidate_decode_seconds_per_token\": 2.1}]}}" ;;
   boot_ctl) json="{\"passed\": false, \"score\": null, \"metrics\": {\"error\": \"LEG-SERVE-BOOT-FAILED: the serial-control leg's resident did not boot (1): abcd1234\", \"paired_legs\": []}}" ;;
   boot_ctl2) json="{\"passed\": false, \"score\": null, \"metrics\": {\"error\": \"LEG-SERVE-BOOT-FAILED: the serial-control leg's resident did not boot (1): abcd1234\", \"paired_legs\": [{\"pair\": 1, \"prompt_sha256\": \"deadbeef\", \"control_prefill_seconds_per_token\": 1.0, \"control_decode_seconds_per_token\": 2.0, \"candidate_prefill_seconds_per_token\": 1.1, \"candidate_decode_seconds_per_token\": 2.1}]}}" ;;
 esac
+audit="{\"passed\": false, \"score\": null, \"metrics\": {\"paired_legs\": []}}"
+if [[ "${what}" == control2 ]]; then
+  audit="{\"passed\": false, \"score\": null, \"metrics\": {\"paired_legs\": [{\"pair\": 1, \"candidate_prefill_seconds_per_token\": 1.1, \"candidate_decode_seconds_per_token\": 2.1}]}}"
+fi
+case "${what}" in
+  control_false) audit='{"passed": false, "metrics": {"paired_legs": false}}' ;;
+  control_object) audit='{"passed": false, "metrics": {"paired_legs": {}}}' ;;
+  control_string) audit='{"passed": false, "metrics": {"paired_legs": "none"}}' ;;
+esac
+if [[ "${what}" != control_noaudit && -n "${BENCHD_PRIVATE_AUDIT_PATH:-}" ]]; then
+  printf '%s\n' "${audit}" > "${BENCHD_PRIVATE_AUDIT_PATH}"
+fi
 echo "stub benchd run ${n}: ${what}" >&2
 printf '%s\n' "${json}" | tee "${score}"
 : > "${score}.sha256"
@@ -145,6 +166,7 @@ measure() { # measure FIXTURE [env...]  -> stdout+stderr; argv in ${WORK}/argv
   rm -f "${WORK}/argv"
   env -u MLXFAST_LIVE_GOLDEN_CHOICE -u SANDBOX_USER -u MLXFAST_QWEN_MTP_TRACK_ID -u MLXFAST_PRIVATE_DIR \
     BENCHD="${WORK}/benchd" STUB_ARGV="${WORK}/argv" STUB_PRIVATE_LOG="${WORK}/private.log" STUB_REAL_FIND="$(command -v find)" \
+    BENCHD_PRIVATE_AUDIT_PATH="${WORK}/private-audit.json" \
     MLXFAST_BASELINE_WORKSPACE="${WORK}/ws" MLXFAST_BASELINE_CALIBRATION="${WORK}/cal.json" \
     MLXFAST_NEMOTRON35_GOLDEN_DIR="${GOLDENS}" MLXFAST_ENGINE_BIN="${WORK}/engine" \
     MLXFAST_WEIGHTS_PATH="${WORK}/weights" SPEC_DECLARATION_MANIFEST="${ROOT}/mtp-head.manifest.json" \
@@ -241,7 +263,7 @@ PLAN_ENV=()
 plan() {
   printf '%s\n' "$@" > "${WORK}/plan"
   : > "${WORK}/runs"
-  rm -f "${ROOT}/score.json" "${ROOT}/score.json.sha256" "${WORK}"/runs.*
+  rm -f "${ROOT}/score.json" "${ROOT}/score.json.sha256" "${WORK}"/runs.* "${WORK}/private-audit.json"
   out="$(measure "${WORK}/full.json" STUB_PLAN="${WORK}/plan" \
     STUB_RUNS="${WORK}/runs" SERVE_UP_MEMINFO="${WORK}/meminfo" WAIT_FOR_MEMORY_TIMEOUT_S=0 \
     ${PLAN_ENV[@]+"${PLAN_ENV[@]}"})"
@@ -263,6 +285,49 @@ plan control pass
   && ok "retry: control failure then pass is scored from attempt 2 alone, attempts=2, one marker" \
   || fail "retry: control+pass: rc=${rc} runs=${runs} out: $(tail -5 <<<"${out}")"
 
+plan control2 pass
+[[ "${rc}" -eq 75 && "${runs}" == "control2 " && "$(markers)" -eq 1 ]] \
+  && grep -q "control_leg_attempts=1" <<<"${out}" \
+  && grep -q "retry was withheld because candidate pairs were already measured" <<<"${out}" \
+  && ok "retry: pair-2 control divergence after candidate timing is final infrastructure" \
+  || fail "retry: pair-2 control divergence: rc=${rc} runs=${runs} out: $(tail -5 <<<"${out}")"
+
+plan control_noaudit pass
+[[ "${rc}" -eq 75 && "${runs}" == "control_noaudit " && "$(markers)" -eq 1 ]] \
+  && grep -q "control_leg_attempts=1" <<<"${out}" \
+  && grep -q "retry was withheld because the private audit was missing or unreadable" <<<"${out}" \
+  && ok "retry: a missing private audit withholds the retry" \
+  || fail "retry: missing private audit: rc=${rc} runs=${runs} out: $(tail -5 <<<"${out}")"
+
+for malformed in false object string; do
+  plan "control_${malformed}" pass
+  [[ "${rc}" -eq 75 && "${runs}" == "control_${malformed} " && "$(markers)" -eq 1 ]] \
+    && grep -q "control_leg_attempts=1" <<<"${out}" \
+    && grep -q "retry was withheld because the private audit was missing or unreadable" <<<"${out}" \
+    && ok "retry: paired_legs ${malformed} withholds the retry" \
+    || fail "retry: paired_legs ${malformed}: rc=${rc} runs=${runs} out: $(tail -5 <<<"${out}")"
+done
+
+REAL_JQ="$(command -v jq)"
+mkdir -p "${WORK}/jq-fail-bin"
+cat > "${WORK}/jq-fail-bin/jq" <<EOF
+#!/usr/bin/env bash
+if [[ "\${STUB_JQ_FAIL_AUDIT_PREDICATE:-0}" == 1 && "\$*" == *'any('* \
+      && "\${!#}" == "\${BENCHD_PRIVATE_AUDIT_PATH:-}" ]]; then
+  exit 2
+fi
+exec ${REAL_JQ@Q} "\$@"
+EOF
+chmod +x "${WORK}/jq-fail-bin/jq"
+PLAN_ENV=(PATH="${WORK}/jq-fail-bin:${PATH}" STUB_JQ_FAIL_AUDIT_PREDICATE=1)
+plan control pass
+[[ "${rc}" -eq 75 && "${runs}" == "control " && "$(markers)" -eq 1 ]] \
+  && grep -q "control_leg_attempts=1" <<<"${out}" \
+  && grep -q "retry was withheld because the private audit was missing or unreadable" <<<"${out}" \
+  && ok "retry: a jq error while reading candidate timing withholds the retry" \
+  || fail "retry: private-audit jq error: rc=${rc} runs=${runs} out: $(tail -5 <<<"${out}")"
+PLAN_ENV=()
+
 plan control control pass
 [[ "${rc}" -eq 75 && "${runs}" == "control control " && "$(markers)" -eq 1 ]] \
   && grep -q "Serial control leg diverged twice" <<<"${out}" && grep -q "control_leg_attempts=2" <<<"${out}" \
@@ -274,6 +339,19 @@ plan floor pass
   && grep -q "control_leg_attempts=1" <<<"${out}" \
   && ok "retry: a candidate failure is never retried" \
   || fail "retry: floor: rc=${rc} runs=${runs} out: $(tail -3 <<<"${out}")"
+
+TEARDOWN_MARKER="${WORK}/teardown-failed"
+rm -f "${TEARDOWN_MARKER}"
+PLAN_ENV=(TEARDOWN_FAILED_MARKER="${TEARDOWN_MARKER}")
+plan teardown pass
+[[ "${rc}" -eq 75 && "${runs}" == "teardown " && "$(markers)" -eq 1 ]] \
+  && grep -q "control_leg_attempts=1" <<<"${out}" \
+  && grep -q "Leg teardown failed" <<<"${out}" \
+  && [[ -f "${TEARDOWN_MARKER}" && "$(stat -c %a "${TEARDOWN_MARKER}")" == 600 ]] \
+  && ok "teardown: a LEG-TEARDOWN-FAILED seal exits 75 and writes a mode-600 marker" \
+  || fail "teardown: rc=${rc} runs=${runs} out: $(tail -5 <<<"${out}")"
+rm -f "${TEARDOWN_MARKER}"
+PLAN_ENV=()
 
 plan control floor
 [[ "${rc}" -eq 1 && "${runs}" == "control floor " ]] && jq -e '.metrics.error | startswith("performance floor")' "${ROOT}/score.json" >/dev/null \
@@ -350,15 +428,20 @@ rc=$?
 # current user; the stub ipcs lists nothing, so no real IPC object is touched).
 SB="${WORK}/sb"
 JOBDIR="${SB}/root/42-1"
-mkdir -p "${SB}/bin" "${SB}/tmp" "${SB}/home" "${SB}/runner-temp"
+mkdir -p "${SB}/bin" "${SB}/tmp" "${SB}/home" "${SB}/runner-temp" \
+  "${SB}/shm" "${SB}/mqueue" "${SB}/sysvipc"
 for d in cargo-home target kernels-out sock adapter-home; do mkdir -p "${JOBDIR}/${d}"; done
 printf '%s\n' "${SB}/tmp" > "${SB}/wipe-dirs"
+printf '%s\n' 'key shmid perms size cpid lpid nattch uid gid cuid cgid atime dtime ctime rss swap' > "${SB}/sysvipc/shm"
+printf '%s\n' 'key semid perms nsems uid gid cuid cgid otime ctime' > "${SB}/sysvipc/sem"
+printf '%s\n' 'key msqid perms cbytes qnum lspid lrpid uid gid cuid cgid stime rtime ctime' > "${SB}/sysvipc/msg"
 REAL_FIND="$(command -v find)"
 cat > "${SB}/bin/sudo" <<EOF
 #!/usr/bin/env bash
 [[ "\$1 \$2" == "-n -u" && "\$4" == "--" ]] || exit 97
 shift 4
 [[ "\$1" == kill ]] && exit 0
+[[ "\$1 \$2 \$3" == "test -w ${SB}/home" ]] && exit 1
 if [[ "\$1" == find ]]; then
   # nemosub cannot delete runner-owned socket dirs left by a crashed resident.
   shift
@@ -374,6 +457,11 @@ if [[ "\$1" == find ]]; then
   exec ${REAL_FIND@Q} "\${args[@]}"
 fi
 exec "\$@"
+EOF
+cat > "${SB}/bin/stat" <<EOF
+#!/usr/bin/env bash
+[[ "\$1 \$2 \$3 \$4" == "-Lc %u -- ${SB}/home" ]] && { echo 0; exit 0; }
+exec $(command -v stat) "\$@"
 EOF
 cat > "${SB}/bin/find" <<EOF
 #!/usr/bin/env bash
@@ -400,12 +488,30 @@ EOF
 printf '#!/usr/bin/env bash\nexit 0\n' > "${SB}/bin/ipcs"
 chmod +x "${SB}/bin/"*
 SB_ENV=(PATH="${SB}/bin:${PATH}" SANDBOX_USER="$(id -un)" SANDBOX_ROOT="${SB}/root" SANDBOX_JOB=42-1
-        RUNNER_TEMP="${SB}/runner-temp" SANDBOX_WIPE_LIST="${SB}/wipe-dirs" SANDBOX_WIPE_HOME="${SB}/home")
+        RUNNER_TEMP="${SB}/runner-temp" SANDBOX_WIPE_LIST="${SB}/wipe-dirs" SANDBOX_WIPE_HOME="${SB}/home"
+        SANDBOX_SYSVIPC_DIR="${SB}/sysvipc" SANDBOX_DEV_SHM="${SB}/shm" SANDBOX_DEV_MQUEUE="${SB}/mqueue")
 env "${SB_ENV[@]}" "${ROOT}/tools/stage-cuda-engine.sh" --print-shim > "${SB}/engine"
 cp "${WORK}/engine" "${SB}/engine.sandboxed"
 chmod +x "${SB}/engine" "${SB}/engine.sandboxed"
 echo setup-leftover > "${SB}/tmp/setup-leftover"
 PLAN_ENV=("${SB_ENV[@]}" MLXFAST_ENGINE_BIN="${SB}/engine")
+echo adapter-state > "${JOBDIR}/adapter-home/state"
+mkdir "${JOBDIR}/sock/stale-leg"
+echo socket-state > "${JOBDIR}/sock/stale-leg/state"
+plan pass
+[[ "${rc}" -eq 75 && -z "${runs}" ]] && grep -q "Pre-measurement sandbox reset failed" <<<"${out}" \
+  && ok "measure: stale adapter-home or socket state fails before attempt 1" \
+  || fail "measure: stale per-leg state: rc=${rc} runs=${runs} out: $(tail -3 <<<"${out}")"
+rm -f "${JOBDIR}/adapter-home/state" "${JOBDIR}/sock/stale-leg/state"
+rmdir "${JOBDIR}/sock/stale-leg"
+
+chmod g+w "${SB}/engine.sandboxed"
+plan pass
+[[ "${rc}" -eq 75 && -z "${runs}" ]] && grep -q "Pre-measurement sandbox state check failed" <<<"${out}" \
+  && ok "measure: a group-writable staged engine fails before attempt 1" \
+  || fail "measure: writable build output: rc=${rc} runs=${runs} out: $(tail -3 <<<"${out}")"
+chmod g-w "${SB}/engine.sandboxed"
+
 plan pass
 [[ "${rc}" -eq 0 && "${runs}" == "pass " && ! -e "${SB}/tmp/setup-leftover" ]] \
   && ok "measure: a file planted in shared tmp before the run is gone when attempt 1 starts" \
@@ -415,21 +521,28 @@ plan control pass
 [[ "${rc}" -eq 0 && "${runs}" == "control pass " && "$(tr '\n' ' ' < "${WORK}/runs.seen")" == "0 0 " ]] \
   && ok "retry: every file attempt 1 planted in the five per-job sandbox dirs is gone when attempt 2 starts" \
   || fail "retry: sandboxed teardown: rc=${rc} runs=${runs} seen=$(tr '\n' ' ' < "${WORK}/runs.seen" 2>/dev/null) out: $(tail -4 <<<"${out}")"
+for d in cargo-home target kernels-out sock adapter-home; do rm -rf "${JOBDIR:?}/${d}/"*; done
 
-echo runner-owned > "${JOBDIR}/sock/runner-sock-leftover"
-PLAN_ENV=("${SB_ENV[@]}" MLXFAST_ENGINE_BIN="${SB}/engine" STUB_JOBDIR="${JOBDIR}")
+TEARDOWN_MARKER="${SB}/runner-temp/teardown-failed"
+rm -f "${TEARDOWN_MARKER}"
+PLAN_ENV=("${SB_ENV[@]}" MLXFAST_ENGINE_BIN="${SB}/engine" STUB_JOBDIR="${JOBDIR}" STUB_RUNNER_SOCK=1
+          TEARDOWN_FAILED_MARKER="${TEARDOWN_MARKER}")
 plan boot_ctl pass
-[[ "${rc}" -eq 0 && "${runs}" == "boot_ctl pass " && ! -e "${JOBDIR}/sock/runner-sock-leftover" ]] \
+[[ "${rc}" -eq 0 && "${runs}" == "boot_ctl pass " && ! -e "${JOBDIR}/sock/runner-sock-leftover" \
+    && ! -e "${TEARDOWN_MARKER}" ]] \
   && ok "retry: clear_sandbox_job_dirs removes runner-owned leftovers the sandbox user could not delete" \
   || fail "retry: runner-owned sock cleanup: rc=${rc} runs=${runs} leftover=$(test -e "${JOBDIR}/sock/runner-sock-leftover" && echo yes || echo no)"
+for d in cargo-home target kernels-out sock adapter-home; do rm -rf "${JOBDIR:?}/${d}/"*; done
 
 LOG_FORBIDDEN_DIR='zz-candidate-log-forbidden-dir'
 LOG_FORBIDDEN_CHILD='zz-candidate-log-forbidden-child'
 mkdir "${JOBDIR}/target/${LOG_FORBIDDEN_DIR}"
 echo x > "${JOBDIR}/target/${LOG_FORBIDDEN_DIR}/${LOG_FORBIDDEN_CHILD}"
-PLAN_ENV=("${SB_ENV[@]}" MLXFAST_ENGINE_BIN="${SB}/engine" STUB_JOBDIR="${JOBDIR}")
+PLAN_ENV=("${SB_ENV[@]}" MLXFAST_ENGINE_BIN="${SB}/engine" STUB_JOBDIR="${JOBDIR}"
+          TEARDOWN_FAILED_MARKER="${TEARDOWN_MARKER}")
 plan boot_ctl pass
 [[ "${rc}" -eq 75 && "${runs}" == "boot_ctl " ]] \
+  && [[ -f "${TEARDOWN_MARKER}" && "$(stat -c %a "${TEARDOWN_MARKER}")" == 600 ]] \
   && grep -q 'sandbox job subdirectory target is not empty after cleanup (2 leftover entries)' <<<"${out}" \
   && ! grep -qF "${LOG_FORBIDDEN_DIR}" <<<"${out}" \
   && ! grep -qF "${LOG_FORBIDDEN_CHILD}" <<<"${out}" \
@@ -438,6 +551,7 @@ plan boot_ctl pass
   && ok "retry: fail-closed cleanup logs only the job sub-dir name and a count, never entry names" \
   || fail "retry: fail-closed cleanup log: rc=${rc} runs=${runs} out: $(tail -5 <<<"${out}")"
 
+rm -f "${TEARDOWN_MARKER}"
 rm -f "${JOBDIR}/target/${LOG_FORBIDDEN_DIR}/${LOG_FORBIDDEN_CHILD}"
 rmdir "${JOBDIR}/target/${LOG_FORBIDDEN_DIR}"
 for d in cargo-home target kernels-out sock adapter-home; do rm -f "${JOBDIR}/${d}"/*; done

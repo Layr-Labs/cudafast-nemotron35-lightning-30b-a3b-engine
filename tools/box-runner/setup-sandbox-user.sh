@@ -7,8 +7,9 @@
 #
 # Setup is idempotent and ends by running --check. It creates:
 #   - group nemoshare (members runner and nemosub; runner's other groups untouched)
-#   - system user nemosub: shell /usr/sbin/nologin, home /var/lib/nemosub 0700,
-#     not in docker, bench or sudo
+#   - system user nemosub: shell /usr/sbin/nologin, passwd home
+#     /var/lib/nemosub root:root 0755 with no ACL or xattr, and not in docker,
+#     bench or sudo. Ranked processes use per-job homes instead.
 #   - /var/lib/nemotron35/sandbox, runner:nemoshare 2750
 #   - /etc/sudoers.d/nemotron35-sandbox (validated with visudo, installed by rename)
 #   - a Rust toolchain in /opt/rust (root-owned, world-readable), the same
@@ -122,6 +123,19 @@ sandbox_cargo_version() {
 
 in_group() { id -nG "$1" 2>/dev/null | tr ' ' '\n' | grep -qx "$2"; }
 stat_is() { [[ "$(stat -c '%a %U %G' "$1" 2>/dev/null)" == "$2" ]]; }
+home_acl_clean() {
+  local acl
+  acl="$(getfacl -cp -- "${SANDBOX_HOME}" 2>/dev/null)" || return 1
+  ! grep -Eq '^(default:|user:[^:]+:|group:[^:]+:|mask:)' <<<"${acl}"
+}
+no_xattrs() {
+  python3 - "$1" <<'PY'
+import os
+import sys
+
+raise SystemExit(bool(os.listxattr(sys.argv[1], follow_symlinks=False)))
+PY
+}
 in_no_forbidden_group() {
   local g
   id -u "${SANDBOX_USER}" || return 1
@@ -232,7 +246,10 @@ run_check() {
     test "$(getent passwd "${SANDBOX_USER}" | cut -d: -f7)" = /usr/sbin/nologin
   check "${SANDBOX_USER} home is ${SANDBOX_HOME}" \
     test "$(getent passwd "${SANDBOX_USER}" | cut -d: -f6)" = "${SANDBOX_HOME}"
-  check "${SANDBOX_HOME} is ${SANDBOX_USER}-owned, mode 0700" stat_is "${SANDBOX_HOME}" "700 ${SANDBOX_USER} ${SANDBOX_USER}"
+  check "${SANDBOX_HOME} is root-owned, mode 0755" stat_is "${SANDBOX_HOME}" "755 root root"
+  check "${SANDBOX_USER} cannot write ${SANDBOX_HOME}" sandbox_denied test -w "${SANDBOX_HOME}"
+  check "${SANDBOX_HOME} has no extended or default ACL" home_acl_clean
+  check "${SANDBOX_HOME} has no xattr" no_xattrs "${SANDBOX_HOME}"
   check "${SANDBOX_USER} is in none of: ${FORBIDDEN_GROUPS[*]}" in_no_forbidden_group
   check "group ${SHARE_GROUP} exists" getent group "${SHARE_GROUP}"
   check "${RUNNER_USER} is in ${SHARE_GROUP}" in_group "${RUNNER_USER}" "${SHARE_GROUP}"
@@ -344,8 +361,17 @@ setup_users() {
 
 setup_dirs() {
   mkdir -p "${SANDBOX_HOME}" "${SANDBOX_ROOT}"
-  chown "${SANDBOX_USER}:${SANDBOX_USER}" "${SANDBOX_HOME}"
-  chmod 0700 "${SANDBOX_HOME}"
+  chown root:root "${SANDBOX_HOME}"
+  setfacl -b "${SANDBOX_HOME}"
+  chmod 0755 "${SANDBOX_HOME}"
+  python3 - "${SANDBOX_HOME}" <<'PY'
+import os
+import sys
+
+path = sys.argv[1]
+for name in os.listxattr(path, follow_symlinks=False):
+    os.removexattr(path, name, follow_symlinks=False)
+PY
   chown "${RUNNER_USER}:${SHARE_GROUP}" "${SANDBOX_ROOT}"
   chmod 2750 "${SANDBOX_ROOT}"
 }

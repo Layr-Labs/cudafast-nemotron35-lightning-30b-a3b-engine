@@ -116,7 +116,10 @@ ok "no R2 credential, signer, or dist token in the job environment"
 #                                     the host's own Python and network.
 #   SANDBOX_ENGINE_PATH               test-only PATH override for the sandboxed engine shim
 #   SANDBOX_WIPE_LIST /               test-only overrides of tools/sandbox-wipe.sh's
-#   SANDBOX_WIPE_HOME                 directory list and the sandbox user's home
+#   SANDBOX_WIPE_HOME /               directory list, home, POSIX IPC dirs and
+#   SANDBOX_SYSVIPC_DIR /             SysV IPC tables
+#   SANDBOX_DEV_SHM /
+#   SANDBOX_DEV_MQUEUE
 #   SERVE_UP_NO_CAP_DROP /            tools/serve-up.sh's escape hatches that drop
 #   SERVE_UP_ALLOW_NEW_PRIVS          --cap-drop ALL / no-new-privileges from the
 #                                     sandboxed resident container
@@ -150,7 +153,7 @@ ok "no R2 credential, signer, or dist token in the job environment"
 # this preflight runs. The workflow's engine-build-cache step sets
 # MLXFAST_SKIP_ENGINE_BUILD=1 LATER in the same job, after this preflight, and
 # only on a verified cache hit, so that write and this refusal are consistent.
-for var in BENCHD MLXFAST_SKIP_WEIGHTS_DOWNLOAD SKIP_MODEL_DOWNLOAD MLXFAST_LOCAL_COOL_GATE MLXFAST_LOCAL_ALLOW_GOLDEN_DRIFT MLXFAST_SKIP_ENGINE_BUILD MLXFAST_SKIP_WEIGHTS_SHA256 SERVE_UP_LAUNCHER SERVE_UP_NO_CAP_DROP SERVE_UP_ALLOW_NEW_PRIVS SANDBOX_ENGINE_PATH SANDBOX_WIPE_LIST SANDBOX_WIPE_HOME STAGE_VLLM_OVERLAY_BASE ENGINE_EOS_IDS DS4_RESIDENT_SOCKET BENCH_WORKER_RESIDENT_SOCKET; do
+for var in BENCHD MLXFAST_SKIP_WEIGHTS_DOWNLOAD SKIP_MODEL_DOWNLOAD MLXFAST_LOCAL_COOL_GATE MLXFAST_LOCAL_ALLOW_GOLDEN_DRIFT MLXFAST_SKIP_ENGINE_BUILD MLXFAST_SKIP_WEIGHTS_SHA256 SERVE_UP_LAUNCHER SERVE_UP_NO_CAP_DROP SERVE_UP_ALLOW_NEW_PRIVS SANDBOX_ENGINE_PATH SANDBOX_WIPE_LIST SANDBOX_WIPE_HOME SANDBOX_SYSVIPC_DIR SANDBOX_DEV_SHM SANDBOX_DEV_MQUEUE STAGE_VLLM_OVERLAY_BASE ENGINE_EOS_IDS DS4_RESIDENT_SOCKET BENCH_WORKER_RESIDENT_SOCKET; do
   eval "value=\${${var}:-}"
   [[ -z "${value}" ]] || fail "${var} is set in the ranked job's environment; it weakens or bypasses what the ranked run measures"
 done
@@ -159,7 +162,20 @@ engine_overrides="$(env | cut -d= -f1 | grep -E '^(RESIDENT_|VLLM_|HF_|TRANSFORM
   || fail "engine configuration preset in the ranked job's environment: ${engine_overrides}; the fixture's engine_env is the only engine configuration"
 ok "no measurement-weakening override in the job environment"
 
-# --- 2b. the GPU temperature reader resolves --------------------------------
+# --- 2b. the box-wide GPU lock is private from participant code -------------
+GPU_LOCK=/tmp/mtplx-gpu-exclusive.lock
+[[ -f "${GPU_LOCK}" && ! -L "${GPU_LOCK}" ]] \
+  || fail "${GPU_LOCK} is missing or is not a regular file; run the cuda-setup-scripts gpu-lock unit, which creates it as root:bench 0660"
+command -v sudo >/dev/null 2>&1 || fail "sudo is required to check ${GPU_LOCK} as ${SANDBOX_USER:-nemosub}"
+if ! sudo -n -u "${SANDBOX_USER:-nemosub}" -- true >/dev/null 2>&1; then
+  fail "cannot check ${GPU_LOCK} as ${SANDBOX_USER:-nemosub}; run tools/box-runner/setup-sandbox-user.sh --check"
+fi
+if sudo -n -u "${SANDBOX_USER:-nemosub}" -- test -w "${GPU_LOCK}"; then
+  fail "${GPU_LOCK} is writable by ${SANDBOX_USER:-nemosub}; run the cuda-setup-scripts gpu-lock unit to restore root:bench 0660"
+fi
+ok "box GPU lock exists and is not writable by ${SANDBOX_USER:-nemosub}"
+
+# --- 2c. the GPU temperature reader resolves --------------------------------
 # Contract section 5.2: no calibration without thermal control, and a
 # missing reader REFUSES rather than silently self-disabling.
 #
@@ -189,7 +205,7 @@ else
 fi
 ok "GPU temperature reader resolved: ${GPU_TEMP_SOURCE}"
 
-# --- 2c. the reader gives a plausible reading -------------------------------
+# --- 2d. the reader gives a plausible reading -------------------------------
 # A sensor that reads at or below the 5C implausibility floor is broken or
 # frozen, and a broken sensor passes every cool gate on an arbitrarily hot GPU.
 first_temp="$(read_gpu_temp || true)"

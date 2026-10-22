@@ -304,11 +304,13 @@ Deferred seed work lands in the decode window and makes decode slower. Decode
 work done early, inside `free_decode_begin`, leaves the decode window and is
 not scored, which breaks obligations 1 and 2 above.
 
-**Enforced by the workflow.** The ranked workflow reads benchd's private audit
-(runner-only) and refuses a run whose seed-prefill window is over 1.5× the
-control leg's (decode work moved into `free_decode_begin`) or over 1.5× faster
-than it (the seed prefill reused earlier work). The seed-window figures stay
-private; a refusal names only the rule (`tools/score-plausibility-gate.sh`).
+**Enforced by the workflow.** The ranked workflow reads benchd's private audit.
+The candidate-over-control limit depends on the declared depth: 1.2 at
+depth 0, 1.35 at 1, 1.5 at 2 and 3, 1.6 at 4 and 1.65 at 5 and 6
+(the fixture key `seed_window_cand_over_control_limit_by_depth`). The
+control-over-candidate limit stays 1.5.
+The seed-window figures stay private. A refusal names only the rule
+(`tools/score-plausibility-gate.sh`).
 
 The seed token's index: `seed_token` is `expected_decode_seed_token`;
 `free_decode_run` returns the N tokens after it, so `tokens[0]` = `expected_decode_tokens[0]`.
@@ -318,8 +320,8 @@ The seed token's index: `seed_token` is `expected_decode_seed_token`;
 | Quantity | Value |
 |---|---|
 | Seed tokens per stream | 496 |
-| Unmeasured prefill warm-up passes before the timed prefill | 1 (same prompt, same phase, computed in full) |
-| Timed prefill passes per phase | 5; the phase's prefill time is their median |
+| Unmeasured prefill warm-up passes before the timed prefill | 1 (the pinned public warm-up golden, computed in full and never scored) |
+| Timed prefill passes per phase | 1; that pass supplies the phase's prefill time |
 | Checked decode steps | 128 |
 | Golden shape | 496 `prompt_tokens` and an answer of at most 1024 `expected_tokens` per case (the answer ends at the first end-of-turn token), plus the free-run `benchmark` block |
 | Streams per window | 1 |
@@ -368,8 +370,8 @@ The score is the mean of the three per-pair composites
 (`official_pair_combine`: `mean`). The floors and the ceiling gate every pair;
 the workflow gate (`tools/score-plausibility-gate.sh`) enforces the 5.0 decode
 ceiling on every pair.
-Timed prefill is the median of five passes after one unmeasured warm-up pass
-(`official_prefill_timed_runs` = 5, `official_prefill_warmup_runs` = 1).
+Each pair has one timed prefill pass after one unmeasured warm-up pass.
+The warm-up uses the pinned public golden and is never scored.
 
 **Prefill ceiling (workflow gate).** A ranked run whose prefill gain is above
 1.5 in any pair fails and gets no sealed score: no reveal block and no score
@@ -379,6 +381,23 @@ scores near 1.0, and a gain far above that usually means the timed passes
 reused earlier work, which section 8 bans. The gate does not detect all reuse;
 section 8 still applies below the ceiling. The same script also enforces the
 seed-prefill window ceilings described in section 5.1.1.
+
+### 5.3.1 Anti-cheat guards
+
+benchd applies these guards only when the fixture enables them.
+
+- Prefill gain cannot exceed 1.5. Decode gain cannot exceed 5.0.
+  The refusal is `SPEEDUP-ABOVE-CEILING`.
+- Each seed window must exist. It cannot exceed 1.7 times its timed prefill.
+  Refusals are `SEED-WINDOW-NOT-OBSERVED` and `SEED-WINDOW-ABOVE-LIMIT`.
+- All goldens must resolve inside a fresh private directory.
+  Refusals are `PRIVATE-DIR-REQUIRED` and `GOLDEN-OUTSIDE-PRIVATE-DIR`.
+- Sandbox override variables are not permitted.
+  The refusal is `SANDBOX-OVERRIDE-REFUSED`.
+- The warm-up uses a pinned public golden. This golden is never scored.
+- Golden `g` supplies prefill. Golden `g+1` supplies decode, with wraparound.
+- benchd checks each leg teardown. The refusal is `LEG-TEARDOWN-FAILED`.
+- A reused prompt fails with `PROMPT-REUSE-REFUSED`.
 
 ### 5.4 Token fidelity
 
@@ -598,7 +617,7 @@ The rest of the command surface:
 | Engine source | vLLM `v0.27.1` @ `6e448d0ea9bf3d88d898b65449ca6dc2aec170ac` (`vllm/VENDOR.json`) |
 | Engine image | `docker.io/vllm/vllm-openai:v0.27.1` @ `sha256:1c8e60a0841b333c700488cb029d3664807249da0c071e862191b00fe34b228c` |
 | Driver floor | `580.159.03` |
-| benchd | `Layr-Labs/benchd` dist commit `7045ed65635049c32fd378e579448ac66fb12152`, built from source `b65af98c2a060df12f2ced849c68528b825fecdb` (public snapshot `81a7d45b940d3501e52d7774bb2e8b9abd2c0372`); `dist/linux-aarch64/benchd.manifest.json` there gives each binary's sha256 and bytes. `tools/fetch-benchd.sh` (`PINNED_SOURCE_COMMIT` / `PINNED_PUBLIC_SOURCE_COMMIT`) is the authority. |
+| benchd | `Layr-Labs/benchd` dist commit `80f8819dde25b55f1f5c5dc1c85863498135f87e`, built from source `10afddd4af99bcec1cbf87e57242f224df0bdac7` (public snapshot `6b6f7cf1fe1423e60cdf0ff936ac2d3f26ac348b`); `dist/linux-aarch64/benchd.manifest.json` there gives each binary's sha256 and bytes. `tools/fetch-benchd.sh` (`PINNED_SOURCE_COMMIT` / `PINNED_PUBLIC_SOURCE_COMMIT`) is the authority. |
 
 ## 8. Prohibited techniques
 
@@ -611,11 +630,10 @@ catches it:
   caching back on, since benchd's phases replay the same prompt. It also
   includes keeping KV or Mamba state across a `sync`, or answering from a
   recorded stream. Bit-identical output does not make it legitimate.
-  It also covers the prefill warm-up pass: the timed prefill follows one
-  unmeasured prefill of the SAME prompt in the SAME phase, and each pass must
-  be computed in full. Carrying anything from the warm-up pass into the timed
-  pass is this offence. The workflow's prefill ceiling (section 5.3) refuses such
-  a run when the gain shows it.
+  It also covers the prefill warm-up pass. The warm-up uses a separate public
+  golden, and each pass must be computed in full. Carrying warm-up work into a
+  timed pass is this offence. The workflow's prefill ceiling can refuse such a
+  run when the gain shows it.
 - **Hardcoded content.** Hidden prompts, token ids or answers.
 - **Timing and protocol tricks.** Timing shortcuts, protocol injection, moving
   work across the prefill/decode boundary (section 5.1.1), network access, and

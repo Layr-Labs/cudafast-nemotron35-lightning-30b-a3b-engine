@@ -117,9 +117,9 @@ The score is serial-anchored, so a faster candidate scores above 1.
 - **Pairs.** A ranked run measures 3 pairs on one box in one job. Each pair is
   one serial-control leg on the organizer-staged reference tree, then one
   candidate leg at your declared depth.
-- **Workload.** Every leg is single-stream: a 496-token prompt (one unmeasured
-  warm-up prefill, then five timed prefills of the same prompt, scored by their
-  median) and a 128-step decode. The prompts are the fixture's `live_goldens`:
+- **Workload.** Every leg is single-stream. It runs one unmeasured public
+  warm-up prefill, then one timed prefill of a 496-token prompt. That pass is
+  scored. A 128-step decode follows. The timed prompts are the fixture's `live_goldens`:
   three hidden coding prompts. Each one is a user message in the model's own
   chat template, with thinking off.
 - **Every job measures every live golden.** Pair k measures prompt

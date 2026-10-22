@@ -82,8 +82,8 @@ Every point links to the document that has the detail.
   - **Why:** without it, a submission could read the hidden prompts and
     goldens, or rewrite the measuring tools.
 - **Sealed score.** `score.json` names each prompt only by its sha256. It
-  carries no prompt text. The pinned benchd (source `b65af98`, bench pull
-  requests 421 to 424) keeps engine-written text, audit fields, the hello
+  carries no prompt text. The pinned benchd (source `10afddd`, which includes bench
+  pull requests 421 to 424) keeps engine-written text, audit fields, the hello
   identity and engine-derived numbers out of the sealed output: they are
   sealed as digests or omitted, and a full copy goes only to a private audit
   file on the box. The sealed output and the failure messages name no token
@@ -170,7 +170,7 @@ and the engineering log, section 7.14.
 
 These tests ran on the earlier fork benchd, which had the timed replay and the
 stricter sealing. The track now uses the public `Layr-Labs/benchd` channel
-(dist `7045ed6`, public source snapshot `81a7d45` of source `b65af98`;
+(dist `80f8819`, public source snapshot `6b6f7cf` of source `10afddd`;
 engineering log section 7.13). It has the stricter sealing again (bench pull
 requests 421 to 424), but not the timed replay.
 
@@ -180,10 +180,10 @@ Details are in the [engineering log](docs/nemotron35-port-notes.md), sections
 ## Fleet state
 
 - **Boxes.** Five Spark boxes run the ranked job. Each has the live goldens
-  staged, a version-3 calibration under 2% on the reference tree `fb5c48b`, and
+  staged, a version-3 calibration under 2% on the reference tree `f683185`, and
   the pinned benchd bytes. Runners register through a GitHub App.
 - **Branches.** `main` is the armed contest base
-  (`official_scoring_enabled: true`, reference tree `fb5c48b`).
+  (`official_scoring_enabled: true`, reference tree `f683185`).
 - **Where the goldens live.** Scoring reads only each Spark's local copy
   (`/srv/nemotron35/goldens`, unreadable by the sandbox user); a ranked job
   never fetches goldens. The live pool is also kept in an

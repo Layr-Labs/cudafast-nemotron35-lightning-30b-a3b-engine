@@ -183,6 +183,7 @@ EOF
     esac
     ln -s "${entry}" "${ROOT}/$(basename "${entry}")"
   done
+  ln -s "${REPO_ROOT}/correctness_prompts" "${ROOT}/correctness_prompts"
   PREFLIGHT8="${ROOT}/tools/ranked-box-preflight.sh"
 
   # The staged pool, and the contract re-pinned to it. Only sha256 and bytes
@@ -347,7 +348,8 @@ EOF
   # check. Without this, a section 8 that refused unconditionally would pass
   # every case above it.
   control8="$(run_preflight)"
-  if grep -q 'ranked-box-preflight: all checks passed' <<<"${control8}"; then
+  if grep -q 'ranked-box-preflight: all checks passed' <<<"${control8}" \
+    && grep -q 'warm-up golden matches its contract pin' <<<"${control8}"; then
     echo "ok    section 8 / control: a correctly staged box passes every check"
   else
     fail "section 8 / control: a correctly staged box did not pass; got: $(tail -3 <<<"${control8}")"
@@ -466,6 +468,10 @@ EOF
     "calibration_max_cv_percent is 'false', not a usable percentage"
   rotation_case "calibration CV limit is a string" '.calibration_max_cv_percent = "2.0"' \
     "calibration_max_cv_percent is '2.0', not a usable percentage"
+  rotation_case "warm-up golden byte pin" '.warmup_golden.bytes += 1' \
+    "warm-up golden: byte-count mismatch"
+  rotation_case "warm-up golden sha256 pin" '.warmup_golden.sha256 = ("0" * 64)' \
+    "warm-up golden: sha256 mismatch"
   # SECOND is in the pool with its oracles pinned. The two cases below
   # construct the broken state explicitly: SECOND stays in the pool, its own
   # oracle pins are removed or replaced, and its oracle files are not staged

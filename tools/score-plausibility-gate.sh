@@ -7,10 +7,10 @@ PREFILL_GAIN_CEILING=1.5
 # The contract's decodeSpeedupCeiling; this benchd does not enforce it on the official path.
 DECODE_GAIN_CEILING=5.0
 
-# Seed-prefill window ratios: decode work moved into free_decode_begin, or seed
-# prefill reusing earlier work (participant contract sections 5.1.1 and 8).
-SEED_WINDOW_SLOW_CEILING=1.5
+# Seed-prefill window ratio: seed prefill reusing earlier work (participant
+# contract sections 5.1.1 and 8). The other direction is depth-specific.
 SEED_WINDOW_GAIN_CEILING=1.5
+CONTRACT="${3:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/fixtures/nemotron35_lightning_30b_a3b_track.json}"
 
 score_path="${1:-}"
 audit_path="${2:-}"
@@ -24,7 +24,7 @@ if [[ ! -f "${score_path}" ]]; then
   exit 0
 fi
 
-DECODE_GAIN_CEILING="${DECODE_GAIN_CEILING}" exec python3 -I - "${score_path}" "${PREFILL_GAIN_CEILING}" "${SEED_WINDOW_SLOW_CEILING}" "${SEED_WINDOW_GAIN_CEILING}" "${audit_path}" <<'PY'
+DECODE_GAIN_CEILING="${DECODE_GAIN_CEILING}" exec python3 -I - "${score_path}" "${PREFILL_GAIN_CEILING}" "${SEED_WINDOW_GAIN_CEILING}" "${audit_path}" "${CONTRACT}" <<'PY'
 import json
 import math
 import os
@@ -32,9 +32,9 @@ import sys
 
 path = sys.argv[1]
 ceiling = float(sys.argv[2])
-seed_slow_ceiling = float(sys.argv[3])
-seed_gain_ceiling = float(sys.argv[4])
-audit_path = sys.argv[5] if len(sys.argv) > 5 else ""
+seed_gain_ceiling = float(sys.argv[3])
+audit_path = sys.argv[4]
+contract_path = sys.argv[5]
 prefix = "score-plausibility-gate:"
 
 try:
@@ -124,6 +124,36 @@ if not isinstance(audit, dict):
     print(f"{prefix} REFUSED private benchd audit is not an object")
     sys.exit(1)
 
+audit_metrics = audit.get("metrics") or {}
+
+try:
+    with open(contract_path, encoding="utf-8") as f:
+        contract = json.load(f)
+except (OSError, json.JSONDecodeError):
+    print(f"{prefix} REFUSED track fixture is missing or invalid")
+    sys.exit(1)
+limits = contract.get("seed_window_cand_over_control_limit_by_depth")
+if limits is None:
+    # A fixture without per-depth limits keeps the fixed 1.5 rule.
+    seed_slow_ceiling = 1.5
+    seed_slow_label = "fixed 1.5 limit"
+else:
+    depth = audit_metrics.get("effective_spec_depth")
+    if isinstance(depth, bool) or not isinstance(depth, int):
+        print(f"{prefix} REFUSED private audit has no integer metrics.effective_spec_depth")
+        sys.exit(1)
+    seed_slow_ceiling = limits.get(str(depth)) if isinstance(limits, dict) else None
+    seed_slow_label = f"depth {depth} limit"
+if limits is not None and (
+    isinstance(seed_slow_ceiling, bool)
+    or not isinstance(seed_slow_ceiling, (int, float))
+    or not math.isfinite(float(seed_slow_ceiling))
+    or float(seed_slow_ceiling) <= 1.0
+):
+    print(f"{prefix} REFUSED fixture has no valid seed-window limit for effective_spec_depth {depth}")
+    sys.exit(1)
+seed_slow_ceiling = float(seed_slow_ceiling)
+
 score_val = data.get("score")
 audit_score = audit.get("score")
 if (
@@ -195,7 +225,7 @@ for entry, pair in zip(audit_legs, score_pairs):
         sys.exit(1)
     if cand_f > seed_slow_ceiling * ctrl_f:
         print(
-            f"{prefix} REFUSED pair {pair}: seed-prefill window is over 1.5x the control leg's "
+            f"{prefix} REFUSED pair {pair}: seed-prefill window is over the {seed_slow_label} "
             "(decode work moved into free_decode_begin; participant contract 5.1.1 and 8)"
         )
         sys.exit(1)

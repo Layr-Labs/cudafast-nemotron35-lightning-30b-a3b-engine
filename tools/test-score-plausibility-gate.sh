@@ -29,15 +29,20 @@ write_score() {
 }
 
 write_audit() {
+  printf '%s' "$1" | jq '.metrics.effective_spec_depth //= 3' > "${WORK}/audit.json"
+}
+
+write_audit_without_depth() {
   printf '%s' "$1" > "${WORK}/audit.json"
 }
 
 run_gate() {
+  local args=("${WORK}/score.json")
   if [[ -f "${WORK}/audit.json" ]]; then
-    "${GATE}" "${WORK}/score.json" "${WORK}/audit.json" 2>&1
-  else
-    "${GATE}" "${WORK}/score.json" 2>&1
+    args+=("${WORK}/audit.json")
   fi
+  [[ -z "${GATE_CONTRACT:-}" ]] || args+=("${GATE_CONTRACT}")
+  "${GATE}" "${args[@]}" 2>&1
 }
 
 # Honest private audit: same score and pairs, seed windows 1:1.
@@ -281,6 +286,65 @@ write_score '{"passed": true, "score": 2.0, "metrics": {"paired_legs": [
 ]}}'
 out="$(run_gate)"; rc=$?
 if [[ "${rc}" -eq 0 ]]; then ok "(q) decode gain exactly 5.0 passes"; else bad "(q) decode gain exactly 5.0 passes" "rc=${rc} out=${out}"; fi
+
+# (r) depth 3, candidate seed 1.33x control -> ok under its 1.5 limit
+write_score '{"passed": true, "score": 1.0, "metrics": {"paired_legs": [
+  {"pair": 1, "control_prefill_seconds_per_token": 1.0, "candidate_prefill_seconds_per_token": 1.0, "control_decode_seconds_per_token": 1.0, "candidate_decode_seconds_per_token": 1.0}
+]}}'
+write_audit '{"score": 1.0, "metrics": {"effective_spec_depth": 3, "paired_legs": [
+  {"pair": 1, "control_seed_prefill_window_seconds_per_token": 1.0, "candidate_seed_prefill_window_seconds_per_token": 1.33}
+]}}'
+out="$(run_gate)"; rc=$?
+if [[ "${rc}" -eq 0 ]]; then ok "(r) depth 3 seed ratio 1.33 passes"; else bad "(r) depth 3 seed ratio 1.33 passes" "rc=${rc} out=${out}"; fi
+
+# (s) depth 6, candidate seed 1.47x control -> ok under its 1.7 limit
+write_audit '{"score": 1.0, "metrics": {"effective_spec_depth": 6, "paired_legs": [
+  {"pair": 1, "control_seed_prefill_window_seconds_per_token": 1.0, "candidate_seed_prefill_window_seconds_per_token": 1.47}
+]}}'
+out="$(run_gate)"; rc=$?
+if [[ "${rc}" -eq 0 ]]; then ok "(s) depth 6 seed ratio 1.47 passes"; else bad "(s) depth 6 seed ratio 1.47 passes" "rc=${rc} out=${out}"; fi
+
+# (s2) depth 6, candidate seed 1.6x control -> ok under its 1.7 limit (the old fixed 1.5 would refuse it)
+write_audit '{"score": 1.0, "metrics": {"effective_spec_depth": 6, "paired_legs": [
+  {"pair": 1, "control_seed_prefill_window_seconds_per_token": 1.0, "candidate_seed_prefill_window_seconds_per_token": 1.6}
+]}}'
+out="$(run_gate)"; rc=$?
+if [[ "${rc}" -eq 0 ]]; then ok "(s2) depth 6 seed ratio 1.6 passes"; else bad "(s2) depth 6 seed ratio 1.6 passes" "rc=${rc} out=${out}"; fi
+
+# (t) depth 6, candidate seed 1.75x control -> refused above its 1.7 limit
+write_audit '{"score": 1.0, "metrics": {"effective_spec_depth": 6, "paired_legs": [
+  {"pair": 1, "control_seed_prefill_window_seconds_per_token": 1.0, "candidate_seed_prefill_window_seconds_per_token": 1.75}
+]}}'
+out="$(run_gate)"; rc=$?
+if [[ "${rc}" -eq 1 && "${out}" == *"REFUSED pair 1:"* ]]; then ok "(t) depth 6 seed ratio 1.75 refused"; else bad "(t) depth 6 seed ratio 1.75 refused" "rc=${rc} out=${out}"; fi
+
+# (u) a passed audit without the candidate depth -> refused
+write_audit_without_depth '{"score": 1.0, "metrics": {"paired_legs": [
+  {"pair": 1, "control_seed_prefill_window_seconds_per_token": 1.0, "candidate_seed_prefill_window_seconds_per_token": 1.0}
+]}}'
+out="$(run_gate)"; rc=$?
+if [[ "${rc}" -eq 1 && "${out}" == *"effective_spec_depth"* ]]; then ok "(u) missing candidate depth refused"; else bad "(u) missing candidate depth refused" "rc=${rc} out=${out}"; fi
+
+# (v) a depth with no configured limit -> refused
+write_audit '{"score": 1.0, "metrics": {"effective_spec_depth": 7, "paired_legs": [
+  {"pair": 1, "control_seed_prefill_window_seconds_per_token": 1.0, "candidate_seed_prefill_window_seconds_per_token": 1.0}
+]}}'
+out="$(run_gate)"; rc=$?
+if [[ "${rc}" -eq 1 && "${out}" == *"no valid seed-window limit"* ]]; then ok "(v) missing depth limit refused"; else bad "(v) missing depth limit refused" "rc=${rc} out=${out}"; fi
+
+# (w) an old fixture keeps the fixed 1.5 limit and does not require a depth
+OLD_FIXTURE="${WORK}/old-fixture.json"
+jq 'del(.seed_window_cand_over_control_limit_by_depth)' \
+  "${REPO_ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json" > "${OLD_FIXTURE}"
+write_audit_without_depth '{"score": 1.0, "metrics": {"paired_legs": [
+  {"pair": 1, "control_seed_prefill_window_seconds_per_token": 1.0, "candidate_seed_prefill_window_seconds_per_token": 1.6}
+]}}'
+GATE_CONTRACT="${OLD_FIXTURE}" out="$(run_gate)"; rc=$?
+if [[ "${rc}" -eq 1 && "${out}" == *"REFUSED pair 1:"* && "${out}" == *"fixed 1.5 limit"* && "${out}" != *"Traceback"* ]]; then
+  ok "(w) old fixture ratio 1.6 refuses cleanly"
+else
+  bad "(w) old fixture ratio 1.6 refuses cleanly" "rc=${rc} out=${out}"
+fi
 
 echo "score-plausibility-gate: ${passed} passed, ${failed} failed"
 [[ "${failed}" -eq 0 ]]

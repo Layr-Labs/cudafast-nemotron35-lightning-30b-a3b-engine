@@ -79,6 +79,12 @@ EOF
 cat > "${BIN}/benchd" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${STUB_BENCHD_LOG}"
+printf 'private=%s\n' "${MLXFAST_PRIVATE_DIR:-}" >> "${STUB_PRIVATE_LOG}"
+if [ -n "${MLXFAST_PRIVATE_DIR:-}" ]; then
+  printf 'mode=%s\n' "$(stat -c %a "${MLXFAST_PRIVATE_DIR}")" >> "${STUB_PRIVATE_LOG}"
+  find "${MLXFAST_PRIVATE_DIR}" -maxdepth 1 -type f -printf 'file=%f\n' \
+    | sort >> "${STUB_PRIVATE_LOG}"
+fi
 [ "${1:-}" = "calibrate-baseline" ] || exit 1
 out=""
 while [ $# -gt 0 ]; do
@@ -87,7 +93,7 @@ while [ $# -gt 0 ]; do
 done
 [ -n "${out}" ] || exit 1
 printf '{"version":3}\n' > "${out}"
-exit 0
+exit "${STUB_BENCHD_EXIT:-0}"
 EOF
 chmod 755 "${BIN}"/*
 
@@ -142,6 +148,7 @@ mkdir -p "${GOLDEN_DIR}"
 for name in "${LIVE_GOLDENS[@]}"; do echo '{}' > "${GOLDEN_DIR}/${name}.golden.json"; done
 
 WEIGHTS="${WORK}/weights"; mkdir -p "${WEIGHTS}"
+RUNNER_TEMP_DIR="${WORK}/runner-temp"; mkdir -p "${RUNNER_TEMP_DIR}"
 LOCK="${WORK}/never-taken.lock"
 BOX="test-box-1"
 
@@ -155,8 +162,11 @@ drive() { # drive OUTFILE [args...]
       BENCHD_BIN_DIR="${BENCHD_DIR}" \
       STUB_SERVE_LOG="${WORK}/serve.log" \
       STUB_BENCHD_LOG="${WORK}/benchd.log" \
+      STUB_PRIVATE_LOG="${WORK}/private.log" \
+      STUB_BENCHD_EXIT="${STUB_BENCHD_EXIT:-0}" \
+      RUNNER_TEMP="${RUNNER_TEMP_DIR}" \
       BENCHD="${BIN}/benchd" \
-      "${DRIVER}" "$@" --fixture "${FIXTURE}" --lock "${LOCK}" > "${out}" 2>&1
+      "${DRIVER}" "$@" --fixture "${FIXTURE_OVERRIDE-${FIXTURE}}" --lock "${LOCK}" > "${out}" 2>&1
   return $?
 }
 
@@ -169,7 +179,7 @@ inputs_digest() {
 INPUTS_BEFORE="$(inputs_digest)"
 
 # --- case 1: --dry-run ------------------------------------------------------
-: > "${WORK}/serve.log"; : > "${WORK}/benchd.log"
+: > "${WORK}/serve.log"; : > "${WORK}/benchd.log"; : > "${WORK}/private.log"
 DRY="${WORK}/dry.out"
 drive "${DRY}" "${BOX}" "${WORK}/out1/baseline-calibration.json" --dry-run
 [ $? -eq 0 ] || { fail "case 1: --dry-run exited non-zero"; sed 's/^/    /' "${DRY}" >&2; }
@@ -185,6 +195,7 @@ DRY_FLAGS=(
   "--track nemotron3.5-lightning-30b-a3b-cuda-v1"
   "--reference-commit ${REF_COMMIT}"
   "--benchd-source-commit ${BENCHD_COMMIT}"
+  "--warmup-golden ${REPO_ROOT}/correctness_prompts/public-longcopy-gate-english-496.golden.json"
 )
 dry_missing=0
 for needle in "${DRY_FLAGS[@]}"; do
@@ -204,7 +215,7 @@ grep -qF -- "${WS}/tools/serve-up.sh --boot --spec serial --draft-len 0" "${DRY}
 ok "case 1: --dry-run took no lock, booted nothing and wrote nothing"
 
 # --- case 2: a full mechanics run -------------------------------------------
-: > "${WORK}/serve.log"; : > "${WORK}/benchd.log"
+: > "${WORK}/serve.log"; : > "${WORK}/benchd.log"; : > "${WORK}/private.log"
 OUT="${WORK}/run/baseline-calibration.json"
 RUN_OUT="${WORK}/run.out"
 drive "${RUN_OUT}" "${BOX}" "${OUT}"
@@ -226,7 +237,6 @@ run_missing=0
 for needle in "--baseline-workspace ${WS}" \
               "--engine .build/release/mlxfast-runtime-worker" \
               "--weights ${WEIGHTS}" \
-              "${GOLDEN_NEEDLES[@]}" \
               "--out ${OUT}" "--passes 3" "--box ${BOX}" \
               "--track nemotron3.5-lightning-30b-a3b-cuda-v1" \
               "--reference-commit ${REF_COMMIT}" \
@@ -245,6 +255,59 @@ case "${cal}" in
   *) ok "case 2: --engine is relative to the reference workspace" ;;
 esac
 [ -s "${OUT}" ] && ok "case 2: the calibration file was written" || fail "case 2: no calibration file"
+
+PRIVATE_DIR="$(sed -n 's/^private=//p' "${WORK}/private.log")"
+[ -n "${PRIVATE_DIR}" ] \
+  && ok "case 2: benchd received MLXFAST_PRIVATE_DIR" \
+  || fail "case 2: benchd did not receive MLXFAST_PRIVATE_DIR"
+grep -qx 'mode=700' "${WORK}/private.log" \
+  && ok "case 2: the private directory had mode 0700" \
+  || fail "case 2: the private directory did not have mode 0700"
+EXPECTED_PRIVATE_FILES="$(printf '%s\n' "${LIVE_GOLDENS[@]/%/.golden.json}" \
+  public-longcopy-gate-english-496.golden.json | sort | sed 's/^/file=/')"
+ACTUAL_PRIVATE_FILES="$(grep '^file=' "${WORK}/private.log" || true)"
+[ "${ACTUAL_PRIVATE_FILES}" = "${EXPECTED_PRIVATE_FILES}" ] \
+  && ok "case 2: the private directory held exactly the passed goldens" \
+  || fail "case 2: wrong private files: ${ACTUAL_PRIVATE_FILES}"
+private_args_ok=1
+for name in "${LIVE_GOLDENS[@]}"; do
+  [[ "${cal}" == *"--golden ${PRIVATE_DIR}/${name}.golden.json --prompt ${name}"* ]] \
+    || private_args_ok=0
+done
+[[ "${cal}" == *"--warmup-golden ${PRIVATE_DIR}/public-longcopy-gate-english-496.golden.json"* ]] \
+  || private_args_ok=0
+[[ "${cal}" != *"--golden ${GOLDEN_DIR}/"* ]] || private_args_ok=0
+[ "${private_args_ok}" -eq 1 ] \
+  && ok "case 2: benchd received only private golden paths" \
+  || fail "case 2: benchd did not receive only private golden paths"
+[ ! -e "${PRIVATE_DIR}" ] \
+  && ok "case 2: the private directory was removed after success" \
+  || fail "case 2: the private directory remained after success"
+
+# The EXIT trap also removes the private directory after a benchd refusal.
+: > "${WORK}/private.log"
+STUB_BENCHD_EXIT=9 drive "${WORK}/private-fail.out" "${BOX}" "${WORK}/private-fail.json"
+[ $? -eq 4 ] || fail "case 2b: a benchd refusal must exit 4"
+FAILED_PRIVATE_DIR="$(sed -n 's/^private=//p' "${WORK}/private.log")"
+[ -n "${FAILED_PRIVATE_DIR}" ] && [ ! -e "${FAILED_PRIVATE_DIR}" ] \
+  && ok "case 2b: the private directory was removed after failure" \
+  || fail "case 2b: the private directory remained after failure"
+
+# An old fixture keeps the original paths and does not set the private variable.
+OLD_FIXTURE="${WORK}/fixture-old.json"
+jq 'del(.warmup_golden, .require_private_dir)' "${FIXTURE}" > "${OLD_FIXTURE}"
+: > "${WORK}/benchd.log"; : > "${WORK}/private.log"
+FIXTURE_OVERRIDE="${OLD_FIXTURE}" drive "${WORK}/old.out" "${BOX}" "${WORK}/old.json"
+old_cal="$(grep '^calibrate-baseline ' "${WORK}/benchd.log" || true)"
+if grep -q -- '--warmup-golden' "${WORK}/benchd.log"; then
+  fail "case 2c: an old fixture passed --warmup-golden"
+elif grep -q '^private=.' "${WORK}/private.log"; then
+  fail "case 2c: an old fixture set MLXFAST_PRIVATE_DIR"
+elif [[ "${old_cal}" != *"--golden ${GOLDEN_DIR}/pool-9.golden.json"* ]]; then
+  fail "case 2c: an old fixture did not keep the staged golden paths"
+else
+  ok "case 2c: an old fixture keeps the old interface"
+fi
 # APPLIES NOTHING ELSE: the benchmark inputs are byte-identical after the run.
 # Snapshotted rather than compared against git, so the suite is honest on a
 # working tree that legitimately carries uncommitted changes.

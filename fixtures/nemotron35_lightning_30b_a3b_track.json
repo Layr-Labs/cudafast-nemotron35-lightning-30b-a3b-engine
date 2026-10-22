@@ -19,6 +19,24 @@
   "scored_batch_size": 1,
   "decode_speedup_floor": 0.95,
   "prefill_speedup_floor": 0.95,
+  "decode_speedup_ceiling": 5.0,
+  "prefill_speedup_ceiling": 1.5,
+  "seed_window_max_ratio": 1.7,
+  "require_private_dir": true,
+  "decode_golden_offset": 1,
+  "warmup_golden": {
+    "sha256": "5edc020ba47b6e035dfd5584b2020627c9c2c68597800f4e65d69115d695e58c",
+    "bytes": 28357
+  },
+  "seed_window_cand_over_control_limit_by_depth": {
+    "0": 1.2,
+    "1": 1.35,
+    "2": 1.5,
+    "3": 1.5,
+    "4": 1.6,
+    "5": 1.65,
+    "6": 1.65
+  },
   "scored_exponents": {
     "prefill_gain_exponent": 0.25,
     "decode_gain_exponent": 0.75
@@ -38,7 +56,7 @@
   "benchmark_decode_steps": 128,
   "local_submit_benchmark_decode_steps": 1023,
   "official_prefill_warmup_runs": 1,
-  "official_prefill_timed_runs": 5,
+  "official_prefill_timed_runs": 1,
   "vocab_size": 131072,
   "num_hidden_layers": 52,
   "seed_tokens": 496,
@@ -50,7 +68,7 @@
     "pool-10",
     "pool-11"
   ],
-  "baseline_reference_commit": "fb5c48b8977409ebeb789315c7c1171c9726fa16",
+  "baseline_reference_commit": "f68318514e80b910597b1e00146ed64ddbbe2ec0",
   "timed_prompt_pool": [
     {
       "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-9.golden.json",

@@ -27,6 +27,8 @@ FIRST="${NAMES[0]}"
 # 100+i bytes, and every per-depth oracle mtp<d> is sha256 "<d>"x64 and
 # 1000+d bytes (only measure-and-score reads them here).
 jq '(.timed_prompt_pool[0].r2_path | split("/")[:-1] | join("/")) as $prefix
+    | .warmup_golden = {sha256: "5edc020ba47b6e035dfd5584b2020627c9c2c68597800f4e65d69115d695e58c", bytes: 28357}
+    | .require_private_dir = true
     | .timed_prompt_pool = [.live_goldens | to_entries[]
         | {r2_path: "\($prefix)/\(.value).golden.json", sha256: ("a" * 64), bytes: (100 + .key)}]
     | .speculative_oracles = (reduce .live_goldens[] as $n ({};
@@ -73,9 +75,10 @@ jq '.live_golden_rotation.mode = "round_robin"' "${WORK}/rot.json" > "${WORK}/mo
 
 # --- measure-and-score measures every live golden ------------------------------
 ROOT="${WORK}/root"
-mkdir -p "${ROOT}/tools" "${ROOT}/fixtures"
+mkdir -p "${ROOT}/tools" "${ROOT}/fixtures" "${ROOT}/correctness_prompts"
 for entry in "${REPO_ROOT}"/tools/*; do ln -s "${entry}" "${ROOT}/tools/$(basename "${entry}")"; done
 ln -s "${REPO_ROOT}/benchmark.json" "${ROOT}/benchmark.json"
+cp "${REPO_ROOT}/correctness_prompts/public-longcopy-gate-english-496.golden.json" "${ROOT}/correctness_prompts/"
 jq '.spec = {enabled: false, num_speculative_tokens: 0}' "${REPO_ROOT}/mtp-head.manifest.json" > "${ROOT}/mtp-head.manifest.json"
 jq '.spec = {enabled: true, num_speculative_tokens: 3}' "${REPO_ROOT}/mtp-head.manifest.json" > "${WORK}/mtp3.manifest.json"
 CONTRACT="${ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json"
@@ -101,6 +104,13 @@ cat > "${WORK}/benchd" <<'EOF'
 #!/usr/bin/env bash
 if [[ "$2" == --help ]]; then echo "${STUB_FLAGS:---control-golden --mtp-depth --live-prompt}"; exit 0; fi
 printf '%s\n' "$@" > "${STUB_ARGV}"
+if [[ -n "${STUB_PRIVATE_LOG:-}" ]]; then
+  printf 'dir=%s\n' "${MLXFAST_PRIVATE_DIR:-}" > "${STUB_PRIVATE_LOG}"
+  if [[ -n "${MLXFAST_PRIVATE_DIR:-}" ]]; then
+    printf 'mode=%s\n' "$(stat -c %a "${MLXFAST_PRIVATE_DIR}")" >> "${STUB_PRIVATE_LOG}"
+    "${STUB_REAL_FIND:-find}" "${MLXFAST_PRIVATE_DIR}" -mindepth 1 -maxdepth 1 -type f -printf 'file=%f\n' | sort >> "${STUB_PRIVATE_LOG}"
+  fi
+fi
 [[ -n "${STUB_PLAN:-}" ]] || exit 0
 n=$(( $(wc -l < "${STUB_RUNS}") + 1 ))
 what="$(sed -n "${n}p" "${STUB_PLAN}")"
@@ -133,8 +143,8 @@ chmod +x "${WORK}/benchd"
 measure() { # measure FIXTURE [env...]  -> stdout+stderr; argv in ${WORK}/argv
   cp "$1" "${CONTRACT}"; shift
   rm -f "${WORK}/argv"
-  env -u MLXFAST_LIVE_GOLDEN_CHOICE -u SANDBOX_USER -u MLXFAST_QWEN_MTP_TRACK_ID \
-    BENCHD="${WORK}/benchd" STUB_ARGV="${WORK}/argv" \
+  env -u MLXFAST_LIVE_GOLDEN_CHOICE -u SANDBOX_USER -u MLXFAST_QWEN_MTP_TRACK_ID -u MLXFAST_PRIVATE_DIR \
+    BENCHD="${WORK}/benchd" STUB_ARGV="${WORK}/argv" STUB_PRIVATE_LOG="${WORK}/private.log" STUB_REAL_FIND="$(command -v find)" \
     MLXFAST_BASELINE_WORKSPACE="${WORK}/ws" MLXFAST_BASELINE_CALIBRATION="${WORK}/cal.json" \
     MLXFAST_NEMOTRON35_GOLDEN_DIR="${GOLDENS}" MLXFAST_ENGINE_BIN="${WORK}/engine" \
     MLXFAST_WEIGHTS_PATH="${WORK}/weights" SPEC_DECLARATION_MANIFEST="${ROOT}/mtp-head.manifest.json" \
@@ -146,26 +156,58 @@ argv_after() { grep -A1 -xF -- "$1" "${WORK}/argv" | tail -1; }
 
 argv_all() { grep -A1 -xF -- "$1" "${WORK}/argv" | grep -vxF -- "$1" | grep -vxF -- --; }
 want_list() { local f="$1"; shift; local n; for n in "${NAMES[@]}"; do printf '%s\n' "${GOLDENS}/${n}${f}"; done; }
+want_private_list() { local d="$1" f="$2" n; for n in "${NAMES[@]}"; do printf '%s\n' "${d}/${n}${f}"; done; }
 
 out="$(measure "${WORK}/full.json")"
-if [[ "$(argv_all --golden)" == "$(want_list .golden.json)" ]] \
-  && [[ "$(argv_all --control-golden)" == "$(want_list .golden.json)" ]] \
+private_dir="$(sed -n 's/^dir=//p' "${WORK}/private.log")"
+if [[ "$(argv_all --golden)" == "$(want_private_list "${private_dir}" .golden.json)" ]] \
+  && [[ "$(argv_all --control-golden)" == "$(want_private_list "${private_dir}" .golden.json)" ]] \
   && [[ "$(argv_all --golden-bytes)" == "$(seq 100 $((99 + ${#NAMES[@]})))" ]] \
   && ! argv_has --live-prompt && ! argv_has --mtp-depth; then
   ok "measure: serial: every live golden, in fixture order, is a --golden and its own --control-golden, with its pin; no --live-prompt"
 else
   fail "measure: serial run did not hand benchd every live golden; out: $(tail -2 <<<"${out}"); argv: $(tr '\n' ' ' < "${WORK}/argv" 2>/dev/null)"
 fi
+if [[ "$(argv_after --warmup-golden)" == "${private_dir}/public-longcopy-gate-english-496.golden.json" ]] \
+  && [[ "$(argv_after --warmup-golden-sha256)" == "5edc020ba47b6e035dfd5584b2020627c9c2c68597800f4e65d69115d695e58c" ]] \
+  && [[ "$(argv_after --warmup-golden-bytes)" == "28357" ]] \
+  && grep -qx 'mode=700' "${WORK}/private.log" \
+  && [[ "$(grep '^file=' "${WORK}/private.log")" == $'file=pool-10.golden.json\nfile=pool-11.golden.json\nfile=pool-9.golden.json\nfile=public-longcopy-gate-english-496.golden.json' ]] \
+  && [[ ! -d "${private_dir}" ]]; then
+  ok "measure: private dir has only passed goldens and warm-up, carries its pin, has mode 0700, and is removed"
+else
+  fail "measure: private golden staging is wrong: $(tr '\n' ' ' < "${WORK}/private.log" 2>/dev/null); argv: $(tr '\n' ' ' < "${WORK}/argv" 2>/dev/null)"
+fi
+
+jq 'del(.warmup_golden, .require_private_dir)' "${WORK}/full.json" > "${WORK}/no-private.json"
+out="$(measure "${WORK}/no-private.json")"
+if [[ "$(argv_all --golden)" == "$(want_list .golden.json)" ]] \
+  && ! argv_has --warmup-golden \
+  && [[ "$(sed -n 's/^dir=//p' "${WORK}/private.log")" == "" ]]; then
+  ok "measure: an old fixture keeps direct golden paths and passes no warm-up flag"
+else
+  fail "measure: an old fixture did not keep the old interface: $(tr '\n' ' ' < "${WORK}/argv" 2>/dev/null)"
+fi
 
 out="$(measure "${WORK}/full.json" SPEC_DECLARATION_MANIFEST="${WORK}/mtp3.manifest.json")"
-if [[ "$(argv_all --golden)" == "$(want_list .mtp3.golden.json)" ]] \
+private_dir="$(sed -n 's/^dir=//p' "${WORK}/private.log")"
+if [[ "$(argv_all --golden)" == "$(want_private_list "${private_dir}" .mtp3.golden.json)" ]] \
   && [[ "$(argv_all --golden-sha256 | sort -u)" == "$(printf '3%.0s' $(seq 64))" ]] \
-  && [[ "$(argv_all --control-golden)" == "$(want_list .golden.json)" ]] \
+  && [[ "$(argv_all --control-golden)" == "$(want_private_list "${private_dir}" .golden.json)" ]] \
   && [[ "$(argv_all --control-golden-sha256 | sort -u)" == "$(printf 'a%.0s' $(seq 64))" ]] \
   && [[ "$(argv_after --mtp-depth)" == 3 ]] && ! argv_has --live-prompt; then
   ok "measure: at mtp3 each candidate oracle is speculative_oracles.<prompt>.mtp3 and each control golden is the serial tape"
 else
   fail "measure: mtp3 run did not use the per-depth oracles; out: $(tail -2 <<<"${out}"); argv: $(tr '\n' ' ' < "${WORK}/argv" 2>/dev/null)"
+fi
+if [[ "$(grep '^file=' "${WORK}/private.log" | wc -l)" -eq 7 ]] \
+  && [[ "$(grep -c '^file=.*\.mtp3\.golden\.json$' "${WORK}/private.log")" -eq 3 ]] \
+  && [[ "$(grep -c '^file=pool-.*\.golden\.json$' "${WORK}/private.log")" -eq 6 ]] \
+  && grep -qx 'file=public-longcopy-gate-english-496.golden.json' "${WORK}/private.log" \
+  && [[ ! -d "${private_dir}" ]]; then
+  ok "measure: mtp3 private dir has exactly three timed, three control, and one warm-up golden"
+else
+  fail "measure: mtp3 private dir did not contain exactly the seven passed goldens: $(tr '\n' ' ' < "${WORK}/private.log")"
 fi
 
 jq --arg n "${NAMES[1]}" 'del(.speculative_oracles[$n].mtp3)' "${WORK}/full.json" > "${WORK}/no-oracle.json"
@@ -237,7 +279,7 @@ plan control floor
 [[ "${rc}" -eq 1 && "${runs}" == "control floor " ]] && jq -e '.metrics.error | startswith("performance floor")' "${ROOT}/score.json" >/dev/null \
   && ok "retry: a candidate failure on attempt 2 is the result (no third run)" \
   || fail "retry: control+floor: rc=${rc} runs=${runs}"
-cmp -s "${WORK}/runs.argv.1" "${WORK}/runs.argv.2" && grep -qxF "${GOLDENS}/${FIRST}.golden.json" "${WORK}/runs.argv.2" \
+cmp -s "${WORK}/runs.argv.1" "${WORK}/runs.argv.2" && grep -qE "/${FIRST}\.golden\.json$" "${WORK}/runs.argv.2" \
   && ok "retry: attempt 2 runs benchd with the identical argv (the same goldens)" \
   || fail "retry: attempt 2's argv differs from attempt 1's"
 

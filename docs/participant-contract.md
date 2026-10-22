@@ -306,7 +306,7 @@ not scored, which breaks obligations 1 and 2 above.
 
 **Enforced by the workflow.** The ranked workflow reads benchd's private audit.
 The candidate-over-control limit depends on the declared depth: 1.2 at
-depth 0, 1.35 at 1, 1.5 at 2 and 3, 1.6 at 4 and 1.65 at 5 and 6
+depth 0, 1.45 at 1, 1.5 at 2 and 3, 1.6 at 4 and 1.65 at 5 and 6
 (the fixture key `seed_window_cand_over_control_limit_by_depth`). The
 control-over-candidate limit stays 1.5.
 The seed-window figures stay private. A refusal names only the rule

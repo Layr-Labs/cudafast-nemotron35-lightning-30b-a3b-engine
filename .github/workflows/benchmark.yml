@@ -692,6 +692,9 @@ jobs:
           # measure-and-score.sh forwards the two as benchd's
           # --baseline-workspace and --baseline-calibration, and refuses by name
           # when either is unset.
+          # Runner-private; nemosub is denied RUNNER_TEMP; read by the plausibility gate.
+          rm -f "${RUNNER_TEMP}/benchd-private-audit.json"
+          export BENCHD_PRIVATE_AUDIT_PATH="${RUNNER_TEMP}/benchd-private-audit.json"
           MLXFAST_SCORE_PATH=score.json ./tools/nemotron35-measure-and-score.sh
 
       - name: Sandbox cleanup (kill nemosub processes, remove per-job dirs)
@@ -742,7 +745,7 @@ jobs:
           fi
           exit "${rc}"
 
-      - name: Score plausibility gate (prefill ceiling)
+      - name: Score plausibility gate (prefill and seed-window ceilings)
         # Contract section 8: prefill gain above the ceiling means the timed pass
         # reused earlier work. Run after sandbox cleanup and before reveal so a
         # refused score is never printed or uploaded.
@@ -750,10 +753,23 @@ jobs:
         run: |
           set -uo pipefail
           set +e
-          gate_out="$(./tools/score-plausibility-gate.sh score.json 2>&1)"
+          gate_out="$(./tools/score-plausibility-gate.sh score.json "${RUNNER_TEMP}/benchd-private-audit.json" 2>&1)"
           gate_rc=$?
           set -e
           printf '%s\n' "${gate_out}"
+          # Organizer copy of the private audit; a failed copy is a warning only.
+          kept=0
+          if [[ -f "${RUNNER_TEMP}/benchd-private-audit.json" ]]; then
+            if install -d -m 700 "${HOME}/nemotron35-private-audit" \
+                && install -m 600 "${RUNNER_TEMP}/benchd-private-audit.json" "${HOME}/nemotron35-private-audit/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"; then
+              kept=1
+            else
+              echo "::warning::could not keep the organizer copy of the private benchd audit"
+            fi
+          fi
+          if [[ "${gate_rc}" -ne 0 && "${kept}" -eq 1 ]]; then
+            echo "::warning::plausibility gate failed; the private audit is kept on the runner box"
+          fi
           if [[ "${gate_rc}" -eq 0 ]]; then
             ( umask 077; : > "${RUNNER_TEMP}/plausibility-ok" )
           else

@@ -243,7 +243,7 @@ class Session:
                 bound = int_field("max_tokens")
             return {"ok": True, "token": self.sync(tokens, bound)}, True
         if op == "eval":
-            return {"ok": True, "token": self.eval(int_field("token"))}, True
+            return {"ok": True, "token": self.eval(int_field("token")) + 1}, True  # NEGATIVE TEST: wrong token
         if op == "argmax":
             return {"ok": True, "token": self._need_frontier().token}, True
         if op == "top_logits":

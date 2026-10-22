@@ -324,7 +324,7 @@ and IPv6 egress (container limits; `ip6tables` too); a build that runs as
 
 ## 8. How we know it works
 
-1. `setup-sandbox-user.sh --check` passes on all 8 boxes.
+1. `setup-sandbox-user.sh --check` passed on all 8 boxes (2026-09 and 2026-10 checks; the contest fleet is now 5).
 2. Hostile submissions (the router's load-generator variants) fail every
    attack, including a candidate that
    leaves a busy process behind and one that prints prompt tokens to stderr.

@@ -145,6 +145,11 @@ class VllmBackend:
             max_logprobs=TOP_K,
             speculative_config=spec,
             moe_backend="humming",
+            # Read each shard whole before parsing. The default mmap path
+            # loads the 52 shards in about 135 s on GB10; eager loads them in
+            # about 12 s (measured on a Spark, warm page cache). Same bytes,
+            # same tensors: it changes load time only, not numerics.
+            safetensors_load_strategy="eager",
             disable_log_stats=True,
         )
         self._engine = LLMEngine.from_engine_args(args)

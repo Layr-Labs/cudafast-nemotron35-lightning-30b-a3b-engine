@@ -304,6 +304,12 @@ Deferred seed work lands in the decode window and makes decode slower. Decode
 work done early, inside `free_decode_begin`, leaves the decode window and is
 not scored, which breaks obligations 1 and 2 above.
 
+**Enforced by the workflow.** The ranked workflow reads benchd's private audit
+(runner-only) and refuses a run whose seed-prefill window is over 1.5× the
+control leg's (decode work moved into `free_decode_begin`) or over 1.5× faster
+than it (the seed prefill reused earlier work). The seed-window figures stay
+private; a refusal names only the rule (`tools/score-plausibility-gate.sh`).
+
 The seed token's index: `seed_token` is `expected_decode_seed_token`;
 `free_decode_run` returns the N tokens after it, so `tokens[0]` = `expected_decode_tokens[0]`.
 
@@ -369,7 +375,8 @@ artifact (`tools/score-plausibility-gate.sh`, run after sandbox cleanup and
 before the reveal). This is a policy ceiling: real prefill work on this engine
 scores near 1.0, and a gain far above that usually means the timed passes
 reused earlier work, which section 8 bans. The gate does not detect all reuse;
-section 8 still applies below the ceiling.
+section 8 still applies below the ceiling. The same script also enforces the
+seed-prefill window ceilings described in section 5.1.1.
 
 ### 5.4 Token fidelity
 

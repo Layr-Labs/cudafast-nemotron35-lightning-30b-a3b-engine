@@ -570,12 +570,18 @@ else
   env "${RESIDENT_ENV[@]}" python3 "${SCRIPT_DIR}/harness/vllm_resident/resident.py" >"${RESIDENT_LOG}" 2>&1 &
 fi
 RESIDENT_PID=$!
+# A sandboxed resident runs submission code: its output can carry what it saw, so it stays in the
+# runner-private log file and never reaches the job log.
+show_resident_log() {
+  if [[ -n "${SANDBOX_USER_ID}" ]]; then log "(sandboxed: not printed; ${RESIDENT_LOG} on the box)"
+  else tail -40 "${RESIDENT_LOG}" >&2 || true; fi
+}
 
 start="$(date +%s)"
 while :; do
   if ! kill -0 "${RESIDENT_PID}" 2>/dev/null; then
     log "the resident exited before it was healthy; its log:"
-    tail -40 "${RESIDENT_LOG}" >&2 || true
+    show_resident_log
     exit 1
   fi
   # Sandboxed, there is no ready file (see the header); the bound socket is the hint.
@@ -586,7 +592,7 @@ while :; do
   now="$(date +%s)"
   if (( now - start >= SERVE_UP_HEALTH_TIMEOUT_S )); then
     log "the resident was not healthy within ${SERVE_UP_HEALTH_TIMEOUT_S}s; its log:"
-    tail -40 "${RESIDENT_LOG}" >&2 || true
+    show_resident_log
     exit 1
   fi
   sleep 2

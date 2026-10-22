@@ -211,6 +211,9 @@ if [[ -f "${KERNELS_SRC}/build.sh" ]]; then
       rm -rf "${ROOT_DIR}/.build/kernels"
       die "kernels refused: harness/kernels/build.sh produced a symlink, special file or setuid/setgid file: ${odd//$'\n'/; }"
     fi
+    # The copy keeps the build's modes and ACLs; the sandbox user must not be able to write it.
+    if command -v setfacl >/dev/null; then setfacl -bR "${ROOT_DIR}/.build/kernels"; fi
+    chmod -R u=rwX,go=rX "${ROOT_DIR}/.build/kernels"
   fi
 else
   log "no harness/kernels/build.sh; nothing to build"

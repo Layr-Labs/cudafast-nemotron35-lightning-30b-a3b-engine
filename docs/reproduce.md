@@ -7,7 +7,7 @@ for dev `main` after PR #37 (fixture unchanged since `c1ef8de`), recorded
 
 | Input | Section | Recorded result |
 |---|---|---|
-| benchd binaries | [1](#1-rebuild-benchd-from-source) | byte-identical rebuild of dist `80f8819` from source `10afddd` |
+| benchd binaries | [1](#1-rebuild-benchd-from-source) | byte-identical rebuild of dist `92da41a` from source `918b8ac` |
 | Hidden goldens | [2](#2-re-record-the-hidden-goldens) | 21 files, byte-identical on two Sparks, all pinned in the fixture |
 | Box calibration | [3](#3-recalibrate-a-box) | 4 Sparks, every CV under 1% (limit 2%) |
 | Ranked score | [4](#4-reproduce-a-ranked-score) | dev run: `passed: true`, score 1.310 |
@@ -18,12 +18,12 @@ benchd is pinned in `tools/fetch-benchd.sh`:
 
 | Pin | Value |
 |---|---|
-| Repository | `Layr-Labs/benchd` (public dist channel and public source snapshot `6b6f7cf`, the same source tree as the development commit `10afddd`) |
-| `PINNED_COMMIT` (dist) | `80f8819dde25b55f1f5c5dc1c85863498135f87e` |
-| `PINNED_SOURCE_COMMIT` | `10afddd4af99bcec1cbf87e57242f224df0bdac7` |
-| `PINNED_PUBLIC_SOURCE_COMMIT` | `6b6f7cf1fe1423e60cdf0ff936ac2d3f26ac348b` |
-| `dist/linux-aarch64/benchd` | sha256 `0377ebdcc656205acdfd8d4b1e789318ff40a594fb0427a4e04ace8fb1e897da`, 3,914,064 bytes |
-| `dist/linux-aarch64/record-correctness-golden` | sha256 `527645bc918311a47ce8bf073b13a0d3dbcea590b5409326cd9017bb554a5c9d`, 1,643,288 bytes |
+| Repository | `Layr-Labs/benchd` (public dist channel and public source snapshot `0aacae3`, the same source tree as the development commit `918b8ac`) |
+| `PINNED_COMMIT` (dist) | `92da41a15ed7e80896c67033dbcf813a88fa9dc8` |
+| `PINNED_SOURCE_COMMIT` | `918b8acaf122fb4bedef1f79f580c7c23c65b905` |
+| `PINNED_PUBLIC_SOURCE_COMMIT` | `0aacae37f70e681d2465fff23856665a04bc44cd` |
+| `dist/linux-aarch64/benchd` | sha256 `6f37438f95f2e77c5521304e7430040b86aa702b71b9b9704eecda0d2e97e9a7`, 3,992,264 bytes |
+| `dist/linux-aarch64/record-correctness-golden` | sha256 `210fd6b58be1bd6ee86d7c7e1a521b406346906b18ba6d017fb3cff7c006ae8f`, 1,716,152 bytes |
 
 The bench repository builds the Linux binaries in a pinned container
 (`deploy/Dockerfile.dist-linux`), which fetches the source commit by sha from
@@ -32,10 +32,10 @@ the public `Layr-Labs/benchd` repository at the dist commit, on a host with
 Docker:
 
 ```bash
-git checkout 80f8819dde25b55f1f5c5dc1c85863498135f87e
+git checkout 92da41a15ed7e80896c67033dbcf813a88fa9dc8
 BENCHD_DIST_NO_CACHE=1 BENCHD_DIST_BRANCH=main \
   BENCHD_DIST_REPO=https://github.com/Layr-Labs/benchd.git \
-  ./scripts/build-dist-linux.sh 6b6f7cf1fe1423e60cdf0ff936ac2d3f26ac348b
+  ./scripts/build-dist-linux.sh 0aacae37f70e681d2465fff23856665a04bc44cd
 git diff --stat -- dist/linux-aarch64   # no output: the rebuilt bytes equal the published ones
 ```
 

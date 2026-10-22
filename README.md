@@ -225,7 +225,7 @@ run blocks the upload. Run `yukon run` yourself before you submit.
 | MTP head | the `mtp.*` tensors inside `model-00052-of-00052.safetensors` (BF16, 2,670,652,160 bytes) |
 | Engine source | vLLM `v0.27.1` @ `6e448d0ea9bf3d88d898b65449ca6dc2aec170ac` |
 | Engine image | `docker.io/vllm/vllm-openai:v0.27.1` @ `sha256:1c8e60a0841b333c700488cb029d3664807249da0c071e862191b00fe34b228c` (arm64) |
-| benchd | `Layr-Labs/benchd` dist `80f8819dde25b55f1f5c5dc1c85863498135f87e`, built from source `10afddd4af99bcec1cbf87e57242f224df0bdac7` (public snapshot `6b6f7cf1fe1423e60cdf0ff936ac2d3f26ac348b`; `PINNED_COMMIT`, `PINNED_SOURCE_COMMIT` and `PINNED_PUBLIC_SOURCE_COMMIT` in `tools/fetch-benchd.sh`); the dist's `dist/linux-aarch64/benchd.manifest.json` pins each binary's sha256 and bytes |
+| benchd | `Layr-Labs/benchd` dist `92da41a15ed7e80896c67033dbcf813a88fa9dc8`, built from source `918b8acaf122fb4bedef1f79f580c7c23c65b905` (public snapshot `0aacae37f70e681d2465fff23856665a04bc44cd`; `PINNED_COMMIT`, `PINNED_SOURCE_COMMIT` and `PINNED_PUBLIC_SOURCE_COMMIT` in `tools/fetch-benchd.sh`); the dist's `dist/linux-aarch64/benchd.manifest.json` pins each binary's sha256 and bytes |
 | Goldens | `timed_prompt_pool[]` (the 3 serial goldens that `live_goldens` names: `pool-9`, `pool-10`, `pool-11`, three 496-token chat-template coding prompts), `speculative_oracles` (18 per-depth oracles) and `hidden_correctness_golden` (the `pool-9` serial pin) in the fixture: 21 files pinned by sha256 and bytes (staged on each box, never committed; see [OVERVIEW.md](OVERVIEW.md)) |
 
 ## The ranked run

@@ -171,13 +171,13 @@ box.
   trusted side vendors the crates first, and then the build runs offline, so
   a `build.rs` that fetches anything fails.
 - **What comes back is the score, nothing else.** The adapter's stderr is kept
-  private and never returned, and job logs are not shown to participants. The
-  score record carries no text your engine supplied. An engine error appears
+  private and never returned. Job logs can be public; they carry no text your
+  engine supplied, and neither does the score record. An engine error appears
   as a failure class plus the sha256 and byte count of its message. Identity
   strings and acceptance lengths are summarised, not copied.
-- **Reported digests must be well-formed.** `head_provenance_sha256` and
-  `runner_manifest_sha256` must be 64 lowercase hex characters, or they seal
-  as `invalid`.
+- **Reported digests are hashed.** The score record carries the sha256 of the
+  `head_provenance_sha256` and `runner_manifest_sha256` strings your engine
+  reports, never the reported values themselves.
 - **Nothing persists between jobs or legs.** Temp files, shared memory, IPC
   objects and message queues the sandbox user leaves are wiped, every process
   it started is killed after its leg, and it cannot schedule jobs. Do not rely
@@ -619,7 +619,7 @@ The rest of the command surface:
 | Engine source | vLLM `v0.27.1` @ `6e448d0ea9bf3d88d898b65449ca6dc2aec170ac` (`vllm/VENDOR.json`) |
 | Engine image | `docker.io/vllm/vllm-openai:v0.27.1` @ `sha256:1c8e60a0841b333c700488cb029d3664807249da0c071e862191b00fe34b228c` |
 | Driver floor | `580.159.03` |
-| benchd | `Layr-Labs/benchd` dist commit `80f8819dde25b55f1f5c5dc1c85863498135f87e`, built from source `10afddd4af99bcec1cbf87e57242f224df0bdac7` (public snapshot `6b6f7cf1fe1423e60cdf0ff936ac2d3f26ac348b`); `dist/linux-aarch64/benchd.manifest.json` there gives each binary's sha256 and bytes. `tools/fetch-benchd.sh` (`PINNED_SOURCE_COMMIT` / `PINNED_PUBLIC_SOURCE_COMMIT`) is the authority. |
+| benchd | `Layr-Labs/benchd` dist commit `92da41a15ed7e80896c67033dbcf813a88fa9dc8`, built from source `918b8acaf122fb4bedef1f79f580c7c23c65b905` (public snapshot `0aacae37f70e681d2465fff23856665a04bc44cd`); `dist/linux-aarch64/benchd.manifest.json` there gives each binary's sha256 and bytes. `tools/fetch-benchd.sh` (`PINNED_SOURCE_COMMIT` / `PINNED_PUBLIC_SOURCE_COMMIT`) is the authority. |
 
 ## 8. Prohibited techniques
 

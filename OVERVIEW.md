@@ -82,7 +82,7 @@ Every point links to the document that has the detail.
   - **Why:** without it, a submission could read the hidden prompts and
     goldens, or rewrite the measuring tools.
 - **Sealed score.** `score.json` names each prompt only by its sha256. It
-  carries no prompt text. The pinned benchd (source `10afddd`, which includes bench
+  carries no prompt text. The pinned benchd (source `918b8ac`, which includes bench
   pull requests 421 to 424) keeps engine-written text, audit fields, the hello
   identity and engine-derived numbers out of the sealed output: they are
   sealed as digests or omitted, and a full copy goes only to a private audit
@@ -170,7 +170,7 @@ and the engineering log, section 7.14.
 
 These tests ran on the earlier fork benchd, which had the timed replay and the
 stricter sealing. The track now uses the public `Layr-Labs/benchd` channel
-(dist `80f8819`, public source snapshot `6b6f7cf` of source `10afddd`;
+(dist `92da41a`, public source snapshot `0aacae3` of source `918b8ac`;
 engineering log section 7.13). It has the stricter sealing again (bench pull
 requests 421 to 424), but not the timed replay.
 

@@ -273,6 +273,14 @@ verify_pin() {
     || fail "${label}: sha256 mismatch (staged ${got_sha}, pinned ${want_sha}): ${path}"
 }
 
+if jq -e '.warmup_golden != null' "${CONTRACT}" >/dev/null; then
+  warmup_path="${REPO_ROOT}/correctness_prompts/public-longcopy-gate-english-496.golden.json"
+  warmup_sha="$(jq -r '.warmup_golden.sha256 // empty' "${CONTRACT}")"
+  warmup_bytes="$(jq -r '.warmup_golden.bytes // empty' "${CONTRACT}")"
+  verify_pin "${warmup_path}" "${warmup_sha}" "${warmup_bytes}" "warm-up golden"
+  ok "warm-up golden matches its contract pin (bytes then sha256)"
+fi
+
 expected_list=""
 while IFS='	' read -r r2_path want_sha want_bytes; do
   [[ -n "${r2_path}" ]] || continue

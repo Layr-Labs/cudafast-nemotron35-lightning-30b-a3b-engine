@@ -368,12 +368,14 @@ EOF
   exit 1
 fi
 GOLDEN_ARGS=()
+GOLDEN_PATHS=()
 for i in "${!GOLDEN_BASENAMES[@]}"; do
   if [[ ! -f "${GOLDEN_DIR}/${GOLDEN_BASENAMES[$i]}" ]]; then
     echo "nemotron35-measure-and-score.sh: live golden not found at ${GOLDEN_DIR}/${GOLDEN_BASENAMES[$i]}" >&2
     echo "  live_goldens names '${LIVE_GOLDEN_NAMES[$i]}' (fixtures/nemotron35_lightning_30b_a3b_track.json); stage ${GOLDEN_BASENAMES[$i]} into MLXFAST_NEMOTRON35_GOLDEN_DIR." >&2
     exit 1
   fi
+  GOLDEN_PATHS+=("${GOLDEN_DIR}/${GOLDEN_BASENAMES[$i]}")
   GOLDEN_ARGS+=(--golden "${GOLDEN_DIR}/${GOLDEN_BASENAMES[$i]}" --golden-sha256 "${GOLDEN_SHA256S[$i]}" --golden-bytes "${GOLDEN_BYTES_LIST[$i]}")
 done
 
@@ -451,6 +453,7 @@ SCORE_PATH="${MLXFAST_SCORE_PATH:-score.json}"
 # tape at depth 0; a speculative declaration on such a benchd is refused rather
 # than measured against the wrong oracle.
 CONTROL_ARGS=()
+CONTROL_PATHS=()
 if "${BENCHD}" iterate --help 2>&1 | grep -q -- '--control-golden'; then
   for i in "${!SERIAL_GOLDEN_BASENAMES[@]}"; do
     control_path="${GOLDEN_DIR}/${SERIAL_GOLDEN_BASENAMES[$i]}"
@@ -458,6 +461,7 @@ if "${BENCHD}" iterate --help 2>&1 | grep -q -- '--control-golden'; then
       echo "nemotron35-measure-and-score.sh: serial golden not found at ${control_path}; the serial-control leg has no tape to verify against." >&2
       exit 1
     fi
+    CONTROL_PATHS+=("${control_path}")
     CONTROL_ARGS+=(--control-golden "${control_path}" --control-golden-sha256 "${SERIAL_GOLDEN_SHA256S[$i]}" --control-golden-bytes "${SERIAL_GOLDEN_BYTES_LIST[$i]}")
     echo "nemotron35-measure-and-score.sh: serial-control leg for ${LIVE_GOLDEN_NAMES[$i]} verifies against ${SERIAL_GOLDEN_BASENAMES[$i]} (sha256 ${SERIAL_GOLDEN_SHA256S[$i]}, ${SERIAL_GOLDEN_BYTES_LIST[$i]} bytes)" >&2
   done
@@ -465,11 +469,70 @@ elif [[ "${SPEC_DESC}" != "serial" ]]; then
   echo "nemotron35-measure-and-score.sh: REFUSING -- the declaration is ${SPEC_DESC} but this benchd has no --control-golden; the serial-control leg would be verified against the ${SPEC_DESC} tape." >&2
   exit 1
 fi
+
+# New anti-cheat inputs are opt-in. An old fixture keeps the old paths and
+# command line. A private fixture gets fresh, mode-0700 copies that only benchd
+# can name. The checkout's public golden is the separate warm-up input.
+PRIVATE_DIR=""
+HELD=""
+cleanup() {
+  [[ -z "${HELD:-}" ]] || rm -rf -- "${HELD}"
+  [[ -z "${PRIVATE_DIR:-}" ]] || rm -rf -- "${PRIVATE_DIR}"
+}
+
+WARMUP_ARGS=()
+WARMUP_PATH=""
+if jq -e '.warmup_golden != null' "${CONTRACT}" >/dev/null; then
+  WARMUP_PATH="${SCRIPT_DIR}/correctness_prompts/public-longcopy-gate-english-496.golden.json"
+  WARMUP_SHA="$(jq -r '.warmup_golden.sha256 // empty' "${CONTRACT}")"
+  WARMUP_BYTES="$(jq -r '.warmup_golden.bytes // empty' "${CONTRACT}")"
+  if [[ ! -f "${WARMUP_PATH}" ]]; then
+    echo "nemotron35-measure-and-score.sh: warm-up golden not found at ${WARMUP_PATH}" >&2
+    exit 1
+  fi
+fi
+
+if [[ "$(jq -r '.require_private_dir // false' "${CONTRACT}")" == "true" ]]; then
+  PRIVATE_DIR="$(mktemp -d "${RUNNER_TEMP:-/tmp}/nemotron35-private.XXXXXX")"
+  trap cleanup EXIT
+  chmod 0700 "${PRIVATE_DIR}"
+
+  for i in "${!GOLDEN_PATHS[@]}"; do
+    dest="${PRIVATE_DIR}/${GOLDEN_BASENAMES[$i]}"
+    cp -- "${GOLDEN_PATHS[$i]}" "${dest}"
+    GOLDEN_PATHS[$i]="${dest}"
+  done
+  GOLDEN_ARGS=()
+  for i in "${!GOLDEN_PATHS[@]}"; do
+    GOLDEN_ARGS+=(--golden "${GOLDEN_PATHS[$i]}" --golden-sha256 "${GOLDEN_SHA256S[$i]}" --golden-bytes "${GOLDEN_BYTES_LIST[$i]}")
+  done
+
+  for i in "${!CONTROL_PATHS[@]}"; do
+    dest="${PRIVATE_DIR}/${SERIAL_GOLDEN_BASENAMES[$i]}"
+    cp -- "${CONTROL_PATHS[$i]}" "${dest}"
+    CONTROL_PATHS[$i]="${dest}"
+  done
+  CONTROL_ARGS=()
+  for i in "${!CONTROL_PATHS[@]}"; do
+    CONTROL_ARGS+=(--control-golden "${CONTROL_PATHS[$i]}" --control-golden-sha256 "${SERIAL_GOLDEN_SHA256S[$i]}" --control-golden-bytes "${SERIAL_GOLDEN_BYTES_LIST[$i]}")
+  done
+
+  if [[ -n "${WARMUP_PATH}" ]]; then
+    cp -- "${WARMUP_PATH}" "${PRIVATE_DIR}/$(basename -- "${WARMUP_PATH}")"
+    WARMUP_PATH="${PRIVATE_DIR}/$(basename -- "${WARMUP_PATH}")"
+  fi
+fi
+
+if [[ -n "${WARMUP_PATH}" ]]; then
+  WARMUP_ARGS=(--warmup-golden "${WARMUP_PATH}" --warmup-golden-sha256 "${WARMUP_SHA}" --warmup-golden-bytes "${WARMUP_BYTES}")
+fi
+
 iterate_official=(
   "${BENCHD}" iterate
   --engine "${ENGINE_BIN}"
   --weights "${WEIGHTS_PATH}"
   "${GOLDEN_ARGS[@]}"
+  "${WARMUP_ARGS[@]}"
   --mode official
   --score-path "${SCORE_PATH}"
   --contract "${CONTRACT}"
@@ -573,17 +636,25 @@ fi
 # it), so each attempt's stdout (benchd's copy of score.json) and marker are
 # held in a private directory and printed only for the attempt that counts.
 HELD="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/measure-held.XXXXXX")"
-trap 'rm -rf -- "${HELD}"' EXIT
+trap cleanup EXIT
 INTEGRITY_PATH="$(dirname -- "${SCORE_PATH}")/benchmark-integrity.json"
 
 run_attempt() {
   rm -f -- "${HELD}/stdout" "${HELD}/marker"
   set +e
-  "${iterate_official[@]}" 2>&1 >"${HELD}/stdout" \
+  run_benchd 2>&1 >"${HELD}/stdout" \
     | awk -v held="${HELD}/marker" 'index($0, "benchd iterate: wrote score.json") { print > held; next } { print; fflush() }' >&2
   local rc="${PIPESTATUS[0]}"
   set -e
   return "${rc}"
+}
+
+run_benchd() {
+  if [[ -n "${PRIVATE_DIR}" ]]; then
+    (export MLXFAST_PRIVATE_DIR="${PRIVATE_DIR}"; exec "${iterate_official[@]}")
+  else
+    "${iterate_official[@]}"
+  fi
 }
 
 # Only THIS attempt's seal counts: the marker must have been held from this run

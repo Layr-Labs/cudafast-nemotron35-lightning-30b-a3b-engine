@@ -243,13 +243,25 @@ GOLDEN_DIR="${MLXFAST_NEMOTRON35_GOLDEN_DIR:-}"
 LIVE_GOLDENS="$(jq -r '(.live_goldens // [])[]' "${FIXTURE}")"
 [ -n "${LIVE_GOLDENS}" ] || refuse missing-live-golden "${FIXTURE} declares no live_goldens"
 GOLDEN_ARGS=()
+GOLDEN_NAMES=()
+GOLDEN_PATHS=()
 for name in ${LIVE_GOLDENS}; do
   case "${name}" in *[!a-z0-9_-]*) refuse missing-live-golden "live_goldens name '${name}' is not [a-z0-9_-]+" ;; esac
   [ -r "${GOLDEN_DIR}/${name}.golden.json" ] || refuse missing-golden \
     "cannot read the live golden ${GOLDEN_DIR}/${name}.golden.json; stage the pool into MLXFAST_NEMOTRON35_GOLDEN_DIR"
+  GOLDEN_NAMES+=("${name}")
+  GOLDEN_PATHS+=("${GOLDEN_DIR}/${name}.golden.json")
   GOLDEN_ARGS+=(--golden "${GOLDEN_DIR}/${name}.golden.json" --prompt "${name}")
 done
 LIVE_GOLDEN="$(printf '%s' "${LIVE_GOLDENS}" | tr '\n' ' ')"
+
+WARMUP_ARGS=()
+if jq -e '.warmup_golden != null' "${FIXTURE}" >/dev/null; then
+  WARMUP_GOLDEN="${REPO_DIR}/correctness_prompts/public-longcopy-gate-english-496.golden.json"
+  [ -r "${WARMUP_GOLDEN}" ] || refuse missing-golden \
+    "cannot read the warm-up golden ${WARMUP_GOLDEN}"
+  WARMUP_ARGS=(--warmup-golden "${WARMUP_GOLDEN}")
+fi
 
 # --- benchd -----------------------------------------------------------------
 # Honoured as-is when the caller sets it, exactly as measure-and-score.sh does.
@@ -293,20 +305,24 @@ esac
 # fallback is a value nobody chose: passing them puts the whole band's identity
 # in the command line the run log records, and makes a disagreement a refusal
 # here rather than a surprise in the file.
-CALIBRATE_ARGV=(
-  "${BENCHD}" calibrate-baseline
-  --baseline-workspace "${WORKSPACE}"
-  --engine "${ENGINE_REL}"
-  --weights "${WEIGHTS_DIR}"
-  "${GOLDEN_ARGS[@]}"
-  --out "${OUT}"
-  --passes "${PASSES}"
-  --box "${BOX}"
-  --track "${TRACK_ID}"
-  --contract "${FIXTURE}"
-  --reference-commit "${WANT_REF_COMMIT}"
-  --benchd-source-commit "${BENCHD_SOURCE_COMMIT}"
-)
+set_calibrate_argv() {
+  CALIBRATE_ARGV=(
+    "${BENCHD}" calibrate-baseline
+    --baseline-workspace "${WORKSPACE}"
+    --engine "${ENGINE_REL}"
+    --weights "${WEIGHTS_DIR}"
+    "${GOLDEN_ARGS[@]}"
+    "${WARMUP_ARGS[@]}"
+    --out "${OUT}"
+    --passes "${PASSES}"
+    --box "${BOX}"
+    --track "${TRACK_ID}"
+    --contract "${FIXTURE}"
+    --reference-commit "${WANT_REF_COMMIT}"
+    --benchd-source-commit "${BENCHD_SOURCE_COMMIT}"
+  )
+}
+set_calibrate_argv
 
 # --- dry run ----------------------------------------------------------------
 if [ "${DRY_RUN}" -eq 1 ]; then
@@ -366,12 +382,36 @@ kill_run_group() {
     # shellcheck disable=SC2086
     kill -KILL ${pids} 2>/dev/null || true
   fi
+  [ -z "${PRIVATE_DIR:-}" ] || rm -rf -- "${PRIVATE_DIR}"
 }
 trap kill_run_group EXIT
 
+# Match the ranked path. New anti-cheat fixtures get fresh private copies.
+# Old fixtures keep the staged paths and the old benchd environment.
+PRIVATE_DIR=""
+BENCHD_ENV=()
+if [ "$(jq -r '(.require_private_dir == true) or (.warmup_golden != null)' "${FIXTURE}")" = "true" ]; then
+  PRIVATE_DIR="$(mktemp -d "${RUNNER_TEMP:-/tmp}/nemotron35-private.XXXXXX")"
+  chmod 0700 "${PRIVATE_DIR}"
+
+  GOLDEN_ARGS=()
+  for i in "${!GOLDEN_PATHS[@]}"; do
+    dest="${PRIVATE_DIR}/$(basename -- "${GOLDEN_PATHS[$i]}")"
+    cp -- "${GOLDEN_PATHS[$i]}" "${dest}"
+    GOLDEN_ARGS+=(--golden "${dest}" --prompt "${GOLDEN_NAMES[$i]}")
+  done
+  if [ "${#WARMUP_ARGS[@]}" -gt 0 ]; then
+    WARMUP_GOLDEN_PRIVATE="${PRIVATE_DIR}/$(basename -- "${WARMUP_GOLDEN}")"
+    cp -- "${WARMUP_GOLDEN}" "${WARMUP_GOLDEN_PRIVATE}"
+    WARMUP_ARGS=(--warmup-golden "${WARMUP_GOLDEN_PRIVATE}")
+  fi
+  BENCHD_ENV+=("MLXFAST_PRIVATE_DIR=${PRIVATE_DIR}")
+  set_calibrate_argv
+fi
+
 printf 'calibrate-box: capturing %s passes of the SERIAL control leg on %s (%s)\n' \
   "${PASSES}" "${BOX}" "${LIVE_GOLDEN}" >&2
-if ! "${CALIBRATE_ARGV[@]}"; then
+if ! env "${BENCHD_ENV[@]}" "${CALIBRATE_ARGV[@]}"; then
   printf 'calibrate-box: benchd refused the capture or the stability gate; nothing was pinned\n' >&2
   exit 4
 fi

@@ -138,7 +138,7 @@
 #                       benchd is published from Layr-Labs bench main.
 #                       There is no per-track bench branch. Main carries the
 #                       two changes this track needs: the fixture-declared
-#                       median of several timed prefill passes and the 60 C
+#                       timed prefill pass count and the 60 C
 #                       GB10 cool gate (docs/nemotron35-port-notes.md
 #                       sections 7.5, 7.7 and 7.13).
 #   BENCHD_COMMIT       the bench commit whose dist/ is fetched. Default: the
@@ -181,15 +181,15 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BRANCH="${BENCHD_BRANCH:-main}"
-# THE PIN. The pin is Layr-Labs/benchd main @ 7045ed6 (the public channel).
+# THE PIN. The pin is Layr-Labs/benchd main @ 80f8819 (the public channel).
 # It publishes dist/ (aarch64-apple-darwin), dist/linux-aarch64 and
 # dist/linux-x86_64.
-# The binaries are built from source_commit b65af98 of the organizer's
+# The binaries are built from source_commit 10afddd of the organizer's
 # development channel (Layr-Labs/mlxfast-bench-dev; bench pull request 425).
-# The public manifests name 81a7d45, the public snapshot of that source.
+# The public manifests name 6b6f7cf, the public snapshot of that source.
 # The snapshot tree is the development source tree without dist/.
 # The development channel publishes the same six files byte for byte.
-# Its manifests name b65af98. A ranked box stages that pair.
+# Its manifests name 10afddd. A ranked box stages that pair.
 # So the script accepts both names (PINNED_SOURCE_COMMIT and
 # PINNED_PUBLIC_SOURCE_COMMIT).
 # That source includes:
@@ -216,9 +216,9 @@ BRANCH="${BENCHD_BRANCH:-main}"
 #     calibration_max_cv_percent (2.0 here) instead of a fixed 1 %.
 # This benchd has no timed-divergence reference replay: the timed decode window
 # is an exact match against the per-depth oracle.
-PINNED_COMMIT="7045ed65635049c32fd378e579448ac66fb12152"
-PINNED_SOURCE_COMMIT="b65af98c2a060df12f2ced849c68528b825fecdb"
-PINNED_PUBLIC_SOURCE_COMMIT="81a7d45b940d3501e52d7774bb2e8b9abd2c0372"
+PINNED_COMMIT="80f8819dde25b55f1f5c5dc1c85863498135f87e"
+PINNED_SOURCE_COMMIT="10afddd4af99bcec1cbf87e57242f224df0bdac7"
+PINNED_PUBLIC_SOURCE_COMMIT="6b6f7cf1fe1423e60cdf0ff936ac2d3f26ac348b"
 COMMIT="${BENCHD_COMMIT:-${PINNED_COMMIT}}"
 SOURCE_COMMIT_PIN="${BENCHD_SOURCE_COMMIT:-${PINNED_SOURCE_COMMIT}}"
 DEST_DIR="${BENCHD_BIN_DIR:-${REPO_ROOT}/benchd-bin}"

@@ -215,13 +215,20 @@ delete_owned_paths() {
   done
 }
 count_foreign_writable() {
-  local root="$1" list
+  local root="$1" list wipe_dir
+  # A wipe-list dir below another one (/tmp/.X11-unix below /tmp) is itself
+  # checked as a root; its own entry is not a hit, its contents still are.
+  local skip=()
+  for wipe_dir in "${DIRS[@]}"; do skip+=(! -path "${wipe_dir}"); done
   list="$(mktemp)" || return 1
   if [[ -n "${JOB_DIR}" && "${root}" == "${JOB_DIR}" ]]; then
     sandbox_find "${root}" ! -path "${JOB_DIR}/adapter-home" ! -path "${JOB_DIR}/sock" \
       ! -user "${SANDBOX_USER}" -writable -print0 >"${list}" 2>/dev/null
   else
-    sandbox_find "${root}" ! -user "${SANDBOX_USER}" -writable -print0 >"${list}" 2>/dev/null
+    # X11 and ICE sockets need the session's auth cookie. Symlinks hold only
+    # their target name, and -writable tests the target.
+    sandbox_find "${root}" "${skip[@]}" ! \( -type s \( -path '*/.X11-unix/*' -o -path '*/.ICE-unix/*' \) \) \
+      ! -type l ! -user "${SANDBOX_USER}" -writable -print0 >"${list}" 2>/dev/null
   fi
   if [[ "$?" -ne 0 ]]; then
     rm -f -- "${list}"
@@ -269,6 +276,22 @@ if ! collect_owned_paths "${WIPE_HOME}"; then
 else
   n="${#OWNED_PATHS[@]}"
   [[ "${n}" -eq 0 ]] || { echo "sandbox-wipe.sh: ${n} ${SANDBOX_USER}-owned path(s) remain under the sandbox home" >&2; left=1; }
+fi
+if n="$(python3 - "${DIRS[@]}" 2>/dev/null <<'PY'
+import os
+import sys
+
+print(sum(
+    os.path.isdir(path)
+    and any(name.startswith("user.") for name in os.listxattr(path, follow_symlinks=False))
+    for path in sys.argv[1:]
+))
+PY
+)"; then
+  [[ "${n}" -eq 0 ]] \
+    || { echo "sandbox-wipe.sh: ${n} wipe directories have user.* xattrs" >&2; left=1; }
+else
+  left=1
 fi
 SCAN_DIRS=("${DIRS[@]}")
 [[ -z "${JOB_DIR}" || ! -d "${JOB_DIR}" ]] || SCAN_DIRS+=("${JOB_DIR}")

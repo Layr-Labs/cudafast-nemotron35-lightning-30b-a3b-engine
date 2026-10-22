@@ -295,6 +295,72 @@ out="$(run_job_wipe 2>&1)"; status=$?
 [[ "${status}" -ne 0 ]] \
   && ok "case 11: an old job directory under SANDBOX_ROOT fails closed" \
   || fail "case 11: old job directory: status ${status}, '${out}'"
+
+# A wipe-list dir below another one (/tmp/.X11-unix below /tmp, root 1777 on
+# the boxes) is checked as its own root, not counted as a hit under /tmp.
+reset_job; mkdir -m 1777 "${WORK}/tmp/.X11-unix"
+{ cat "${WORK}/wipe-dirs"; echo "${WORK}/tmp/.X11-unix"; } > "${WORK}/wipe-dirs-nested"
+out="$(run_job_wipe SANDBOX_WIPE_LIST="${WORK}/wipe-dirs-nested" 2>&1)"; status=$?
+[[ "${status}" -eq 0 ]] \
+  && ok "case 11: a nested wipe-list directory is not a foreign-owned hit" \
+  || fail "case 11: nested wipe-list directory: status ${status}, '${out}'"
+
+mkdir -m 0777 "${WORK}/tmp/nested-wipe"
+{ cat "${WORK}/wipe-dirs"; echo "${WORK}/tmp/nested-wipe"; } > "${WORK}/wipe-dirs-xattr"
+if python3 - "${WORK}/tmp/nested-wipe" <<'PY'
+import os
+import sys
+os.setxattr(sys.argv[1], "user.test", b"state")
+PY
+then
+  out="$(run_job_wipe SANDBOX_WIPE_LIST="${WORK}/wipe-dirs-xattr" 2>&1)"; status=$?
+  [[ "${status}" -ne 0 ]] && grep -q "1 wipe directories have user\.\* xattrs" <<<"${out}" \
+    && ok "case 11: a user.* xattr on a nested wipe-list directory fails closed" \
+    || fail "case 11: nested wipe-list xattr: status ${status}, '${out}'"
+else
+  ok "case 11: nested wipe-list xattr check skipped because the file system has no xattr support"
+fi
+rmdir "${WORK}/tmp/nested-wipe"
+
+out="$(run_job_wipe 2>&1)"; status=$?
+[[ "${status}" -ne 0 ]] && grep -q "foreign-owned writable path(s)" <<<"${out}" \
+  && ok "case 11: the same directory off the wipe list fails closed" \
+  || fail "case 11: unlisted nested directory: status ${status}, '${out}'"
+rmdir "${WORK}/tmp/.X11-unix"
+
+# Only X11 and ICE session sockets are trusted; a foreign FIFO still is not.
+reset_job
+python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])' "${WORK}/tmp/session-socket"
+chmod 0777 "${WORK}/tmp/session-socket"
+out="$(run_job_wipe 2>&1)"; status=$?
+[[ "${status}" -ne 0 ]] && grep -q "foreign-owned writable path(s)" <<<"${out}" \
+  && ok "case 11: a foreign-owned writable socket fails closed" \
+  || fail "case 11: foreign socket: status ${status}, '${out}'"
+rm -f "${WORK}/tmp/session-socket"
+
+mkdir -m 1777 "${WORK}/tmp/.ICE-unix"
+{ cat "${WORK}/wipe-dirs"; echo "${WORK}/tmp/.ICE-unix"; } > "${WORK}/wipe-dirs-ice"
+python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])' "${WORK}/tmp/.ICE-unix/session-socket"
+chmod 0777 "${WORK}/tmp/.ICE-unix/session-socket"
+out="$(run_job_wipe SANDBOX_WIPE_LIST="${WORK}/wipe-dirs-ice" 2>&1)"; status=$?
+[[ "${status}" -eq 0 ]] \
+  && ok "case 11: a foreign-owned writable ICE socket is not a hit" \
+  || fail "case 11: foreign ICE socket: status ${status}, '${out}'"
+rm -f "${WORK}/tmp/.ICE-unix/session-socket"
+rmdir "${WORK}/tmp/.ICE-unix"
+
+ln -s "${WORK}/lock" "${WORK}/tmp/foreign-link"
+out="$(run_job_wipe 2>&1)"; status=$?
+[[ "${status}" -eq 0 ]] \
+  && ok "case 11: a foreign-owned symlink to a writable directory is not a hit" \
+  || fail "case 11: foreign symlink: status ${status}, '${out}'"
+rm -f "${WORK}/tmp/foreign-link"
+mkfifo -m 0666 "${WORK}/tmp/foreign-fifo"
+out="$(run_job_wipe 2>&1)"; status=$?
+[[ "${status}" -ne 0 ]] && grep -q "foreign-owned writable path(s)" <<<"${out}" \
+  && ok "case 11: a foreign-owned writable FIFO fails closed" \
+  || fail "case 11: foreign FIFO: status ${status}, '${out}'"
+rm -f "${WORK}/tmp/foreign-fifo"
 rm -rf -- "${JOB_ROOT}"
 
 # --- case 5: no sudo to the sandbox user --------------------------------------

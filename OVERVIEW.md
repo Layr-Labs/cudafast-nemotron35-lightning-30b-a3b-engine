@@ -9,8 +9,7 @@ Every point links to the document that has the detail.
 - **Task.** Make `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4` prefill and
   decode faster on a DGX Spark, single stream, without changing what it
   computes beyond a 10% token-tolerance budget.
-- **Track.** `nemotron3.5-lightning-30b-a3b-cuda-v1`, on DGX Spark boxes; five
-  run the ranked job.
+- **Track.** `nemotron3.5-lightning-30b-a3b-cuda-v1`, on 8 DGX Spark boxes.
 - **What a team may edit.** Only `vllm/`, `harness/` and
   `mtp-head.manifest.json` (the speculation depth, 1 to 6). Everything else is
   trusted and is replaced by the organizer's copy.
@@ -180,7 +179,7 @@ Details are in the [engineering log](docs/nemotron35-port-notes.md), sections
 
 ## Fleet state
 
-- **Boxes.** Five Spark boxes run the ranked job. Each has the live goldens
+- **Boxes.** Eight Spark boxes run the ranked job. Each has the live goldens
   staged, a version-3 calibration under 2% on the reference tree `fb5c48b`, and
   the pinned benchd bytes. Runners register through a GitHub App.
 - **Branches.** `main` is the armed contest base

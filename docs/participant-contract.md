@@ -365,7 +365,9 @@ gates each control leg with the band of the prompt that leg measured.
 | `kvBackend` | `vllm-paged` |
 
 The score is the mean of the three per-pair composites
-(`official_pair_combine`: `mean`). The floors and the ceiling gate every pair.
+(`official_pair_combine`: `mean`). The floors and the ceiling gate every pair;
+the workflow gate (`tools/score-plausibility-gate.sh`) enforces the 5.0 decode
+ceiling on every pair.
 Timed prefill is the median of five passes after one unmeasured warm-up pass
 (`official_prefill_timed_runs` = 5, `official_prefill_warmup_runs` = 1).
 

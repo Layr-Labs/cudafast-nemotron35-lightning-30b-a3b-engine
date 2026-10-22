@@ -7,7 +7,7 @@ for dev `main` after PR #37 (fixture unchanged since `c1ef8de`), recorded
 
 | Input | Section | Recorded result |
 |---|---|---|
-| benchd binaries | [1](#1-rebuild-benchd-from-source) | byte-identical rebuild of dist `43a9a16` from source `b65af98` |
+| benchd binaries | [1](#1-rebuild-benchd-from-source) | byte-identical rebuild of dist `7045ed6` from source `b65af98` |
 | Hidden goldens | [2](#2-re-record-the-hidden-goldens) | 21 files, byte-identical on two Sparks, all pinned in the fixture |
 | Box calibration | [3](#3-recalibrate-a-box) | 4 Sparks, every CV under 1% (limit 2%) |
 | Ranked score | [4](#4-reproduce-a-ranked-score) | dev run: `passed: true`, score 1.310 |
@@ -18,21 +18,24 @@ benchd is pinned in `tools/fetch-benchd.sh`:
 
 | Pin | Value |
 |---|---|
-| Repository | `Layr-Labs/mlxfast-bench-dev` (private; read access is needed) |
-| `PINNED_COMMIT` (dist) | `43a9a1642cc22c3fb2f71b9c707699cd3a9602c7` |
+| Repository | `Layr-Labs/benchd` (public dist channel and public source snapshot `81a7d45`, the same source tree as the development commit `b65af98`) |
+| `PINNED_COMMIT` (dist) | `7045ed65635049c32fd378e579448ac66fb12152` |
 | `PINNED_SOURCE_COMMIT` | `b65af98c2a060df12f2ced849c68528b825fecdb` |
+| `PINNED_PUBLIC_SOURCE_COMMIT` | `81a7d45b940d3501e52d7774bb2e8b9abd2c0372` |
 | `dist/linux-aarch64/benchd` | sha256 `ff4017e9b41ee69a41efa3c7866b33bc3524dd2be6b6a22cafd1225cb608338c`, 3,898,160 bytes |
 | `dist/linux-aarch64/record-correctness-golden` | sha256 `bbe18e01de6fac2336ff9c17a2b79e7aba7c4ca4271a392f4eb0a45b12d4c596`, 1,640,408 bytes |
 
 The bench repository builds the Linux binaries in a pinned container
-(`deploy/Dockerfile.dist-linux`), which fetches the source commit by sha. To
-rebuild with no layer cache, from a clone of the bench repository at the dist
-commit, on a host with Docker and a token that can read the bench repository:
+(`deploy/Dockerfile.dist-linux`), which fetches the source commit by sha from
+`BENCHD_DIST_REPO`. To rebuild with no layer cache and no token, from a clone of
+the public `Layr-Labs/benchd` repository at the dist commit, on a host with
+Docker:
 
 ```bash
-git checkout 43a9a1642cc22c3fb2f71b9c707699cd3a9602c7
+git checkout 7045ed65635049c32fd378e579448ac66fb12152
 BENCHD_DIST_NO_CACHE=1 BENCHD_DIST_BRANCH=main \
-  ./scripts/build-dist-linux.sh b65af98c2a060df12f2ced849c68528b825fecdb
+  BENCHD_DIST_REPO=https://github.com/Layr-Labs/benchd.git \
+  ./scripts/build-dist-linux.sh 81a7d45b940d3501e52d7774bb2e8b9abd2c0372
 git diff --stat -- dist/linux-aarch64   # no output: the rebuilt bytes equal the published ones
 ```
 

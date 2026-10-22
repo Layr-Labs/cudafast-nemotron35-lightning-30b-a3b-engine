@@ -3,31 +3,36 @@
 # fetch-benchd.sh -- resolve the `benchd` measurement harness from its release
 # channel.
 #
-# THE PIN IS REMOVED (docs/participant-contract.md section 1). benchd used to be frozen here by
-# ./benchd.pin ({branch, commit, sha256, bytes}), which made every benchd bug
-# fix require an engine-repo pin-advance commit before it could reach a box --
-# the depth/echo fix sat merged in the bench repo while the served pin still
-# carried the bug. That coupling is gone: this repository names only the CHANNEL
-# (the bench repo + branch), and the channel's tip is what runs. Fixing a
-# measurement bug is now: merge it bench-side, republish dist, done -- zero
-# engine commits.
+# benchd is pinned by source_commit (docs/participant-contract.md section 1).
+# The old per-engine binary freeze is removed. That freeze was ./benchd.pin.
+# It froze {branch, commit, sha256, bytes}. It made a benchd fix wait for a pin
+# advance here before the fix could reach a box. A source_commit pin now
+# replaces it. The pin names the CHANNEL (the bench repo and branch). The pin
+# also names the benchd source_commit this track runs: PINNED_SOURCE_COMMIT.
+# PINNED_PUBLIC_SOURCE_COMMIT is the public-snapshot alias of the same build.
+# The script resolves benchd from the channel. The script then refuses a
+# fetched manifest whose source_commit is neither pin (the check below). The
+# script does not run the channel tip automatically. To advance benchd for this
+# track, re-pin in this repository. Do not pick up what the channel last
+# published automatically. This keeps a ranked run reproducible. The run uses
+# exactly the pinned benchd. A benchd fix reaches a box only after an engine
+# commit advances the pin to that fix.
 #
-# WHAT REPLACES THE PIN'S GUARANTEES, stated honestly:
+# WHAT THE PIN GUARANTEES:
 #
 #   * INTEGRITY (the bytes are what the organizer published): the dist channel
-#     publishes `benchd.manifest.json` next to the binary ({branch,
-#     source_commit, sha256, bytes}, written by the bench repo's
-#     scripts/build-dist.sh). The binary is verified against THAT manifest --
-#     fetched from the same organizer-controlled channel -- and nothing
-#     unverified is ever installed or returned. What this no longer defends
-#     against is the channel itself moving, which is the point: the channel is
-#     the organizer's bench repo, participants cannot write to it, and its tip
-#     is now the intended source of truth.
-#   * PROVENANCE (knowing which benchd measured a run): recorded, not pinned.
-#     The resolved {branch, source_commit, sha256} is logged loudly on every
-#     resolve and the manifest is installed beside the binary
-#     (benchd-bin/benchd.manifest.json), so any run's harness identity can be
-#     read off the box afterwards.
+#     publishes `benchd.manifest.json` next to the binary. The manifest holds
+#     {branch, source_commit, sha256, bytes}. The bench repo's
+#     scripts/build-dist.sh writes it. The script verifies the binary against
+#     THAT manifest. The script fetches the manifest from the same
+#     organizer-controlled channel. The script installs nothing unverified and
+#     returns nothing unverified. The manifest source_commit must equal the pin.
+#     If the channel moved past the pin, the script refuses it.
+#   * PROVENANCE (which benchd measured a run): pinned and recorded. The script
+#     logs the resolved {branch, source_commit, sha256} loudly on every resolve.
+#     The script installs the manifest beside the binary
+#     (benchd-bin/benchd.manifest.json). You can read any run's harness identity
+#     off the box afterwards.
 #   * SUBMISSION-PROOFNESS: unchanged. This script and the channel constants
 #     live under tools/, outside editablePaths, and the manifest linter
 #     (FORBIDDEN_EDITABLE) still forbids `benchd.pin`/`benchd-bin` spellings,
@@ -130,7 +135,7 @@
 #
 # Env:
 #   BENCHD_BRANCH       channel branch the manifest must name. Default: main.
-#                       benchd is published from Layr-Labs bench-dev main.
+#                       benchd is published from Layr-Labs bench main.
 #                       There is no per-track bench branch. Main carries the
 #                       two changes this track needs: the fixture-declared
 #                       median of several timed prefill passes and the 60 C
@@ -143,7 +148,9 @@
 #                       BENCHD_SOURCE_COMMIT.
 #   BENCHD_SOURCE_COMMIT
 #                       the source_commit the fetched manifest must name.
-#                       Default: the pinned value below.
+#                       Default: the pinned value below. The public snapshot
+#                       name of that source (PINNED_PUBLIC_SOURCE_COMMIT) is
+#                       also accepted.
 #   BENCHD_EXPECT_TARGET_TRIPLE
 #                       the Rust target triple this host expects the channel to
 #                       have published. Default: derived from `uname -s` and
@@ -163,22 +170,29 @@
 #                       directory.
 #   BENCHD_DIST_BASE_URL
 #                       raw host + repo prefix. Default:
-#                       https://raw.githubusercontent.com/Layr-Labs/mlxfast-bench-dev
-#                       -- the DEVELOPMENT bench repository, which holds this
-#                       track's dist channel while the track is internal. It is
-#                       PRIVATE, so a fetch needs BENCHD_DIST_TOKEN/GITHUB_TOKEN,
-#                       or a verified pair through BENCHD_DIST_LOCAL or in
-#                       benchd-bin/ (the offline path). At launch this default
-#                       changes to the public repository.
+#                       https://raw.githubusercontent.com/Layr-Labs/benchd
+#                       -- the PUBLIC bench repository. A fetch needs no token.
+#                       The organizer's private development channel publishes
+#                       the same bytes; to fetch from it, set this, BENCHD_COMMIT
+#                       to its dist commit and BENCHD_DIST_TOKEN/GITHUB_TOKEN.
 #   BENCHD_DIST_TOKEN / GITHUB_TOKEN
 #                       bearer token for a private channel repo.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BRANCH="${BENCHD_BRANCH:-main}"
-# THE PIN. Layr-Labs/mlxfast-bench-dev main @ 43a9a16 (bench pull request 425)
-# publishes dist/ (aarch64-apple-darwin), dist/linux-aarch64 and
-# dist/linux-x86_64, built from source_commit b65af98. That source includes:
+# THE PIN. The pin is Layr-Labs/benchd main @ 7045ed6 (the public channel).
+# It publishes dist/ (aarch64-apple-darwin), dist/linux-aarch64 and
+# dist/linux-x86_64.
+# The binaries are built from source_commit b65af98 of the organizer's
+# development channel (Layr-Labs/mlxfast-bench-dev; bench pull request 425).
+# The public manifests name 81a7d45, the public snapshot of that source.
+# The snapshot tree is the development source tree without dist/.
+# The development channel publishes the same six files byte for byte.
+# Its manifests name b65af98. A ranked box stages that pair.
+# So the script accepts both names (PINNED_SOURCE_COMMIT and
+# PINNED_PUBLIC_SOURCE_COMMIT).
+# That source includes:
 #   * ecd66fe: decode is the decode window (decode-run time / N, with no seed
 #     prefill), the calibration file is version 3, and the fixture's
 #     official_pair_combine selects the mean of the per-pair composites;
@@ -202,8 +216,9 @@ BRANCH="${BENCHD_BRANCH:-main}"
 #     calibration_max_cv_percent (2.0 here) instead of a fixed 1 %.
 # This benchd has no timed-divergence reference replay: the timed decode window
 # is an exact match against the per-depth oracle.
-PINNED_COMMIT="43a9a1642cc22c3fb2f71b9c707699cd3a9602c7"
+PINNED_COMMIT="7045ed65635049c32fd378e579448ac66fb12152"
 PINNED_SOURCE_COMMIT="b65af98c2a060df12f2ced849c68528b825fecdb"
+PINNED_PUBLIC_SOURCE_COMMIT="81a7d45b940d3501e52d7774bb2e8b9abd2c0372"
 COMMIT="${BENCHD_COMMIT:-${PINNED_COMMIT}}"
 SOURCE_COMMIT_PIN="${BENCHD_SOURCE_COMMIT:-${PINNED_SOURCE_COMMIT}}"
 DEST_DIR="${BENCHD_BIN_DIR:-${REPO_ROOT}/benchd-bin}"
@@ -213,9 +228,9 @@ DEST_MANIFEST="${DEST_DIR}/benchd.manifest.json"
 # the manifest's `binaries` key and the name in the same platform directory.
 RECORDER_NAME="record-correctness-golden"
 DEST_RECORDER="${DEST_DIR}/${RECORDER_NAME}"
-# The DEVELOPMENT bench repository is the default channel while the track is
-# internal. See the BENCHD_DIST_BASE_URL note above.
-BASE_URL="${BENCHD_DIST_BASE_URL:-https://raw.githubusercontent.com/Layr-Labs/mlxfast-bench-dev}"
+# The PUBLIC bench repository is the default channel. See the
+# BENCHD_DIST_BASE_URL note above.
+BASE_URL="${BENCHD_DIST_BASE_URL:-https://raw.githubusercontent.com/Layr-Labs/benchd}"
 
 die() {
   echo "fetch-benchd.sh: $*" >&2
@@ -269,8 +284,8 @@ load_manifest() {
     echo "fetch-benchd.sh:   manifest names branch '${MF_BRANCH}', expected '${BRANCH}' -- wrong channel (${path})" >&2
     return 1
   fi
-  if [[ "${MF_COMMIT}" != "${SOURCE_COMMIT_PIN}" ]]; then
-    echo "fetch-benchd.sh:   manifest names source_commit '${MF_COMMIT}', the pin is '${SOURCE_COMMIT_PIN}' -- not the pinned benchd (${path})" >&2
+  if [[ "${MF_COMMIT}" != "${SOURCE_COMMIT_PIN}" && "${MF_COMMIT}" != "${PINNED_PUBLIC_SOURCE_COMMIT}" ]]; then
+    echo "fetch-benchd.sh:   manifest names source_commit '${MF_COMMIT}', the pin is '${SOURCE_COMMIT_PIN}' (public snapshot '${PINNED_PUBLIC_SOURCE_COMMIT}') -- not the pinned benchd (${path})" >&2
     return 1
   fi
   # A DECLARED recorder must be declared completely. Half an entry -- a digest

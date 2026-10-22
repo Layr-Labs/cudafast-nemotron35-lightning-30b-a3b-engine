@@ -181,15 +181,15 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BRANCH="${BENCHD_BRANCH:-main}"
-# THE PIN. The pin is Layr-Labs/benchd main @ 80f8819 (the public channel).
+# THE PIN. The pin is Layr-Labs/benchd main @ 92da41a (the public channel).
 # It publishes dist/ (aarch64-apple-darwin), dist/linux-aarch64 and
 # dist/linux-x86_64.
-# The binaries are built from source_commit 10afddd of the organizer's
+# The binaries are built from source_commit 918b8ac of the organizer's
 # development channel (Layr-Labs/mlxfast-bench-dev; bench pull request 425).
-# The public manifests name 6b6f7cf, the public snapshot of that source.
+# The public manifests name 0aacae3, the public snapshot of that source.
 # The snapshot tree is the development source tree without dist/.
 # The development channel publishes the same six files byte for byte.
-# Its manifests name 10afddd. A ranked box stages that pair.
+# Its manifests name 918b8ac. A ranked box stages that pair.
 # So the script accepts both names (PINNED_SOURCE_COMMIT and
 # PINNED_PUBLIC_SOURCE_COMMIT).
 # That source includes:
@@ -216,9 +216,9 @@ BRANCH="${BENCHD_BRANCH:-main}"
 #     calibration_max_cv_percent (2.0 here) instead of a fixed 1 %.
 # This benchd has no timed-divergence reference replay: the timed decode window
 # is an exact match against the per-depth oracle.
-PINNED_COMMIT="80f8819dde25b55f1f5c5dc1c85863498135f87e"
-PINNED_SOURCE_COMMIT="10afddd4af99bcec1cbf87e57242f224df0bdac7"
-PINNED_PUBLIC_SOURCE_COMMIT="6b6f7cf1fe1423e60cdf0ff936ac2d3f26ac348b"
+PINNED_COMMIT="92da41a15ed7e80896c67033dbcf813a88fa9dc8"
+PINNED_SOURCE_COMMIT="918b8acaf122fb4bedef1f79f580c7c23c65b905"
+PINNED_PUBLIC_SOURCE_COMMIT="0aacae37f70e681d2465fff23856665a04bc44cd"
 COMMIT="${BENCHD_COMMIT:-${PINNED_COMMIT}}"
 SOURCE_COMMIT_PIN="${BENCHD_SOURCE_COMMIT:-${PINNED_SOURCE_COMMIT}}"
 DEST_DIR="${BENCHD_BIN_DIR:-${REPO_ROOT}/benchd-bin}"

@@ -445,14 +445,22 @@ try:
     s.close()
     reply = json.loads(line.decode())
 except Exception as err:                       # noqa: BLE001 - any failure is unhealthy
-    print(f"probe failed: {err}", file=sys.stderr)
+    # Fixed text only: the error and the reply are resident-controlled and
+    # this stderr can reach the public job log.
+    print("probe failed: the resident did not answer a well-formed hello", file=sys.stderr)
     sys.exit(1)
-if reply.get("ok") is not True:
-    print(f"probe refused: {reply}", file=sys.stderr)
+if not isinstance(reply, dict) or reply.get("ok") is not True:
+    print("probe refused: the resident returned an unsuccessful reply", file=sys.stderr)
     sys.exit(1)
-print(json.dumps({k: reply.get(k) for k in
-                  ("vocab_size", "eos_token", "mtp_armed", "draft_tokens", "ctx_size",
-                   "load_epoch", "ident")}))
+hello = {k: reply.get(k) for k in
+         ("vocab_size", "eos_token", "mtp_armed", "draft_tokens", "ctx_size",
+          "load_epoch", "ident")}
+if (any(type(hello[k]) is not int for k in
+        ("vocab_size", "eos_token", "draft_tokens", "ctx_size", "load_epoch"))
+        or type(hello["mtp_armed"]) is not bool or not isinstance(hello["ident"], str)):
+    print("probe refused: the resident returned a malformed hello reply", file=sys.stderr)
+    sys.exit(1)
+print(json.dumps(hello))
 PY
 }
 
@@ -602,10 +610,10 @@ log "resident healthy on ${SOCKET_PATH} after $(( $(date +%s) - start ))s; every
 HELLO_JSON="$(probe_resident "${SOCKET_PATH}")" || die "the resident stopped answering before the run started"
 hello_depth="$(printf '%s' "${HELLO_JSON}" | jq -r '.draft_tokens - 1')"
 [[ "${hello_depth}" == "${SPEC_DEPTH}" ]] \
-  || die "the resident reports depth ${hello_depth} but this leg declared ${SPEC_DEPTH}"
+  || die "the resident reports a depth other than this leg declared (${SPEC_DEPTH}); its reply is not printed"
 hello_ctx="$(printf '%s' "${HELLO_JSON}" | jq -r '.ctx_size')"
 [[ "${hello_ctx}" == "${CTX_SIZE}" ]] \
-  || die "the resident reports context ${hello_ctx} but the fixture pins ${CTX_SIZE}"
+  || die "the resident reports a context size other than the fixture pins (${CTX_SIZE}); its reply is not printed"
 
 # --- the leg's identity ------------------------------------------------------
 jq -n \

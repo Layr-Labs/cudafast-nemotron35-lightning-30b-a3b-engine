@@ -438,6 +438,15 @@ class ResolveRescoreSlotTest(unittest.TestCase):
         self.assertEqual(resolved["status"], "team_failure")
         self.assertEqual(resolved["value"], 0.0)
 
+    def test_late_boot_failed_team_failure_without_retry(self):
+        row = self._done("boot_failed", 1.0, "a")
+        row["result"] = json.dumps({"metrics": {"paired_legs": [{"pair": 1}]}})
+        row["_off_pool"] = True
+        resolved = router.resolve_rescore_slot([row], 2)
+        self.assertEqual(resolved["status"], "team_failure")
+        self.assertEqual(resolved["value"], 0.0)
+        self.assertEqual(resolved["run_id"], "a")
+
     def test_boot_failed_then_replay_rejected_team_failure(self):
         rows = [
             self._done("boot_failed", 1.0, "a"),

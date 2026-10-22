@@ -98,10 +98,12 @@ out="${WORK}/case1.json"
 if R2_BUCKET_ENDPOINT="${ENDPOINT}" "${RELAXED}" \
      --r2-path "${KEY}" --sha256 "${GOOD_SHA}" --bytes "${GOOD_BYTES}" \
      --out "${out}" >"${WORK}/case1.log" 2>&1; then
-  if [[ -s "${out}" ]] && [[ "$(shasum -a 256 "${out}" | awk '{print $1}')" == "${GOOD_SHA}" ]]; then
+  if [[ -s "${out}" ]] \
+     && [[ "$(shasum -a 256 "${out}" | awk '{print $1}')" == "${GOOD_SHA}" ]] \
+     && [[ "$(stat -c %a "${out}")" == "440" ]]; then
     pass "correct pin accepted, bytes match"
   else
-    fail "case 1: exited 0 but the output file is missing or wrong"
+    fail "case 1: exited 0 but the output file is missing, wrong, or not mode 0440"
   fi
 else
   fail "case 1: refused a correct pin ($(cat "${WORK}/case1.log"))"
@@ -370,15 +372,18 @@ if R2_BUCKET_ENDPOINT="${ENDPOINT}" \
   ok11=1
   for want in all-pool-a.golden.json all-pool-b.golden.json all-oracle-mtp1.golden.json; do
     [[ -f "${ALL_OUT}/${want}" ]] || { fail "case 11: ${want} was not staged"; ok11=0; }
+    file_mode="$(stat -c %a "${ALL_OUT}/${want}" 2>/dev/null)"
+    [[ "${file_mode}" == "440" ]] \
+      || { fail "case 11: ${want} mode is ${file_mode}, expected 440"; ok11=0; }
   done
   [[ "$(pin_sha "${ALL_OUT}/all-pool-a.golden.json")" == "${A_SHA}" ]] \
     || { fail "case 11: the staged pool tape does not match its pin"; ok11=0; }
   # No .partial may survive a successful run, and the staged files are read-only.
   compgen -G "${ALL_OUT}/*.partial" >/dev/null \
     && { fail "case 11: a .partial file survived a successful run"; ok11=0; }
-  perms="$(ls -l "${ALL_OUT}/all-pool-a.golden.json" | cut -c2-10)"
-  [[ "${perms}" == "r--r--r--" ]] \
-    || { fail "case 11: staged golden is ${perms}, expected r--r--r-- (0444)"; ok11=0; }
+  dir_mode="$(stat -c %a "${ALL_OUT}")"
+  [[ "${dir_mode}" == "750" ]] \
+    || { fail "case 11: staging directory mode is ${dir_mode}, expected 750"; ok11=0; }
   grep -q "hidden_correctness_golden resolves to all-pool-a.golden.json" "${WORK}/case11.log" \
     || { fail "case 11: the digest-only hidden oracle was not resolved among the staged files"; ok11=0; }
   grep -q "staged 3 object(s)" "${WORK}/case11.log" \
@@ -392,6 +397,7 @@ fi
 # Idempotence is what makes this safe to put in a converge script: a box that is
 # already staged must not re-fetch, and must not rewrite files it already holds.
 before="$(shasum -a 256 "${ALL_OUT}"/*.json | shasum -a 256 | awk '{print $1}')"
+chmod 0444 "${ALL_OUT}/all-pool-a.golden.json"
 if R2_BUCKET_ENDPOINT="${ENDPOINT}" \
    R2_ACCESS_KEY_ID="stub-key" R2_SECRET_ACCESS_KEY="stub-secret" \
    MLXFAST_NEMOTRON35_R2_DOWNLOADER="${SIGNER}" \
@@ -400,6 +406,8 @@ if R2_BUCKET_ENDPOINT="${ENDPOINT}" \
   after="$(shasum -a 256 "${ALL_OUT}"/*.json | shasum -a 256 | awk '{print $1}')"
   if [[ "${before}" != "${after}" ]]; then
     fail "case 12: the second run changed the staged files"
+  elif [[ "$(stat -c %a "${ALL_OUT}/all-pool-a.golden.json")" != "440" ]]; then
+    fail "case 12: the second run did not restore private mode 0440"
   elif ! grep -q "staged 0 object(s), kept 3" "${WORK}/case12.log"; then
     fail "case 12: the second run did not report every file as already staged ($(tail -2 "${WORK}/case12.log"))"
   else

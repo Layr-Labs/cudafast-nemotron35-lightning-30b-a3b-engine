@@ -305,8 +305,9 @@ fi
 # transport_fetch KEY DEST -- one object, no verification. The caller owns the
 # pin check, and owns removing DEST when the pin does not hold.
 transport_fetch() {
-  local key="$1" dest="$2"
-  mkdir -p "$(dirname "${dest}")"
+  local key="$1" dest="$2" dest_dir
+  dest_dir="$(dirname "${dest}")"
+  [[ -d "${dest_dir}" ]] || (umask 027; mkdir -p "${dest_dir}")
   if [[ "${have_credentials}" == "1" ]]; then
     echo "fetch-goldens.sh: fetching ${key} (credentialed, signed)" >&2
     if ! "${DOWNLOADER}" "${key}" "${dest}"; then
@@ -382,7 +383,7 @@ EOF
   command -v jq >/dev/null 2>&1 \
     || { echo "fetch-goldens.sh: --all reads the contract with jq, and jq is not on PATH" >&2; exit 1; }
 
-  mkdir -p "${OUT_PATH}"
+  install -d -m 0750 "${OUT_PATH}"
   [[ -d "${OUT_PATH}" ]] \
     || { echo "fetch-goldens.sh: --out is not a directory: ${OUT_PATH}" >&2; exit 1; }
 
@@ -412,6 +413,7 @@ EOF
     fi
     dest="${OUT_PATH}/${key##*/}"
     if matches_pin "${dest}" "${want_sha}" "${want_bytes}"; then
+      chmod 0440 "${dest}"
       echo "fetch-goldens.sh: ${key##*/} is already staged and matches its pin" >&2
       kept=$((kept + 1))
       continue
@@ -422,7 +424,7 @@ EOF
     rm -f "${partial}"
     transport_fetch "${key}" "${partial}" || exit 1
     verify_pin "${partial}" "${want_sha}" "${want_bytes}" "${key}" || exit 1
-    chmod 0444 "${partial}"
+    chmod 0440 "${partial}"
     rm -f "${dest}"
     mv "${partial}" "${dest}"
     staged=$((staged + 1))
@@ -462,6 +464,13 @@ fi
 # ============================================================================
 # one object
 # ============================================================================
-transport_fetch "${R2_PATH}" "${OUT_PATH}" || exit 1
-verify_pin "${OUT_PATH}" "${WANT_SHA}" "${WANT_BYTES}" "${R2_PATH}" || exit 1
+# Land the bytes beside the destination and move them in only after the pin
+# holds, so a re-fetch never has to write over a 0440 file and a failed fetch
+# never removes the good one.
+partial="${OUT_PATH}.partial"
+rm -f "${partial}"
+transport_fetch "${R2_PATH}" "${partial}" || { rm -f "${partial}"; exit 1; }
+verify_pin "${partial}" "${WANT_SHA}" "${WANT_BYTES}" "${R2_PATH}" || { rm -f "${partial}"; exit 1; }
+chmod 0440 "${partial}"
+mv -f "${partial}" "${OUT_PATH}"
 echo "fetch-goldens.sh: verified ${R2_PATH} -> ${OUT_PATH} (sha256 ${WANT_SHA}, bytes ${WANT_BYTES})"

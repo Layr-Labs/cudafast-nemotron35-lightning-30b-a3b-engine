@@ -88,6 +88,45 @@ sys.exit(0 if json.loads(line.decode()).get("ok") is True else 1)
 PY
 }
 
+# Run the exact Python body from serve-up.sh's health probe against one reply.
+# Case 8 also proves that ranked probes run as the sandbox user through sudo.
+probe_reply() { # probe_reply LABEL JSON HOSTILE_TEXT EXPECTED_TEXT
+  local label="$1" reply="$2" hostile="$3" expected="$4"
+  local output="${WORK}/probe-${label}.out" rc
+  HOSTILE_REPLY="${reply}" PYTHONPATH="${WORK}/probe-stub" \
+    python3 "${WORK}/serve-up-probe.py" unused >"${output}" 2>&1
+  rc=$?
+  if [[ "${rc}" -ne 0 ]] && grep -qF "${expected}" "${output}" && ! grep -qF "${hostile}" "${output}"; then
+    ok "probe / ${label}: hostile reply text stays out of the log"
+  else
+    fail "probe / ${label}: output exposed hostile text or missed the fixed reason: $(cat "${output}")"
+  fi
+}
+
+awk '
+  /^  "\$\{run\[@\]\}" - "\$1" <<.PY.$/ { copy=1; next }
+  copy && /^PY$/ { exit }
+  copy { print }
+' "${SERVE_UP}" > "${WORK}/serve-up-probe.py"
+mkdir -p "${WORK}/probe-stub"
+cat > "${WORK}/probe-stub/socket.py" <<'PY'
+import os
+AF_UNIX = SOCK_STREAM = 1
+
+class socket:
+    def __init__(self, *_args):
+        self.replies = [os.environ["HOSTILE_REPLY"].encode() + b"\n", b'{"ok":true}\n']
+    def settimeout(self, _timeout): pass
+    def connect(self, _path): pass
+    def sendall(self, _data): pass
+    def recv(self, _size): return self.replies.pop(0)
+    def close(self): pass
+PY
+probe_reply refused '{"ok":false,"error":"HOSTILE_REFUSAL_TEXT"}' \
+  HOSTILE_REFUSAL_TEXT "probe refused: the resident returned an unsuccessful reply"
+probe_reply malformed '{"ok":true,"draft_tokens":"HOSTILE_FIELD_TEXT"}' \
+  HOSTILE_FIELD_TEXT "probe refused: the resident returned a malformed hello reply"
+
 # --- case 1: --boot publishes the socket and leaves the resident serving -----
 SOCKET_OUT="${WORK}/leg1/socket.txt"
 BOOT_OUT="${WORK}/boot.out"

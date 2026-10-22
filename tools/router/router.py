@@ -683,12 +683,19 @@ def rescore_slot_index(row: dict) -> int | None:
 def rescore_run_kind(row: dict, off_pool: bool) -> str:
     if row["state"] != "done":
         return "pending"
+    outcome = row.get("outcome") or ""
+    if outcome == "boot_failed":
+        try:
+            result = json.loads(row.get("result") or "null") or {}
+        except (TypeError, json.JSONDecodeError):
+            result = {}
+        if (result.get("metrics") or {}).get("paired_legs"):
+            return "team_failure"
     if off_pool:
         return "infra"
     incident = row.get("incident") or ""
     if incident.startswith("watchdog:"):
         return "team_failure"
-    outcome = row.get("outcome") or ""
     if outcome == "pass":
         return "scored"
     if outcome == "boot_failed":

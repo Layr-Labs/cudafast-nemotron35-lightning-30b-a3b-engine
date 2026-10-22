@@ -26,10 +26,9 @@ The benchmarker is a prebuilt `benchd` binary. `./tools/fetch-benchd.sh`
 resolves it from the bench repository's release channel for this track, and
 verifies it against the channel's `benchd.manifest.json` (`{branch,
 source_commit, sha256, bytes}`). A submission cannot change what measures it.
-While the track is internal, the channel is the `main` branch of the
-DEVELOPMENT bench repository. That repository is private, so the fetch needs
-`GITHUB_TOKEN` (or `BENCHD_DIST_TOKEN`), or a verified pair through
-`BENCHD_DIST_LOCAL`. At launch the channel moves to the public repository.
+The channel is the `main` branch of the public `Layr-Labs/benchd`
+repository, and the fetch needs no token. A verified pair through
+`BENCHD_DIST_LOCAL` needs no network.
 
 ## 2. What the track measures
 
@@ -216,7 +215,8 @@ The head is the `mtp.*` tensors inside the pinned
   only. The fixture's `declaration_max_bytes` is 3 GiB, so the pinned head
   fits the cap.
 
-The shipped declaration is disabled: the reference tree runs serial, and the
+The shipped declaration enables MTP at depth 3 (`enabled: true`,
+`num_speculative_tokens: 3`). The reference tree runs serial, and the
 reference scored against itself is a null control of about 1.000.
 
 ### 4.2 What you may not do
@@ -391,7 +391,8 @@ no timed token tolerance, so none applies.
 refuses to seal an official artifact while it is `false` or absent, and so does
 `tools/ranked-box-preflight.sh`.
 
-The fixture ships UNARMED. It is armed only after four steps are done:
+The fixture ships ARMED (`official_scoring_enabled: true`). It was armed only
+after four steps were done:
 
 1. every golden is recorded on a Spark and pinned (the pending entries carry the
    sentinel `NEMOTRON35-LIGHTNING-CUDA-PENDING-ORGANIZER`, which the preflight

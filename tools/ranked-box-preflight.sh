@@ -638,7 +638,7 @@ jq -e . >/dev/null 2>&1 < "${BASELINE_CALIBRATION}" \
 
 # Version 3 holds one entry for each prompt in prompts[], and its decode mean is
 # the DECODE WINDOW per token: decode-run time / N, with no seed prefill in it
-# (benchd ecd66fe, David 2026-10-07). Versions 1 and 2 recorded the whole window
+# (benchd ecd66fe, 2026-10-07). Versions 1 and 2 recorded the whole window
 # (seed prefill plus decode, over N) as decode, so their band does not describe
 # the control leg benchd measures now.
 cal_version="$(jq -r '.version // empty' "${BASELINE_CALIBRATION}")"

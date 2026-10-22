@@ -31,7 +31,7 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null && pwd -P)"
 VERBOSE=0
 [[ "${1:-}" == "-v" ]] && VERBOSE=1
 
-EXPECTED_MIN_ASSERTIONS=49
+EXPECTED_MIN_ASSERTIONS=50
 PASSED=0; FAILED=0; FAILURES=()
 pass() { PASSED=$((PASSED+1)); [[ "${VERBOSE}" == "1" ]] && echo "ok    $1"; return 0; }
 fail() { FAILED=$((FAILED+1)); FAILURES+=("$1"); echo "FAIL  $1" >&2; }
@@ -120,6 +120,7 @@ echo "docker $*" >> "${LOG}"
   [[ "${a}" == KERNELS_OUT=* ]] || continue
   touch "${a#KERNELS_OUT=}/k.so"
   [[ -n "${STUB_KERNELS_SYMLINK:-}" ]] && ln -s /etc/passwd "${a#KERNELS_OUT=}/leak.so"
+  [[ -n "${STUB_KERNELS_SUID:-}" ]] && touch "${a#KERNELS_OUT=}/suid.so" && chmod 4755 "${a#KERNELS_OUT=}/suid.so"
 done
 exit 0
 EOF
@@ -312,6 +313,10 @@ err="$(STUB_KERNELS_SYMLINK=1 SANDBOX_USER="${ME}" SANDBOX_ROOT="${WORK}/sandbox
 check "kernels output with a symlink is refused" \
   test "${rc}" -ne 0 -a -n "$(grep -F 'kernels refused' <<<"${err}")"
 check "the refused kernels copy is deleted" test ! -e "${REPO}/.build/kernels"
+err="$(STUB_KERNELS_SUID=1 SANDBOX_USER="${ME}" SANDBOX_ROOT="${WORK}/sandbox" SANDBOX_JOB=71-1 \
+  "${REPO}/tools/engine/build.sh" 2>&1 >/dev/null)"; rc=$?
+check "kernels output with a setuid file is refused" \
+  test "${rc}" -ne 0 -a -n "$(grep -F 'kernels refused' <<<"${err}")"
 
 echo "engine-build-sandbox: ${PASSED} passed, ${FAILED} failed"
 if [[ "${FAILED}" -ne 0 ]]; then

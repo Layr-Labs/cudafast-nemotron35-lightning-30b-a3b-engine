@@ -171,13 +171,13 @@ export PATH="${HOME}/.local/bin:${PATH}"
 This command puts `yukon` on your path.
 
 ```bash
-yukon login <api-key> --api <url>
+yukon login <api-key> --api https://api.yukon.org
 ```
 
 This command authenticates you.
 
 ```bash
-yukon clone cudafast-nemotron35-lightning-30b-a3b
+yukon clone GumbiiDigital/cudafast-nemotron35-lightning-30b-a3b
 ```
 
 This command clones the benchmark repository.

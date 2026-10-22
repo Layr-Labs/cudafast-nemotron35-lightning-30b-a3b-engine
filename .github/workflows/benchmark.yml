@@ -467,11 +467,22 @@ jobs:
         # (present by digest; ENGINE_BUILD_OFFLINE=1 forbids a pull) and
         # verifies the staged snapshot against the fixture pins. It exits
         # non-zero rather than proceed without either.
+        # The setup can build participant GPU kernels. Hold the same box-wide
+        # GPU lock as measurement and calibration for the whole setup step.
+        # The lock is waited for and is released when this step exits.
         env:
           ENGINE_BUILD_OFFLINE: "1"
           SANDBOX_JOB: ${{ github.run_id }}-${{ github.run_attempt }}
           SERVE_UP_CONTAINER_USER: ${{ env.SANDBOX_USER }}
-        run: ./setup.sh
+        run: |
+          set -euo pipefail
+          lock=/tmp/mtplx-gpu-exclusive.lock
+          if [[ ! -e "${lock}" ]]; then
+            ( umask 0000; : > "${lock}" ) || { echo "::error::cannot create ${lock}" >&2; exit 1; }
+          fi
+          exec 9<> "${lock}"
+          flock 9
+          ./setup.sh
 
       - name: Record the dispatched candidate sha (author-at-seal)
         # benchd's official seal AUTHORS the sha it publishes, and it fails

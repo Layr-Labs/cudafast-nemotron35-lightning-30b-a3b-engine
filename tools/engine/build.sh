@@ -150,7 +150,7 @@ else
   # prlimit runs INSIDE the sudo, so the limits bind the sandbox user's build.
   sudo -n -u "${SANDBOX_USER}" -- prlimit --nproc="${CARGO_NPROC_LIMIT:-4096}" \
     --as="${CARGO_AS_LIMIT:-68719476736}" env PATH="${RUST_DIR:-/opt/rust}/cargo/bin:/usr/bin:/bin" \
-    RUSTUP_HOME="${RUST_DIR:-/opt/rust}/rustup" CARGO_HOME="${JOB}/cargo-home" \
+    HOME="${JOB}/cargo-home" RUSTUP_HOME="${RUST_DIR:-/opt/rust}/rustup" CARGO_HOME="${JOB}/cargo-home" \
     CARGO_TARGET_DIR="${JOB}/target" ENGINE_CUDA_ARCH="${ARCH}" \
     cargo build --release --locked --offline --manifest-path "${MANIFEST}"
   sandbox_quiet
@@ -217,5 +217,32 @@ if [[ -f "${KERNELS_SRC}/build.sh" ]]; then
   fi
 else
   log "no harness/kernels/build.sh; nothing to build"
+fi
+
+if [[ -n "${SANDBOX_USER}" ]]; then
+  # Measurement reads only the runner-owned copies under .build. Remove the
+  # sandbox-owned build trees, and keep their parent dirs read-only to the
+  # sandbox group. This leaves no build directory for cross-leg state.
+  for sub in cargo-home target kernels-out; do
+    path="${JOB}/${sub}"
+    sudo -n -u "${SANDBOX_USER}" -- chmod -R u+rwX "${path}" >/dev/null 2>&1 || true
+    sudo -n -u "${SANDBOX_USER}" -- find -P "${path}" -mindepth 1 -delete >/dev/null 2>&1 || true
+    find -P "${path}" -mindepth 1 -delete >/dev/null 2>&1 || true
+    count="$(find -P "${path}" -mindepth 1 -printf . 2>/dev/null | wc -c)" \
+      || die "cannot verify the empty sandbox build directory ${sub}"
+    (( count == 0 )) || die "sandbox build directory ${sub} is not empty after staging (${count} entries remain)"
+    chmod 2750 "${path}"
+  done
+
+  # These are the only build outputs used during measurement. Strip inherited
+  # ACLs and write bits that participant files can carry into the staged copy.
+  outputs=("${ROOT_DIR}/.build/release" "${ROOT_DIR}/.build/vllm-overlay" "${ROOT_DIR}/.build/kernels")
+  for path in "${outputs[@]}"; do [[ -d "${path}" ]] || die "staged output is missing: ${path}"; done
+  if command -v setfacl >/dev/null; then setfacl -bR "${outputs[@]}"; fi
+  chmod -R u=rwX,go=rX "${outputs[@]}"
+  odd="$(find -P "${outputs[@]}" ! -user "$(id -u)" -print -quit)"
+  [[ -z "${odd}" ]] || die "a staged measurement output is not owned by $(id -un): ${odd}"
+  odd="$(find -P "${outputs[@]}" -perm /022 -print -quit)"
+  [[ -z "${odd}" ]] || die "a staged measurement output remains group- or other-writable: ${odd}"
 fi
 log "engine built and staged"

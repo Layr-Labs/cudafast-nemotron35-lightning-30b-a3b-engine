@@ -132,7 +132,7 @@ fi
 # shared dirs, then wait for memory (docs/sandbox-design.md).
 sandbox_leg_teardown_wipe() {
   local user="$1"
-  local left=""
+  local left="" job_dir name path count owner group mode acl new_owner new_group
   for _ in 1 2 3 4 5 6 7 8 9 10; do
     sudo -n -u "${user}" -- kill -KILL -1 >/dev/null 2>&1 || true
     left="$(pgrep -u "${user}" 2>/dev/null | tr '\n' ' ' || true)"
@@ -142,6 +142,49 @@ sandbox_leg_teardown_wipe() {
   if [[ -n "${left// /}" ]]; then
     die "${user} processes survived kill -KILL -1: ${left}"
   fi
+  [[ "${SANDBOX_ROOT:-}" == /* && "${SANDBOX_JOB:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] \
+    || die "sandbox state cleanup needs an absolute SANDBOX_ROOT and a plain SANDBOX_JOB"
+  job_dir="${SANDBOX_ROOT%/}/${SANDBOX_JOB}"
+  path="${job_dir}/adapter-home"
+  [[ -d "${path}" && ! -L "${path}" ]] || die "sandbox state directory adapter-home is missing or is a symlink"
+  read -r owner group mode < <(stat -Lc '%u %g %a' -- "${path}") \
+    || die "cannot read adapter-home metadata"
+  [[ "${mode}" == 2770 ]] || die "sandbox state directory adapter-home is not mode 2770"
+  acl="$(getfacl -cp -- "${path}")" || die "cannot read adapter-home ACL"
+  sudo -n -u "${user}" -- chmod -R u+rwX "${path}" >/dev/null 2>&1 || true
+  sudo -n -u "${user}" -- find -P "${path}" -mindepth 1 -delete >/dev/null 2>&1 || true
+  find -P "${path}" -mindepth 1 -delete >/dev/null 2>&1 || true
+  rmdir -- "${path}" || die "cannot remove sandbox state directory adapter-home"
+  mkdir -m 2770 -- "${path}" || die "cannot recreate sandbox state directory adapter-home"
+  chown "${owner}:${group}" -- "${path}" || die "cannot restore adapter-home owner and group"
+  chmod 2770 -- "${path}" || die "cannot restore adapter-home mode"
+  printf '%s\n' "${acl}" | setfacl --set-file=- -- "${path}" \
+    || die "cannot restore adapter-home ACL"
+
+  for name in adapter-home sock; do
+    path="${job_dir}/${name}"
+    [[ -d "${path}" && ! -L "${path}" ]] || die "sandbox state directory ${name} is missing or is a symlink"
+    if [[ "${name}" == sock ]]; then
+      sudo -n -u "${user}" -- chmod -R u+rwX "${path}" >/dev/null 2>&1 || true
+      sudo -n -u "${user}" -- find -P "${path}" -mindepth 1 -delete >/dev/null 2>&1 || true
+      find -P "${path}" -mindepth 1 -delete >/dev/null 2>&1 || true
+    fi
+    count="$(find -P "${path}" -mindepth 1 -printf . 2>/dev/null | wc -c)" \
+      || die "cannot verify sandbox state directory ${name}"
+    (( count == 0 )) || die "sandbox state directory ${name} is not empty after candidate-leg --stop (${count} entries remain)"
+  done
+  read -r new_owner new_group mode < <(stat -Lc '%u %g %a' -- "${job_dir}/adapter-home") \
+    || die "cannot verify adapter-home metadata"
+  [[ "${new_owner}" == "${owner}" && "${new_group}" == "${group}" && "${mode}" == 2770 ]] \
+    || die "recreated adapter-home has changed owner, group or mode"
+  python3 - "${job_dir}/adapter-home" <<'PY' \
+    || die "recreated adapter-home still has user.* xattrs"
+import os
+import sys
+raise SystemExit(any(name.startswith("user.")
+                     for name in os.listxattr(sys.argv[1], follow_symlinks=False)))
+PY
+  # The wipe runs after adapter-home and sock are reset: it requires both empty.
   if ! SANDBOX_USER="${user}" "${SCRIPT_DIR}/tools/sandbox-wipe.sh"; then
     die "sandbox wipe after candidate-leg --stop failed"
   fi

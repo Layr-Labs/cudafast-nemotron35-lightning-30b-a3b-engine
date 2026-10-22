@@ -202,7 +202,7 @@ box_job() { # box_job BOX KEY STEPS FILE_SUFFIX NAME...
   [[ -z "${REFRESH_BOX_SNAPSHOT:-}" ]] || snap="MLXFAST_TARGET_SNAPSHOT_DIR=${REFRESH_BOX_SNAPSHOT}"
   # serve-up refuses a /tmp socket under docker, and the operator's shell has no
   # SERVE_UP_* or BENCHD_BIN_DIR: give the recording private dirs and the staged benchd.
-  rsh "${box}" "mkdir -p \$HOME/rsock \$HOME/${dir}/log && cd ${BOX_REPO} && ${snap} SERVE_UP_SOCKET_DIR=\$HOME/rsock SERVE_UP_LOG_DIR=\$HOME/${dir}/log BENCHD_BIN_DIR=${REFRESH_BOX_BENCHD:-/srv/nemotron35/benchd-bin} flock -w ${LOCK_WAIT} ${LOCK} tools/record-goldens.sh" \
+  rsh "${box}" "mkdir -p \$HOME/rsock \$HOME/${dir}/log && cd ${BOX_REPO} && [[ -f ${LOCK} && ! -L ${LOCK} ]] && exec 9<${LOCK} && flock -w ${LOCK_WAIT} 9 && ${snap} SERVE_UP_SOCKET_DIR=\$HOME/rsock SERVE_UP_LOG_DIR=\$HOME/${dir}/log BENCHD_BIN_DIR=${REFRESH_BOX_BENCHD:-/srv/nemotron35/benchd-bin} tools/record-goldens.sh" \
     "--prompts \$HOME/${dir}/prompts --out \$HOME/${dir}/out ${only[*]} --steps ${steps}" \
     >"${logf}" 2>&1 || { log "record: ${key} on ${box} failed; see ${GEN}/rec-${key}.log"; return 1; }
   run mkdir -p "${GEN}/rec/${key}"

@@ -329,6 +329,7 @@ class Router:
 
     def finish(self, row, run, ranked) -> None:
         result, passed, score, error = None, None, None, ""
+        teardown_failed = False
         with tempfile.TemporaryDirectory(prefix="router-art-") as tmp:
             try:
                 sh([self.gh, "run", "download", str(row["run_id"]), "--repo", self.repo,
@@ -343,7 +344,10 @@ class Router:
                 # ponytail: artifact storage can be over quota (billing); the job
                 # log prints the same score.json, so read it from there instead.
                 result = score_from_log(self.ranked_log(row["run_id"]))
-                if result:  # an empty {} stays empty: no score, not a refusal
+                if result == "teardown_failed":
+                    teardown_failed = True
+                    result = None
+                elif result:  # an empty {} stays empty: no score, not a refusal
                     result["score_source"] = "job-log"
                     # A log-derived PASS is trusted only if benchd's own step
                     # succeeded; a forged block cannot make that step green.
@@ -368,9 +372,10 @@ class Router:
             pl = (result.get("metrics") or {}).get("paired_legs")
             if pl is not None:
                 paired_legs = pl
-        outcome = classify(run.get("conclusion"), passed, error, failed_step,
-                           ranked is not None and bool(result), setup_ran(ranked),
-                           incident=row["incident"] or "", paired_legs=paired_legs)
+        outcome = "teardown_failed" if teardown_failed else classify(
+            run.get("conclusion"), passed, error, failed_step,
+            ranked is not None and bool(result), setup_ran(ranked),
+            incident=row["incident"] or "", paired_legs=paired_legs)
         self._update(row["id"], state="done", finished_at=time.time(), conclusion=run.get("conclusion"),
                      passed=passed, score=score, error=error or failed_step, outcome=outcome,
                      result=json.dumps(result) if result else None,
@@ -658,7 +663,7 @@ MEASURE_STEP_PREFIX = "GPU-exclusive measurement"
 RESCORE_NOTE_RE = re.compile(r"rescore \S+ run (\d+)/(\d+)")
 TEAM_FAILURE_OUTCOMES = frozenset({
     "replay_rejected", "floor_failed", "correctness_failed", "refused", "surface_refused", "unsealed",
-    "watchdog_timeout",
+    "watchdog_timeout", "teardown_failed",
 })
 POST_SETUP_INFRA_OUTCOMES = frozenset({"control_failed", "band_refused"})
 INFRA_OUTCOMES = frozenset({
@@ -691,6 +696,8 @@ def rescore_run_kind(row: dict, off_pool: bool) -> str:
             result = {}
         if (result.get("metrics") or {}).get("paired_legs"):
             return "team_failure"
+    if outcome == "teardown_failed":
+        return "team_failure"
     if off_pool:
         return "infra"
     incident = row.get("incident") or ""
@@ -797,7 +804,7 @@ def _seal_body_matches(body: str, expected_hash: str, expected_bytes: int) -> bo
     return False
 
 
-def score_from_log(log: str) -> dict | None:
+def score_from_log(log: str) -> dict | str | None:
     """Parse the post-cleanup commit-reveal score block from a ranked job log."""
     lines = _log_text_lines(log)
     end_idx = end_m = None
@@ -810,6 +817,13 @@ def score_from_log(log: str) -> dict | None:
         return None
     nonce = end_m.group(1)
     if end_m.group(2) == "none":
+        marker = f"NEMOTRON35-TEARDOWN-FAILED {nonce}"
+        begin = f"NEMOTRON35-SCORE-BEGIN {nonce}"
+        for i in range(end_idx - 1, -1, -1):
+            if lines[i] == begin:
+                if lines[i + 1:end_idx] == [marker]:
+                    return "teardown_failed"
+                break
         return {}
     expected_hash, expected_bytes = end_m.group(3), int(end_m.group(4))
     begin_re = re.compile(rf"^NEMOTRON35-SCORE-BEGIN {re.escape(nonce)}$")
@@ -863,6 +877,8 @@ def classify(conclusion, passed, error: str, failed_step: str, have_score: bool,
     # benchd boots this leg with the label "candidate" (main.rs boot_leg).
     if e.startswith("LEG-SERVE-BOOT-FAILED: the candidate leg"):
         return "boot_failed"
+    if e.startswith("LEG-TEARDOWN-FAILED"):
+        return "teardown_failed"
     if "TIMED-REPLAY-REJECTED" in e:
         return "replay_rejected"
     if "performance floor failed" in e:
@@ -888,7 +904,8 @@ EXPECT = {
     "pass": {"pass"},
     "replay_rejected": {"replay_rejected"},
     "boot_failed": {"boot_failed"},
-    "refused": {"surface_refused", "preflight_refused", "refused", "unsealed", "watchdog_timeout"},
+    "refused": {"surface_refused", "preflight_refused", "refused", "unsealed", "watchdog_timeout",
+                "teardown_failed"},
     "measure": None,  # any terminal outcome is acceptable; the number is the point
 }
 

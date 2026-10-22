@@ -88,9 +88,12 @@ nothing to the timed path (a native process with plain pipes).
    into the trusted staging path, which `nemosub` cannot write, without
    following links, and re-checks the copy (a regular file; for the kernels
    output, no symlink or special file anywhere), so a swap after the check is
-   refused. Needs a Rust
-   toolchain `nemosub` can use (a shared read-only `/opt/rust`, same version
-   as `runner`'s).
+   refused. After the build, `runner` removes all files from `cargo-home`,
+   `target` and `kernels-out`. These directories then have mode `2750`.
+   The staged adapter, vLLM overlay and kernels stay under `.build`.
+   `runner` owns these staged files. The files have no group or other write
+   permission. The build needs a Rust toolchain that `nemosub` can use.
+   The shared read-only `/opt/rust` has the same version as `runner`'s toolchain.
 2. **Kernels (E2).** The container runs `--user nemosub`, mounts the checkout
    **read-only**, and mounts only a `nemosub`-owned output directory
    read-write, outside the checkout. It gets CPU, memory and process limits
@@ -173,26 +176,37 @@ nothing to the timed path (a native process with plain pipes).
    secret, a golden or a hidden prompt there; runner-private files go in
    `RUNNER_TEMP`.** It can also fill
    `/tmp` (a nuisance, not a leak). Nothing it leaves may reach the next leg or
-   job. `tools/sandbox-wipe.sh` deletes every `nemosub`-owned file in every
+   job. The passwd home is root-owned and mode `0755`. It has no ACL or xattr.
+   The sandbox user cannot write it. The resident uses its per-leg run home.
+   The adapter uses the per-job `adapter-home`.
+   `tools/sandbox-wipe.sh` deletes every `nemosub`-owned file in every
    directory it can write (the box's wipe list: every world-writable directory
-   on a local filesystem, so `/tmp`, `/var/tmp`, `/run/lock`, `/var/crash`,
-   plus `/dev/shm` and `/dev/mqueue`, recorded once by
-   `setup-sandbox-user.sh`) and in its home, and its SysV IPC objects, then
-   verifies none remain. It runs:
+   on a local filesystem, so `/tmp`, `/var/tmp`, `/run/lock`, and `/var/crash`).
+   It also deletes owned files below the passwd home. The script always adds
+   `/dev/shm` and `/dev/mqueue` to the list. It reads each SysV IPC table in
+   `/proc/sysvipc`. It selects an object when its numeric `uid` or `cuid`
+   equals the sandbox uid. If `/proc/sysvipc` is absent, it uses `ipcs -c`.
+   An unreadable table or a failed command makes the wipe fail. The script
+   removes each object as `nemosub` first. Existing root sudo access is the
+   fallback. The script does not add sudo rights. It verifies that no selected
+   file or IPC object remains. It also checks foreign-owned writable paths.
+   It checks each wipe-list directory and the per-job directory.
+   A hit fails the wipe.
+   The error gives only a count. It never gives a path name. It runs:
    - at **job start** and **job end** (the ranked workflow);
    - **before the timed measurement**, when `SANDBOX_USER` is set:
      `tools/nemotron35-measure-and-score.sh` kills every `nemosub` process,
-     runs the wipe, then `tools/wait-for-memory.sh` (so setup leftovers and
-     anything from an earlier step cannot fill `/dev/shm` before pair 1's
-     control leg);
+     runs the wipe, then `tools/wait-for-memory.sh`. It also verifies an empty
+     `adapter-home` and `sock`. It refuses staged build output that is not
+     runner-owned or has a group or other write bit;
    - **after every candidate leg**, when `serve-up.sh --stop` tears down a
      sandboxed resident (`SERVE_UP_CONTAINER_USER` is set or derived from
      `SERVE_UP_SANDBOX_TREE`, or the socket path
      lies under `$SANDBOX_ROOT/$SANDBOX_JOB/sock/`): after the container is
-     gone, the same kill-and-verify step, then the wipe, then
-     `tools/wait-for-memory.sh` (`--stop` fails if any step fails; the wipe
-     user is `SERVE_UP_CONTAINER_USER`, else `SANDBOX_USER`, else `--stop`
-     refuses);
+     gone, the same kill-and-verify step runs. The wipe runs next. The stop
+     recreates and verifies `adapter-home`, and empties all directories under
+     `sock`. The wipe also verifies the passwd home metadata.
+     Then `tools/wait-for-memory.sh` runs. The stop fails if any step fails;
    - **between the two control-leg retry attempts**, when
      `measure-and-score.sh` discards attempt 1: kill, wipe, wait for memory,
      then empty the five per-job directories the sandbox user writes.
@@ -215,10 +229,10 @@ that changes each name for a second runner on the same box.
 
 | Thing | Value |
 |---|---|
-| Sandbox user | `nemosub`: system user, shell `/usr/sbin/nologin`, home `/var/lib/nemosub` (0700), NOT in `docker`, `bench` or `sudo` |
+| Sandbox user | `nemosub`: system user, shell `/usr/sbin/nologin`, passwd home `/var/lib/nemosub` (`root:root` `0755`, no ACL, no xattr), NOT in `docker`, `bench` or `sudo` |
 | Shared group | `nemoshare`: members `runner` and `nemosub` |
 | Sandbox root | `/var/lib/nemotron35/sandbox`, owner `runner:nemoshare`, mode `2750` (nemosub can traverse and read, not write) |
-| Per-job dirs (created by `runner` under the root, removed at job end) | `<root>/<job>/vendor` and `<root>/<job>/sock` `2750` (read-only to nemosub; `serve-up.sh` creates each leg's `sock/<tag>/` itself, `2770`); `<root>/<job>/cargo-home`, `<root>/<job>/target`, `<root>/<job>/kernels-out`, `<root>/<job>/adapter-home` all `2770` (nemosub writes; `adapter-home` is the adapter's `HOME` and `TMPDIR`) |
+| Per-job dirs (created by `runner` under the root, removed at job end) | `vendor` and `sock` start as `2750`. `cargo-home`, `target` and `kernels-out` start as `2770` for the build. The Rust build uses `cargo-home` for `HOME` and `CARGO_HOME`. Setup empties them and changes them to `2750`. `adapter-home` stays `2770`. The adapter uses it for `HOME` and `TMPDIR`. `serve-up.sh` creates each `sock/<tag>/` as `2770`. Each sandboxed stop recreates `adapter-home` with its owner, group, mode and default ACL. It empties `sock`. |
 | Rust for nemosub | `/opt/rust/cargo` + `/opt/rust/rustup`, root-owned, world-readable, same toolchain as `runner`'s (`rustup show active-toolchain` as runner); callers set `PATH=/opt/rust/cargo/bin:...` AND `RUSTUP_HOME=/opt/rust/rustup` |
 | sudoers | `/etc/sudoers.d/nemotron35-sandbox`: `runner ALL=(nemosub) NOPASSWD:SETENV: ALL` |
 | Drop to sandbox | `sudo -n -u nemosub --preserve-env=VAR1,VAR2 -- cmd …` (never a shell string) |
@@ -227,21 +241,21 @@ that changes each name for a second runner on the same box.
 | Resolver | ACL `u:nemosub:---` on `/run/systemd/resolve/io.systemd.Resolve` and `/run/nscd/socket` when present, re-applied at boot by `nemotron35-sandbox-acl.service` |
 | No persistence | `nemosub` in `/etc/cron.deny` and `/etc/at.deny`; no crontab, no at job, no linger |
 | Wipe list | `/etc/nemotron35-sandbox/wipe-dirs`, root 0644, one directory per line: every world-writable directory on a local filesystem that `nemosub` can enter and write, plus `/dev/shm` and `/dev/mqueue`; written by `setup-sandbox-user.sh` (re-run it after adding a mount) |
-| Wipe | `tools/sandbox-wipe.sh`: every `nemosub`-owned file under each wipe-list directory (a missing one is skipped) and `/var/lib/nemosub`, and its SysV IPC, then verified gone; a missing or empty wipe list fails it. The workflow runs it at job start and end; `nemotron35-measure-and-score.sh` runs kill + wipe + `wait-for-memory.sh` before the first timed attempt and again between control-leg retries (plus clears per-job sandbox dirs on retry); candidate `serve-up.sh --stop` runs kill + wipe + `wait-for-memory.sh` when the stop tears down a sandboxed leg (see item 4) |
+| Wipe | `tools/sandbox-wipe.sh` removes owned files and SysV IPC with a matching `uid` or `cuid`. It verifies the passwd home. It rejects foreign-owned writable paths in wipe-list and per-job directories. It always includes `/dev/shm` and `/dev/mqueue`. Enumeration errors fail the wipe. The workflow runs it at job start and end. The measure script runs it before measurement and between retries. Candidate `serve-up.sh --stop` also recreates `adapter-home` and empties `sock`. |
 | Adapter limits | `prlimit --fsize=67108864 --nproc` (default 4096, `ADAPTER_NPROC_LIMIT`) `--as` (default 16 GiB, `ADAPTER_AS_LIMIT` in bytes) on the adapter in `tools/run-engine-sandboxed.sh`; the build uses separate `CARGO_NPROC_LIMIT` / `CARGO_AS_LIMIT` |
 | Resident logs | `SERVE_UP_LOG_DIR` (from `actions-runner/.env`, else `/var/lib/nemotron35/serve-log`) `runner:runner` 0750, nothing in it other-readable; `serve-up.sh` writes resident logs 0600, the identity file 0640 |
 | Checkout access | per job, as `runner`: `setfacl -R -P -m u:nemosub:rX` (and `-d`) on `$GITHUB_WORKSPACE`, `--x` on each parent up to `runner`'s home, `---` on every other entry directly under each of those parents (all but the component leading to the checkout), on `RUNNER_TEMP` and on `_work/_actions` and `_work/_tool` when present; setup gives `--x` on `runner`'s home, `actions-runner`, `_work` and `---` on every entry under the first two but the next one down and on `_work/_*`. Files `runner` writes under the checkout are `nemosub`-readable (default ACL): never a secret there |
 | Workflow env | `SANDBOX_USER` and `SANDBOX_ROOT` from the runner environment, else `nemosub` and `/var/lib/nemotron35/sandbox` (the first step of the ranked job resolves them into `GITHUB_ENV`), `SANDBOX_JOB=<run_id>-<run_attempt>`, `SERVE_UP_SANDBOX_TREE=$GITHUB_WORKSPACE` in the measurement step: only the candidate checkout's serve-up takes `SANDBOX_USER` as its container user, and the reference tree's serve-up runs as `runner` |
 | Box check | `tools/box-runner/setup-sandbox-user.sh --check` exits 0 only if all of the above holds |
 
-benchd spawns `tools/serve-up.sh --stop` with its own environment (it does not
-call `env_clear`; see `crates/benchd/src/legserve.rs`), so the workflow's
-`SANDBOX_*` and `SERVE_UP_SANDBOX_TREE` reach the stop path on candidate
-legs. A failed `--stop` is only logged by benchd; the pre-measurement wipe and
-the job-end cleanup are the backstops if a per-leg stop misses something. benchd
-also re-checks load and GPU utilisation before every timed phase (its
-"quiescing" gate); the per-leg quiet check in item 4 is the kill-and-verify
-step plus that gate.
+benchd starts `tools/serve-up.sh --stop` with its own environment. It does not
+call `env_clear` in `crates/benchd/src/legserve.rs`. Thus, `SANDBOX_*` and
+`SERVE_UP_SANDBOX_TREE` reach the stop path on candidate legs. If a stop fails
+after a successful measurement, benchd seals `LEG-TEARDOWN-FAILED` and refuses
+the run. The driver reports exit code 75 without a new measured attempt. The
+router classifies this result as infrastructure. The job-end cleanup is the
+final backstop. benchd also checks load and GPU use before each timed phase.
+Its quiescing gate and the kill check in item 4 form the per-leg quiet check.
 
 ## 6. Operator steps
 
@@ -264,7 +278,10 @@ step plus that gate.
 Two runners can serve jobs on one box. Each runner has its own runner account,
 sandbox user, share group, units and files. The GPU lock
 `/tmp/mtplx-gpu-exclusive.lock` is shared, so the two runners never measure at
-the same time. A job of one runner never kills, wipes or reads the processes
+the same time. The `cuda-setup-scripts` `gpu-lock` unit creates it.
+The lock is `root:bench` and mode `0660`. A ranked job never creates it.
+The sandbox user is not in `bench` and cannot write the lock.
+A job of one runner never kills, wipes or reads the processes
 and files of the other runner's sandbox user.
 
 Each name in section 6a comes from one environment variable. If a variable is

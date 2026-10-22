@@ -8,7 +8,8 @@
 #      sandbox user from the repo root with --offline and a job-private
 #      CARGO_HOME/target; the kernels container gets --user, a read-only
 #      checkout mount, one writable kernels-out mount and the limits; the
-#      per-job dirs have the contract modes; the outputs are staged, the
+#      build-only per-job dirs are empty and read-only to the sandbox group;
+#      the outputs are staged, runner-owned and not group-writable; the
 #      adapter as <staged>.sandboxed and a shim at the staged path that execs
 #      tools/run-engine-sandboxed.sh on it.
 #   2b. a second runner's SHARE_GROUP and RUST_DIR (docs/sandbox-design.md
@@ -54,7 +55,13 @@ mkdir -p "${REPO}/tools/engine" "${REPO}/fixtures" "${REPO}/harness/protocol-ada
 cp "${REPO_ROOT}/tools/engine/build.sh" "${REPO}/tools/engine/build.sh"
 cp "${REPO_ROOT}/tools/stage-cuda-engine.sh" "${REPO}/tools/stage-cuda-engine.sh"
 cp "${REPO_ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json" "${REPO}/fixtures/"
-printf '#!/usr/bin/env bash\nexit 0\n' > "${REPO}/tools/stage-vllm-overlay.sh"; chmod +x "${REPO}/tools/stage-vllm-overlay.sh"
+cat > "${REPO}/tools/stage-vllm-overlay.sh" <<'EOF'
+#!/usr/bin/env bash
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+mkdir -p "${root}/.build/vllm-overlay/vllm"
+: > "${root}/.build/vllm-overlay/vllm/__init__.py"
+EOF
+chmod +x "${REPO}/tools/stage-vllm-overlay.sh"
 touch "${REPO}/harness/kernels/build.sh"
 GOOD_TOML='[package]
 name = "adapter"
@@ -169,22 +176,22 @@ check "sandbox user checked with sudo -n true" logged "sudo cwd=${REPO} -n -u ${
 check "vendor runs as the caller from the repo root, own CARGO_HOME" \
   logged "cargo cwd=${REPO} CARGO_HOME= CARGO_TARGET_DIR= ENGINE_CUDA_ARCH= vendor --locked --manifest-path ${MANIFEST} ${JOB}/vendor"
 check "build runs via sudo as the sandbox user, offline, from the repo root" \
-  logged "sudo cwd=${REPO} -n -u ${ME} -- prlimit --nproc=4096 --as=68719476736 env PATH=/opt/rust/cargo/bin:/usr/bin:/bin RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=${JOB}/cargo-home CARGO_TARGET_DIR=${JOB}/target ENGINE_CUDA_ARCH=sm_121 cargo build --release --locked --offline --manifest-path ${MANIFEST}"
+  logged "sudo cwd=${REPO} -n -u ${ME} -- prlimit --nproc=4096 --as=68719476736 env PATH=/opt/rust/cargo/bin:/usr/bin:/bin HOME=${JOB}/cargo-home RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=${JOB}/cargo-home CARGO_TARGET_DIR=${JOB}/target ENGINE_CUDA_ARCH=sm_121 cargo build --release --locked --offline --manifest-path ${MANIFEST}"
 check "cargo build sees only the job-private CARGO_HOME and target" \
   logged "cargo cwd=${REPO} CARGO_HOME=${JOB}/cargo-home CARGO_TARGET_DIR=${JOB}/target ENGINE_CUDA_ARCH=sm_121 build --release --locked --offline --manifest-path ${MANIFEST}"
 check "no cargo build runs outside sudo" \
   not_logged "CARGO_TARGET_DIR= ENGINE_CUDA_ARCH=sm_121 build"
-check "source replacement written to the sandbox CARGO_HOME" \
-  grep -q 'replace-with = "vendored-sources"' "${JOB}/cargo-home/config.toml"
+check "sandbox CARGO_HOME is empty after the build" test -z "$(find "${JOB}/cargo-home" -mindepth 1 -print -quit)"
 check "nothing written to a repo .cargo" test ! -e "${REPO}/.cargo"
 check "every sandbox process killed after the build" logged "sudo cwd=${REPO} -n -u ${ME} -- kill -KILL -1"
-for d in vendor:2750 sock:2750 cargo-home:2770 target:2770 kernels-out:2770 adapter-home:2770; do
+for d in vendor:2750 sock:2750 cargo-home:2750 target:2750 kernels-out:2750 adapter-home:2770; do
   check "job dir ${d%%:*} mode ${d##*:}" test "$(stat -c %a "${JOB}/${d%%:*}")" == "${d##*:}"
 done
+check "build-only job dirs are empty before measurement" \
+  test -z "$(find "${JOB}/cargo-home" "${JOB}/target" "${JOB}/kernels-out" -mindepth 1 -print -quit)"
 check "kernels container: sandbox uid, nemoshare gid, read-only checkout, one writable mount, limits, no caps, no new privileges" \
   logged "docker run --rm --gpus all --network none --user $(id -u):4242 --mount type=bind,src=${REPO},dst=${REPO},readonly --mount type=bind,src=${JOB}/kernels-out,dst=${JOB}/kernels-out --cpus 16 --memory 32g --pids-limit 4096 --cap-drop ALL --security-opt no-new-privileges --env HOME=/tmp --env KERNELS_OUT=${JOB}/kernels-out ${TAIL}"
-check "sandboxed adapter staged next to the shim as .sandboxed" \
-  cmp -s "${JOB}/target/release/cuda-engine" "${STAGED}.sandboxed"
+check "sandboxed adapter staged next to the shim as .sandboxed" test -x "${STAGED}.sandboxed"
 check "the .sandboxed adapter is a regular file, mode 755, ours" \
   test ! -L "${STAGED}.sandboxed" -a -f "${STAGED}.sandboxed" \
     -a "$(stat -c '%a %U' "${STAGED}.sandboxed")" == "755 ${ME}"
@@ -202,6 +209,10 @@ exec ${REPO}/tools/run-engine-sandboxed.sh \"\$@\""
 check "the shim bakes in PATH, the SANDBOX_* values and the log dir, then execs the wrapper" \
   test "$(cat "${STAGED}")" == "${EXPECTED_SHIM}"
 check "kernels-out copied into .build/kernels" test -f "${REPO}/.build/kernels/k.so"
+check "all staged measurement outputs are runner-owned" \
+  test -z "$(find "${REPO}/.build/release" "${REPO}/.build/vllm-overlay" "${REPO}/.build/kernels" ! -user "$(id -u)" -print -quit)"
+check "no staged measurement output is group- or other-writable" \
+  test -z "$(find "${REPO}/.build/release" "${REPO}/.build/vllm-overlay" "${REPO}/.build/kernels" -perm /022 -print -quit)"
 
 # ---- 2b. a second runner's names: SHARE_GROUP and RUST_DIR -------------------
 rm -rf "${REPO}/.build"
@@ -215,7 +226,7 @@ else
 fi
 JOB2="${WORK}/sandbox/42-2"
 check "second runner: cargo uses RUST_DIR's toolchain" \
-  logged "sudo cwd=${REPO} -n -u ${ME} -- prlimit --nproc=4096 --as=68719476736 env PATH=/opt/layrsub-rust/cargo/bin:/usr/bin:/bin RUSTUP_HOME=/opt/layrsub-rust/rustup CARGO_HOME=${JOB2}/cargo-home CARGO_TARGET_DIR=${JOB2}/target ENGINE_CUDA_ARCH=sm_121 cargo build --release --locked --offline --manifest-path ${MANIFEST}"
+  logged "sudo cwd=${REPO} -n -u ${ME} -- prlimit --nproc=4096 --as=68719476736 env PATH=/opt/layrsub-rust/cargo/bin:/usr/bin:/bin HOME=${JOB2}/cargo-home RUSTUP_HOME=/opt/layrsub-rust/rustup CARGO_HOME=${JOB2}/cargo-home CARGO_TARGET_DIR=${JOB2}/target ENGINE_CUDA_ARCH=sm_121 cargo build --release --locked --offline --manifest-path ${MANIFEST}"
 check "second runner: the kernels container runs with SHARE_GROUP's gid" \
   grep -qF -- "docker run --rm --gpus all --network none --user $(id -u):5353 " "${LOG}"
 

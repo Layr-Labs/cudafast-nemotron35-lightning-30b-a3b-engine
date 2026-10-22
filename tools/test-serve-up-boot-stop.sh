@@ -54,6 +54,8 @@ ok()   { echo "ok: $*"; }
 
 command -v python3 >/dev/null 2>&1 || { echo "test-serve-up-boot-stop.sh: python3 is required" >&2; exit 1; }
 command -v jq      >/dev/null 2>&1 || { echo "test-serve-up-boot-stop.sh: jq is required" >&2; exit 1; }
+command -v getfacl >/dev/null 2>&1 || { echo "test-serve-up-boot-stop.sh: getfacl is required" >&2; exit 1; }
+command -v setfacl >/dev/null 2>&1 || { echo "test-serve-up-boot-stop.sh: setfacl is required" >&2; exit 1; }
 
 # --- the synthetic window ---------------------------------------------------
 WEIGHTS="${WORK}/weights"
@@ -342,9 +344,12 @@ cp "${ROOT_DIR}/tools/sandbox-wipe.sh" "${ROOT_DIR}/tools/wait-for-memory.sh" "$
 cp "${ROOT_DIR}/fixtures/nemotron35_lightning_30b_a3b_track.json" "${TREE}/fixtures/"
 cp -R "${ROOT_DIR}/harness/vllm_resident" "${TREE}/harness/"
 STUB="${WORK}/stub"
-mkdir -p "${STUB}/bin" "${WORK}/sbx-wipe/shm" "${WORK}/sbx-home"
+mkdir -p "${STUB}/bin" "${WORK}/sbx-wipe/shm" "${WORK}/sbx-wipe/mqueue" "${WORK}/sbx-home" "${WORK}/sbx-sysvipc"
 printf '%s\n' "${WORK}/sbx-wipe/shm" > "${WORK}/sbx-wipe-dirs"
 : > "${WORK}/sbx-ipc"
+printf '%s\n' 'key shmid perms size cpid lpid nattch uid gid cuid cgid atime dtime ctime rss swap' > "${WORK}/sbx-sysvipc/shm"
+printf '%s\n' 'key semid perms nsems uid gid cuid cgid otime ctime' > "${WORK}/sbx-sysvipc/sem"
+printf '%s\n' 'key msqid perms cbytes qnum lspid lrpid uid gid cuid cgid stime rtime ctime' > "${WORK}/sbx-sysvipc/msg"
 cat > "${STUB}/bin/ipcs" <<'STUBEOF'
 #!/usr/bin/env bash
 echo "------ header --------"
@@ -394,6 +399,7 @@ printf '%s\n' "\$*" >> "${STUB}/sudo.log"
 shift 4
 [[ "\$1" == kill || "\$1" == true ]] && exit 0
 [[ "\$1" == ipcrm ]] && exec "${STUB}/bin/ipcrm" "\${@:2}"
+[[ "\$1 \$2 \$3" == "test -w ${WORK}/sbx-home" ]] && exit 1
 exec "\$@"
 STUBEOF
 cat > "${STUB}/bin/pgrep" <<'STUBEOF'
@@ -407,6 +413,11 @@ cat > "${STUB}/bin/id" <<STUBEOF
 [[ "\$*" == "-u nemosub" || "\$*" == "-u ${ME}" ]] && { echo 4242; exit 0; }
 exec $(command -v id) "\$@"
 STUBEOF
+cat > "${STUB}/bin/stat" <<STUBEOF
+#!/usr/bin/env bash
+[[ "\$1 \$2 \$3 \$4" == "-Lc %u -- ${WORK}/sbx-home" ]] && { echo 0; exit 0; }
+exec $(command -v stat) "\$@"
+STUBEOF
 cat > "${STUB}/bin/getent" <<STUBEOF
 #!/usr/bin/env bash
 [[ "\$*" == "group nemoshare" ]] && { echo 'nemoshare:x:4343:runner,nemosub'; exit 0; }
@@ -419,7 +430,8 @@ dserve() { # dserve [VAR=VALUE...] ARGS... -- serve-up from the copied tree via 
   env PATH="${STUB}/bin:${PATH}" SERVE_UP_LAUNCHER=docker \
       SERVE_UP_WEIGHTS_DIR="${WEIGHTS}" SERVE_UP_LOG_DIR="${WORK}/dlogs" \
       SERVE_UP_SOCKET_DIR="${SOCKDIR}" SERVE_UP_HEALTH_TIMEOUT_S=60 \
-      SERVE_UP_MEMINFO="${WORK}/meminfo" "$@"
+      SERVE_UP_MEMINFO="${WORK}/meminfo" SANDBOX_SYSVIPC_DIR="${WORK}/sbx-sysvipc" \
+      SANDBOX_DEV_SHM="${WORK}/sbx-wipe/shm" SANDBOX_DEV_MQUEUE="${WORK}/sbx-wipe/mqueue" "$@"
 }
 run_arg_after() { # run_arg_after FLAG -- every value that follows FLAG in the last docker run
   awk -v flag="$1" 'prev == flag { print } { prev = $0 }' "${STUB}/docker-run.argv"
@@ -459,12 +471,62 @@ grep -q 'sandbox-wipe.sh' "${WORK}/stop7.out" 2>/dev/null \
   || ok "case 7: unsandboxed --stop does not run sandbox-wipe"
 
 # --- case 8: SERVE_UP_CONTAINER_USER=nemosub -------------------------------
-mkdir -p "${SBXROOT}/42-1" && mkdir -m 2750 "${SBXROOT}/42-1/sock"
+mkdir -p "${SBXROOT}/42-1" && mkdir -m 2750 "${SBXROOT}/42-1/sock" \
+  && mkdir -m 2770 "${SBXROOT}/42-1/adapter-home"
 sbx() {
   dserve SERVE_UP_CONTAINER_USER="${ME}" SANDBOX_ROOT="${SBXROOT}" SANDBOX_JOB=42-1 \
     SANDBOX_WIPE_LIST="${WORK}/sbx-wipe-dirs" SANDBOX_WIPE_HOME="${WORK}/sbx-home" \
     STUB_IPC="${WORK}/sbx-ipc" STUB_PGREP_USER="${ME}" "$@"
 }
+# A direct stop needs no live socket. It tests the state cleanup even when the
+# host test sandbox does not permit Unix sockets.
+DIRECT_TAG=111-20260101T000000Z
+mkdir -p "${SBXROOT}/42-1/sock/${DIRECT_TAG}/run"
+echo old > "${SBXROOT}/42-1/sock/${DIRECT_TAG}/run/state"
+echo old > "${SBXROOT}/42-1/adapter-home/state"
+setfacl -d -m u::rwx,g::rwx,o::--- "${SBXROOT}/42-1/adapter-home"
+ADAPTER_HOME_INODE="$(stat -c %i "${SBXROOT}/42-1/adapter-home")"
+ADAPTER_HOME_OWNER="$(stat -c %u:%g "${SBXROOT}/42-1/adapter-home")"
+ADAPTER_HOME_DEFAULT_ACL="$(getfacl -cp "${SBXROOT}/42-1/adapter-home" | sed -n '/^default:/p')"
+XATTR_TEST=0
+if python3 - "${SBXROOT}/42-1/adapter-home" <<'PY'
+import os, sys
+try:
+    for path in sys.argv[1:]:
+        os.setxattr(path, "user.sandbox-test", b"state", follow_symlinks=False)
+except OSError:
+    raise SystemExit(1)
+PY
+then
+  XATTR_TEST=1
+else
+  echo "SKIP: case 8 user.* xattr regression; the test filesystem does not support xattrs"
+fi
+sbx WAIT_FOR_MEMORY_TIMEOUT_S=0.1 WAIT_FOR_MEMORY_POLL_S=0.01 \
+  "${TREE}/tools/serve-up.sh" --stop \
+  --socket "${SBXROOT}/42-1/sock/${DIRECT_TAG}/vllm-resident.sock" > "${WORK}/direct-stop.out" 2>&1
+[[ $? -eq 0 && -z "$(find "${SBXROOT}/42-1/adapter-home" "${SBXROOT}/42-1/sock" -mindepth 1 -print -quit)" ]] \
+  && ok "case 8: sandboxed --stop recreates adapter-home and empties all socket directories without a live resident" \
+  || fail "case 8: direct sandboxed --stop left per-leg state"
+[[ "$(stat -c %a "${SBXROOT}/42-1/adapter-home")" == 2770 \
+   && "$(stat -c %u:%g "${SBXROOT}/42-1/adapter-home")" == "${ADAPTER_HOME_OWNER}" \
+   && "$(getfacl -cp "${SBXROOT}/42-1/adapter-home" | sed -n '/^default:/p')" == "${ADAPTER_HOME_DEFAULT_ACL}" ]] \
+  && ok "case 8: recreated adapter-home keeps mode 2770, owner, group and its default ACL" \
+  || fail "case 8: recreated adapter-home changed its metadata"
+if [[ "${XATTR_TEST}" -eq 1 ]]; then
+  if python3 - "${SBXROOT}/42-1/adapter-home" <<'PY'
+import os, sys
+raise SystemExit(any(name.startswith("user.") for path in sys.argv[1:]
+                     for name in os.listxattr(path, follow_symlinks=False)))
+PY
+  then
+    [[ "$(stat -c %i "${SBXROOT}/42-1/adapter-home")" != "${ADAPTER_HOME_INODE}" ]] \
+      && ok "case 8: adapter-home is new and its user.* xattr is gone" \
+      || ok "case 8: adapter-home has no user.* xattr after inode reuse"
+  else
+    fail "case 8: a user.* xattr survived sandboxed --stop"
+  fi
+fi
 sbx "${TREE}/tools/serve-up.sh" --boot --spec mtp --draft-len 2 \
   --socket-out "${WORK}/leg8/socket.txt" > "${WORK}/boot8.out" 2>&1 \
   || { fail "case 8: --boot exited non-zero"; sed 's/^/    /' "${WORK}/boot8.out" >&2; }
@@ -505,6 +567,9 @@ grep -qxF -- "-n -u ${ME} -- python3 - ${SOCKET8}" "${STUB}/sudo.log" 2>/dev/nul
 # A sidecar the sandbox user plants beside its socket, naming a process it does
 # not own, must not be signalled: --stop goes by the container name only.
 echo candidate-shm-leftover > "${WORK}/sbx-wipe/shm/candidate-shm-leftover"
+echo adapter-leftover > "${SBXROOT}/42-1/adapter-home/adapter-leftover"
+mkdir -p "${SBXROOT}/42-1/sock/earlier-leg"
+echo socket-leftover > "${SBXROOT}/42-1/sock/earlier-leg/socket-leftover"
 sleep 300 & DECOY_PID=$!
 printf '%s\n\n\n' "${DECOY_PID}" > "${SOCKET8}.pid"
 sbx WAIT_FOR_MEMORY_TIMEOUT_S=0.1 WAIT_FOR_MEMORY_POLL_S=0.01 \
@@ -521,10 +586,13 @@ grep -Fxq -- "-n -u ${ME} -- kill -KILL -1" "${STUB}/sudo.log" 2>/dev/null \
   && ok "case 8: --stop kills remaining sandbox processes before the wipe" \
   || fail "case 8: --stop did not run kill -KILL -1 as ${ME}"
 [[ ! -f "${WORK}/sbx-wipe/shm/candidate-shm-leftover" ]] \
-  && grep -q "sandbox-wipe.sh: nothing ${ME}-owned left" "${WORK}/stop8.out" \
+  && grep -q "sandbox-wipe.sh: no sandbox state remains in" "${WORK}/stop8.out" \
   && grep -q 'wait-for-memory:' "${WORK}/stop8.out" \
   && ok "case 8: --stop runs sandbox-wipe after a sandboxed resident" \
   || fail "case 8: --stop did not wipe shared dirs (leftover=$(test -f "${WORK}/sbx-wipe/shm/candidate-shm-leftover" && echo yes || echo no))"
+[[ -z "$(find "${SBXROOT}/42-1/adapter-home" "${SBXROOT}/42-1/sock" -mindepth 1 -print -quit)" ]] \
+  && ok "case 8: --stop recreates adapter-home and removes all earlier socket directories" \
+  || fail "case 8: --stop left per-leg state under adapter-home or sock"
 # Without SERVE_UP_CONTAINER_USER or SANDBOX_* the socket shape alone keeps --stop
 # off the sidecar and skips the wipe.
 dserve "${TREE}/tools/serve-up.sh" --stop --socket "${SOCKET8}" > "${WORK}/stop8b.out" 2>&1 \
@@ -546,7 +614,7 @@ dserve SANDBOX_USER="${ME}" SANDBOX_ROOT="${SBXROOT}" SANDBOX_JOB=42-1 \
   "${TREE}/tools/serve-up.sh" --stop --socket "${SOCKET8D}" > "${WORK}/stop8d.out" 2>&1 \
   || fail "case 8d: --stop exited non-zero"
 [[ ! -f "${WORK}/sbx-wipe/shm/socket-shape-wipe-leftover" ]] \
-  && grep -q "sandbox-wipe.sh: nothing ${ME}-owned left" "${WORK}/stop8d.out" \
+  && grep -q "sandbox-wipe.sh: no sandbox state remains in" "${WORK}/stop8d.out" \
   && grep -q 'wait-for-memory:' "${WORK}/stop8d.out" \
   && ok "case 8d: --stop wipes (and waits for memory) from socket shape + SANDBOX_USER alone" \
   || fail "case 8d: socket-shape-only stop did not wipe (leftover=$(test -f "${WORK}/sbx-wipe/shm/socket-shape-wipe-leftover" && echo yes || echo no))"
@@ -623,7 +691,7 @@ mkdir -p "${WORK}/sbx-etc"
 cp "${WORK}/sbx-wipe-dirs" "${WORK}/sbx-etc/wipe-dirs"
 second() {
   dserve SERVE_UP_CONTAINER_USER="${ME}" SANDBOX_ROOT="${SBXROOT}" SANDBOX_JOB=42-1 \
-    SHARE_GROUP=layrshare SANDBOX_ETC="${WORK}/sbx-etc" SERVE_UP_CONTAINER_PREFIX=layr-serve-up- \
+    SHARE_GROUP=layrshare SANDBOX_ETC="${WORK}/sbx-etc" SANDBOX_WIPE_HOME="${WORK}/sbx-home" SERVE_UP_CONTAINER_PREFIX=layr-serve-up- \
     STUB_IPC="${WORK}/sbx-ipc" STUB_PGREP_USER="${ME}" "$@"
 }
 second "${TREE}/tools/serve-up.sh" --boot --spec serial --draft-len 0 \

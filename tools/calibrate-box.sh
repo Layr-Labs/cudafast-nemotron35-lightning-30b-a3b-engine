@@ -363,7 +363,9 @@ mkdir -p "${OUT_DIR}"
 printf '%s\n' "$$" > "${OUT_DIR}/run.pid"
 ps -o pgid= -p $$ 2>/dev/null | tr -d '[:space:]' > "${OUT_DIR}/run.pgid" || true
 
-exec 9>>"${LOCK_PATH}" || refuse lock-unwritable "cannot open the GPU lock ${LOCK_PATH}"
+[[ -f "${LOCK_PATH}" && ! -L "${LOCK_PATH}" ]] \
+  || refuse lock-missing "${LOCK_PATH} is missing or is not a regular file; run the cuda-setup-scripts gpu-lock unit"
+exec 9<"${LOCK_PATH}" || refuse lock-unreadable "cannot open the GPU lock ${LOCK_PATH}"
 if ! flock -w "${LOCK_WAIT}" 9; then
   printf 'calibrate-box: REFUSE gpu-lock-busy: %s is held by another run after %ss. Nothing has been loaded.\n' \
     "${LOCK_PATH}" "${LOCK_WAIT}" >&2

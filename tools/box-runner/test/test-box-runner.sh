@@ -36,7 +36,7 @@ VERBOSE=0
 # This floor is the only thing that notices a section silently stopping (an
 # early `exit`, a deleted block) under `set -uo pipefail` without `-e`, where a
 # truncated suite otherwise reports "0 failed" and looks green.
-EXPECTED_MIN_ASSERTIONS=126
+EXPECTED_MIN_ASSERTIONS=133
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/box-runner-test.XXXXXX")"
 # shellcheck disable=SC2329  # invoked indirectly via `trap cleanup EXIT` below
@@ -604,6 +604,11 @@ if [[ "${SBX_NET_DENY:-1}" == 1 && "$*" == *"/dev/"[tu][cd]p* ]]; then exit 1; f
 # ancestor carries a u:nemosub:--- ACL (the setfacl stub's record) or its mode
 # gives "other" nothing -- the sandbox user's view, simulated.
 if [[ "$1" == test ]]; then
+  case "$2:$3" in
+    "-w:${SBX_FS}/var/lib/nemosub"|"-w:${SBX_FS}/var/lib/layrsub")
+      [[ "${SBX_HOME_WRITABLE:-0}" == 1 ]] || exit 1
+      ;;
+  esac
   for a in "${@:2}"; do
     [[ "${a}" == "${SBX_FS}"/* && -e "${a}" ]] || continue
     [[ "$(stat -c %a "${a}")" == *0 ]] && exit 1
@@ -615,6 +620,16 @@ if [[ "$1" == test ]]; then
   done
 fi
 exec "$@"
+EOF
+cat > "${SBIN}/stat" <<'EOF'
+#!/usr/bin/env bash
+case "$1:$2:$3" in
+  "-c:%a %U %G:${SBX_FS}/var/lib/nemosub"|"-c:%a %U %G:${SBX_FS}/var/lib/layrsub")
+    printf '%s root root\n' "$(/usr/bin/stat -c %a "$3")"
+    exit 0
+    ;;
+esac
+exec /usr/bin/stat "$@"
 EOF
 cat > "${SBIN}/runuser" <<'EOF'
 #!/usr/bin/env bash
@@ -749,6 +764,11 @@ assert_true "sandbox setup: the resident log dir is chowned runner:runner" grep 
 assert_eq "sandbox setup: an older log in it loses other-read" 640 "$(stat -c %a "${sl}/old/vllm-resident.x.log")"
 assert_true "sandbox setup: crontab removed and linger disabled" \
   bash -c "grep -qx 'crontab -r -u nemosub' '${SBX_LOG}' && grep -qx 'loginctl disable-linger nemosub' '${SBX_LOG}'"
+assert_true "sandbox setup: the passwd home is root-owned" \
+  grep -qxF "chown root:root ${FS}/var/lib/nemosub" "${SBX_LOG}"
+assert_eq "sandbox setup: the passwd home is mode 0755" 755 "$(stat -c %a "${FS}/var/lib/nemosub")"
+assert_true "sandbox setup: the passwd home has no extended ACL" \
+  grep -qxF "setfacl -b ${FS}/var/lib/nemosub" "${SBX_LOG}"
 
 # No setfacl: refused by name, before anything is changed. PATH holds only
 # the stubs and links to every other real tool.
@@ -789,6 +809,12 @@ for p in actions-runner/.env actions-runner/_diag .cache; do
 done
 assert_true "sandbox --check: the wipe list exists" grep -q '^PASS  wipe list .* exists' <<<"${out}"
 assert_true "sandbox --check: nothing nemosub-owned in the wipe-list dirs" grep -q '^PASS  nothing nemosub-owned in any wipe-list directory' <<<"${out}"
+assert_true "sandbox --check: the passwd home is root-owned and mode 0755" \
+  grep -q '^PASS  .*var/lib/nemosub is root-owned, mode 0755' <<<"${out}"
+assert_true "sandbox --check: the passwd home is not sandbox-writable" \
+  grep -q '^PASS  nemosub cannot write .*var/lib/nemosub' <<<"${out}"
+assert_true "sandbox --check: the passwd home has no ACL or xattr" \
+  bash -c "grep -q '^PASS  .*var/lib/nemosub has no extended or default ACL' <<<\"\$0\" && grep -q '^PASS  .*var/lib/nemosub has no xattr' <<<\"\$0\"" "${out}"
 assert_true "sandbox --check: nemosub cannot read the resident log dir" grep -q "^PASS  nemosub cannot read the resident log dir ${FS}/var/lib/nemotron35/serve-log-env\$" <<<"${out}"
 # Negative: a file "nemosub" (here: this user) left in /run/lock fails the check;
 # lifting the home denies and opening the log dir fail theirs.
@@ -804,6 +830,27 @@ assert_true "sandbox --check: missing runner home default deny ACL fails" \
 echo "${FS}/home/runner u:nemosub:---" >> "${SBX_DEFAULT_ACL}"
 assert_true "sandbox --check: a readable resident log dir fails" grep -q '^FAIL  nemosub cannot read the resident log dir' <<<"${out}"
 rm -f "${FS}/run/lock/leftover"; cp "${sbx}/acl.saved" "${SBX_ACL}"; chmod 0750 "${sl}"
+out="$(sbx_check SBX_HOME_WRITABLE=1)"
+assert_true "sandbox --check: a writable passwd home fails" \
+  grep -q '^FAIL  nemosub cannot write .*var/lib/nemosub' <<<"${out}"
+echo "${FS}/var/lib/nemosub u:nemosub:---" >> "${SBX_DEFAULT_ACL}"
+out="$(sbx_check)"
+assert_true "sandbox --check: a default ACL on the passwd home fails" \
+  grep -q '^FAIL  .*var/lib/nemosub has no extended or default ACL' <<<"${out}"
+sed -i "\\#^${FS}/var/lib/nemosub #d" "${SBX_DEFAULT_ACL}"
+python3 - "${FS}/var/lib/nemosub" <<'PY'
+import os
+import sys
+os.setxattr(sys.argv[1], "user.test", b"state")
+PY
+out="$(sbx_check)"
+assert_true "sandbox --check: an xattr on the passwd home fails" \
+  grep -q '^FAIL  .*var/lib/nemosub has no xattr' <<<"${out}"
+python3 - "${FS}/var/lib/nemosub" <<'PY'
+import os
+import sys
+os.removexattr(sys.argv[1], "user.test")
+PY
 mv "${wl}" "${wl}.off"
 out="$(sbx_check)"
 assert_true "sandbox --check: a missing wipe list fails" grep -q '^FAIL  wipe list .* exists' <<<"${out}"

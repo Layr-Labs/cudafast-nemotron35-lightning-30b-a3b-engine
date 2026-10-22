@@ -202,11 +202,14 @@ if [[ -f "${KERNELS_SRC}/build.sh" ]]; then
     sandbox_quiet
     # -rP copies a symlink as a symlink and never follows it; the COPY is then
     # checked, so a swap between any check and the copy cannot slip through.
-    cp -rP --preserve=mode "${KERNELS_OUT}/." "${ROOT_DIR}/.build/kernels/"
-    odd="$(find "${ROOT_DIR}/.build/kernels" -type l -o ! -type f ! -type d | head -5)"
+    # --preserve=mode keeps a setuid/setgid bit, and the copy is runner-owned, so
+    # such a regular file is refused too (a setgid directory is harmless).
+    cp -rP --preserve=mode "${KERNELS_OUT}/." "${ROOT_DIR}/.build/kernels/" \
+      || { rm -rf "${ROOT_DIR}/.build/kernels"; die "kernels refused: copying ${KERNELS_OUT} failed"; }
+    odd="$(find "${ROOT_DIR}/.build/kernels" \( -type l -o ! -type f ! -type d -o -type f -perm /6000 \) -print -quit)"
     if [[ -n "${odd}" ]]; then
       rm -rf "${ROOT_DIR}/.build/kernels"
-      die "kernels refused: harness/kernels/build.sh produced a symlink or special file: ${odd//$'\n'/; }"
+      die "kernels refused: harness/kernels/build.sh produced a symlink, special file or setuid/setgid file: ${odd//$'\n'/; }"
     fi
   fi
 else

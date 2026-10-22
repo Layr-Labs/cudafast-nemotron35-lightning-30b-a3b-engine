@@ -80,6 +80,7 @@ python3 tools/lint-benchmark-manifest.py
 These commands check the adapter, the resident and the manifest with no GPU.
 
 ```bash
+mkdir -p "$HOME/rsock" && export SERVE_UP_SOCKET_DIR="$HOME/rsock"
 ./setup.sh && ./tools/local-baseline.sh
 ```
 

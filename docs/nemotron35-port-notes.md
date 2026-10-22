@@ -714,7 +714,7 @@ workflow on test branches and `tools/router/loadgen.py --hours 3 --seed 20260927
   `ff4017e9…338c` (3,898,160 bytes) and `record-correctness-golden`
   `bbe18e01…c596` (1,640,408 bytes), equal to the published dist.
 
-- **Live pool and custody.** Three coding tasks (Python, Rust, TypeScript),
+- **Live pool and custody.** Three coding tasks,
   each one user message through the pinned chat template, exactly 496 tokens
   (`tools/author-prompts.py --chat`). Recorded on Spark box 3 and Spark box 4
   (serial plus MTP 1 to 6): 21 files, byte-identical on both boxes, pinned by
@@ -756,9 +756,8 @@ workflow on test branches and `tools/router/loadgen.py --hours 3 --seed 20260927
 
 - **Held-out final pool.** The September pool (8 stitched prompts, 4096
   tokens) did not fit the 3-pair, 496-token fixture, so it was retired. The
-  new pool is three organizer-written coding tasks (`final-1` Go, `final-2`
-  TypeScript, `final-3` Python), each exactly 496 tokens through the chat
-  template. Recorded on 2026-10-20 on Spark box 4 and Spark box 2 at `c1ef8de` with
+  new pool is three organizer-written coding tasks, each exactly 496 tokens
+  through the chat template. Recorded on 2026-10-20 on Spark box 4 and Spark box 2 at `c1ef8de` with
   benchd `b65af98`: 21 goldens, byte-identical on both boxes. It is kept in
   the organizer's private state and archive and is not on any golden
   directory of a box; the rescore reads its `pins.json`.

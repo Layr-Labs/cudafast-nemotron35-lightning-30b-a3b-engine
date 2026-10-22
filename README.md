@@ -98,10 +98,12 @@ pre-staged and named by `MLXFAST_TARGET_SNAPSHOT_DIR`, and `setup.sh` only
 verifies it.
 
 ```bash
+mkdir -p "$HOME/rsock" && export SERVE_UP_SOCKET_DIR="$HOME/rsock"
 ./tools/local-baseline.sh
 ```
 
-This command boots a resident for your declared depth. It then runs benchd's
+The resident's socket must not be under `/tmp`, which the container hides, so
+set `SERVE_UP_SOCKET_DIR` first (it also applies to `yukon run`). This command boots a resident for your declared depth. It then runs benchd's
 local-iterate leg over the public golden of that depth, which the organizer
 recorded on a Spark: `correctness_prompts/public-longcopy-gate-english-496.golden.json`
 for serial, `correctness_prompts/public-longcopy-gate-english-496.mtp<N>.golden.json`

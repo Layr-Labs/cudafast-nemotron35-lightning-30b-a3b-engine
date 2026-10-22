@@ -1,7 +1,7 @@
 # Nemotron 3.5 Lightning challenge: overview
 
 A one-page summary of the challenge: what it is, how a submission is scored,
-what was built and why, how it was tested, and what is left before launch.
+what was built and why, how it was tested, and the fleet.
 Every point links to the document that has the detail.
 
 ## The challenge
@@ -9,7 +9,8 @@ Every point links to the document that has the detail.
 - **Task.** Make `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4` prefill and
   decode faster on a DGX Spark, single stream, without changing what it
   computes beyond a 10% token-tolerance budget.
-- **Track.** `nemotron3.5-lightning-30b-a3b-cuda-v1`, on 8 DGX Sparks.
+- **Track.** `nemotron3.5-lightning-30b-a3b-cuda-v1`, on DGX Spark boxes; five
+  run the ranked job.
 - **What a team may edit.** Only `vllm/`, `harness/` and
   `mtp-head.manifest.json` (the speculation depth, 1 to 6). Everything else is
   trusted and is replaced by the organizer's copy.
@@ -169,21 +170,19 @@ and the engineering log, section 7.14.
 | Fairness after all fixes (40 unchanged engines, all 8 boxes) | 39 pass, mean 0.9956, sd 0.0049; one GPU-transient boot failure (now re-run, see above) |
 
 These tests ran on the earlier fork benchd, which had the timed replay and the
-stricter sealing. The track now uses Layr-Labs bench-dev (engineering log
-section 7.13). The pinned dist (`43a9a16`, source `b65af98`) has the stricter
-sealing again (bench pull requests 421 to 424), but not the timed replay.
+stricter sealing. The track now uses the public `Layr-Labs/benchd` channel
+(dist `7045ed6`, public source snapshot `81a7d45` of source `b65af98`;
+engineering log section 7.13). It has the stricter sealing again (bench pull
+requests 421 to 424), but not the timed replay.
 
 Details are in the [engineering log](docs/nemotron35-port-notes.md), sections
 7.9–7.12.
 
 ## Fleet state
 
-- **Boxes.** All 8 were set up, sandboxed, calibrated and staged for the
-  October soak. Runners register through a GitHub App. Re-verify each ranked
-  box before launch: runner registration, the staged `pool-9/10/11` goldens
-  and a version-3 calibration. On 2026-10-20 Spark box 1 to Spark box 4 had all 21
-  goldens staged, a version-3 calibration under 2%, the reference tree
-  `5be35aa` and benchd `b65af98`.
+- **Boxes.** Five Spark boxes run the ranked job. Each has the live goldens
+  staged, a version-3 calibration under 2% on the reference tree `fb5c48b`, and
+  the pinned benchd bytes. Runners register through a GitHub App.
 - **Branches.** `main` is the armed contest base
   (`official_scoring_enabled: true`, reference tree `fb5c48b`).
 - **Where the goldens live.** Scoring reads only each Spark's local copy
@@ -195,16 +194,6 @@ Details are in the [engineering log](docs/nemotron35-port-notes.md), sections
   read the checkout ([pool refresh doc](docs/pool-refresh-and-final-rescore.md#where-the-goldens-live)).
 - **Cost.** No GitHub-hosted runner is used, and CI is manual only. The
   ranked job uploads one artifact: the sealed `score.json` that Yukon reads.
-
-## Before launch
-
-| Item | Owner |
-|---|---|
-| Confirm which score source intake reads: the job log (as built) or the `benchmark.json` `scoreArtifact` upload | Intake service |
-| Parse the job-log score exactly as `docs/submission-restriction-spec.md` §10 states (nonce-tagged block only) | Intake service |
-| Confirm intake returns only the sealed score to teams | Intake service |
-| Arm the base on opening day (`official_scoring_enabled: true`) | Organizer |
-| Decide what participants see (a stripped copy without organizer docs, pool names and the sandbox threat model) | Organizer |
 
 ## Document map
 

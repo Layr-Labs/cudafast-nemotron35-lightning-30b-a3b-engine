@@ -91,10 +91,12 @@ snapshot. It needs cargo, docker with the NVIDIA container runtime, jq,
 python3, curl and sha256sum.
 
 ```bash
+mkdir -p "$HOME/rsock" && export SERVE_UP_SOCKET_DIR="$HOME/rsock"
 ./tools/local-baseline.sh
 ```
 
-This command runs one local leg through benchd on the public golden.
+This command runs one local leg through benchd on the public golden. The
+resident's socket must not be under `/tmp`, which the container hides.
 
 ```bash
 cargo test --manifest-path harness/protocol-adapter/Cargo.toml

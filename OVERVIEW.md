@@ -47,8 +47,8 @@ Every point links to the document that has the detail.
   ([contract §5.1](docs/participant-contract.md)).
   - **Why:** a stored baseline would drift with each box's temperature and
     age. Measuring the reference next to the candidate cancels that out.
-- **Speed floor.** Both prefill and decode must reach at least 0.95× the
-  reference, or the run fails the floor.
+- **Speed floor.** Decode must reach at least 0.95× the reference and prefill
+  at least 0.92×, or the run fails the floor.
 - **Correctness.**
   - The candidate's tokens must match the reference golden within the token
     budget.

@@ -117,7 +117,7 @@ State on 2026-10-20 (section 7.14 has the record).
    Every box is calibrated with a CV limit of 2% (`calibration_max_cv_percent`,
    PR #34); the measured CVs are all under 1% (section 7.14).
 5. **GB10 temperature — resolved.** `nvidia-smi` reports a GPU temperature on
-   all eight Sparks, and the cool gate is 60 °C (section 7.5).
+   all eight Sparks tested in 2026-09, and the cool gate is 60 °C (section 7.5).
 6. **Logit ties — open.** The current benchd has no timed reference replay, so
    the timed window is an exact match (sections 7.8 and 7.13).
 

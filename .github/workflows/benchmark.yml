@@ -742,6 +742,26 @@ jobs:
           fi
           exit "${rc}"
 
+      - name: Score plausibility gate (prefill ceiling)
+        # Contract section 8: prefill gain above the ceiling means the timed pass
+        # reused earlier work. Run after sandbox cleanup and before reveal so a
+        # refused score is never printed or uploaded.
+        if: always()
+        run: |
+          set -uo pipefail
+          set +e
+          gate_out="$(./tools/score-plausibility-gate.sh score.json 2>&1)"
+          gate_rc=$?
+          set -e
+          printf '%s\n' "${gate_out}"
+          if [[ "${gate_rc}" -eq 0 ]]; then
+            ( umask 077; : > "${RUNNER_TEMP}/plausibility-ok" )
+          else
+            last_line="${gate_out##*$'\n'}"
+            echo "::error title=score refused by the plausibility gate::${last_line}" >&2
+            exit 1
+          fi
+
       - name: Reveal the sealed score
         id: reveal
         # After sandbox cleanup: no participant process can still be alive. The
@@ -751,7 +771,7 @@ jobs:
           set -euo pipefail
           nonce="$(cat "${RUNNER_TEMP}/score-nonce")"
           echo "NEMOTRON35-SCORE-BEGIN ${nonce}"
-          if [[ -f "${RUNNER_TEMP}/cleanup-ok" ]]; then
+          if [[ -f "${RUNNER_TEMP}/cleanup-ok" && -f "${RUNNER_TEMP}/plausibility-ok" ]]; then
             if [[ -f score.json ]]; then
               cat score.json
               if [[ -s score.json ]] && [[ "$(tail -c1 score.json)" != $'\n' ]]; then

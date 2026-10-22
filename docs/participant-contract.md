@@ -363,6 +363,14 @@ The score is the mean of the three per-pair composites
 Timed prefill is the median of five passes after one unmeasured warm-up pass
 (`official_prefill_timed_runs` = 5, `official_prefill_warmup_runs` = 1).
 
+**Prefill ceiling (workflow gate).** A ranked run whose prefill gain is above
+1.5 in any pair fails and gets no sealed score: no reveal block and no score
+artifact (`tools/score-plausibility-gate.sh`, run after sandbox cleanup and
+before the reveal). This is a policy ceiling: real prefill work on this engine
+scores near 1.0, and a gain far above that usually means the timed passes
+reused earlier work, which section 8 bans. The gate does not detect all reuse;
+section 8 still applies below the ceiling.
+
 ### 5.4 Token fidelity
 
 benchd applies a per-stream token-tolerance gate with a **10% budget** against
@@ -597,7 +605,8 @@ catches it:
   It also covers the prefill warm-up pass: the timed prefill follows one
   unmeasured prefill of the SAME prompt in the SAME phase, and each pass must
   be computed in full. Carrying anything from the warm-up pass into the timed
-  pass is this offence.
+  pass is this offence. The workflow's prefill ceiling (section 5.3) refuses such
+  a run when the gain shows it.
 - **Hardcoded content.** Hidden prompts, token ids or answers.
 - **Timing and protocol tricks.** Timing shortcuts, protocol injection, moving
   work across the prefill/decode boundary (section 5.1.1), network access, and

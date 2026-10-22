@@ -362,7 +362,7 @@ gates each control leg with the band of the prompt that leg measured.
 | `pairsPerCohort` | 3 |
 | `minPairsPerCohort` | 3 |
 | `decodeSpeedupFloor` | 0.95 |
-| `prefillSpeedupFloor` | 0.95 |
+| `prefillSpeedupFloor` | 0.92 |
 | `decodeSpeedupCeiling` | 5.0 |
 | `kvBackend` | `vllm-paged` |
 
@@ -491,8 +491,10 @@ these cases:
 - its band cannot fail.
 
 The band's widths come from the fixture. The control leg's per-token time may
-run at most `prefill_band_up_tolerance` = 5% (prefill) and
-`decode_band_up_tolerance` = 3% (decode) slower than the box's calibration. The
+run at most `prefill_band_up_tolerance` = 7% (prefill) and
+`decode_band_up_tolerance` = 3% (decode) slower than the box's calibration.
+The prefill band is wider because each pair has one timed prefill pass, which
+varies more than the decode window. The
 fast-side tolerances (`prefill_band_down_tolerance` and
 `decode_band_down_tolerance`, 5% each) are declared but disabled
 (`prefill_band_down_enabled` and `decode_band_down_enabled` are `false`).

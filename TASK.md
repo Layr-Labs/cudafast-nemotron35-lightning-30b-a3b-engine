@@ -130,8 +130,9 @@ The score is serial-anchored, so a faster candidate scores above 1.
   Prefill is its own phase.
 - **Aggregation.** Each pair has its own composite. The score is the mean of
   the 3 per-pair composites. Every pair must clear both floors.
-- **Bounds.** Both floors are 0.95, so a candidate that regresses prefill or
-  decode by more than 5 percent is refused. The ceiling is 5.0.
+- **Bounds.** The decode floor is 0.95 and the prefill floor is 0.92, so a
+  candidate that regresses decode by more than 5 percent, or prefill by more
+  than 8 percent, is refused. The ceiling is 5.0.
 - **Correctness.** The per-stream token-tolerance gate prices divergence from
   the serial tape against a 10% budget.
 

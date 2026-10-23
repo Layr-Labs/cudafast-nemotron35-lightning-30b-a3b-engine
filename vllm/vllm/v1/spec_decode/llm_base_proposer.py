@@ -648,7 +648,11 @@ class SpecDecodeBaseProposer:
             positions = self.mrope_positions[:, token_indices_to_sample]
         else:
             positions = self.positions[token_indices_to_sample]
-        hidden_states = hidden_states[token_indices_to_sample]
+        if hidden_states is last_hidden_states:
+            # Same tensor, same index: reuse the gather done above.
+            hidden_states = sample_hidden_states
+        else:
+            hidden_states = hidden_states[token_indices_to_sample]
 
         if self.constant_draft_positions:
             # Write the sampling positions into the front of the
@@ -704,7 +708,9 @@ class SpecDecodeBaseProposer:
             # Update the inputs.
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax() returns int64 by default.
-            input_ids = draft_token_ids_list[-1].int()
+            input_ids = draft_token_ids_list[-1]
+            if self.supports_mm_inputs or self.use_heterogeneous_vocab:
+                input_ids = input_ids.int()
 
             if self.use_heterogeneous_vocab:
                 # Map target token IDs to draft vocab space (TLI algorithm)
@@ -781,8 +787,8 @@ class SpecDecodeBaseProposer:
                 draft_probs_list.append(draft_probs)
             draft_token_ids_list.append(draft_token_ids)
 
-        if set_moe_row_src is not None:
-            set_moe_row_src(max(num_input_tokens, input_batch_size), None)
+        # No identity reset here: the next cycle's first pass re-points rows
+        # [0, num_input_tokens) before any read (batch size is always 1).
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)

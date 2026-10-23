@@ -96,6 +96,15 @@ the caps:
 The cap exists so that source cannot hide lookup tables. It also refuses
 symlinks and special files anywhere under an editable path.
 
+Before archive extraction, the intake validates every member. It refuses
+hardlinks, symlinks, special files, duplicate names, absolute paths, parent
+paths, NUL paths, sparse members, and paths outside `editablePaths`. It also
+refuses a negative or non-integer member size. It applies the per-file and
+total byte caps from the trusted `benchmark.json`. The router also limits an
+archive to 10,000 members. Before tar parsing, it limits expanded bytes to
+`maxTotalBytes + max(64 KiB, maxTotalBytes / 4)`. After validation, it creates
+approved directories and writes approved regular files.
+
 ### 3.3 What you may not edit
 
 Everything else: `tools/`, `fixtures/`, `setup.sh`, `benchmark.sh`,
@@ -541,7 +550,14 @@ file's byte count and sha256 against its pin before a ranked run. The fixture's
   (default 5), one run per slot, across different boxes on a held-out pool
   that was never staged during the contest. Each slot is its first run that
   ends with a score or a team failure; infrastructure outcomes and off-pool
-  prompts are re-run, not scored. In the final re-score only, the first candidate
+  prompts are re-run, not scored. The router checks team failures and watchdog
+  outcomes before it checks the prompt. It marks a run off-pool only when the
+  run has a sealed, finite numeric score and a present scored prompt. The
+  scored prompt is off-pool when it is not in the run fixture's `live_goldens`.
+  Booleans, text, NaN, and infinite values are not score evidence. Thus, a
+  missing score or prompt is not off-pool evidence. A cancelled run without a
+  sealed score is a team failure and is not re-dispatched. The run outcome
+  still controls the slot. In the final re-score only, the first candidate
   resident boot failure in a slot may be re-dispatched once; a second boot
   failure in the same slot counts as 0.0. A run that fails because of the
   submission, or a reference-leg or band failure that persists after re-runs,

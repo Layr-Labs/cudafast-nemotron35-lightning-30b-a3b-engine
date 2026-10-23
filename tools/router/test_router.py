@@ -4,6 +4,7 @@ stands in for GitHub (ROUTER_REMOTE); retries and dispatch use a fake `gh`."""
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import py_compile
@@ -92,6 +93,199 @@ class RouterSubmitTest(unittest.TestCase):
         (sub / "vllm/link").symlink_to("/etc/passwd")
         with self.assertRaisesRegex(RuntimeError, "symlink"):
             self.r.submit(sub, "t", "pass")
+
+    def test_archive_refusal_leaves_target_empty(self):
+        def add_file(tf, name, data=b"x"):
+            member = tarfile.TarInfo(name)
+            member.size = len(data)
+            tf.addfile(member, io.BytesIO(data))
+
+        cases = ("hardlink", "symlink", "device", "fifo", "duplicate", "parent", "absolute",
+                 "outside", "file-size", "total-size", "member-count")
+        for case in cases:
+            with self.subTest(case=case):
+                tar = Path(self.tmp.name) / f"{case}.tar"
+                with tarfile.open(tar, "w") as tf:
+                    if case == "hardlink":
+                        member = tarfile.TarInfo("harness/link")
+                        member.type = tarfile.LNKTYPE
+                        member.linkname = "harness/target"
+                        tf.addfile(member)
+                    elif case == "symlink":
+                        member = tarfile.TarInfo("harness/link")
+                        member.type = tarfile.SYMTYPE
+                        member.linkname = "target"
+                        tf.addfile(member)
+                    elif case in ("device", "fifo"):
+                        member = tarfile.TarInfo(f"harness/{case}")
+                        member.type = tarfile.CHRTYPE if case == "device" else tarfile.FIFOTYPE
+                        tf.addfile(member)
+                    elif case == "duplicate":
+                        add_file(tf, "harness/x")
+                        add_file(tf, "harness/x")
+                    elif case == "parent":
+                        add_file(tf, "../x")
+                    elif case == "absolute":
+                        add_file(tf, "/x")
+                    elif case == "outside":
+                        add_file(tf, "tools/x")
+                    elif case == "file-size":
+                        add_file(tf, "harness/x", b"xx")
+                    elif case == "total-size":
+                        add_file(tf, "harness/x")
+                        add_file(tf, "harness/y")
+                    else:
+                        add_file(tf, "harness/x")
+                        add_file(tf, "harness/y")
+                target = Path(self.tmp.name) / f"target-{case}"
+                target.mkdir()
+                limits = {
+                    "file-size": (10, 1, 10),
+                    "total-size": (1, 10, 10),
+                    "member-count": (10, 10, 1),
+                }.get(case, (10, 10, 10))
+                with self.assertRaisesRegex(RuntimeError, "refusing archive"):
+                    router.extract_submission_archive(
+                        tar, target, ["vllm", "harness", "mtp-head.manifest.json"], *limits)
+                self.assertEqual(list(target.iterdir()), [])
+
+    def test_archive_refuses_sparse_members_before_write(self):
+        tar = Path(self.tmp.name) / "sparse.tar"
+        with tarfile.open(tar, "w", format=tarfile.PAX_FORMAT) as tf:
+            member = tarfile.TarInfo("harness/sparse")
+            member.size = 0
+            member.pax_headers = {"GNU.sparse.map": "0,0", "GNU.sparse.realsize": "1"}
+            tf.addfile(member, io.BytesIO())
+        target = Path(self.tmp.name) / "target-sparse"
+        target.mkdir()
+        with self.assertRaisesRegex(RuntimeError, "sparse"):
+            router.extract_submission_archive(tar, target, ["harness"], 10, 10, 10)
+        self.assertEqual(list(target.iterdir()), [])
+
+    def test_archive_refuses_invalid_member_sizes_before_write(self):
+        pax_tar = Path(self.tmp.name) / "invalid-pax-size.tar"
+        with tarfile.open(pax_tar, "w", format=tarfile.PAX_FORMAT) as tf:
+            member = tarfile.TarInfo("harness/file")
+            member.size = 0
+            member.pax_headers = {"size": "1.5"}
+            tf.addfile(member, io.BytesIO())
+        pax_target = Path(self.tmp.name) / "target-invalid-pax-size"
+        pax_target.mkdir()
+        with self.assertRaisesRegex(RuntimeError, "invalid size"):
+            router.extract_submission_archive(pax_tar, pax_target, ["harness"], 10, 10, 10)
+        self.assertEqual(list(pax_target.iterdir()), [])
+
+        source = Path(self.tmp.name) / "invalid-size.tar"
+        source.write_bytes(b"")
+
+        class FakeTar:
+            def __init__(self, member):
+                self.member = member
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                return iter((self.member,))
+
+            def extractfile(self, _member):
+                raise AssertionError("invalid member reached extraction")
+
+        for size in (-1, "1"):
+            with self.subTest(size=size):
+                member = tarfile.TarInfo("harness/file")
+                member.size = size
+                target = Path(self.tmp.name) / f"target-invalid-size-{size}"
+                target.mkdir()
+                with mock.patch.object(router.tarfile, "open", return_value=FakeTar(member)):
+                    with self.assertRaisesRegex(RuntimeError, "invalid size"):
+                        router.extract_submission_archive(source, target, ["harness"], 10, 10, 10)
+                self.assertEqual(list(target.iterdir()), [])
+
+    def test_archive_nul_path_refusal_leaves_target_empty(self):
+        tar = Path(self.tmp.name) / "nul.tar"
+        with tarfile.open(tar, "w", format=tarfile.PAX_FORMAT) as tf:
+            good = tarfile.TarInfo("harness/good")
+            good.size = 1
+            tf.addfile(good, io.BytesIO(b"x"))
+            bad = tarfile.TarInfo("harness/bad")
+            bad.size = 1
+            bad.pax_headers = {"path": "harness/nul\0path"}
+            tf.addfile(bad, io.BytesIO(b"x"))
+        target = Path(self.tmp.name) / "target-nul"
+        target.mkdir()
+        try:
+            with self.assertRaisesRegex(RuntimeError, "NUL"):
+                router.extract_submission_archive(tar, target, ["harness"], 10, 10, 10)
+        finally:
+            self.assertEqual(list(target.iterdir()), [])
+
+    def test_archive_value_error_during_extraction_cleans_target(self):
+        tar = Path(self.tmp.name) / "value-error.tar"
+        with tarfile.open(tar, "w") as tf:
+            for name in ("harness/a", "harness/b"):
+                member = tarfile.TarInfo(name)
+                member.size = 1
+                tf.addfile(member, io.BytesIO(b"x"))
+        target = Path(self.tmp.name) / "target-value-error"
+        target.mkdir()
+        real_copy = shutil.copyfileobj
+        copies = 0
+
+        def fail_second_copy(source, destination):
+            nonlocal copies
+            copies += 1
+            if copies == 2:
+                raise ValueError("copy failed")
+            real_copy(source, destination)
+
+        try:
+            with mock.patch.object(router.shutil, "copyfileobj", side_effect=fail_second_copy):
+                with self.assertRaisesRegex(RuntimeError, "copy failed"):
+                    router.extract_submission_archive(tar, target, ["harness"], 10, 10, 10)
+        finally:
+            self.assertEqual(list(target.iterdir()), [])
+
+    def test_archive_preserves_empty_editable_directory(self):
+        tar = Path(self.tmp.name) / "empty-harness.tar"
+        with tarfile.open(tar, "w") as tf:
+            directory = tarfile.TarInfo("harness/")
+            directory.type = tarfile.DIRTYPE
+            directory.mode = 0o755
+            tf.addfile(directory)
+        sid = self.r.submit(tar, "t", "pass")
+        branch = self.r.db.execute("SELECT branch FROM submissions WHERE id=?", (sid,)).fetchone()[0]
+        self.assertNotIn("harness/a.txt", self.tree(branch))
+
+    def test_archive_refuses_compressed_metadata_bomb(self):
+        tar = Path(self.tmp.name) / "metadata.tar.gz"
+        with tarfile.open(tar, "w:gz", format=tarfile.PAX_FORMAT) as tf:
+            member = tarfile.TarInfo("harness/x")
+            member.size = 1
+            member.pax_headers = {"comment": "x" * (1024 * 1024)}
+            tf.addfile(member, io.BytesIO(b"x"))
+        self.assertLess(tar.stat().st_size, 10_000)
+        target = Path(self.tmp.name) / "target-metadata"
+        target.mkdir()
+        with self.assertRaisesRegex(RuntimeError, "expanded archive"):
+            router.extract_submission_archive(tar, target, ["harness"], 1, 1, 10)
+        self.assertEqual(list(target.iterdir()), [])
+
+    def test_archive_supports_standard_tar_compression(self):
+        for compression in ("gz", "bz2", "xz", "zst"):
+            with self.subTest(compression=compression):
+                tar = Path(self.tmp.name) / f"normal.tar.{compression}"
+                with tarfile.open(tar, f"w:{compression}") as tf:
+                    member = tarfile.TarInfo("harness/x")
+                    member.size = 1
+                    tf.addfile(member, io.BytesIO(b"x"))
+                target = Path(self.tmp.name) / f"target-{compression}"
+                target.mkdir()
+                router.extract_submission_archive(tar, target, ["harness"], 10, 10, 10)
+                self.assertEqual((target / "harness/x").read_bytes(), b"x")
 
 
 class TeamFreezeRescoreTest(unittest.TestCase):
@@ -221,12 +415,13 @@ class TeamFreezeRescoreTest(unittest.TestCase):
             self.r.rescore("origin/main", self.pins, self.log, top=2, runs=2)
         # B completes both in-pool slots; A's second slot is off-pool (infra) so A stays incomplete.
         sha = lambda name: __import__("hashlib").sha256(f"{name}.golden.json".encode()).hexdigest()
-        results = [("A", 1.0, "final-1"), ("A", 3.0, "botany"), ("B", 1.5, "final-2"), ("B", 1.7, "final-1")]
+        results = [("A", 1.0, "final-1"), ("A", 3.0, "final-9"), ("B", 1.5, "final-2"), ("B", 1.7, "final-1")]
         for r, (team, score, prompt) in zip(rows, results):
+            metrics = ({"baseline_golden_sha256": sha(prompt)} if prompt in ("final-1", "final-2")
+                       else {"live_prompt": prompt})
             self.r._update(r["id"], state="done", passed=1, score=score, box=f"box-{score}",
                            outcome="pass",
-                           result=json.dumps({"passed": True, "score": score,
-                                              "metrics": {"baseline_golden_sha256": sha(prompt)}}))
+                           result=json.dumps({"passed": True, "score": score, "metrics": metrics}))
         out = self.t / "rep"
         summary = self.r.rescore_report(out)
         self.assertEqual(summary["ranking"][0]["team"], "B")
@@ -238,7 +433,7 @@ class TeamFreezeRescoreTest(unittest.TestCase):
         self.assertIsNone(summary["ranking"][1]["mean"])
         self.assertEqual(len(summary["off_pool_runs"]), 1)
         rep = json.loads((out / "rescore.json").read_text())
-        self.assertEqual({r["prompt"] for r in rep["runs"]}, {"final-1", "final-2", ""})
+        self.assertEqual({r["prompt"] for r in rep["runs"]}, {"final-1", "final-2", "final-9"})
         self.assertIn("box-1.7", (out / "rescore.html").read_text())
 
     def test_rescore_report_slot_mean_counts_team_failures_as_zero(self):
@@ -283,7 +478,6 @@ class TeamFreezeRescoreTest(unittest.TestCase):
         self.r.rescore("origin/main", self.pins, self.log, top=1, runs=2)
         rows = self.r.db.execute("SELECT * FROM submissions WHERE rescore='final' ORDER BY created").fetchall()
         sha_final = __import__("hashlib").sha256(b"final-1.golden.json").hexdigest()
-        sha_botany = __import__("hashlib").sha256(b"botany.golden.json").hexdigest()
         by_slot = {router.rescore_slot_index(dict(r)): r for r in rows}
         self.r._update(by_slot[0]["id"], state="done", passed=1, score=1.0, outcome="pass",
                        result=json.dumps({"metrics": {"baseline_golden_sha256": sha_final}}))
@@ -298,8 +492,8 @@ class TeamFreezeRescoreTest(unittest.TestCase):
         self.assertEqual(retry_row["rescore_slot"], 1)
         with self.assertRaisesRegex(RuntimeError, "still queued or running"):
             self.r.rescore_retry("final")
-        self.r._update(retry_row["id"], state="done", passed=0, outcome="pass",
-                       result=json.dumps({"metrics": {"baseline_golden_sha256": sha_botany}}))
+        self.r._update(retry_row["id"], state="done", passed=1, score=9.0, outcome="pass",
+                       result=json.dumps({"metrics": {"live_prompt": "botany"}}))
         summary = self.r.rescore_report(self.t / "off-pool")
         self.assertEqual(summary["ranking"][0]["status"], "incomplete")
         self.assertEqual(len(summary["off_pool_runs"]), 1)
@@ -392,6 +586,33 @@ class TeamFreezeRescoreTest(unittest.TestCase):
         self.assertEqual(resolved["status"], "team_failure")
         self.assertEqual(resolved["value"], 0.0)
 
+    def test_rescore_missing_scores_are_team_failures_without_retry(self):
+        self.sub("A", "a", 1.0)
+        self.r.freeze()
+        self.log.write_text(f"{time.time() + 1} final box-1 final-1.golden.json {'b' * 64}\n")
+        self.r.rescore("origin/main", self.pins, self.log, top=1, runs=3)
+        rows = self.r.db.execute(
+            "SELECT * FROM submissions WHERE rescore='final' ORDER BY created").fetchall()
+        by_slot = {router.rescore_slot_index(dict(row)): row for row in rows}
+        self.r._update(by_slot[0]["id"], state="done", passed=0, score=None, outcome="unsealed")
+        self.r._update(by_slot[1]["id"], state="done", passed=0, score=None,
+                       outcome="watchdog_timeout", incident="watchdog: cancelled after 90 min")
+        self.r._update(by_slot[2]["id"], state="done", passed=0, score=None, outcome="cancelled")
+
+        summary = self.r.rescore_report(self.t / "missing-score")
+        slots = summary["ranking"][0]["slots"]
+        self.assertEqual([slot["status"] for slot in slots],
+                         ["team_failure", "team_failure", "team_failure"])
+        self.assertEqual(summary["off_pool_runs"], [])
+        self.assertEqual(router.rescore_run_kind({**dict(by_slot[0]), "state": "done",
+                                                  "outcome": "unsealed"}, True), "team_failure")
+        self.assertEqual(router.rescore_run_kind({**dict(by_slot[1]), "state": "done",
+                                                  "outcome": "watchdog_timeout"}, True), "team_failure")
+        self.assertEqual(router.rescore_run_kind({**dict(by_slot[2]), "state": "done",
+                                                  "outcome": "cancelled"}, True), "team_failure")
+        self.assertEqual(router.contest_run_value({"state": "done", "outcome": "cancelled", "score": None}), 0.0)
+        self.assertEqual(self.r.rescore_retry("final")["redispatched"], [])
+
 
 class ResolveRescoreSlotTest(unittest.TestCase):
     @staticmethod
@@ -464,6 +685,14 @@ class ResolveRescoreSlotTest(unittest.TestCase):
         resolved = router.resolve_rescore_slot([row], 2)
         self.assertEqual(resolved["status"], "team_failure")
         self.assertEqual(resolved["value"], 0.0)
+
+    def test_off_pool_requires_finite_numeric_score(self):
+        pool = {"final-1"}
+        for score in (None, False, True, "1.0", float("nan"), float("inf"), float("-inf")):
+            with self.subTest(score=score):
+                self.assertFalse(router.scored_prompt_is_off_pool({"score": score}, "final-9", pool))
+        self.assertFalse(router.scored_prompt_is_off_pool({"score": 1}, "final-1", pool))
+        self.assertTrue(router.scored_prompt_is_off_pool({"score": 1.0}, "final-9", pool))
 
 
 def uuid_hex():

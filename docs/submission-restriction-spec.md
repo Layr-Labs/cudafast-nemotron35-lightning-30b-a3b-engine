@@ -326,6 +326,16 @@ ranked workflow) is responsible for:
   and fail closed on an empty or unparseable allowlist. Read `editablePaths`
   from the trusted base, never from the archive: this is also what stands in
   for upstream's trusted-source-scope check (`verify-trusted-source-scope.sh`).
+- **Archive validation.** Validate all members before the first write. Refuse
+  hardlinks, symlinks, special files, duplicate names, absolute paths, parent
+  paths, NUL paths, sparse members, and paths outside `editablePaths`. Refuse
+  each negative or non-integer member size before byte accounting. Read the
+  byte caps from the trusted `benchmark.json`. The router permits at most
+  10,000 archive members. After
+  standard decompression, it limits expanded bytes to
+  `maxTotalBytes + max(64 KiB, maxTotalBytes / 4)`. After validation, create
+  approved directories and write approved regular files. A refusal leaves
+  the archive staging directory empty.
 - **Dispatching only on the trusted base.** The workflow, tools and fixture
   come from the base commit; a submission changes only its editable paths.
 - **Returning only the score.** Job logs are never shown to participants
@@ -421,8 +431,7 @@ conclusions and the parse result:
   `unsealed` for load tests).
 - Failures before **Setup** runs: **`surface_refused`**, **`preflight_refused`**
   (and related refused outcomes), not `unsealed`.
-- **`cancelled`** (manual or external cancel, not the watchdog): infrastructure,
-  not a team failure.
+- **`cancelled`** without a sealed score: team failure. Do not re-dispatch it.
 
 The reference parser in this repository is `tools/router/router.py`
 `score_from_log` (organizer tooling, outside participant `editablePaths`).

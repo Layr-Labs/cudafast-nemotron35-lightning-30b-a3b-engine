@@ -12,6 +12,7 @@ trap 'rm -rf "${WORK}"' EXIT
 
 passed=0
 failed=0
+GATE_DECLARED_DEPTH=3
 
 ok() {
   echo "ok    $1"
@@ -37,10 +38,9 @@ write_audit_without_depth() {
 }
 
 run_gate() {
-  local args=("${WORK}/score.json")
-  if [[ -f "${WORK}/audit.json" ]]; then
-    args+=("${WORK}/audit.json")
-  fi
+  local audit="" args
+  [[ ! -f "${WORK}/audit.json" ]] || audit="${WORK}/audit.json"
+  args=("${WORK}/score.json" "${audit}" "${GATE_DECLARED_DEPTH:-3}")
   [[ -z "${GATE_CONTRACT:-}" ]] || args+=("${GATE_CONTRACT}")
   "${GATE}" "${args[@]}" 2>&1
 }
@@ -301,34 +301,55 @@ if [[ "${rc}" -eq 0 ]]; then ok "(r) depth 3 seed ratio 1.33 passes"; else bad "
 write_audit '{"score": 1.0, "metrics": {"effective_spec_depth": 6, "paired_legs": [
   {"pair": 1, "control_seed_prefill_window_seconds_per_token": 1.0, "candidate_seed_prefill_window_seconds_per_token": 1.47}
 ]}}'
-out="$(run_gate)"; rc=$?
+GATE_DECLARED_DEPTH=6; out="$(run_gate)"; rc=$?
 if [[ "${rc}" -eq 0 ]]; then ok "(s) depth 6 seed ratio 1.47 passes"; else bad "(s) depth 6 seed ratio 1.47 passes" "rc=${rc} out=${out}"; fi
 
 # (s2) depth 6, candidate seed 1.6x control -> ok under its 1.7 limit (the old fixed 1.5 would refuse it)
 write_audit '{"score": 1.0, "metrics": {"effective_spec_depth": 6, "paired_legs": [
   {"pair": 1, "control_seed_prefill_window_seconds_per_token": 1.0, "candidate_seed_prefill_window_seconds_per_token": 1.6}
 ]}}'
-out="$(run_gate)"; rc=$?
+GATE_DECLARED_DEPTH=6; out="$(run_gate)"; rc=$?
 if [[ "${rc}" -eq 0 ]]; then ok "(s2) depth 6 seed ratio 1.6 passes"; else bad "(s2) depth 6 seed ratio 1.6 passes" "rc=${rc} out=${out}"; fi
 
 # (t) depth 6, candidate seed 1.75x control -> refused above its 1.7 limit
 write_audit '{"score": 1.0, "metrics": {"effective_spec_depth": 6, "paired_legs": [
   {"pair": 1, "control_seed_prefill_window_seconds_per_token": 1.0, "candidate_seed_prefill_window_seconds_per_token": 1.75}
 ]}}'
-out="$(run_gate)"; rc=$?
+GATE_DECLARED_DEPTH=6; out="$(run_gate)"; rc=$?
 if [[ "${rc}" -eq 1 && "${out}" == *"REFUSED pair 1:"* ]]; then ok "(t) depth 6 seed ratio 1.75 refused"; else bad "(t) depth 6 seed ratio 1.75 refused" "rc=${rc} out=${out}"; fi
 
 # (u) a passed audit without the candidate depth -> refused
 write_audit_without_depth '{"score": 1.0, "metrics": {"paired_legs": [
   {"pair": 1, "control_seed_prefill_window_seconds_per_token": 1.0, "candidate_seed_prefill_window_seconds_per_token": 1.0}
 ]}}'
+GATE_DECLARED_DEPTH=3
 out="$(run_gate)"; rc=$?
 if [[ "${rc}" -eq 1 && "${out}" == *"effective_spec_depth"* ]]; then ok "(u) missing candidate depth refused"; else bad "(u) missing candidate depth refused" "rc=${rc} out=${out}"; fi
+
+# (u2) the audit depth cannot select a limit that differs from the declaration.
+write_audit '{"score": 1.0, "metrics": {"effective_spec_depth": 6, "paired_legs": [
+  {"pair": 1, "control_seed_prefill_window_seconds_per_token": 1.0, "candidate_seed_prefill_window_seconds_per_token": 1.0}
+]}}'
+out="$(run_gate)"; rc=$?
+if [[ "${rc}" -eq 1 && "${out}" == *"does not match declared depth 3"* ]]; then ok "(u2) audit depth mismatch refused"; else bad "(u2) audit depth mismatch refused" "rc=${rc} out=${out}"; fi
+
+# (u3) serial accepts an absent or zero depth, but no other value.
+write_audit_without_depth '{"score": 1.0, "metrics": {"paired_legs": [
+  {"pair": 1, "control_seed_prefill_window_seconds_per_token": 1.0, "candidate_seed_prefill_window_seconds_per_token": 1.0}
+]}}'
+GATE_DECLARED_DEPTH=0; out="$(run_gate)"; rc=$?
+if [[ "${rc}" -eq 0 ]]; then ok "(u3) serial audit with absent depth passes"; else bad "(u3) serial audit with absent depth passes" "rc=${rc} out=${out}"; fi
+write_audit '{"score": 1.0, "metrics": {"effective_spec_depth": 1, "paired_legs": [
+  {"pair": 1, "control_seed_prefill_window_seconds_per_token": 1.0, "candidate_seed_prefill_window_seconds_per_token": 1.0}
+]}}'
+GATE_DECLARED_DEPTH=0; out="$(run_gate)"; rc=$?
+if [[ "${rc}" -eq 1 && "${out}" == *"does not match declared depth 0"* ]]; then ok "(u3) serial audit with depth one refused"; else bad "(u3) serial audit with depth one refused" "rc=${rc} out=${out}"; fi
 
 # (v) a depth with no configured limit -> refused
 write_audit '{"score": 1.0, "metrics": {"effective_spec_depth": 7, "paired_legs": [
   {"pair": 1, "control_seed_prefill_window_seconds_per_token": 1.0, "candidate_seed_prefill_window_seconds_per_token": 1.0}
 ]}}'
+GATE_DECLARED_DEPTH=7
 out="$(run_gate)"; rc=$?
 if [[ "${rc}" -eq 1 && "${out}" == *"no valid seed-window limit"* ]]; then ok "(v) missing depth limit refused"; else bad "(v) missing depth limit refused" "rc=${rc} out=${out}"; fi
 
@@ -339,7 +360,13 @@ jq 'del(.seed_window_cand_over_control_limit_by_depth)' \
 write_audit_without_depth '{"score": 1.0, "metrics": {"paired_legs": [
   {"pair": 1, "control_seed_prefill_window_seconds_per_token": 1.0, "candidate_seed_prefill_window_seconds_per_token": 1.6}
 ]}}'
-GATE_CONTRACT="${OLD_FIXTURE}" out="$(run_gate)"; rc=$?
+write_audit '{"score": 1.0, "metrics": {"effective_spec_depth": 3, "paired_legs": [
+  {"pair": 1, "control_seed_prefill_window_seconds_per_token": 1.0, "candidate_seed_prefill_window_seconds_per_token": 1.6}
+]}}'
+GATE_DECLARED_DEPTH=3
+GATE_CONTRACT="${OLD_FIXTURE}"
+out="$(run_gate)"; rc=$?
+unset GATE_CONTRACT
 if [[ "${rc}" -eq 1 && "${out}" == *"REFUSED pair 1:"* && "${out}" == *"fixed 1.5 limit"* && "${out}" != *"Traceback"* ]]; then
   ok "(w) old fixture ratio 1.6 refuses cleanly"
 else

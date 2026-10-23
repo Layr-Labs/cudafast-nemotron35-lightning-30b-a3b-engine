@@ -21,7 +21,8 @@
 #      adapter-home and sock directories are trusted only with fixed metadata;
 #   5. removes every SysV object whose owner uid or creator uid is the sandbox
 #      uid;
-#   6. verifies nothing tied to the sandbox uid is left in any of those places,
+#   6. clears the sandbox user's persistent and user keyrings;
+#   7. verifies nothing tied to the sandbox uid is left in any of those places,
 #      and exits non-zero if something is. Only counts are printed: a name
 #      could carry prompt text.
 #
@@ -65,6 +66,52 @@ as_sandbox true || { echo "sandbox-wipe.sh: 'sudo -n -u ${SANDBOX_USER}' fails; 
 SANDBOX_UID="$(id -u "${SANDBOX_USER}" 2>/dev/null)" \
   || { echo "sandbox-wipe.sh: cannot resolve uid for ${SANDBOX_USER}" >&2; exit 1; }
 as_sandbox kill -KILL -1 >/dev/null 2>&1
+
+KEYRING_STATUS="$(as_sandbox python3 - keyring-clear "${SANDBOX_UID}" <<'PY'
+import ctypes
+import errno
+import os
+import sys
+
+machine = os.uname().machine
+syscall_number = {"aarch64": 219, "arm64": 219,
+                  "x86_64": 250, "amd64": 250}.get(machine)
+if syscall_number is None:
+    raise SystemExit(1)
+
+libc = ctypes.CDLL(None, use_errno=True)
+KEYCTL_CLEAR = 7
+KEYCTL_GET_PERSISTENT = 22
+KEY_SPEC_PROCESS_KEYRING = -2
+KEY_SPEC_USER_KEYRING = -4
+KEY_SPEC_USER_SESSION_KEYRING = -5
+unsupported = {errno.EOPNOTSUPP, errno.ENOSYS}
+was_unsupported = False
+
+def keyctl(command, arg2=0, arg3=0):
+    global was_unsupported
+    result = libc.syscall(*(ctypes.c_long(value) for value in
+                            (syscall_number, command, arg2, arg3, 0, 0)))
+    if result == -1:
+        error = ctypes.get_errno()
+        if error in unsupported:
+            was_unsupported = True
+            return None
+        raise SystemExit(1)
+    return result
+
+persistent = keyctl(KEYCTL_GET_PERSISTENT, int(sys.argv[2]), KEY_SPEC_PROCESS_KEYRING)
+if persistent is not None:
+    keyctl(KEYCTL_CLEAR, persistent)
+keyctl(KEYCTL_CLEAR, KEY_SPEC_USER_KEYRING)
+keyctl(KEYCTL_CLEAR, KEY_SPEC_USER_SESSION_KEYRING)
+print("unsupported" if was_unsupported else "cleared")
+PY
+)" || { echo "sandbox-wipe.sh: cannot clear sandbox keyrings" >&2; exit 1; }
+case "${KEYRING_STATUS}" in
+  cleared|unsupported) ;;
+  *) echo "sandbox-wipe.sh: cannot clear sandbox keyrings" >&2; exit 1 ;;
+esac
 
 if [[ -n "${JOB_DIR}" ]] && ! python3 - "${SANDBOX_ROOT%/}" "${SANDBOX_JOB}" "$(id -u)" <<'PY'
 import os
@@ -312,4 +359,4 @@ for kind in -m -s -q; do
   [[ "${n}" -eq 0 ]] || { echo "sandbox-wipe.sh: ${n} SysV IPC object(s) tied to uid ${SANDBOX_UID} (${kind}) remain" >&2; left=1; }
 done
 [[ "${left}" -eq 0 ]] || exit 1
-echo "sandbox-wipe.sh: no sandbox state remains in ${#DIRS[@]} wipe directories, the passwd home, the job directory, or SysV IPC"
+echo "sandbox-wipe.sh: no sandbox state remains in ${#DIRS[@]} wipe directories, the passwd home, the job directory, or SysV IPC; keyrings ${KEYRING_STATUS}"

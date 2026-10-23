@@ -561,8 +561,8 @@ fi
 # serial while its oracle is the MTP one. benchd carries the declared depth
 # with --mtp-depth N; a benchd that does not know the flag cannot run an MTP
 # leg, and that is a refusal, never a silent serial run.
+DECLARED_DEPTH="$("${SCRIPT_DIR}/tools/spec-declaration.sh" draft-len)"
 if [[ "${SPEC_DESC}" != "serial" ]]; then
-  DECLARED_DEPTH="$("${SCRIPT_DIR}/tools/spec-declaration.sh" draft-len)"
   if "${BENCHD}" iterate --help 2>&1 | grep -q -- '--mtp-depth'; then
     iterate_official+=( --mtp-depth "${DECLARED_DEPTH}" )
     echo "nemotron35-measure-and-score.sh: benchd will request the declared spec (--mtp-depth ${DECLARED_DEPTH})" >&2

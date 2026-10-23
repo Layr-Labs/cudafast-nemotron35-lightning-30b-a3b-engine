@@ -10,7 +10,8 @@ DECODE_GAIN_CEILING=5.0
 # Seed-prefill window ratio: seed prefill reusing earlier work (participant
 # contract sections 5.1.1 and 8). The other direction is depth-specific.
 SEED_WINDOW_GAIN_CEILING=1.5
-CONTRACT="${3:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/fixtures/nemotron35_lightning_30b_a3b_track.json}"
+DECLARED_DEPTH="${3:-}"
+CONTRACT="${4:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/fixtures/nemotron35_lightning_30b_a3b_track.json}"
 
 score_path="${1:-}"
 audit_path="${2:-}"
@@ -24,7 +25,7 @@ if [[ ! -f "${score_path}" ]]; then
   exit 0
 fi
 
-DECODE_GAIN_CEILING="${DECODE_GAIN_CEILING}" exec python3 -I - "${score_path}" "${PREFILL_GAIN_CEILING}" "${SEED_WINDOW_GAIN_CEILING}" "${audit_path}" "${CONTRACT}" <<'PY'
+DECODE_GAIN_CEILING="${DECODE_GAIN_CEILING}" exec python3 -I - "${score_path}" "${PREFILL_GAIN_CEILING}" "${SEED_WINDOW_GAIN_CEILING}" "${audit_path}" "${DECLARED_DEPTH}" "${CONTRACT}" <<'PY'
 import json
 import math
 import os
@@ -34,7 +35,8 @@ path = sys.argv[1]
 ceiling = float(sys.argv[2])
 seed_gain_ceiling = float(sys.argv[3])
 audit_path = sys.argv[4]
-contract_path = sys.argv[5]
+declared_depth_text = sys.argv[5]
+contract_path = sys.argv[6]
 prefix = "score-plausibility-gate:"
 
 try:
@@ -127,6 +129,24 @@ if not isinstance(audit, dict):
 audit_metrics = audit.get("metrics") or {}
 
 try:
+    if not declared_depth_text.isascii() or not declared_depth_text.isdecimal():
+        raise ValueError
+    declared_depth = int(declared_depth_text)
+except ValueError:
+    print(f"{prefix} REFUSED declared depth is missing or not a non-negative integer")
+    sys.exit(1)
+
+audit_depth = audit_metrics.get("effective_spec_depth")
+if declared_depth == 0 and audit_depth is None:
+    audit_depth = 0
+if isinstance(audit_depth, bool) or not isinstance(audit_depth, int):
+    print(f"{prefix} REFUSED private audit has no integer metrics.effective_spec_depth")
+    sys.exit(1)
+if audit_depth != declared_depth:
+    print(f"{prefix} REFUSED private audit effective_spec_depth {audit_depth} does not match declared depth {declared_depth}")
+    sys.exit(1)
+
+try:
     with open(contract_path, encoding="utf-8") as f:
         contract = json.load(f)
 except (OSError, json.JSONDecodeError):
@@ -138,19 +158,15 @@ if limits is None:
     seed_slow_ceiling = 1.5
     seed_slow_label = "fixed 1.5 limit"
 else:
-    depth = audit_metrics.get("effective_spec_depth")
-    if isinstance(depth, bool) or not isinstance(depth, int):
-        print(f"{prefix} REFUSED private audit has no integer metrics.effective_spec_depth")
-        sys.exit(1)
-    seed_slow_ceiling = limits.get(str(depth)) if isinstance(limits, dict) else None
-    seed_slow_label = f"depth {depth} limit"
+    seed_slow_ceiling = limits.get(str(declared_depth)) if isinstance(limits, dict) else None
+    seed_slow_label = f"depth {declared_depth} limit"
 if limits is not None and (
     isinstance(seed_slow_ceiling, bool)
     or not isinstance(seed_slow_ceiling, (int, float))
     or not math.isfinite(float(seed_slow_ceiling))
     or float(seed_slow_ceiling) <= 1.0
 ):
-    print(f"{prefix} REFUSED fixture has no valid seed-window limit for effective_spec_depth {depth}")
+    print(f"{prefix} REFUSED fixture has no valid seed-window limit for declared depth {declared_depth}")
     sys.exit(1)
 seed_slow_ceiling = float(seed_slow_ceiling)
 

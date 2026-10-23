@@ -9,6 +9,7 @@
 #
 #   * the socket path is the FIRST LINE of the file, so one `head -1` reads it;
 #   * --boot exits 0 with the resident STILL SERVING;
+#   * --boot closes its output pipes before it hands the resident over;
 #   * --stop ends it and cleans up after it;
 #   * --stop is IDEMPOTENT, because the caller runs it on success and on failure
 #     alike and a second call must not turn a clean failure into two.
@@ -56,6 +57,34 @@ command -v python3 >/dev/null 2>&1 || { echo "test-serve-up-boot-stop.sh: python
 command -v jq      >/dev/null 2>&1 || { echo "test-serve-up-boot-stop.sh: jq is required" >&2; exit 1; }
 command -v getfacl >/dev/null 2>&1 || { echo "test-serve-up-boot-stop.sh: getfacl is required" >&2; exit 1; }
 command -v setfacl >/dev/null 2>&1 || { echo "test-serve-up-boot-stop.sh: setfacl is required" >&2; exit 1; }
+
+capture_pipes() { # capture_pipes OUTPUT COMMAND... -- both command streams are pipes
+  python3 - "$@" <<'PY'
+import os
+import pathlib
+import signal
+import subprocess
+import sys
+
+output = pathlib.Path(sys.argv[1])
+process = subprocess.Popen(
+    sys.argv[2:], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    start_new_session=True,
+)
+try:
+    stdout, stderr = process.communicate(timeout=10)
+except subprocess.TimeoutExpired:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    stdout, stderr = process.communicate()
+    output.write_bytes(stdout + stderr)
+    raise SystemExit(124)
+output.write_bytes(stdout + stderr)
+raise SystemExit(process.returncode)
+PY
+}
 
 # --- the synthetic window ---------------------------------------------------
 WEIGHTS="${WORK}/weights"
@@ -105,6 +134,18 @@ probe_reply() { # probe_reply LABEL JSON HOSTILE_TEXT EXPECTED_TEXT
   fi
 }
 
+probe_accept() { # probe_accept LABEL JSON
+  local output="${WORK}/probe-$1.out" rc
+  HOSTILE_REPLY="$2" PYTHONPATH="${WORK}/probe-stub" \
+    python3 "${WORK}/serve-up-probe.py" unused >"${output}" 2>&1
+  rc=$?
+  if [[ "${rc}" -eq 0 ]]; then
+    ok "probe / $1: accepted"
+  else
+    fail "probe / $1: rc=${rc}, output=$(cat "${output}")"
+  fi
+}
+
 awk '
   /^  "\$\{run\[@\]\}" - "\$1" <<.PY.$/ { copy=1; next }
   copy && /^PY$/ { exit }
@@ -118,16 +159,115 @@ AF_UNIX = SOCK_STREAM = 1
 class socket:
     def __init__(self, *_args):
         self.replies = [os.environ["HOSTILE_REPLY"].encode() + b"\n", b'{"ok":true}\n']
-    def settimeout(self, _timeout): pass
+    def settimeout(self, timeout):
+        with open(os.environ["PROBE_TIMEOUTS"], "a") as fp:
+            fp.write(f"{timeout}\n")
     def connect(self, _path): pass
     def sendall(self, _data): pass
     def recv(self, _size): return self.replies.pop(0)
     def close(self): pass
 PY
+export PROBE_TIMEOUTS="${WORK}/probe-timeouts"
+: > "${PROBE_TIMEOUTS}"
 probe_reply refused '{"ok":false,"error":"HOSTILE_REFUSAL_TEXT"}' \
   HOSTILE_REFUSAL_TEXT "probe refused: the resident returned an unsuccessful reply"
 probe_reply malformed '{"ok":true,"draft_tokens":"HOSTILE_FIELD_TEXT"}' \
   HOSTILE_FIELD_TEXT "probe refused: the resident returned a malformed hello reply"
+max_reply="$(python3 - <<'PY'
+import json
+reply = {"ok": True, "vocab_size": 1, "eos_token": 1, "mtp_armed": False,
+         "draft_tokens": 1, "ctx_size": 1, "load_epoch": 1, "ident": ""}
+text = json.dumps(reply)
+reply["ident"] = "x" * (65536 - len(text))
+text = json.dumps(reply)
+assert len(text.encode()) == 65536
+print(text)
+PY
+)"
+probe_accept maximum "${max_reply}"
+probe_reply oversized "$(python3 -c 'print("x" * 65537)')" \
+  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx "probe failed: the resident hello reply exceeded 65536 bytes"
+mapfile -t probe_timeouts < "${PROBE_TIMEOUTS}"
+if [[ "${#probe_timeouts[@]}" -ge 3 ]] \
+    && awk -v t="${probe_timeouts[0]}" 'BEGIN { exit !(t > 29 && t <= 30) }' \
+    && awk -v a="${probe_timeouts[0]}" -v b="${probe_timeouts[1]}" -v c="${probe_timeouts[2]}" \
+      'BEGIN { exit !(b <= a && c <= b) }'; then
+  ok "probe / deadline: connect and hello use one 30-second monotonic deadline"
+else
+  fail "probe / deadline: expected one 30-second deadline, got: ${probe_timeouts[*]:-none}"
+fi
+
+# --- case 0: resident logs have a size cap and a count cap ------------------
+UNCAPPED_LOGDIR="${WORK}/uncapped-logs"
+serve SERVE_UP_LOG_DIR="${UNCAPPED_LOGDIR}" "${SERVE_UP}" --boot --spec serial \
+  --draft-len 0 --socket-out "${WORK}/uncapped-socket.txt" > "${WORK}/uncapped-boot.out" 2>&1
+UNCAPPED_SOCKET="$(head -1 "${WORK}/uncapped-socket.txt" 2>/dev/null)"
+for _ in $(seq 1 10); do hello_ok "${UNCAPPED_SOCKET}" || break; done
+sleep 0.1
+uncapped_log="$(find -P "${UNCAPPED_LOGDIR}" -maxdepth 1 -type f -name 'vllm-resident.*.log' -print -quit)"
+if [[ -n "${uncapped_log}" && "$(stat -c %s "${uncapped_log}")" -gt 128 ]]; then
+  ok "case 0: the test writer exceeds 128 bytes without the test cap"
+else
+  fail "case 0: the test writer did not exceed 128 bytes"
+fi
+serve "${SERVE_UP}" --stop --socket "${UNCAPPED_SOCKET}" >/dev/null 2>&1
+
+CAP_LOGDIR="${WORK}/cap-logs"
+mkdir -p "${CAP_LOGDIR}"
+for stamp in 20260101T000001Z 20260101T000002Z 20260101T000003Z; do
+  printf 'old\n' > "${CAP_LOGDIR}/vllm-resident.1-${stamp}.log"
+  sleep 0.01
+done
+ln -s "${WORK}/keep-me" "${CAP_LOGDIR}/vllm-resident.1-20260101T000000Z.log"
+printf 'sentinel\n' > "${WORK}/keep-me"
+serve SERVE_UP_LOG_DIR="${CAP_LOGDIR}" SERVE_UP_LOG_KEEP=2 \
+  SERVE_UP_RESIDENT_LOG_MAX_BYTES=128 "${SERVE_UP}" --boot --spec serial \
+  --draft-len 0 --socket-out "${WORK}/cap-socket.txt" > "${WORK}/cap-boot.out" 2>&1
+CAP_SOCKET="$(head -1 "${WORK}/cap-socket.txt" 2>/dev/null)"
+for _ in $(seq 1 10); do hello_ok "${CAP_SOCKET}" || break; done
+sleep 0.1
+regular_logs="$(find -P "${CAP_LOGDIR}" -maxdepth 1 -type f -name 'vllm-resident.*.log' | wc -l | tr -d ' ')"
+if [[ "${regular_logs}" == 2 \
+    && -L "${CAP_LOGDIR}/vllm-resident.1-20260101T000000Z.log" \
+    && "$(cat "${WORK}/keep-me")" == sentinel ]]; then
+  ok "case 0: start keeps two runner logs and does not follow a matching symlink"
+else
+  fail "case 0: log retention kept ${regular_logs} regular logs or changed the symlink target"
+fi
+new_cap_log="$(find -P "${CAP_LOGDIR}" -maxdepth 1 -type f -name 'vllm-resident.*.log' -printf '%T@ %p\n' | sort -n | tail -1 | cut -d' ' -f2-)"
+if [[ -n "${new_cap_log}" && "$(stat -c %s "${new_cap_log}")" == 128 \
+    && "$(stat -c %a "${new_cap_log}")" == 600 ]]; then
+  ok "case 0: the host resident log stays at 128 bytes and mode 0600"
+else
+  fail "case 0: host log size or mode is wrong"
+fi
+serve "${SERVE_UP}" --stop --socket "${CAP_SOCKET}" >/dev/null 2>&1
+
+# The log drain must not keep the caller's capture pipes open. Benchd uses
+# Command::output() for this boot and waits for both pipes to close.
+PIPE_SOCKET_OUT="${WORK}/pipe-socket.txt"
+PIPE_BOOT_OUT="${WORK}/pipe-boot.out"
+capture_pipes "${PIPE_BOOT_OUT}" env \
+  SERVE_UP_WEIGHTS_DIR="${WEIGHTS}" \
+  SERVE_UP_LOG_DIR="${WORK}/pipe-logs" \
+  SERVE_UP_SOCKET_DIR="${SOCKDIR}" \
+  SERVE_UP_HEALTH_TIMEOUT_S=60 \
+  SERVE_UP_MEMINFO="${WORK}/meminfo" \
+  "${SERVE_UP}" --boot --spec serial --draft-len 0 --socket-out "${PIPE_SOCKET_OUT}"
+pipe_rc=$?
+PIPE_SOCKET="$(head -1 "${PIPE_SOCKET_OUT}" 2>/dev/null)"
+PIPE_PID=""
+if [[ -n "${PIPE_SOCKET}" ]]; then
+  PIPE_PID="$(sed -n 1p "${PIPE_SOCKET}.pid" 2>/dev/null | tr -d '[:space:]')"
+fi
+if [[ "${pipe_rc}" -eq 0 && -n "${PIPE_PID}" ]] && kill -0 "${PIPE_PID}" 2>/dev/null; then
+  ok "case 0: piped boot returns while the resident stays alive"
+else
+  fail "case 0: piped boot rc=${pipe_rc}; the resident did not stay alive"
+fi
+if [[ -n "${PIPE_SOCKET}" ]]; then
+  serve "${SERVE_UP}" --stop --socket "${PIPE_SOCKET}" >/dev/null 2>&1
+fi
 
 # --- case 1: --boot publishes the socket and leaves the resident serving -----
 SOCKET_OUT="${WORK}/leg1/socket.txt"
@@ -398,6 +538,11 @@ printf '%s\n' "\$*" >> "${STUB}/sudo.log"
 [[ "\$1" == -n && "\$2" == -u && "\$4" == -- ]] || { echo "stub sudo: unexpected argv: \$*" >&2; exit 1; }
 shift 4
 [[ "\$1" == kill || "\$1" == true ]] && exit 0
+if [[ "\$1 \${2:-} \${3:-}" == "python3 - keyring-clear" ]]; then
+  cat >/dev/null
+  echo unsupported
+  exit 0
+fi
 [[ "\$1" == ipcrm ]] && exec "${STUB}/bin/ipcrm" "\${@:2}"
 [[ "\$1 \$2 \$3" == "test -w ${WORK}/sbx-home" ]] && exit 1
 exec "\$@"
@@ -438,7 +583,7 @@ run_arg_after() { # run_arg_after FLAG -- every value that follows FLAG in the l
 }
 
 # --- case 7: unsandboxed, the docker path is exactly today's -----------------
-dserve "${TREE}/tools/serve-up.sh" --boot --spec serial --draft-len 0 \
+dserve SERVE_UP_RESIDENT_LOG_MAX_BYTES=128 "${TREE}/tools/serve-up.sh" --boot --spec serial --draft-len 0 \
   --socket-out "${WORK}/leg7/socket.txt" > "${WORK}/boot7.out" 2>&1 \
   || { fail "case 7: --boot exited non-zero"; sed 's/^/    /' "${WORK}/boot7.out" >&2; }
 SOCKET7="$(head -1 "${WORK}/leg7/socket.txt" 2>/dev/null)"
@@ -459,6 +604,14 @@ SOCKET7="$(head -1 "${WORK}/leg7/socket.txt" 2>/dev/null)"
 [[ "$(sed -n 3p "${SOCKET7}.pid" 2>/dev/null)" == serve-up-* ]] \
   && ok "case 7: the pid sidecar beside the socket names the container" \
   || fail "case 7: no sidecar with the container name beside the socket"
+for _ in $(seq 1 10); do hello_ok "${SOCKET7}" || break; done
+sleep 0.1
+docker_log="$(find -P "${WORK}/dlogs" -maxdepth 1 -type f -name 'vllm-resident.*.log' -printf '%T@ %p\n' | sort -n | tail -1 | cut -d' ' -f2-)"
+if [[ -n "${docker_log}" && "$(stat -c %s "${docker_log}")" -le 128 ]]; then
+  ok "case 7: the Docker resident log stays at 128 bytes"
+else
+  fail "case 7: Docker resident log exceeds 128 bytes"
+fi
 dserve "${TREE}/tools/serve-up.sh" --stop --socket "${SOCKET7}" > "${WORK}/stop7.out" 2>&1
 [[ ! -e "${SOCKET7}" && ! -e "${SOCKET7}.pid" && -z "$(ls "${STUB}"/container.* 2>/dev/null)" ]] \
   && ok "case 7: --stop ended the container and removed socket and sidecar" \

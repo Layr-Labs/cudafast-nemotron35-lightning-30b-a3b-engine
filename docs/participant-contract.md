@@ -172,12 +172,11 @@ box.
   a `build.rs` that fetches anything fails.
 - **What comes back is the score, nothing else.** The adapter's stderr is kept
   private and never returned. Job logs can be public; they carry no text your
-  engine supplied, and neither does the score record. An engine error appears
-  as a failure class plus the sha256 and byte count of its message. Identity
-  strings and acceptance lengths are summarised, not copied.
-- **Reported digests are hashed.** The score record carries the sha256 of the
-  `head_provenance_sha256` and `runner_manifest_sha256` strings your engine
-  reports, never the reported values themselves.
+  engine supplied, and neither does the score record. Public output carries
+  fixed markers, never engine-chosen values (#433). Adapter stdout lines are
+  capped and the channel bounded (#431). The private audit keeps full details.
+- **Reported digests are private.** Public output uses a fixed marker when the
+  engine reports `head_provenance_sha256` or `runner_manifest_sha256`.
 - **Nothing persists between jobs or legs.** Temp files, shared memory, IPC
   objects and message queues the sandbox user leaves are wiped, every process
   it started is killed after its leg, and it cannot schedule jobs. Do not rely
@@ -333,6 +332,10 @@ The seed token's index: `seed_token` is `expected_decode_seed_token`;
 Every timed phase waits behind benchd's GPU cool-down gate. The ranked job
 waits for the box to go quiescent first, and refuses to run with no
 temperature reader.
+
+Setup has a 45-minute limit. GPU-exclusive measurement has a 90-minute limit.
+The ranked job has a 150-minute limit. Cleanup and reveal use `always()`, so
+they still run after either step reaches its limit.
 
 ### 5.2.1 Every job measures every live golden
 
@@ -622,7 +625,7 @@ The rest of the command surface:
 | Engine source | vLLM `v0.27.1` @ `6e448d0ea9bf3d88d898b65449ca6dc2aec170ac` (`vllm/VENDOR.json`) |
 | Engine image | `docker.io/vllm/vllm-openai:v0.27.1` @ `sha256:1c8e60a0841b333c700488cb029d3664807249da0c071e862191b00fe34b228c` |
 | Driver floor | `580.159.03` |
-| benchd | `Layr-Labs/benchd` dist commit `92da41a15ed7e80896c67033dbcf813a88fa9dc8`, built from source `918b8acaf122fb4bedef1f79f580c7c23c65b905` (public snapshot `0aacae37f70e681d2465fff23856665a04bc44cd`); `dist/linux-aarch64/benchd.manifest.json` there gives each binary's sha256 and bytes. `tools/fetch-benchd.sh` (`PINNED_SOURCE_COMMIT` / `PINNED_PUBLIC_SOURCE_COMMIT`) is the authority. |
+| benchd | `Layr-Labs/benchd` dist commit `4d7aa439ec82b280c62233944eaa57695c59fda7`, built from source `b0a79f281821b46b86f0049e3fbf232546898626` (public snapshot `45bfca2cd2ab1bcf572cfd9133e900f7dc7def11`); public output carries fixed markers, never engine-chosen values (#433), and adapter stdout lines are capped and the channel bounded (#431). `tools/fetch-benchd.sh` is the authority. |
 
 ## 8. Prohibited techniques
 

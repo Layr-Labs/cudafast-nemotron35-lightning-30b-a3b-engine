@@ -172,6 +172,27 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
                 eps=getattr(config, "layer_norm_epsilon", 1e-5),
             )
 
+        # Row source for the MoE input. The drafter only samples one row per
+        # request, so the proposer points every row of a request at that row.
+        # All rows then route to the same experts and the MoE reads only those
+        # experts' weights. The kernels are row-independent, so the sampled
+        # row's output is bit-identical. Identity by default.
+        max_rows = (
+            model_config.max_model_len if model_config is not None else 8192
+        )
+        from vllm.config import get_current_vllm_config
+
+        try:
+            max_rows = max(
+                max_rows,
+                get_current_vllm_config().scheduler_config.max_num_batched_tokens,
+            )
+        except Exception:
+            pass
+        self.register_buffer(
+            "moe_row_src", torch.arange(max_rows, dtype=torch.long), persistent=False
+        )
+
     def forward(
         self,
         inputs_embeds: torch.Tensor,
@@ -192,11 +213,16 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
             )
             hidden_states, _ = self.eh_proj(fused)
 
-        # Call parent forward (MoE)
-        hidden_states, residual = super().forward(
-            hidden_states=hidden_states,
-            residual=residual,
+        # MoE (parent forward inlined to gather the routed rows)
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.norm(hidden_states)
+        else:
+            hidden_states, residual = self.norm(hidden_states, residual)
+        hidden_states = hidden_states.index_select(
+            0, self.moe_row_src[: hidden_states.shape[0]]
         )
+        hidden_states = self.mixer(hidden_states)
 
         # End norm
         if self.has_end_norm:
@@ -357,6 +383,33 @@ class NemotronHMTP(nn.Module, SupportsPP):
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
+
+    def _moe_row_src_buffers(self) -> list[torch.Tensor]:
+        bufs = getattr(self, "_moe_row_src_cache", None)
+        if bufs is None:
+            bufs = [
+                m.moe_row_src
+                for m in self.model.layers.values()
+                if isinstance(m, NemotronHMTPMoEDecoderLayer)
+            ]
+            self._moe_row_src_cache = bufs
+        return bufs
+
+    def set_moe_row_src(self, num_rows: int, src_row: torch.Tensor | None) -> None:
+        """Point MoE rows [0, num_rows) at src_row (a 1-element GPU tensor),
+        or at the identity when src_row is None."""
+        for buf in self._moe_row_src_buffers():
+            if src_row is None:
+                buf[:num_rows].copy_(self._arange_like(buf, num_rows))
+            else:
+                buf[:num_rows].copy_(src_row.reshape(1).expand(num_rows))
+
+    def _arange_like(self, buf: torch.Tensor, n: int) -> torch.Tensor:
+        ar = getattr(self, "_moe_row_arange", None)
+        if ar is None or ar.numel() < buf.numel():
+            ar = torch.arange(buf.numel(), dtype=buf.dtype, device=buf.device)
+            self._moe_row_arange = ar
+        return ar[:n]
 
     def forward(
         self,

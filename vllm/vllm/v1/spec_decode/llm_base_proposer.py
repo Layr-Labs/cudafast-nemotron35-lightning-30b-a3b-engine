@@ -565,6 +565,20 @@ class SpecDecodeBaseProposer:
         model_kwargs, slot_mapping_size = self.build_model_inputs_first_pass(
             num_tokens, num_input_tokens, mm_embed_inputs
         )
+        # Single-request drafting: only the sampled row of the MTP MoE is used,
+        # so route every row through it (bit-identical sampled output).
+        moe_row_model = self.model
+        if isinstance(moe_row_model, BreakableCUDAGraphWrapper):
+            moe_row_model = moe_row_model.unwrap()
+        set_moe_row_src = getattr(moe_row_model, "set_moe_row_src", None)
+        if not callable(set_moe_row_src) or batch_size != 1:
+            set_moe_row_src = None
+        if set_moe_row_src is not None:
+            if getattr(self, "_moe_row_zero", None) is None:
+                self._moe_row_zero = torch.zeros(
+                    1, dtype=torch.long, device=token_indices_to_sample.device
+                )
+            set_moe_row_src(num_input_tokens, token_indices_to_sample[:1])
         # Step 0 of index_share_for_mtp_iteration: let the MTP layer
         # compute its own indices (skip_topk=False) so subsequent steps
         # can reuse them.
@@ -603,6 +617,10 @@ class SpecDecodeBaseProposer:
             self.model.model.compact_topk_indices(token_indices_to_sample)
 
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
+        if set_moe_row_src is not None and (
+            self.num_speculative_tokens <= 1 or self.parallel_drafting
+        ):
+            set_moe_row_src(num_input_tokens, None)
 
         # No draft tokens requested (e.g. Dynamic SD decided K=0).
         # The prefill forward pass above already ran to keep the drafter
@@ -679,6 +697,9 @@ class SpecDecodeBaseProposer:
 
         block_size = self.block_size
         assert block_size > 0, "block_size has not been initialized."
+        if set_moe_row_src is not None:
+            # Padded rows of the single-token steps copy row 0.
+            set_moe_row_src(input_batch_size, self._moe_row_zero)
         for token_index in range(self.num_speculative_tokens - 1):
             # Update the inputs.
             # cast to int32 is crucial when eagle model is compiled.
@@ -759,6 +780,9 @@ class SpecDecodeBaseProposer:
                 assert draft_probs_list is not None
                 draft_probs_list.append(draft_probs)
             draft_token_ids_list.append(draft_token_ids)
+
+        if set_moe_row_src is not None:
+            set_moe_row_src(max(num_input_tokens, input_batch_size), None)
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)

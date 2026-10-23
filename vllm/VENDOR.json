@@ -16,6 +16,10 @@
       "why": "VLLM_HUMMING_BATCH_INVARIANT=1 turns on humming's deterministic MoE kernels without the global batch-invariant mode (which forces CUTLASS W4A4 on W4A16 linears)"
     },
     {
+      "file": "vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py",
+      "why": "batch-invariant MoE tuning entries with fewer than 8 warps per CTA run 2 CTAs per SM when their shared memory fits twice; only the persistent grid grows, tile K order is unchanged"
+    },
+    {
       "file": "vllm/model_executor/layers/mamba/ops/ssd_pinned_configs.py (+ pins in ssd_state_passing.py, ssd_bmm.py, ssd_chunk_scan.py, ssd_chunk_state.py)",
       "why": "Triton autotune picked different SSD tile configs per boot on GB10, making the same prompt yield one of two token streams; each kernel is pinned to one config (VLLM_MAMBA_SSD_AUTOTUNE=1 restores autotuning)"
     },

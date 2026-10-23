@@ -64,6 +64,22 @@ Idempotent steps, each refusing on any mismatch:
    (N × 7 goldens, 21 for 3 prompts), spread across the fleet with `tools/record-goldens.sh`,
    each one on **two** boxes and required to be byte-identical (the engine is
    deterministic; a mismatch means a broken box or engine).
+
+   Each recording job resolves and checks the remote home once.
+   The home must be an absolute, canonical path that the remote user owns.
+   It must not be `/`, contain a `..` component, or have a symlink ancestor.
+   The script builds all recording paths from this checked value.
+   Each job uses `<checked-home>/nemotron35-refresh/<label>/<key>`.
+   The remote shell creates this tree with `umask 077` and mode `0700`.
+   Before the first copy, the script checks each directory's mode and owner.
+   After retrieval, the script checks that each expected output exists.
+   It then deletes only the job directory and verifies that the directory is absent.
+   An `EXIT` trap tries the same cleanup after each job failure.
+   Cleanup accepts exactly one nonempty job-name component below the generation.
+   The component can contain letters, digits, `_`, `.`, `@`, `:`, `%`, `+`, and `-`.
+   Cleanup refuses the generation root, `/`, `.`, `..`, names with `/`, outside paths, and symlink paths.
+   Cleanup does not follow symlinks.
+
 3. **Stage**: install the new goldens next to the current ones on every box of `REFRESH_BOXES`
    (`/srv/nemotron35/goldens`, root:bench 0750), verified by sha256. The old
    generation stays in place, so in-flight jobs are unaffected.
@@ -101,9 +117,10 @@ job measures every live golden.
    It is kept off the boxes: goldens and prompts live only in
    `.mlxfast-private/final/` on the organizer workstation and in the organizer
    archive (never in git, never staged, never pinned in a pushed fixture)
-   until the close; the box-side recordings are deleted after the two-box
-   check. The pool must have as many prompts as `official_pairs` (or a
-   divisor of it), because the re-score fixture makes it the `live_goldens`.
+   until the close. The script deletes each box-side job after it verifies
+   retrieval. It compares the two local copies later. The pool must have as many
+   prompts as `official_pairs` (or a divisor of it), because the re-score fixture
+   makes it the `live_goldens`.
 2. **Freeze**: at the deadline the router stops accepting submissions.
 3. **Select**: for each team, its best submission by mean contest score over
    runs that scored or failed because of the submission (a team failure counts

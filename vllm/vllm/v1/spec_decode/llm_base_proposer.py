@@ -251,9 +251,6 @@ class SpecDecodeBaseProposer:
             and self.speculative_config.draft_sample_method == "probabilistic"
         )
         self._last_draft_probs: torch.Tensor | None = None
-        self._num_rejected_cpu: torch.Tensor | None = None
-        self._num_rejected_event: torch.Event | None = None
-        self._draft_plan_event: torch.Event | None = None
 
         self._slot_mapping_buffer = torch.zeros(
             self.max_positions, dtype=torch.int64, device=device
@@ -560,7 +557,6 @@ class SpecDecodeBaseProposer:
         per_group_attn_metadata, per_layer_attn_metadata = (
             self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
         )
-        num_rejected_cpu = self._copy_num_rejected_to_cpu(num_rejected_tokens_gpu)
 
         cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
             self._determine_batch_execution_and_padding(num_tokens)
@@ -693,28 +689,11 @@ class SpecDecodeBaseProposer:
         # to remove the "padding" (i.e. rejected tokens).
         # Only apply this adjustment when we have rejected tokens
         # (i.e., not the first proposal).
-        order_draft_plans = False
         if self.num_speculative_tokens > 1 and num_rejected_tokens_gpu is not None:
-            seq_lens_cpu = common_attn_metadata._seq_lens_cpu
             common_attn_metadata.seq_lens -= num_rejected_tokens_gpu
             # Invalidate the CPU-side shadows to avoid H<>D sync.
             common_attn_metadata._seq_lens_cpu = None
             common_attn_metadata._num_computed_tokens_cpu = None
-            # The draft plan reads seq_lens_cpu; deriving it from the copied
-            # counts waits for the first pass to start, not to finish. The
-            # bound keeps the step kernel's seq_lens update an exact +1.
-            if (
-                num_rejected_cpu is not None
-                and seq_lens_cpu is not None
-                and seq_lens_cpu.shape == num_rejected_cpu.shape
-                and seq_lens_cpu.dtype == num_rejected_cpu.dtype
-                and common_attn_metadata.max_seq_len + self.num_speculative_tokens
-                <= self.max_model_len
-            ):
-                assert self._num_rejected_event is not None
-                self._num_rejected_event.synchronize()
-                common_attn_metadata._seq_lens_cpu = seq_lens_cpu - num_rejected_cpu
-                order_draft_plans = True
 
         block_size = self.block_size
         assert block_size > 0, "block_size has not been initialized."
@@ -745,19 +724,11 @@ class SpecDecodeBaseProposer:
             # (e.g. Gemma4 MTP), common_attn_metadata is invariant across
             # loop iterations so we build once and reuse.
             if not self.constant_draft_positions or token_index == 0:
-                # A plan rewrites pinned host buffers that the previous plan's
-                # H2D copies read; wait until those copies have run.
-                if order_draft_plans and token_index > 0:
-                    assert self._draft_plan_event is not None
-                    self._draft_plan_event.synchronize()
                 _, per_layer_attn_metadata = (
                     self.build_per_group_and_layer_attn_metadata(
                         common_attn_metadata, draft_index=token_index + 1
                     )
                 )
-                if order_draft_plans:
-                    assert self._draft_plan_event is not None
-                    self._draft_plan_event.record()
 
             # copy inputs to buffer for cudagraph
             self.input_ids[:batch_size] = input_ids
@@ -818,40 +789,6 @@ class SpecDecodeBaseProposer:
         if draft_probs_list is not None:
             self._last_draft_probs = torch.stack(draft_probs_list, dim=1).contiguous()
         return draft_token_ids
-
-    def _copy_num_rejected_to_cpu(
-        self, num_rejected_tokens_gpu: torch.Tensor | None
-    ) -> torch.Tensor | None:
-        """Start the D2H copy of the per-request rejected counts.
-
-        Called after the first pass's attention plan has queued its H2D copies
-        from pinned buffers, so the event also marks those copies as done.
-        """
-        if (
-            num_rejected_tokens_gpu is None
-            or self.num_speculative_tokens <= 1
-            or self.parallel_drafting
-            or not PIN_MEMORY
-            or num_rejected_tokens_gpu.dtype != torch.int32
-            or num_rejected_tokens_gpu.shape[0] > self.max_batch_size
-            or not self.draft_attn_groups
-            or any(
-                group.backend.get_name() != "FLASHINFER"
-                for group in self.draft_attn_groups
-            )
-        ):
-            return None
-        if self._num_rejected_cpu is None:
-            self._num_rejected_cpu = torch.empty(
-                self.max_batch_size, dtype=torch.int32, pin_memory=True
-            )
-            self._num_rejected_event = torch.Event()
-            self._draft_plan_event = torch.Event()
-        assert self._num_rejected_event is not None
-        num_rejected_cpu = self._num_rejected_cpu[: num_rejected_tokens_gpu.shape[0]]
-        num_rejected_cpu.copy_(num_rejected_tokens_gpu, non_blocking=True)
-        self._num_rejected_event.record()
-        return num_rejected_cpu
 
     def _update_positions_dependent_metadata(
         self,

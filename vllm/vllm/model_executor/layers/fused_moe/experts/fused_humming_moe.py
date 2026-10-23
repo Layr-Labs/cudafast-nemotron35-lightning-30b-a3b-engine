@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Fused MoE utilities for Humming."""
 
-import copy
 import json
 import math
 from typing import TYPE_CHECKING, Any
@@ -110,35 +109,6 @@ def _humming_batch_invariant() -> bool:
     ) == "1"
 
 
-# LOCAL PATCH (cudafast-nemotron35, vllm/VENDOR.json "local_patches"): humming's
-# heuristic picks num_ctas_per_sm before its batch-invariant step shrinks block K
-# to 512 // a_bits, so the small-M entries (decode, verify) keep one 4-warp CTA
-# per SM. Give them the second resident CTA the heuristic grants to small CTAs
-# whose shared memory fits twice. This only doubles the persistent grid: without
-# stream-K every output tile is still computed by one CTA over all K blocks in
-# the same order, so the numerics are unchanged.
-def _two_ctas_per_sm(tuning_configs: list, meta: Any, gemm_type: Any) -> list:
-    from humming.tune import get_heuristics_class
-    from humming.utils.smem import estimate_smem_size_layer
-
-    max_smem_size = get_heuristics_class().max_smem_size
-    tuning_configs = copy.deepcopy(tuning_configs)
-    for _, _, config in tuning_configs:
-        block_shape = tuple(config["block_shape"])
-        num_warps = math.prod(block_shape) // math.prod(config["warp_shape"])
-        smem_size = estimate_smem_size_layer(
-            meta, block_shape, gemm_type, config["num_stages"]
-        )
-        if (
-            not config["use_stream_k"]
-            and config.get("num_ctas_per_sm", 1) == 1
-            and num_warps < 8
-            and smem_size * 2 <= max_smem_size
-        ):
-            config["num_ctas_per_sm"] = 2
-    return tuning_configs
-
-
 def get_humming_moe_gemm_type() -> str:
     env_gemm_type: str | None = envs.VLLM_HUMMING_MOE_GEMM_TYPE
     gemm_type = "indexed"
@@ -202,15 +172,6 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             gemm_type=self.humming_gemm_type(),
             sublayer_name="w2",
         )
-        if _humming_batch_invariant():
-            metas = self.layer.humming_metas
-            gemm_type = self.humming_gemm_type()
-            self.w13_tuning_config = _two_ctas_per_sm(
-                self.w13_tuning_config, metas["w13"], gemm_type
-            )
-            self.w2_tuning_config = _two_ctas_per_sm(
-                self.w2_tuning_config, metas["w2"], gemm_type
-            )
         self.compute_config_str = json.dumps(self.compute_config)
         self.w13_tuning_config_str = json.dumps(self.w13_tuning_config)
         self.w2_tuning_config_str = json.dumps(self.w2_tuning_config)

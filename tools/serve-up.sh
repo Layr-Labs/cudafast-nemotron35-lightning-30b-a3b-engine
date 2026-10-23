@@ -57,6 +57,9 @@
 #   SERVE_UP_SPEC_DRAFT_LEN   declared num_speculative_tokens (default 1 when SPECULATIVE=1)
 #   SERVE_UP_LOG_DIR          where the run's identity, ready file and resident
 #                             log are kept (default <repo>/.build/resident)
+#   SERVE_UP_LOG_KEEP         maximum resident logs kept after a boot (default 20)
+#   SERVE_UP_RESIDENT_LOG_MAX_BYTES
+#                             maximum bytes in one resident log (default 67108864)
 #   SERVE_UP_SOCKET_DIR       where the resident's Unix socket is bound (default
 #                             ${TMPDIR:-/tmp}). SEPARATE from the log dir because a
 #                             Unix socket path holds only 107 bytes on Linux and
@@ -380,8 +383,14 @@ fi
 SERVE_UP_LOG_DIR="${SERVE_UP_LOG_DIR:-${SCRIPT_DIR}/.build/resident}"
 SERVE_UP_SOCKET_DIR="${SERVE_UP_SOCKET_DIR:-${TMPDIR:-/tmp}}"
 SERVE_UP_HEALTH_TIMEOUT_S="${SERVE_UP_HEALTH_TIMEOUT_S:-3600}"
+SERVE_UP_LOG_KEEP="${SERVE_UP_LOG_KEEP:-20}"
+SERVE_UP_RESIDENT_LOG_MAX_BYTES="${SERVE_UP_RESIDENT_LOG_MAX_BYTES:-67108864}"
 SERVE_UP_MEMINFO="${SERVE_UP_MEMINFO:-/proc/meminfo}"
 SERVE_UP_LAUNCHER="${SERVE_UP_LAUNCHER:-docker}"
+[[ "${SERVE_UP_LOG_KEEP}" =~ ^[1-9][0-9]*$ ]] \
+  || die "SERVE_UP_LOG_KEEP must be a positive integer (got '${SERVE_UP_LOG_KEEP}')"
+[[ "${SERVE_UP_RESIDENT_LOG_MAX_BYTES}" =~ ^[1-9][0-9]*$ ]] \
+  || die "SERVE_UP_RESIDENT_LOG_MAX_BYTES must be a positive integer (got '${SERVE_UP_RESIDENT_LOG_MAX_BYTES}')"
 case "${SERVE_UP_LAUNCHER}" in docker|host) ;; *) die "SERVE_UP_LAUNCHER must be docker or host (got '${SERVE_UP_LAUNCHER}')" ;; esac
 SANDBOX_USER_ID=""
 if [[ -n "${SERVE_UP_CONTAINER_USER:-}" ]]; then
@@ -399,6 +408,22 @@ fi
 mkdir -p "${SERVE_UP_LOG_DIR}" "${SERVE_UP_SOCKET_DIR}"
 SERVE_UP_LOG_DIR="$(cd -- "${SERVE_UP_LOG_DIR}" && pwd -P)"
 SERVE_UP_SOCKET_DIR="$(cd -- "${SERVE_UP_SOCKET_DIR}" && pwd -P)"
+
+# Leave room for this boot's log. Delete only old, regular, runner-owned logs.
+mapfile -t resident_logs < <(
+  find -P "${SERVE_UP_LOG_DIR}" -maxdepth 1 -type f -uid "$(id -u)" \
+    -name 'vllm-resident.*.log' -printf '%T@ %p\n' | sort -n
+)
+remove_count=$(( ${#resident_logs[@]} - SERVE_UP_LOG_KEEP + 1 ))
+for ((i = 0; i < remove_count; i++)); do
+  old_log="${resident_logs[i]#* }"
+  old_name="$(basename -- "${old_log}")"
+  if [[ "${old_name}" =~ ^vllm-resident\.[0-9]+-[0-9]{8}T[0-9]{6}Z\.log$ \
+      && -f "${old_log}" && ! -L "${old_log}" \
+      && "$(stat -Lc %u -- "${old_log}" 2>/dev/null)" == "$(id -u)" ]]; then
+    rm -f -- "${old_log}"
+  fi
+done
 # The container mounts its own --tmpfs /tmp, which hides a bind of the host's
 # /tmp: the socket would never appear here and the health wait would run out.
 [[ "${SERVE_UP_LAUNCHER}" != "docker" || "${SERVE_UP_SOCKET_DIR}" != "/tmp" ]] \
@@ -471,22 +496,44 @@ probe_resident() {
   local run=(python3)
   [[ -z "${SANDBOX_USER_ID}" ]] || run=(sudo -n -u "${SERVE_UP_CONTAINER_USER}" -- python3)
   "${run[@]}" - "$1" <<'PY'
-import json, socket, sys
+import json, socket, sys, time
 try:
+    deadline = time.monotonic() + 30
+    def remaining():
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError
+        return left
+
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(10)
+    s.settimeout(remaining())
     s.connect(sys.argv[1])
+    s.settimeout(remaining())
     s.sendall(b'{"op":"hello"}\n')
     line = b""
-    while not line.endswith(b"\n"):
-        chunk = s.recv(65536)
+    while b"\n" not in line:
+        s.settimeout(remaining())
+        chunk = s.recv(min(65536, 65537 - len(line)))
         if not chunk:
             break
         line += chunk
-    s.sendall(b'{"op":"bye"}\n')
-    s.recv(65536)  # the bye's acknowledgement, so the resident logs a clean close
+        before_newline = line.split(b"\n", 1)[0]
+        if len(before_newline) > 65536:
+            raise OverflowError
+    if b"\n" in line:
+        line = line.split(b"\n", 1)[0] + b"\n"
+    try:  # best effort, inside the same total deadline; the hello is already read
+        s.settimeout(remaining())
+        s.sendall(b'{"op":"bye"}\n')
+        s.settimeout(remaining())
+        s.recv(65536)  # the bye's acknowledgement, so the resident logs a clean close
+    except OSError:
+        pass
     s.close()
     reply = json.loads(line.decode())
+except OverflowError:
+    print("probe failed: the resident hello reply exceeded 65536 bytes", file=sys.stderr)
+    sys.exit(1)
 except Exception as err:                       # noqa: BLE001 - any failure is unhealthy
     # Fixed text only: the error and the reply are resident-controlled and
     # this stderr can reach the public job log.
@@ -576,8 +623,23 @@ rm -f "${SOCKET_PATH}" "${READY_FILE}" 2>/dev/null || true
 # The resident log is runner's alone (0600, created before anything writes it):
 # a candidate resident's log can carry the hidden prompts, and the log dir
 # outlives the job. The identity file is 0640. Neither is ever other-readable.
-( umask 077 && : > "${RESIDENT_LOG}" ) || die "cannot create the resident log ${RESIDENT_LOG}"
+( umask 077 && set -o noclobber && : > "${RESIDENT_LOG}" ) \
+  || die "cannot create the resident log ${RESIDENT_LOG}"
+chmod 0600 "${RESIDENT_LOG}" || die "cannot set mode 0600 on ${RESIDENT_LOG}"
 ( umask 027 && : >> "${IDENTITY_FILE}" && chmod 0640 "${IDENTITY_FILE}" ) || die "cannot create ${IDENTITY_FILE}"
+cap_resident_log() {
+  python3 -c '
+import os, sys
+left = int(sys.argv[2])
+fd = os.open(sys.argv[1], os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW)
+with os.fdopen(fd, "ab", buffering=0) as out:
+    while data := os.read(0, 65536):
+        if left:
+            part = data[:left]
+            out.write(part)
+            left -= len(part)
+' "${RESIDENT_LOG}" "${SERVE_UP_RESIDENT_LOG_MAX_BYTES}"
+}
 RESIDENT_ENV=(
   "RESIDENT_SOCKET=${SOCKET_PATH}"
   "RESIDENT_READY_FILE=${READY_FILE}"
@@ -609,6 +671,7 @@ if [[ "${SERVE_UP_LAUNCHER}" == "docker" ]]; then
   fi
   docker run --rm --init --name "${CONTAINER_NAME}" \
     --gpus all --ipc host --network none \
+    --log-opt max-size=16m --log-opt max-file=1 \
     --user "${container_user}" "${hardening[@]}" \
     --read-only --tmpfs /tmp:rw,exec,size=8g \
     --mount "type=bind,src=${SCRIPT_DIR},dst=${SCRIPT_DIR},readonly" \
@@ -616,9 +679,9 @@ if [[ "${SERVE_UP_LAUNCHER}" == "docker" ]]; then
     "${rw_mounts[@]}" \
     "${docker_env[@]}" \
     --entrypoint python3 "${IMAGE_REF}" \
-    "${SCRIPT_DIR}/harness/vllm_resident/resident.py" >"${RESIDENT_LOG}" 2>&1 &
+    "${SCRIPT_DIR}/harness/vllm_resident/resident.py" > >(cap_resident_log >/dev/null 2>&1) 2>&1 &
 else
-  env "${RESIDENT_ENV[@]}" python3 "${SCRIPT_DIR}/harness/vllm_resident/resident.py" >"${RESIDENT_LOG}" 2>&1 &
+  env "${RESIDENT_ENV[@]}" python3 "${SCRIPT_DIR}/harness/vllm_resident/resident.py" > >(cap_resident_log >/dev/null 2>&1) 2>&1 &
 fi
 RESIDENT_PID=$!
 # A sandboxed resident runs submission code: its output can carry what it saw, so it stays in the

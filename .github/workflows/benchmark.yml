@@ -209,25 +209,19 @@ jobs:
     # COUNT, so it moves whenever that ruling moves -- it is restated here rather
     # than left implicit:
     #
-    #   official_pairs 2 (contract §5.2, the fixture's value that benchd
-    #   enforces), so 2 pairs x 2 legs (serial control + candidate) = 4 timed
+    #   official_pairs 3 (contract §5.2, the fixture's value that benchd
+    #   enforces), so 3 pairs x 2 legs (serial control + candidate) = 6 timed
     #   legs, and benchd gates PER PHASE -- prefill and decode are separate
-    #   cool_gate() calls on each leg -- so up to 8 gated phases x 900 s =
-    #   120 min of cool-down ALONE, worst case, before a single token is timed.
+    #   cool_gate() calls on each leg -- so up to 12 gated phases x 900 s =
+    #   180 min of cool-down ALONE, worst case, before a single token is timed.
     #
-    # 120 min of gating plus a cold checkpoint fetch, the engine build and the
-    # measurement itself does not fit in 180. At the cap GitHub kills the job
-    # mid-measurement, which burns the box's slot and produces nothing. 360 is
-    # the challenger's own budget for the same reason.
+    # The 90-minute measurement limit stops a box before that pathological
+    # ceiling. A phase that spends 900 s means the box did not reach the gate
+    # temperature. That run is a refusal, not a useful slow run.
     #
-    # WHY 360 STILL SUFFICES: the 900 s ceiling is NOT an operating point. A
-    # phase that actually burns 900 s means the box never reached the gate
-    # temperature, which is itself the refusal condition -- that run is
-    # rejected and retried on a clean box rather than proceeding. Eight
-    # consecutive 900 s waits is not a slow run, it is a broken box, and it fails
-    # rather than finishing at minute 359. 120 min is the pathological ceiling
-    # this cap must not be BELOW, not the expected cost (about 6 min measured).
-    timeout-minutes: 360
+    # The 150-minute job limit covers the 45-minute setup limit, the 90-minute
+    # measurement limit, and 15 minutes for the other steps and cleanup.
+    timeout-minutes: 150
     # THIS JOB SETS NO ENVIRONMENT OF ITS OWN. Every staged asset the scored path
     # needs but the checkout does not carry comes from the runner service's
     # environment, which fleet-bootstrap owns:
@@ -465,6 +459,7 @@ jobs:
           ./tools/fetch-benchd.sh
 
       - name: Setup (engine + pinned checkpoint)
+        timeout-minutes: 45
         # Second half of benchmark.json's setupCommand, verbatim. ./setup.sh
         # builds the adapter, stages the vLLM overlay from the pinned image
         # (present by digest; ENGINE_BUILD_OFFLINE=1 forbids a pull) and
@@ -520,6 +515,7 @@ jobs:
           printf 'MLXFAST_LIVE_GOLDEN_CHOICE=%s\n' "${choice}" >> "${GITHUB_ENV}"
 
       - name: GPU-exclusive measurement (lock, quiesce, benchd iterate --mode official, seal)
+        timeout-minutes: 90
         env:
           SANDBOX_JOB: ${{ github.run_id }}-${{ github.run_attempt }}
           # benchd boots both legs with this environment. Only the tree at this
@@ -749,7 +745,8 @@ jobs:
         run: |
           set -uo pipefail
           set +e
-          gate_out="$(./tools/score-plausibility-gate.sh score.json "${RUNNER_TEMP}/benchd-private-audit.json" 2>&1)"
+          declared_depth="$(./tools/spec-declaration.sh draft-len)"
+          gate_out="$(./tools/score-plausibility-gate.sh score.json "${RUNNER_TEMP}/benchd-private-audit.json" "${declared_depth}" 2>&1)"
           gate_rc=$?
           set -e
           printf '%s\n' "${gate_out}"

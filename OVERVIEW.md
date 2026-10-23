@@ -82,12 +82,12 @@ Every point links to the document that has the detail.
   - **Why:** without it, a submission could read the hidden prompts and
     goldens, or rewrite the measuring tools.
 - **Sealed score.** `score.json` names each prompt only by its sha256. It
-  carries no prompt text. The pinned benchd (source `918b8ac`, which includes bench
-  pull requests 421 to 424) keeps engine-written text, audit fields, the hello
-  identity and engine-derived numbers out of the sealed output: they are
-  sealed as digests or omitted, and a full copy goes only to a private audit
-  file on the box. The sealed output and the failure messages name no token
-  value.
+  carries no prompt text. The pinned benchd (source `b0a79f2`) keeps
+  engine-written text, audit fields, the hello identity and engine-derived
+  numbers out of the sealed output. Public output carries fixed markers, never
+  engine-chosen values (#433). Adapter stdout lines are capped and the channel
+  bounded (#431). A full copy goes only to a private audit file on the box.
+  The sealed output and failure messages name no token value.
   - **Remaining risk:** whether a run failed, and the kind of failure, stay
     visible, so a failed run can still carry a very small signal.
 - **A score that cannot be forged or erased from the log.** Participant code
@@ -170,9 +170,9 @@ and the engineering log, section 7.14.
 
 These tests ran on the earlier fork benchd, which had the timed replay and the
 stricter sealing. The track now uses the public `Layr-Labs/benchd` channel
-(dist `92da41a`, public source snapshot `0aacae3` of source `918b8ac`;
+(dist `4d7aa43`, public source snapshot `45bfca2` of source `b0a79f2`;
 engineering log section 7.13). It has the stricter sealing again (bench pull
-requests 421 to 424), but not the timed replay.
+requests 421 to 424, 431 and 433), but not the timed replay.
 
 Details are in the [engineering log](docs/nemotron35-port-notes.md), sections
 7.9–7.12.

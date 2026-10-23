@@ -23,7 +23,8 @@
 #      have no default ACL or user.* xattr;
 #  10. a writable path that the sandbox user does not own fails the wipe;
 #  11. the runner-owned job, adapter-home and sock directories are trusted
-#      only with fixed metadata and empty state directories.
+#      only with fixed metadata and empty state directories;
+#  12. each wipe clears the persistent and user keyrings as the sandbox user.
 #
 # Hermetic: no root, no real IPC objects touched.
 set -uo pipefail
@@ -77,6 +78,19 @@ awk -v id="$2" -v col="${id_col}" 'NR == 1 || $col != id' "${STUB_SYSVIPC}/${tab
 mv "${STUB_SYSVIPC}/${table}.new" "${STUB_SYSVIPC}/${table}"
 EOF
 chmod +x "${WORK}/bin/"*
+REAL_PYTHON="$(command -v python3)"
+cat > "${WORK}/bin/python3" <<EOF
+#!/usr/bin/env bash
+if [[ "\$1 \${2:-}" == "- keyring-clear" ]]; then
+  cat >/dev/null
+  case "\${STUB_KEYRING_STATUS:-cleared}" in
+    cleared|unsupported) echo "\${STUB_KEYRING_STATUS:-cleared}"; exit 0 ;;
+    *) exit 1 ;;
+  esac
+fi
+exec ${REAL_PYTHON@Q} "\$@"
+EOF
+chmod +x "${WORK}/bin/python3"
 REAL_FIND="$(command -v find)"
 REAL_STAT="$(command -v stat)"
 cat > "${WORK}/bin/stat" <<EOF
@@ -147,6 +161,26 @@ grep -qxF -- "-n -u ${ME} -- ipcrm -m 11" "${WORK}/log" && grep -qxF -- "-n -u $
   || fail "case 2: ipcrm calls: $(grep ipcrm "${WORK}/log")"
 [[ "$(cat "${WORK}/ipc")" == "-m 0x00000001 12 99998 99998" ]] && ! grep -q "ipcrm -m 12" "${WORK}/log" \
   && ok "case 2: another user's segment is left alone" || fail "case 2: ipc left: $(cat "${WORK}/ipc")"
+if grep -qxF -- "-n -u ${ME} -- python3 - keyring-clear ${ME_UID}" "${WORK}/log" \
+    && grep -q "keyrings cleared" "${WORK}/out1"; then
+  ok "case 12: the wipe clears both keyrings as the sandbox user"
+else
+  fail "case 12: the keyring clear did not run through sandbox sudo"
+fi
+
+: > "${WORK}/log"
+out="$(run_wipe STUB_KEYRING_STATUS=unsupported 2>&1)"; status=$?
+if [[ "${status}" -eq 0 && "${out}" == *"keyrings unsupported"* ]]; then
+  ok "case 12: EOPNOTSUPP or ENOSYS marks keyrings unsupported"
+else
+  fail "case 12: unsupported keyrings: status ${status}, '${out}'"
+fi
+out="$(run_wipe STUB_KEYRING_STATUS=failed 2>&1)"; status=$?
+if [[ "${status}" -ne 0 && "${out}" == *"cannot clear sandbox keyrings"* ]]; then
+  ok "case 12: a keyring clear error fails closed"
+else
+  fail "case 12: keyring failure: status ${status}, '${out}'"
+fi
 
 # A missing /proc/sysvipc uses ipcs -c. A pre-existing root sudo grant is the
 # fallback when the creator cannot remove an object after its owner changes.

@@ -14,26 +14,79 @@ failures=0
 fail() { echo "FAIL: $*" >&2; failures=$((failures + 1)); }
 ok() { echo "ok    $*"; }
 
-FAKE="${WORK}/boxes" STUB="${WORK}/stub" ROOT="${WORK}/root" PRIV="${WORK}/private"
-mkdir -p "${FAKE}" "${STUB}" "${ROOT}/tools" "${ROOT}/fixtures" "${PRIV}"
-export FAKE
+FAKE="${WORK}/boxes" STUB="${WORK}/stub" REMOTE_STUB="${WORK}/remote-stub"
+ROOT="${WORK}/root" PRIV="${WORK}/private"
+mkdir -p "${FAKE}" "${STUB}" "${REMOTE_STUB}" "${ROOT}/tools" "${ROOT}/fixtures" "${PRIV}"
+export FAKE REMOTE_STUB
 
 cat > "${STUB}/ssh" <<'EOF'
 #!/usr/bin/env bash
 while [[ "$1" == -* ]]; do [[ "$1" == -o ]] && shift; shift; done
 box="$1"; shift
 echo "ssh ${box} $*" >> "${FAKE}/calls.log"
-cd "${FAKE}/${box}/home" && HOME="${FAKE}/${box}/home" BOX="${box}" bash -c "$*"
+host="${box%%/*}"
+home="${FAKE}/${host}/home"
+case "${FAKE_REMOTE_FAULT:-}" in
+  home-unset) unset home ;;
+  home-empty) home="" ;;
+  home-root) home=/ ;;
+  home-dotdot) home=/tmp/.. ;;
+  home-symlink) home="${FAKE}/${host}/home-link" ;;
+esac
+cd "${FAKE}/${host}/home" || exit 1
+if [[ -v home ]]; then
+  HOME="${home}" BOX="${host}" PATH="${REMOTE_STUB}:${PATH}" bash -c "$*"
+else
+  env -u HOME BOX="${host}" PATH="${REMOTE_STUB}:${PATH}" bash -c "$*"
+fi
 EOF
 cat > "${STUB}/scp" <<'EOF'
 #!/usr/bin/env bash
 [[ "$1" == -q ]] && shift
+echo "scp $*" >> "${FAKE}/calls.log"
+echo copy >> "${FAKE}/scp.log"
+last="${!#}"
+if [[ "${last}" =~ ^([a-z0-9-]+):(.*/(prompts|out)/)$ ]]; then
+  box="${BASH_REMATCH[1]}"
+  path="${BASH_REMATCH[2]%/}"
+  job="${path%/*}"
+  [[ "${job}" == /* ]] || job="${FAKE}/${box}/home/${job}"
+  mode="$(stat -c %a "${job}" 2>/dev/null || echo missing)"
+  owner="$(stat -c %u "${job}" 2>/dev/null || echo missing)"
+  echo "copy-mode ${box} ${path} ${mode} ${owner} $(id -u)" >> "${FAKE}/calls.log"
+fi
 args=()
 for a in "$@"; do
-  if [[ "${a}" =~ ^([a-z0-9-]+):(.*)$ ]]; then a="${FAKE}/${BASH_REMATCH[1]}/home/${BASH_REMATCH[2]}"; fi
+  if [[ "${a}" =~ ^([a-z0-9-]+):(.*)$ ]]; then
+    box="${BASH_REMATCH[1]}" path="${BASH_REMATCH[2]}"
+    [[ "${path}" == /* ]] || path="${FAKE}/${box}/home/${path}"
+    a="${path}"
+  fi
   args+=("${a}")
 done
 cp "${args[@]}"
+EOF
+cat > "${REMOTE_STUB}/stat" <<'EOF'
+#!/usr/bin/env bash
+path="${!#}"
+if [[ "${path}" == */nemotron35-refresh/* ]]; then
+  case "${FAKE_REMOTE_FAULT:-}:$*" in
+    wrong-mode:*"%a"*) echo 755; exit 0 ;;
+    wrong-owner:*"%u"*) echo $(( $(id -u) + 1 )); exit 0 ;;
+    stat-failure:*"%a"*) echo 700; exit 1 ;;
+    stat-failure:*"%u"*) echo "$(id -u)"; exit 1 ;;
+  esac
+fi
+exec /usr/bin/stat "$@"
+EOF
+cat > "${REMOTE_STUB}/rm" <<'EOF'
+#!/usr/bin/env bash
+path="${!#}"
+[[ "${path}" == /* ]] || path="$(pwd -P)/${path}"
+if [[ "${FAKE_REMOTE_FAULT:-}" == removal-failure && "${path}" == */nemotron35-refresh/* ]]; then
+  exit 0
+fi
+exec /usr/bin/rm "$@"
 EOF
 cat > "${STUB}/sudo" <<'EOF'
 #!/usr/bin/env bash
@@ -94,11 +147,12 @@ else
   for n in $(seq 1 "${count}"); do echo "[${n}]" > "${out}/${label}-${n}.tokens.json"; done
 fi
 EOF
-chmod +x "${STUB}"/* "${RECORD_STUB}" "${WORK}/fake-stitch"
+chmod +x "${STUB}"/* "${REMOTE_STUB}"/* "${RECORD_STUB}" "${WORK}/fake-stitch"
 
 BOXES="b1 b2 b3"
 for b in ${BOXES}; do
   mkdir -p "${FAKE}/${b}/home/nemotron35/repo/tools" "${FAKE}/${b}/home/goldens"
+  ln -s home "${FAKE}/${b}/home-link"
   cp "${RECORD_STUB}" "${FAKE}/${b}/home/nemotron35/repo/tools/record-goldens.sh"
   cp /dev/null "${FAKE}/${b}/home/goldens/.keep"
 done
@@ -131,7 +185,8 @@ SHIPPED_LIVE="$(jq -c '.live_goldens' "${FX}")"
 GPU_LOCK="${WORK}/gpu.lock"
 : > "${GPU_LOCK}"
 refresh_raw() {
-  env PATH="${STUB}:${PATH}" REFRESH_BOXES="${BOXES}" REFRESH_PRIVATE="${PRIV}" \
+  env PATH="${STUB}:${PATH}" FAKE_REMOTE_FAULT="${FAKE_REMOTE_FAULT:-}" \
+    REFRESH_BOXES="${TEST_BOXES:-${BOXES}}" REFRESH_PRIVATE="${PRIV}" \
     REFRESH_BOX_GOLDENS='$HOME/goldens' REFRESH_GPU_LOCK="${GPU_LOCK}" REFRESH_PYTHON="${WORK}/fake-stitch" \
     "${ROOT}/tools/pool-refresh.sh" "$@" 2>&1
 }
@@ -239,6 +294,9 @@ out="$(refresh_raw --label final --step author --count 2 --snapshot "${WORK}" --
 touch "${FAKE}/fail-b2-3"
 out="$(refresh --label g1)" && fail "a failed box job did not fail the run"
 grep -q "mtp3@b2 on b2 failed" <<<"${out}" && ok "a failed box job is named" || fail "no failed-job message: $(tail -3 <<<"${out}")"
+[[ ! -e "${FAKE}/b2/home/nemotron35-refresh/g1/mtp3@b2" ]] \
+  && ok "a failed recording job removes its remote tree" \
+  || fail "a failed recording job left its remote tree"
 before="$(records)"
 rm "${FAKE}/fail-b2-3"
 out="$(refresh --label g1)" || fail "resume failed: $(tail -5 <<<"${out}")"
@@ -267,6 +325,74 @@ grep -q "git -C .* push origin HEAD:main" <<<"${out}" && [[ "$(git -C "${ROOT}" 
 # every golden agreed across two boxes: the serial of g1-1 came from b1 and b2
 grep -q "^record b1 serial .*g1-1" "${FAKE}/calls.log" && grep -q "^record b2 serial .*g1-1" "${FAKE}/calls.log" \
   && ok "each serial golden recorded on two boxes" || fail "serial not recorded twice"
+if ! grep -q '^copy-mode ' "${FAKE}/calls.log"; then
+  fail "no recording copy mode was checked"
+elif awk '$1 == "copy-mode" && ($4 != "700" || $5 != $6) { bad = 1 } END { exit !bad }' "${FAKE}/calls.log"; then
+  fail "a recording copy started before its remote job directory was private"
+else
+  ok "each remote recording job is mode 0700 and owned by its user before copy"
+fi
+clean=1
+for b in ${BOXES}; do
+  [[ "$(nf "${FAKE}/${b}/home/nemotron35-refresh/g1/*")" == 0 ]] \
+    || { fail "${b}: a successful recording job left its remote tree"; clean=0; }
+done
+[[ "${clean}" == 0 ]] || ok "successful recording jobs remove their remote trees"
+
+# --- remote recording guard failures -------------------------------------------
+record_guard_case() {
+  local label="$1" fault="$2" message="$3" out
+  out="$(refresh --label "${label}" --step author --count 1)" \
+    || { fail "${fault}: author failed: ${out}"; return; }
+  if [[ "${fault}" == removal-failure ]]; then
+    mkdir -p "${FAKE}/b1/home/nemotron35-refresh/${label}/serial@b1"
+    mkdir -p "${FAKE}/b2/home/nemotron35-refresh/${label}/serial@b2"
+  fi
+  : > "${FAKE}/scp.log"
+  out="$(FAKE_REMOTE_FAULT="${fault}" TEST_BOXES='b1 b2' \
+    refresh --label "${label}" --step record --count 1)" \
+    && fail "${fault}: the recording guard accepted the fault"
+  if grep -qF "${message}" <<<"${out}" \
+    && [[ ! -s "${FAKE}/scp.log" ]] \
+    && ! grep -q '^done job ' "${PRIV}/refresh/${label}/state"; then
+    ok "${fault}: the run fails before copy and no job is complete"
+  else
+    fail "${fault}: guard result is wrong: $(tail -3 <<<"${out}")"
+  fi
+}
+
+record_guard_case g20 wrong-mode "cannot create a private recording directory"
+record_guard_case g21 wrong-owner "cannot create a private recording directory"
+record_guard_case g22 stat-failure "cannot create a private recording directory"
+record_guard_case g23 removal-failure "cleanup failed"
+record_guard_case g24 home-unset "REFUSING unsafe remote home"
+record_guard_case g25 home-empty "REFUSING unsafe remote home"
+record_guard_case g26 home-root "REFUSING unsafe remote home"
+record_guard_case g27 home-dotdot "REFUSING unsafe remote home"
+record_guard_case g28 home-symlink "REFUSING unsafe remote home"
+
+# --- dangerous cleanup path ----------------------------------------------------
+out="$(refresh --label g6 --step author --count 1)" || fail "g6 author failed: ${out}"
+mkdir -p "${WORK}/do-not-remove"
+echo keep > "${WORK}/do-not-remove/sentinel"
+mkdir -p "${FAKE}/b1/home/nemotron35-refresh/g6"
+ln -s "${WORK}/do-not-remove" "${FAKE}/b1/home/nemotron35-refresh/g6/serial@b1"
+out="$(refresh --label g6 --step record)" && fail "a symlink recording job path was accepted"
+[[ -L "${FAKE}/b1/home/nemotron35-refresh/g6/serial@b1" && -f "${WORK}/do-not-remove/sentinel" ]] \
+  && ok "cleanup refuses a dangerous job path and does not follow its symlink" \
+  || fail "cleanup followed or removed a dangerous job path"
+
+# A box name reaches the job key. A slash must not let cleanup leave the generation.
+out="$(refresh --label g7 --step author --count 1)" || fail "g7 author failed: ${out}"
+mkdir -p "${FAKE}/b1/home/nemotron35-refresh/g7/serial@b1"
+mkdir -p "${FAKE}/b1/home/nemotron35-refresh/g8/victim"
+echo keep > "${FAKE}/b1/home/nemotron35-refresh/g8/victim/sentinel"
+out="$(TEST_BOXES='b1/../../g8/victim b2' refresh --label g7 --step record)" \
+  && fail "a traversal recording job path was accepted"
+[[ -f "${FAKE}/b1/home/nemotron35-refresh/g8/victim/sentinel" ]] \
+  && ! grep -Fq 'ssh b1/../../g8/victim ' "${FAKE}/calls.log" \
+  && ok "cleanup refuses traversal before it reaches a sibling generation" \
+  || fail "cleanup reached or removed a sibling generation through traversal"
 
 # --- verify ---------------------------------------------------------------------
 out="$(refresh --label g1 --step verify)" && fail "verify passed before the push" \

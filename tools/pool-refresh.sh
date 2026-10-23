@@ -183,32 +183,148 @@ step_author() {
 # One box job: copy the prompts (and, for an oracle job, the agreed serial
 # goldens) to the box, run record-goldens.sh --only under the GPU lock, fetch
 # the goldens back into <gen>/rec/<key>/.
-box_job() { # box_job BOX KEY STEPS FILE_SUFFIX NAME...
+remote_home() { # remote_home BOX
+  local box="$1" home command
+  command='
+bad() { echo "pool-refresh: REFUSING unsafe remote home" >&2; exit 1; }
+home=${HOME-}
+[[ "$home" == /* && "$home" != / && "$home" != *$'"'"'\n'"'"'* && "$home" != *$'"'"'\r'"'"'* ]] || bad
+case "$home/" in */../*) bad ;; esac
+canonical=$(readlink -f -- "$home") || bad
+[[ "$canonical" == "$home" && -d "$home" && ! -L "$home" ]] || bad
+uid=$(id -u) || bad
+owner=$(stat -c %u -- "$home") || bad
+[[ "$owner" == "$uid" ]] || bad
+path=
+IFS=/ read -r -a parts <<< "${home#/}"
+for part in "${parts[@]}"; do
+  [[ -n "$part" ]] || bad
+  path="$path/$part"
+  [[ ! -L "$path" ]] || bad
+done
+printf "%s\n" "$home"
+'
+  if [[ "${DRY}" == 1 ]]; then
+    rsh "${box}" "${command}"
+    printf '/validated-remote-home\n'
+    return
+  fi
+  home="$(rsh "${box}" "${command}")" \
+    || { log "record: ${box}: remote home validation failed"; return 1; }
+  [[ "${home}" == /* && "${home}" != *$'\n'* && "${home}" != *$'\r'* ]] \
+    || { log "record: ${box}: remote home validation returned an unsafe path"; return 1; }
+  printf '%s\n' "${home}"
+}
+
+remote_job_cleanup() { # remote_job_cleanup BOX GENERATION JOB_NAME
+  local box="$1" generation="$2" job_name="$3" q_generation q_name
+  [[ -n "${job_name}" && "${job_name}" != . && "${job_name}" != .. \
+    && "${job_name}" != */* && "${job_name}" =~ ^[A-Za-z0-9_.@:%+-]+$ ]] \
+    || { log "REFUSING unsafe recording job name"; return 1; }
+  printf -v q_generation %q "${generation}"
+  printf -v q_name %q "${job_name}"
+  rsh "${box}" "generation=${q_generation}; name=${q_name};
+    [[ \"\$name\" != . && \"\$name\" != .. && \"\$name\" =~ ^[A-Za-z0-9_.@:%+-]+\$ ]] || exit 1;
+    if [[ ! -e \"\$generation\" && ! -L \"\$generation\" ]]; then exit 0; fi;
+    [[ -d \"\$generation\" && ! -L \"\$generation\" ]] || exit 1;
+    cd -P -- \"\$generation\" && [[ \"\$PWD\" == \"\$generation\" ]] || exit 1;
+    [[ ! -L \"\$name\" ]] || exit 1;
+    rm -rf -- \"\$name\" && [[ ! -e \"\$name\" && ! -L \"\$name\" ]]"
+}
+
+remote_job_create() { # remote_job_create BOX HOME GENERATION JOB_NAME
+  local box="$1" home="$2" generation="$3" job_name="$4"
+  local base="${home}/nemotron35-refresh" job="${generation}/${job_name}"
+  local q_home q_base q_generation q_label q_name q_job
+  printf -v q_home %q "${home}"
+  printf -v q_base %q "${base}"
+  printf -v q_generation %q "${generation}"
+  printf -v q_label %q "${LABEL}"
+  printf -v q_name %q "${job_name}"
+  printf -v q_job %q "${job}"
+  rsh "${box}" "umask 077; home=${q_home}; base=${q_base}; generation=${q_generation}; label=${q_label}; name=${q_name}; job=${q_job};
+    cd -P -- \"\$home\" && [[ \"\$PWD\" == \"\$home\" ]] || exit 1;
+    if [[ ! -e nemotron35-refresh && ! -L nemotron35-refresh ]]; then mkdir -m 0700 -- nemotron35-refresh || exit 1; fi;
+    [[ -d nemotron35-refresh && ! -L nemotron35-refresh ]] || exit 1;
+    chmod 0700 -- nemotron35-refresh || exit 1;
+    cd -P -- nemotron35-refresh && [[ \"\$PWD\" == \"\$base\" ]] || exit 1;
+    if [[ ! -e \"\$label\" && ! -L \"\$label\" ]]; then mkdir -m 0700 -- \"\$label\" || exit 1; fi;
+    [[ -d \"\$label\" && ! -L \"\$label\" ]] || exit 1;
+    chmod 0700 -- \"\$label\" || exit 1;
+    cd -P -- \"\$label\" && [[ \"\$PWD\" == \"\$generation\" ]] || exit 1;
+    [[ ! -e \"\$name\" && ! -L \"\$name\" ]] || exit 1;
+    mkdir -m 0700 -- \"\$name\" || exit 1;
+    mkdir -m 0700 -- \"\$name/prompts\" \"\$name/out\" || exit 1;
+    uid=\$(id -u) || exit 1;
+    for path in \"\$base\" \"\$generation\" \"\$job\" \"\$job/prompts\" \"\$job/out\"; do
+      [[ -d \"\$path\" && ! -L \"\$path\" ]] || exit 1;
+      mode=\$(stat -c %a -- \"\$path\") || exit 1;
+      owner=\$(stat -c %u -- \"\$path\") || exit 1;
+      [[ \"\$mode\" == 700 && \"\$owner\" == \"\$uid\" ]] || exit 1;
+    done"
+}
+
+box_job() ( # box_job BOX KEY STEPS FILE_SUFFIX NAME...
   local box="$1" key="$2" steps="$3" suffix="$4"; shift 4
-  local names=("$@") dir="${REMOTE}/${key}" only=() n
+  local names=("$@") only=() expected=() remote_args=() n q arg
+  local home generation job repo rsock log_dir q_home q_repo q_rsock q_log q_lock q_wait q_benchd snap=""
   is_done "job ${key}" && { log "record: ${key} done"; return 0; }
+  [[ -n "${key}" && "${key}" != . && "${key}" != .. && "${key}" =~ ^[A-Za-z0-9_.@:%+-]+$ ]] \
+    || { log "REFUSING unsafe recording job name"; return 1; }
+  home="$(remote_home "${box}")" || return 1
+  generation="${home}/${REMOTE}"
+  job="${generation}/${key}"
+  trap 'rc=$?; trap - EXIT; remote_job_cleanup "${box}" "${generation}" "${key}" || log "record: ${key} on ${box}: cleanup failed"; exit "${rc}"' EXIT
   for n in "${names[@]}"; do only+=(--only "${n}"); done
-  rsh "${box}" "rm -rf ${dir} && mkdir -p ${dir}/prompts ${dir}/out"
+  remote_job_cleanup "${box}" "${generation}" "${key}" || return 1
+  remote_job_create "${box}" "${home}" "${generation}" "${key}" \
+    || { log "record: ${key} on ${box}: cannot create a private recording directory"; return 1; }
   local src=() back=()
-  for n in "${names[@]}"; do src+=("${GEN}/prompts/${n}.tokens.json"); back+=("${box}:${dir}/out/${n}${suffix}"); done
-  run scp -q "${src[@]}" "${box}:${dir}/prompts/"
+  for n in "${names[@]}"; do src+=("${GEN}/prompts/${n}.tokens.json"); back+=("${box}:${job}/out/${n}${suffix}"); done
+  run scp -q "${src[@]}" "${box}:${job}/prompts/" || return 1
   if [[ "${steps}" != serial ]]; then
     src=()
     for n in "${names[@]}"; do src+=("${GEN}/goldens/${n}.golden.json"); done
-    run scp -q "${src[@]}" "${box}:${dir}/out/"
+    run scp -q "${src[@]}" "${box}:${job}/out/" || return 1
   fi
-  local snap="" logf="${GEN}/rec-${key}.log"
+  local logf="${GEN}/rec-${key}.log" remote_args_q=""
   [[ "${DRY}" != 1 ]] || logf=/dev/stderr
-  [[ -z "${REFRESH_BOX_SNAPSHOT:-}" ]] || snap="MLXFAST_TARGET_SNAPSHOT_DIR=${REFRESH_BOX_SNAPSHOT}"
+  repo="${home}/${BOX_REPO}"
+  rsock="${home}/rsock"
+  log_dir="${job}/log"
+  printf -v q_home %q "${home}"
+  printf -v q_repo %q "${repo}"
+  printf -v q_rsock %q "${rsock}"
+  printf -v q_log %q "${log_dir}"
+  printf -v q_lock %q "${LOCK}"
+  printf -v q_wait %q "${LOCK_WAIT}"
+  printf -v q_benchd %q "${REFRESH_BOX_BENCHD:-/srv/nemotron35/benchd-bin}"
+  if [[ -n "${REFRESH_BOX_SNAPSHOT:-}" ]]; then
+    printf -v q %q "${REFRESH_BOX_SNAPSHOT}"
+    snap="MLXFAST_TARGET_SNAPSHOT_DIR=${q} "
+  fi
+  remote_args=(--prompts "${job}/prompts" --out "${job}/out" "${only[@]}" --steps "${steps}")
+  for arg in "${remote_args[@]}"; do printf -v q %q "${arg}"; remote_args_q+=" ${q}"; done
   # serve-up refuses a /tmp socket under docker, and the operator's shell has no
   # SERVE_UP_* or BENCHD_BIN_DIR: give the recording private dirs and the staged benchd.
-  rsh "${box}" "mkdir -p \$HOME/rsock \$HOME/${dir}/log && cd ${BOX_REPO} && [[ -f ${LOCK} && ! -L ${LOCK} ]] && exec 9<${LOCK} && flock -w ${LOCK_WAIT} 9 && ${snap} SERVE_UP_SOCKET_DIR=\$HOME/rsock SERVE_UP_LOG_DIR=\$HOME/${dir}/log BENCHD_BIN_DIR=${REFRESH_BOX_BENCHD:-/srv/nemotron35/benchd-bin} tools/record-goldens.sh" \
-    "--prompts \$HOME/${dir}/prompts --out \$HOME/${dir}/out ${only[*]} --steps ${steps}" \
+  rsh "${box}" "home=${q_home}; rsock=${q_rsock};
+    cd -P -- \"\$home\" && [[ \"\$PWD\" == \"\$home\" ]] || exit 1;
+    if [[ ! -e \"\$rsock\" && ! -L \"\$rsock\" ]]; then mkdir -m 0700 -- \"\$rsock\" || exit 1; fi;
+    [[ -d \"\$rsock\" && ! -L \"\$rsock\" ]] || exit 1;
+    mkdir -m 0700 -- ${q_log} && cd -- ${q_repo} && [[ -f ${q_lock} && ! -L ${q_lock} ]] && exec 9<${q_lock} && flock -w ${q_wait} 9 && ${snap}SERVE_UP_SOCKET_DIR=${q_rsock} SERVE_UP_LOG_DIR=${q_log} BENCHD_BIN_DIR=${q_benchd} tools/record-goldens.sh${remote_args_q}" \
     >"${logf}" 2>&1 || { log "record: ${key} on ${box} failed; see ${GEN}/rec-${key}.log"; return 1; }
-  run mkdir -p "${GEN}/rec/${key}"
-  run scp -q "${back[@]}" "${GEN}/rec/${key}/"
+  run mkdir -p "${GEN}/rec/${key}" || return 1
+  run scp -q "${back[@]}" "${GEN}/rec/${key}/" || return 1
+  if [[ "${DRY}" != 1 ]]; then
+    for n in "${names[@]}"; do
+      expected+=("${GEN}/rec/${key}/${n}${suffix}")
+    done
+    for n in "${expected[@]}"; do [[ -f "${n}" ]] || { log "record: ${key} on ${box}: missing retrieved output ${n##*/}"; return 1; }; done
+  fi
+  remote_job_cleanup "${box}" "${generation}" "${key}" || return 1
+  trap - EXIT
   mark "job ${key}"
-}
+)
 
 run_jobs() { # run_jobs JOBFILE -- lines "BOX KEY STEPS SUFFIX NAMES..."; boxes in parallel, a box's jobs in turn
   local jobs="$1" box pids=() rc=0 p

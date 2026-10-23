@@ -42,6 +42,10 @@
     {
       "file": "vllm/model_executor/layers/mamba/ops/mamba_ssm_spec_replay.py (+ the decode branch of mamba_mixer2.py)",
       "why": "spec-decode verifies stored the fp32 SSM state of every draft position ((d+1) x 2 MiB per Mamba layer) although the next verify reads one; slot 0 now keeps the state after token 0, slot 1 a ring of the 16-bit token inputs, and the next verify replays the accepted tokens with the reference's update and launch config, bit-identical (VLLM_MAMBA_SPEC_REPLAY=0 restores the reference kernel)"
+    },
+    {
+      "file": "vllm/v1/attention/backends/flashinfer.py; vllm/config/compilation.py",
+      "why": "Restore submission 766c5c7e FULL uniform speculative-verify graph support and single-request exact graph capture sizes on the tuned MoE/host/Mamba-replay bundle b9a63f4f. Planner, attention arithmetic and model formats remain unchanged."
     }
   ]
 }

@@ -1478,10 +1478,20 @@ class CompilationConfig:
         # sizes for decode and mixed prefill-decode.
         # MRV2 handles cudagraph capture sizing in cudagraph_utils.py
         # and doesn't need below: https://github.com/vllm-project/vllm/pull/45953
+        # With one request per batch the only uniform decode batch is
+        # uniform_decode_query_len tokens; when that size is already captured
+        # no uniform batch is ever padded, so keep the small sizes (1, 2) for
+        # the PIECEWISE graphs (the drafter's single-token steps use them).
+        single_seq_sizes_ok = (
+            max_num_reqs == 1
+            and self.cudagraph_capture_sizes is not None
+            and uniform_decode_query_len in self.cudagraph_capture_sizes
+        )
         if (
             not use_v2_model_runner
             and cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
             and uniform_decode_query_len > 1
+            and not single_seq_sizes_ok
         ):
             self.adjust_cudagraph_sizes_for_spec_decode(
                 uniform_decode_query_len,

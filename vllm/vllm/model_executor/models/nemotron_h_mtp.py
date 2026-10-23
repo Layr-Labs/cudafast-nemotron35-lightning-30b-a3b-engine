@@ -35,6 +35,11 @@ from .nemotron_h import (
     NemotronHAttentionDecoderLayer,
     NemotronHMoEDecoderLayer,
 )
+from .nemotron_h_mtp_kernels import (
+    install_mtp_small_linear,
+    mtp_fast_enabled as _mtp_fast_enabled,
+    register_mtp_moe_layer,
+)
 
 
 class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
@@ -193,6 +198,20 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
             "moe_row_src", torch.arange(max_rows, dtype=torch.long), persistent=False
         )
 
+        # Single-row MoE: with one request in flight every MoE input row is
+        # the same row (see above), so the MoE runs once on that row and the
+        # result is written to every output row. Drafter-only numerics.
+        self._fast_moe = False
+        self._fast_moe_weights = None
+        self._fast_moe_name = prefix
+        try:
+            max_num_seqs = get_current_vllm_config().scheduler_config.max_num_seqs
+        except Exception:
+            max_num_seqs = None
+        if _mtp_fast_enabled("MOE") and max_num_seqs == 1:
+            register_mtp_moe_layer(prefix, self)
+            self._fast_moe = True
+
     def forward(
         self,
         inputs_embeds: torch.Tensor,
@@ -219,10 +238,17 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
             hidden_states = self.norm(hidden_states)
         else:
             hidden_states, residual = self.norm(hidden_states, residual)
-        hidden_states = hidden_states.index_select(
-            0, self.moe_row_src[: hidden_states.shape[0]]
-        )
-        hidden_states = self.mixer(hidden_states)
+        if self._fast_moe:
+            hidden_states = torch.ops.vllm.mtp_moe_single_row(
+                hidden_states,
+                self.moe_row_src[: hidden_states.shape[0]],
+                self._fast_moe_name,
+            )
+        else:
+            hidden_states = hidden_states.index_select(
+                0, self.moe_row_src[: hidden_states.shape[0]]
+            )
+            hidden_states = self.mixer(hidden_states)
 
         # End norm
         if self.has_end_norm:
@@ -367,6 +393,9 @@ class NemotronHMTP(nn.Module, SupportsPP):
         self.model = NemotronHMultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "mtp")
         )
+        # Small-M BF16 GEMMs for the head's dense layers (drafter only).
+        if _mtp_fast_enabled("DENSE"):
+            install_mtp_small_linear(self.model)
 
         # LM head for generating logits
         self.lm_head = ParallelLMHead(

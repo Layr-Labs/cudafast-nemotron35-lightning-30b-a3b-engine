@@ -1093,6 +1093,23 @@ def _causal_conv1d_update_kernel(
         tl.store(o_ptrs, acc, mask=mask_1d)
 
 
+def _causal_conv1d_update_block_n(batch: int, dim: int, width: int, seqlen: int) -> int:
+    # On GB10, a single 6144-channel Mamba update launches only 24 CTAs at
+    # BLOCK_N=256. A 128-channel tile exposes 48 independent CTAs. Channels
+    # share neither output elements nor state, and the arithmetic for each
+    # channel stays in the existing kernel. Keep all other shapes unchanged.
+    if (
+        batch == 1
+        and dim == 6144
+        and width == 4
+        and 1 <= seqlen <= 7
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability(121)
+    ):
+        return 128
+    return 256
+
+
 def causal_conv1d_update(
     x: torch.Tensor,
     conv_state: torch.Tensor,
@@ -1223,6 +1240,8 @@ def causal_conv1d_update(
         state_len = width - 1
     np2_statelen = triton.next_power_of_2(state_len)
 
+    block_n = _causal_conv1d_update_block_n(batch, dim, width, seqlen)
+
     def grid(META):
         return (
             batch,
@@ -1271,7 +1290,7 @@ def causal_conv1d_update(
         IS_SPEC_DECODING=num_accepted_tokens is not None,
         NP2_STATELEN=np2_statelen,
         HAS_NULL_BLOCK=null_block_id is not None,
-        BLOCK_N=256,
+        BLOCK_N=block_n,
         launch_pdl=current_platform.is_arch_support_pdl(),
     )
     if unsqueeze:

@@ -4,8 +4,84 @@
 import torch
 
 from vllm import _custom_ops as ops
-from vllm.triton_utils import triton
+from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import round_up
+
+
+@triton.jit
+def _small_moe_align_kernel(
+    topk_ids,
+    sorted_ids,
+    expert_ids,
+    num_tokens_post_pad,
+    N: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    ROUTE_BLOCK: tl.constexpr,
+    PAD_BLOCK: tl.constexpr,
+    MAX_PADDED: tl.constexpr,
+    TAIL_BLOCK: tl.constexpr,
+):
+    # Stable integer compaction for at most 42 routes. One representative per
+    # expert computes its padded interval; every route gets its original
+    # within-expert rank. No atomics, scratch buffer or host scalar read.
+    route = tl.arange(0, ROUTE_BLOCK)
+    valid = route < N
+    expert = tl.load(topk_ids + route, valid, other=128).to(tl.int32)
+    same = (expert[:, None] == expert[None, :]) & valid[None, :]
+    count = tl.sum(same.to(tl.int32), axis=1)
+    rank = tl.sum(
+        (same & (route[None, :] < route[:, None])).to(tl.int32), axis=1
+    )
+    leader = valid & (rank == 0)
+    padded = tl.cdiv(count, BLOCK_SIZE) * BLOCK_SIZE
+    before = (expert[None, :] < expert[:, None]) & leader[None, :]
+    start = tl.sum(tl.where(before, padded[None, :], 0), axis=1)
+    total = tl.sum(tl.where(leader, padded, 0), axis=0)
+    tl.store(num_tokens_post_pad, total)
+
+    tl.store(sorted_ids + start + rank, route, valid)
+    slot = tl.arange(0, PAD_BLOCK)
+    # Padding writes are disjoint from real routes and from all other
+    # experts. This needs no store barrier or read-after-write dependency.
+    pad_mask = (
+        leader[:, None]
+        & (slot[None, :] >= count[:, None])
+        & (slot[None, :] < padded[:, None])
+    )
+    tl.store(sorted_ids + start[:, None] + slot[None, :], N, pad_mask)
+    block_mask = (
+        leader[:, None]
+        & (slot[None, :] < padded[:, None])
+        & (slot[None, :] % BLOCK_SIZE == 0)
+    )
+    tl.store(
+        expert_ids + (start[:, None] + slot[None, :]) // BLOCK_SIZE,
+        expert[:, None],
+        block_mask,
+    )
+
+    # Initialize the unused capacity too; consumers may launch from the
+    # allocation's upper bound and mask using num_tokens_post_pad.
+    tail = tl.arange(0, TAIL_BLOCK)
+    tl.store(sorted_ids + tail, N, (tail >= total) & (tail < MAX_PADDED))
+    tl.store(expert_ids + route, -1, (route >= total // BLOCK_SIZE) & (route < N))
+
+
+def _use_small_moe_align(topk_ids, block_size, num_experts, expert_map):
+    return (
+        expert_map is None
+        and num_experts == 128
+        and block_size in (16, 32, 64)
+        and topk_ids.ndim == 2
+        and 1 <= topk_ids.shape[0] <= 7
+        and topk_ids.shape[1] == 6
+        and topk_ids.is_cuda
+        and topk_ids.dtype in (torch.int32, torch.int64)
+        and topk_ids.is_contiguous()
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability(121)
+    )
 
 
 def moe_align_block_size(
@@ -86,6 +162,23 @@ def moe_align_block_size(
         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
+
+    if _use_small_moe_align(topk_ids, block_size, num_experts, expert_map):
+        n = topk_ids.numel()
+        _small_moe_align_kernel[(1,)](
+            topk_ids,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            N=n,
+            BLOCK_SIZE=block_size,
+            ROUTE_BLOCK=triton.next_power_of_2(n),
+            PAD_BLOCK=triton.next_power_of_2(triton.cdiv(n, block_size) * block_size),
+            MAX_PADDED=max_num_tokens_padded,
+            TAIL_BLOCK=triton.next_power_of_2(max_num_tokens_padded),
+            num_warps=4,
+        )
+        return sorted_ids, expert_ids, num_tokens_post_pad
 
     ops.moe_align_block_size(
         topk_ids,

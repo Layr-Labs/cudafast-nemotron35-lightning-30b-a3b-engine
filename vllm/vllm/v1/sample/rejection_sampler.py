@@ -130,12 +130,25 @@ class RejectionSampler(nn.Module):
         # logits tensor. This means any in-place operations on bonus_logits
         # won't affect the original logits tensor.
         assert logits is not None
+        # Single request in raw-logits mode: every row of `logits` is either a
+        # target row or the bonus row, in order, and the reported logprobs are
+        # the unmodified rows. The logprobs then come straight from `logits`,
+        # so the bonus sampler need not copy its row to float32 and the target
+        # rows need no clone (see `_get_logprobs_tensors_single`).
+        single_raw = (
+            self.is_logits_logprobs_mode
+            and not self.is_processed_logprobs_mode
+            and sampling_metadata.max_num_logprobs is not None
+            and sampling_metadata.max_num_logprobs > 0
+            and len(metadata.num_draft_tokens) == 1
+            and logits.shape[0] == metadata.max_spec_len + 1
+        )
         bonus_logits = logits[bonus_logits_indices]
         bonus_sampler_output = self.sampler(
             logits=bonus_logits,
             sampling_metadata=replace(
                 sampling_metadata,
-                max_num_logprobs=-1,
+                max_num_logprobs=None if single_raw else -1,
             ),
             predict_bonus_token=True,
             # Override the logprobs mode to return logits because they are
@@ -153,7 +166,7 @@ class RejectionSampler(nn.Module):
         # Use float32 for the target_logits.
         raw_target_logits = raw_target_logits.to(torch.float32)
         target_logits = raw_target_logits
-        if not self.is_processed_logprobs_mode:
+        if not self.is_processed_logprobs_mode and not single_raw:
             # Clone raw_target_logits before applying processors to preserve
             # the original raw logits for logprobs computation, since
             # apply_logits_processors modifies the tensor in-place.
@@ -185,7 +198,13 @@ class RejectionSampler(nn.Module):
         )
 
         logprobs_tensors = None
-        if sampling_metadata.max_num_logprobs is not None:
+        if single_raw:
+            logprobs_tensors = self._get_logprobs_tensors_single(
+                sampling_metadata.max_num_logprobs,
+                logits,
+                output_token_ids,
+            )
+        elif sampling_metadata.max_num_logprobs is not None:
             logprobs_tensors = self._get_logprobs_tensors(
                 sampling_metadata.max_num_logprobs,
                 metadata,
@@ -199,6 +218,33 @@ class RejectionSampler(nn.Module):
             sampled_token_ids=output_token_ids,
             logprobs_tensors=logprobs_tensors,
         )
+
+    @staticmethod
+    def _get_logprobs_tensors_single(
+        max_num_logprobs: int,
+        logits: torch.Tensor,
+        sampled_token_ids: torch.Tensor,
+    ) -> LogprobsTensors:
+        """Raw-logits logprobs for one request, row i for output position i.
+
+        Same values as `_get_logprobs_tensors` for that case: its
+        `final_logits` is `logits` in float32 (each row is written once from
+        the same row) and its accepted-row indices are 0..n-1. The rank column
+        is not read by the resident (it reads token ids and logprobs only), so
+        it is a host constant instead of a vocab-wide compare.
+        """
+        accepted_logits = logits.to(torch.float32).contiguous()
+        # Rejected slots hold -1; use token 0 there (the row is dropped later).
+        accepted_tokens = sampled_token_ids.flatten().clamp(min=0).to(torch.int64)
+        topk_logprobs, topk_indices = torch.topk(
+            accepted_logits, max_num_logprobs, dim=-1
+        )
+        token_ids = accepted_tokens.unsqueeze(-1)
+        token_logprobs = accepted_logits.gather(-1, token_ids)
+        indices = torch.cat((token_ids, topk_indices), dim=1).to(torch.int32)
+        logprobs = torch.cat((token_logprobs, topk_logprobs), dim=1)
+        ranks = torch.ones(accepted_tokens.shape[0], dtype=torch.int64)
+        return LogprobsTensors(indices, logprobs, ranks)
 
     def _get_logprobs_tensors(
         self,

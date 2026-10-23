@@ -137,9 +137,15 @@ job measures every live golden.
 6. **Slots and retries**: each team has exactly K slots. A slot's value is its
    first run that ends with a score or a team failure (replay rejected, floor or
    correctness failure, refusal, unsealed, `watchdog_timeout`, or a watchdog
-   cancellation because the engine hung). A run whose prompt is not `final-*`
-   counts as infrastructure, not as a score. Infrastructure outcomes do not fill
-   a slot; `router.py rescore-retry` re-dispatches those slots. Per slot, total
+   cancellation because the engine hung). A cancelled run without a sealed
+   score is also a team failure and is not re-dispatched. A run whose scored
+   prompt is not in its fixture's `live_goldens` counts as infrastructure.
+   The router checks team failures and watchdog outcomes before the prompt.
+   It marks a run off-pool only with a sealed, finite numeric score and a
+   present scored prompt. Booleans, text, NaN, and infinite values are not
+   score evidence. A missing score or prompt is not off-pool evidence.
+   Infrastructure outcomes do not fill a slot. `router.py rescore-retry`
+   re-dispatches those slots. Per slot, total
    infrastructure attempts = `1 + --max-infra-retries` (default 2 extra attempts
    after the first, so 3 tries). The first candidate resident boot failure in a
    slot may be re-dispatched once (separate from the infra budget); a second
@@ -147,9 +153,8 @@ job measures every live golden.
    (`control_failed`) or band refusal (`band_refused`) that still fails after
    those attempts counts as **0.0** for that slot (status `penalized`), because
    the submission already ran and the fault is induced by the engine afterward.
-   Pre-setup infrastructure (preflight refusal, setup failure, manual cancellation
-   not caused by the watchdog, or off-pool) leaves the slot **unresolved** when
-   retries are exhausted.
+   Pre-setup infrastructure (preflight refusal, setup failure, or off-pool)
+   leaves the slot **unresolved** when retries are exhausted.
 7. **Rank**: the mean is the average of the K slot values (the score, 0.0 for a
    team failure, or 0.0 for a penalized post-setup infrastructure slot). A team
    with any slot still pending or unresolved has no mean and status `incomplete`;

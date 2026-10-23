@@ -5,9 +5,10 @@ ORGANIZER TOOL, trusted side (outside editablePaths). It does what Yukon's
 service does for a ranked submission (docs/submission-restriction-spec.md
 sections 1 and 4), then drives GitHub Actions the way Yukon does:
 
-  submit   take a directory or tarball holding a participant's editable paths,
-           keep ONLY the base's editablePaths (everything else is dropped and
-           logged), overlay them onto the trusted base with REPLACE semantics
+  submit   take a directory or tarball holding a participant's editable paths.
+           Directory input keeps only the base's editablePaths and logs dropped
+           paths. Archive input refuses paths outside editablePaths before it
+           writes a file. Overlay the result with REPLACE semantics
            (an editable path absent from the archive keeps the trusted copy,
            R3.6), refuse symlinks and special files (R3.8/R3.9), commit, push
            `sub/<id>`, and enqueue.
@@ -40,10 +41,14 @@ resumes where it stopped. The `gh` CLI must be logged in with repo scope.
 from __future__ import annotations
 
 import argparse
+import bz2
 import calendar
+import gzip
 import hashlib
 import html
 import json
+import lzma
+import math
 import re
 import os
 import shutil
@@ -55,7 +60,12 @@ import tarfile
 import tempfile
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+
+try:
+    from compression import zstd
+except ImportError:  # Python versions without tarfile zstd support.
+    zstd = None
 
 DEFAULT_BASE = os.environ.get("ROUTER_BASE", "loadtest/base")
 WORKFLOW = "benchmark.yml"
@@ -74,6 +84,10 @@ FIXTURE_REL = "fixtures/nemotron35_lightning_30b_a3b_track.json"
 TRACK_LABEL = "nemotron3.5-lightning-30b-a3b-cuda-v1"
 WATCHDOG_SECONDS = 90 * 60
 POLL_SECONDS = 60
+ARCHIVE_MAX_MEMBERS = 10_000
+ARCHIVE_MIN_METADATA_BYTES = 64 * 1024
+DEFAULT_MAX_TOTAL_BYTES = 36_047_190
+DEFAULT_MAX_FILE_BYTES = 2_558_837
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS submissions (
@@ -128,6 +142,113 @@ def sh(args: list[str], cwd: str | None = None, check: bool = True, retry: bool 
     return r.stdout
 
 
+def extract_submission_archive(source: Path, target: Path, editable: list[str], max_total_bytes: int,
+                               max_file_bytes: int, max_members: int = ARCHIVE_MAX_MEMBERS) -> None:
+    """Validate a submission tar before writing approved regular files."""
+    if any(target.iterdir()):
+        raise RuntimeError("refusing archive: extraction target is not empty")
+    members: list[tuple[tarfile.TarInfo, Path]] = []
+    seen: set[str] = set()
+    total_bytes = 0
+    try:
+        with source.open("rb") as raw, tempfile.TemporaryFile() as expanded:
+            magic = raw.read(6)
+            raw.seek(0)
+            if magic.startswith(b"\x1f\x8b"):
+                archive = gzip.GzipFile(fileobj=raw)
+            elif magic.startswith(b"BZh"):
+                archive = bz2.BZ2File(raw)
+            elif magic.startswith(b"\xfd7zXZ\x00"):
+                archive = lzma.LZMAFile(raw)
+            elif magic.startswith(b"\x28\xb5\x2f\xfd"):
+                if zstd is None:
+                    raise RuntimeError("refusing archive: zstd is not supported by this Python")
+                archive = zstd.ZstdFile(raw)
+            else:
+                archive = raw
+            expanded_limit = max_total_bytes + max(ARCHIVE_MIN_METADATA_BYTES, max_total_bytes // 4)
+            expanded_bytes = 0
+            try:
+                while chunk := archive.read(min(1024 * 1024, expanded_limit - expanded_bytes + 1)):
+                    expanded_bytes += len(chunk)
+                    if expanded_bytes > expanded_limit:
+                        raise RuntimeError(
+                            f"refusing archive: expanded archive exceeds {expanded_limit} bytes")
+                    expanded.write(chunk)
+            finally:
+                if archive is not raw:
+                    archive.close()
+            expanded.seek(0)
+
+            with tarfile.open(fileobj=expanded, mode="r:") as tf:
+                for count, member in enumerate(tf, 1):
+                    if count > max_members:
+                        raise RuntimeError(f"refusing archive: more than {max_members} members")
+                    name = member.name
+                    if "\0" in name:
+                        raise RuntimeError(f"refusing archive: NUL in path {name!r}")
+                    path = PurePosixPath(name)
+                    if not name or path.is_absolute() or name.startswith("/"):
+                        raise RuntimeError(f"refusing archive: absolute path {name!r}")
+                    raw_parts = name.split("/")
+                    if ".." in raw_parts:
+                        raise RuntimeError(f"refusing archive: parent path {name!r}")
+                    parts = tuple(part for part in raw_parts if part not in ("", "."))
+                    if not parts or parts[0] not in editable:
+                        raise RuntimeError(f"refusing archive: path outside editable roots: {name!r}")
+                    clean_name = "/".join(parts)
+                    if clean_name in seen:
+                        raise RuntimeError(f"refusing archive: duplicate path {clean_name!r}")
+                    seen.add(clean_name)
+                    if member.issym():
+                        raise RuntimeError(f"refusing archive: symlink {clean_name!r}")
+                    if member.islnk():
+                        raise RuntimeError(f"refusing archive: hardlink {clean_name!r}")
+                    if member.issparse() or any(
+                            isinstance(key, str) and key.startswith("GNU.sparse")
+                            for key in member.pax_headers):
+                        raise RuntimeError(f"refusing archive: sparse entry {clean_name!r}")
+                    if not (member.isdir() or member.isreg()):
+                        raise RuntimeError(f"refusing archive: non-regular entry {clean_name!r}")
+                    if member.mode & (stat.S_ISUID | stat.S_ISGID):
+                        raise RuntimeError(f"refusing archive: setuid/setgid entry {clean_name!r}")
+                    pax_size = member.pax_headers.get("size")
+                    if (type(member.size) is not int or member.size < 0 or pax_size is not None
+                            and (type(pax_size) is not str or re.fullmatch(r"[0-9]+", pax_size) is None)):
+                        raise RuntimeError(f"refusing archive: invalid size for {clean_name!r}")
+                    if member.isreg():
+                        if member.size > max_file_bytes:
+                            raise RuntimeError(
+                                f"refusing archive: {clean_name!r} is larger than {max_file_bytes} bytes")
+                        total_bytes += member.size
+                        if total_bytes > max_total_bytes:
+                            raise RuntimeError(
+                                f"refusing archive: files total more than {max_total_bytes} bytes")
+                    members.append((member, Path(*parts)))
+
+                for member, relative in members:
+                    destination = target / relative
+                    if member.isdir():
+                        destination.mkdir(parents=True, exist_ok=True)
+                        continue
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    source_file = tf.extractfile(member)
+                    if source_file is None:
+                        raise RuntimeError(f"refusing archive: cannot read {member.name!r}")
+                    with source_file, destination.open("xb") as output:
+                        shutil.copyfileobj(source_file, output)
+                    destination.chmod(member.mode & 0o777)
+                for member, relative in reversed(members):
+                    if member.isdir():
+                        (target / relative).chmod(member.mode & 0o777)
+    except Exception as e:
+        for path in target.iterdir():
+            shutil.rmtree(path) if path.is_dir() and not path.is_symlink() else path.unlink()
+        if isinstance(e, RuntimeError):
+            raise
+        raise RuntimeError(f"refusing archive: {e}") from e
+
+
 class Router:
     def __init__(self, state_dir: Path, repo: str, base: str, gh: str = "gh"):
         self.state_dir = state_dir
@@ -165,6 +286,22 @@ class Router:
                 raise RuntimeError(f"invalid editable path in the base contract: {p!r}")
         return paths
 
+    def archive_limits(self, ref: str) -> tuple[int, int, int]:
+        raw = sh(["git", "show", f"{ref}:benchmark.json"], cwd=str(self.clone))
+        budget = json.loads(raw).get("editableSurfaceByteBudget") or {}
+
+        def cap(name: str, default: int) -> int:
+            value = budget.get(name, default)
+            if type(value) is not int or value <= 0:
+                raise RuntimeError(f"invalid editableSurfaceByteBudget.{name}: {value!r}")
+            return value
+
+        total = cap("maxTotalBytes", DEFAULT_MAX_TOTAL_BYTES)
+        per_file = cap("maxFileBytes", DEFAULT_MAX_FILE_BYTES)
+        if per_file > total:
+            raise RuntimeError("invalid editableSurfaceByteBudget: maxFileBytes exceeds maxTotalBytes")
+        return total, per_file, ARCHIVE_MAX_MEMBERS
+
     @staticmethod
     def _check_tree(root: Path) -> None:
         """R3.8/R3.9: no symlink, no special file, no hardlink, no setuid/setgid."""
@@ -200,8 +337,7 @@ class Router:
                 shutil.copytree(source, src, symlinks=True)
             else:
                 src.mkdir()
-                with tarfile.open(source) as tf:
-                    tf.extractall(src, filter="tar")
+                extract_submission_archive(source, src, editable, *self.archive_limits(base_ref))
             present = {p.name for p in src.iterdir()}
             # Keep only editablePaths (top-level entry match, as the contract lists them).
             dropped = sorted(n for n in present if n not in editable)
@@ -540,8 +676,8 @@ class Router:
         names: dict = {}
         for r in rows:
             res = json.loads(r.get("result") or "null") or {}
-            prompt = self._scored_prompt(res.get("metrics") or {}, r.get("commit_sha"), names)
-            r["_off_pool"] = not prompt.startswith("final-")
+            prompt, active_pool = self._scored_prompt(res.get("metrics") or {}, r.get("commit_sha"), names)
+            r["_off_pool"] = scored_prompt_is_off_pool(r, prompt, active_pool)
         return rows
 
     def rescore_retry(self, tag: str = "final", max_infra_retries: int = 2) -> dict:
@@ -579,22 +715,25 @@ class Router:
                 redispatched.append({"team": team, "slot": slot_i, "run_id": run_id})
         return {"tag": tag, "max_infra_retries": max_infra_retries, "redispatched": redispatched}
 
-    def _scored_prompt(self, metrics: dict, commit: str | None, cache: dict) -> str:
+    def _scored_prompt(self, metrics: dict, commit: str | None, cache: dict) -> tuple[str, frozenset[str]]:
         """The prompt a run measured. benchd seals no prompt name, only the serial
         golden's sha256 (metrics.baseline_golden_sha256); map it back through the
-        timed_prompt_pool pins of the fixture at the run's own commit. An unknown
-        digest maps to "" and so counts as off-pool."""
-        sha = metrics.get("baseline_golden_sha256")
-        if not sha:
-            return metrics.get("live_prompt") or ""  # records sealed before benchd stopped sealing names
+        timed_prompt_pool pins of the fixture at the run's own commit. Return its
+        active live_goldens too. An unknown digest gives no off-pool evidence."""
         if commit not in cache:
             try:
                 fx = json.loads(sh(["git", "show", f"{commit}:{FIXTURE_REL}"], cwd=str(self.clone)))
             except (RuntimeError, ValueError):
                 fx = {}
-            cache[commit] = {e["sha256"]: e["r2_path"].rsplit("/", 1)[-1].removesuffix(".golden.json")
-                             for e in fx.get("timed_prompt_pool", []) if e.get("sha256") and e.get("r2_path")}
-        return cache[commit].get(sha, "")
+            cache[commit] = (
+                {e["sha256"]: e["r2_path"].rsplit("/", 1)[-1].removesuffix(".golden.json")
+                 for e in fx.get("timed_prompt_pool", []) if e.get("sha256") and e.get("r2_path")},
+                frozenset(fx.get("live_goldens") or ()),
+            )
+        names, active_pool = cache[commit]
+        sha = metrics.get("baseline_golden_sha256")
+        prompt = names.get(sha, "") if sha else metrics.get("live_prompt") or ""
+        return prompt, active_pool
 
     def rescore_report(self, out: Path, tag: str = "final", max_infra_retries: int = 2) -> dict:
         rows = [dict(r) for r in self.db.execute("SELECT * FROM submissions WHERE rescore=? ORDER BY created",
@@ -609,8 +748,8 @@ class Router:
         runs, teams, names = [], {}, {}
         for r in rows:
             res = json.loads(r.get("result") or "null") or {}
-            prompt = self._scored_prompt(res.get("metrics") or {}, r.get("commit_sha"), names)
-            off_pool = not prompt.startswith("final-")
+            prompt, active_pool = self._scored_prompt(res.get("metrics") or {}, r.get("commit_sha"), names)
+            off_pool = scored_prompt_is_off_pool(r, prompt, active_pool)
             r["_off_pool"] = off_pool
             run = {"team": r["team"], "submission": r["source"], "id": r["id"], "state": r["state"],
                    "outcome": r["outcome"], "box": r["box"], "prompt": prompt, "score": r["score"],
@@ -671,6 +810,12 @@ INFRA_OUTCOMES = frozenset({
 })
 
 
+def scored_prompt_is_off_pool(row: dict, prompt: str, active_pool: set[str] | frozenset[str]) -> bool:
+    score = row.get("score")
+    return (isinstance(score, (int, float)) and not isinstance(score, bool) and math.isfinite(score)
+            and bool(prompt) and prompt not in active_pool)
+
+
 def parse_rescore_slot(note: str) -> tuple[int, int] | None:
     m = RESCORE_NOTE_RE.search(note)
     if not m:
@@ -696,19 +841,17 @@ def rescore_run_kind(row: dict, off_pool: bool) -> str:
             result = {}
         if (result.get("metrics") or {}).get("paired_legs"):
             return "team_failure"
-    if outcome == "teardown_failed":
+    incident = row.get("incident") or ""
+    if incident.startswith("watchdog:") or outcome in TEAM_FAILURE_OUTCOMES:
+        return "team_failure"
+    if outcome == "cancelled" and row.get("score") is None:
         return "team_failure"
     if off_pool:
         return "infra"
-    incident = row.get("incident") or ""
-    if incident.startswith("watchdog:"):
-        return "team_failure"
     if outcome == "pass":
         return "scored"
     if outcome == "boot_failed":
         return "boot_failed"
-    if outcome in TEAM_FAILURE_OUTCOMES:
-        return "team_failure"
     if outcome in INFRA_OUTCOMES:
         return "infra"
     if row.get("passed") == 1 and row.get("score") is not None:
@@ -766,6 +909,8 @@ def contest_run_value(row: dict) -> float | None:
     outcome = row.get("outcome") or ""
     if outcome == "pass" and row.get("score") is not None:
         return row["score"]
+    if outcome == "cancelled" and row.get("score") is None:
+        return 0.0
     if outcome == "boot_failed":
         return 0.0
     if outcome in TEAM_FAILURE_OUTCOMES:

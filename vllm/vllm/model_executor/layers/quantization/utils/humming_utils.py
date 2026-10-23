@@ -822,8 +822,6 @@ def _prepare_and_transform_sublayer(
     has_bias: bool,
     num_experts: int,
     param_dtype: torch.dtype,
-    pad_n_to_multiple: int = 256,
-    pad_k_to_multiple: int = 128,
 ) -> None:
     """
     Prepare layer metadata and transform weights for a sublayer.
@@ -836,8 +834,8 @@ def _prepare_and_transform_sublayer(
         layer=layer,
         shape_n=shape_n,
         shape_k=shape_k,
-        pad_n_to_multiple=pad_n_to_multiple,
-        pad_k_to_multiple=pad_k_to_multiple,
+        pad_n_to_multiple=256,
+        pad_k_to_multiple=128,
         input_schema=input_schema,
         weight_schema=weight_schema,
         has_bias=has_bias,
@@ -860,8 +858,6 @@ def _process_single_sublayer(
     num_experts: int,
     param_dtype: torch.dtype,
     force_weight_schema: Any | None = None,
-    pad_n_to_multiple: int = 256,
-    pad_k_to_multiple: int = 128,
 ) -> tuple[Any, Any]:
     """
     Process a single sublayer: convert, optionally requant, prepare, and transform.
@@ -924,8 +920,6 @@ def _process_single_sublayer(
         has_bias=has_bias,
         num_experts=num_experts,
         param_dtype=param_dtype,
-        pad_n_to_multiple=pad_n_to_multiple,
-        pad_k_to_multiple=pad_k_to_multiple,
     )
 
     return current_weight_schema, current_input_schema
@@ -1012,24 +1006,6 @@ def convert_to_humming_moe_kernel_format(
     layer.weight_schemas = {}
     layer.input_schemas = {}
 
-    # LOCAL PATCH (cudafast-nemotron35): unpadded experts plus explicit
-    # batch-invariant tuning configs for the shapes they were tuned for; see
-    # fused_moe/experts/humming_tuned_moe.py. Value-exact, input-independent.
-    from vllm.model_executor.layers.fused_moe.experts.humming_tuned_moe import (
-        select_moe_padding,
-    )
-
-    pad_n_to_multiple, pad_k_to_multiple, tuned = select_moe_padding(
-        weight_schema=weight_schema,
-        input_schema=input_schema,
-        force_weight_schema=force_weight_schema,
-        sublayer_configs=sublayer_configs,
-        num_experts=num_experts,
-        has_bias=has_bias,
-        param_dtype=param_dtype,
-    )
-    layer.humming_tuned_moe = tuned
-
     for sublayer_name, configs in sublayer_configs.items():
         final_weight_schema, final_input_schema = _process_single_sublayer(
             layer=layer,
@@ -1042,8 +1018,6 @@ def convert_to_humming_moe_kernel_format(
             num_experts=num_experts,
             param_dtype=param_dtype,
             force_weight_schema=force_weight_schema,
-            pad_n_to_multiple=pad_n_to_multiple,
-            pad_k_to_multiple=pad_k_to_multiple,
         )
 
         layer.weight_schemas[sublayer_name] = final_weight_schema

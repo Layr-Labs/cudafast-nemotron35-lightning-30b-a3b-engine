@@ -90,7 +90,6 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import compute_iteration_details
-from vllm.v1.worker import hostfast
 from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
@@ -1340,13 +1339,6 @@ class EngineCoreProc(EngineCore):
             signal.signal(signal.SIGTERM, signal_handler)
             signal.signal(signal.SIGINT, signal_handler)
 
-            # LOCAL PATCH (cudafast-nemotron35): startup (compile, capture) is
-            # done; keep the busy loop and its I/O threads on the fastest
-            # cores (v1/worker/hostfast.py).
-            pinned = hostfast.pin_to_fast_cpus()
-            if pinned:
-                logger.info("hostfast: engine core pinned to CPUs %s", pinned)
-
             engine_core.run_busy_loop()
 
         except SystemExit:
@@ -1390,9 +1382,6 @@ class EngineCoreProc(EngineCore):
             self._process_input_queue()
             # Publish request counts before and after GPU step to ensure freshness.
             self._maybe_publish_request_counts()
-            # LOCAL PATCH (cudafast-nemotron35): no automatic GC while busy
-            # (v1/worker/hostfast.py).
-            hostfast.gc_busy()
             # 2) Step the engine core and return the outputs.
             self._process_engine_step()
             self._maybe_publish_request_counts()
@@ -1417,8 +1406,6 @@ class EngineCoreProc(EngineCore):
 
         waited = False
         while not self.has_work() and self.is_running():
-            # LOCAL PATCH (cudafast-nemotron35): automatic GC again while idle.
-            hostfast.gc_idle()
             # Notify callbacks waiting for engine to become idle.
             self._notify_idle_state_callbacks()
             if self.input_queue.empty():

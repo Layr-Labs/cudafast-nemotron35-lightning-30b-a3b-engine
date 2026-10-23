@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Fused MoE utilities for Humming."""
 
-import copy
 import json
 import math
 from typing import TYPE_CHECKING, Any
@@ -18,10 +17,6 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
-)
-from vllm.model_executor.layers.fused_moe.experts.humming_tuned_moe import (
-    relu2_bf16,
-    tuned_moe_configs,
 )
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size,
@@ -114,35 +109,6 @@ def _humming_batch_invariant() -> bool:
     ) == "1"
 
 
-# LOCAL PATCH (cudafast-nemotron35, vllm/VENDOR.json "local_patches"): humming's
-# heuristic picks num_ctas_per_sm before its batch-invariant step shrinks block K
-# to 512 // a_bits, so the small-M entries (decode, verify) keep one 4-warp CTA
-# per SM. Give them the second resident CTA the heuristic grants to small CTAs
-# whose shared memory fits twice. This only doubles the persistent grid: without
-# stream-K every output tile is still computed by one CTA over all K blocks in
-# the same order, so the numerics are unchanged.
-def _two_ctas_per_sm(tuning_configs: list, meta: Any, gemm_type: Any) -> list:
-    from humming.tune import get_heuristics_class
-    from humming.utils.smem import estimate_smem_size_layer
-
-    max_smem_size = get_heuristics_class().max_smem_size
-    tuning_configs = copy.deepcopy(tuning_configs)
-    for _, _, config in tuning_configs:
-        block_shape = tuple(config["block_shape"])
-        num_warps = math.prod(block_shape) // math.prod(config["warp_shape"])
-        smem_size = estimate_smem_size_layer(
-            meta, block_shape, gemm_type, config["num_stages"]
-        )
-        if (
-            not config["use_stream_k"]
-            and config.get("num_ctas_per_sm", 1) == 1
-            and num_warps < 8
-            and smem_size * 2 <= max_smem_size
-        ):
-            config["num_ctas_per_sm"] = 2
-    return tuning_configs
-
-
 def get_humming_moe_gemm_type() -> str:
     env_gemm_type: str | None = envs.VLLM_HUMMING_MOE_GEMM_TYPE
     gemm_type = "indexed"
@@ -192,39 +158,20 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             "use_f16_accum": envs.VLLM_HUMMING_USE_F16_ACCUM,
             "gemm_type": self.humming_gemm_type().value,
         }
-        # LOCAL PATCH (cudafast-nemotron35): explicit batch-invariant configs
-        # for unpadded experts of the tuned shapes (humming_tuned_moe.py).
-        tuned = None
-        if self.humming_gemm_type().value == "indexed":
-            tuned = tuned_moe_configs(self.layer)
-        # The same patch fuses relu^2 into one bit-identical kernel.
-        self._fused_relu2 = tuned is not None
-        if tuned is not None:
-            self.w13_tuning_config, self.w2_tuning_config = tuned
-        else:
-            self.w13_tuning_config = HummingMethod.get_default_tuning_configs(
-                layer=self.layer,
-                use_f16_accum=envs.VLLM_HUMMING_USE_F16_ACCUM,
-                use_batch_invariant=_humming_batch_invariant(),
-                gemm_type=self.humming_gemm_type(),
-                sublayer_name="w13",
-            )
-            self.w2_tuning_config = HummingMethod.get_default_tuning_configs(
-                layer=self.layer,
-                use_f16_accum=envs.VLLM_HUMMING_USE_F16_ACCUM,
-                use_batch_invariant=_humming_batch_invariant(),
-                gemm_type=self.humming_gemm_type(),
-                sublayer_name="w2",
-            )
-            if _humming_batch_invariant():
-                metas = self.layer.humming_metas
-                gemm_type = self.humming_gemm_type()
-                self.w13_tuning_config = _two_ctas_per_sm(
-                    self.w13_tuning_config, metas["w13"], gemm_type
-                )
-                self.w2_tuning_config = _two_ctas_per_sm(
-                    self.w2_tuning_config, metas["w2"], gemm_type
-                )
+        self.w13_tuning_config = HummingMethod.get_default_tuning_configs(
+            layer=self.layer,
+            use_f16_accum=envs.VLLM_HUMMING_USE_F16_ACCUM,
+            use_batch_invariant=_humming_batch_invariant(),
+            gemm_type=self.humming_gemm_type(),
+            sublayer_name="w13",
+        )
+        self.w2_tuning_config = HummingMethod.get_default_tuning_configs(
+            layer=self.layer,
+            use_f16_accum=envs.VLLM_HUMMING_USE_F16_ACCUM,
+            use_batch_invariant=_humming_batch_invariant(),
+            gemm_type=self.humming_gemm_type(),
+            sublayer_name="w2",
+        )
         self.compute_config_str = json.dumps(self.compute_config)
         self.w13_tuning_config_str = json.dumps(self.w13_tuning_config)
         self.w2_tuning_config_str = json.dumps(self.w2_tuning_config)
@@ -606,12 +553,6 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
         input: torch.Tensor,
     ) -> None:
         swiglu_limit = self.quant_config.gemm1_clamp_limit
-        if (
-            activation == MoEActivation.RELU2_NO_MUL
-            and getattr(self, "_fused_relu2", False)
-            and relu2_bf16(input, output)
-        ):
-            return
         if activation == MoEActivation.SILU and swiglu_limit is not None:
             swiglu_limit_func(output=output, input=input, swiglu_limit=swiglu_limit)
         else:

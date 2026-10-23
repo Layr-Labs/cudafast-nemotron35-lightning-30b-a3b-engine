@@ -841,6 +841,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         )  # Extra buffer for mutable paged_kv_indptr.cpu in cuda graph mode
         self.paged_kv_indices = self._make_buffer(max_num_pages)
         self.paged_kv_last_page_len = self._make_buffer(max_num_reqs)
+        # Recorded after each build's non_blocking H2D copies (these buffers
+        # and the wrappers' page-locked plan workspaces); the next build waits
+        # on it before rewriting any of those host sources.
+        self._host_buffers_free_event: torch.Event | None = None
 
     # Keep SM90 prefill/decode Q dtype selection in one place.
     def get_q_data_type(self, is_prefill: bool) -> torch.dtype:
@@ -1115,6 +1119,28 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         return paged_kv_indices
 
     def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> FlashInferMetadata:
+        # A build rewrites pinned host buffers that the previous build's
+        # non_blocking H2D copies read when the GPU reaches them. Nothing else
+        # orders the two once no blocking D2H drains the stream in between,
+        # so wait until the previous build's copies have run.
+        guard = self.pin_memory and not torch.cuda.is_current_stream_capturing()
+        if guard and self._host_buffers_free_event is not None:
+            self._host_buffers_free_event.synchronize()
+        attn_metadata = self._build_unguarded(
+            common_prefix_len, common_attn_metadata, fast_build
+        )
+        if guard:
+            if self._host_buffers_free_event is None:
+                self._host_buffers_free_event = torch.cuda.Event()
+            self._host_buffers_free_event.record()
+        return attn_metadata
+
+    def _build_unguarded(
         self,
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,

@@ -777,6 +777,15 @@ class GPUModelRunner(
         self.num_computed_tokens = torch.zeros(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
+        # Host mirror of every value _prepare_inputs writes into
+        # self.num_computed_tokens (the GPU buffer starts at zero, and so does
+        # the mirror). Rows whose GPU value could not be reproduced on the host
+        # are marked inexact. With it, async spec decode hands the attention
+        # builders the exact seq_lens on the host instead of a blocking
+        # seq_lens.to("cpu"), which drains the whole stream every step.
+        self._nct_mirror = np.zeros(self.max_num_reqs, dtype=np.int64)
+        self._nct_mirror_exact = np.ones(self.max_num_reqs, dtype=bool)
+        self._exact_seq_lens_np: np.ndarray | None = None
         self.prev_num_draft_tokens = self._make_buffer(
             self.max_num_reqs, dtype=torch.int32
         )
@@ -2158,6 +2167,9 @@ class GPUModelRunner(
             and self.valid_sampled_token_count_gpu is not None
             and prev_req_id_to_index
         ):
+            # Host copy of the corrected values, taken before the H2D copies
+            # below are queued (they read these pinned buffers later).
+            mirrored_nct = self._mirror_num_computed_tokens_correction(num_reqs)
             self.prev_positions.copy_to_gpu(num_reqs)
             self.prev_num_draft_tokens.copy_to_gpu()
             cpu_values = self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].to(
@@ -2172,10 +2184,23 @@ class GPUModelRunner(
                 cpu_values,
             )
         else:
+            mirrored_nct = self.input_batch.num_computed_tokens_cpu[:num_reqs].astype(
+                np.int64
+            )
             self.num_computed_tokens[:num_reqs].copy_(
                 self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
                 non_blocking=True,
             )
+        self._exact_seq_lens_np = None
+        if mirrored_nct is None:
+            self._nct_mirror_exact[:num_reqs] = False
+        else:
+            self._nct_mirror[:num_reqs] = mirrored_nct
+            self._nct_mirror_exact[:num_reqs] = True
+            # seq_lens[:num_reqs] below is num_computed_tokens + scheduled.
+            self._exact_seq_lens_np = (
+                mirrored_nct + num_scheduled_tokens[:num_reqs]
+            ).astype(np.int32)
 
         self.req_indices.np[:total_num_scheduled_tokens] = req_indices
         self.req_indices.copy_to_gpu(total_num_scheduled_tokens)
@@ -2295,6 +2320,7 @@ class GPUModelRunner(
         num_scheduled_tokens: dict[str, int] | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         slot_mappings: dict[int, torch.Tensor] | None = None,
+        exact_seq_lens_np: np.ndarray | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         Returns:
@@ -2375,8 +2401,18 @@ class GPUModelRunner(
         is_prefilling[num_reqs:] = False
 
         if self.use_async_spec_decode:
-            # GPU tensors are authoritative in async mode.
+            # GPU tensors are authoritative in async mode. When _prepare_inputs
+            # reproduced this step's GPU seq_lens on the host, hand those
+            # values over so no builder needs a blocking seq_lens.to("cpu").
             seq_lens_cpu = None
+            if (
+                exact_seq_lens_np is not None
+                and not for_cudagraph_capture
+                and exact_seq_lens_np.shape[0] == num_reqs
+            ):
+                # Rows past num_reqs mirror seq_lens[num_reqs:].fill_(0).
+                seq_lens_cpu = torch.zeros(num_reqs_padded, dtype=torch.int32)
+                seq_lens_cpu.numpy()[:num_reqs] = exact_seq_lens_np
             num_computed_tokens_cpu = None
 
         # Compute mm_prefix bidirectional ranges before building
@@ -4388,8 +4424,10 @@ class GPUModelRunner(
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     slot_mappings=slot_mappings_by_group,
+                    exact_seq_lens_np=self._exact_seq_lens_np,
                 )
             )
+            self._exact_seq_lens_np = None
 
             (
                 input_ids,
@@ -4982,6 +5020,42 @@ class GPUModelRunner(
             # Stash for GPU-side correction in _prepare_inputs.
             self.valid_sampled_token_count_gpu = valid_sampled_tokens_count
         self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
+
+    def _mirror_num_computed_tokens_correction(self, num_reqs: int) -> np.ndarray | None:
+        """Host replica of update_num_computed_tokens_for_batch_change.
+
+        Returns exactly what that kernel writes into
+        self.num_computed_tokens[:num_reqs], from the same inputs: the host
+        mirror of the previous GPU values, the previous step's valid sampled
+        token counts (copied to the host right after rejection sampling, before
+        the drafter runs), prev_positions, prev_num_draft_tokens and the host
+        num_computed_tokens. Returns None when a gathered row is not exact.
+        """
+        event = self.valid_sampled_token_count_event
+        counts_cpu = self.valid_sampled_token_count_cpu
+        counts_gpu = self.valid_sampled_token_count_gpu
+        if event is None or counts_cpu is None or counts_gpu is None:
+            return None
+        prev = self.prev_positions.np[:num_reqs]
+        gather = np.maximum(prev, 0)
+        participating = (prev >= 0) & (self.prev_num_draft_tokens.np[gather] > 0)
+        cpu_values = self.input_batch.num_computed_tokens_cpu[:num_reqs].astype(
+            np.int64
+        )
+        if not participating.any():
+            return cpu_values
+        rows = gather[participating]
+        if (
+            int(rows.max()) >= counts_gpu.shape[0]
+            or not self._nct_mirror_exact[rows].all()
+        ):
+            return None
+        # Fires once the previous step's rejection sampling has run: the copy
+        # stream recorded it before the drafter passes were queued.
+        event.synchronize()
+        counts = counts_cpu.numpy()[gather].astype(np.int64)
+        corrected = self._nct_mirror[gather] + counts
+        return np.where(participating, corrected, cpu_values)
 
     def _get_valid_sampled_token_count(self) -> list[int]:
         # Wait until valid_sampled_tokens_count is copied to cpu,

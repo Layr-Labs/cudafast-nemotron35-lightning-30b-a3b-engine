@@ -338,7 +338,17 @@ impl EngineSession for ResidentSession {
     fn sync_to_frontier(&mut self, tokens: &[i64]) -> Result<(), String> {
         // `max_tokens: 1`: the resident's request finishes at the frontier
         // token, so the engine is idle when this reply arrives.
-        let reply = self.call(json!({"op": "sync", "tokens": tokens, "max_tokens": 1}))?;
+        // `argmax_only`: the frontier token is all a prefill reads, so the
+        // engine computes no top-k logits for it.
+        let reply = self
+            .call(json!({"op": "sync", "tokens": tokens, "max_tokens": 1, "argmax_only": true}))?;
+        self.take_frontier(&reply)
+    }
+
+    fn sync_argmax_only(&mut self, tokens: &[i64]) -> Result<(), String> {
+        // A resident that predates the flag ignores it and computes the top-k
+        // anyway: slower, never wrong.
+        let reply = self.call(json!({"op": "sync", "tokens": tokens, "argmax_only": true}))?;
         self.take_frontier(&reply)
     }
 

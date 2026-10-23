@@ -130,6 +130,54 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(len(ids), 8)
         self.assertEqual(logits, sorted(logits, reverse=True))
 
+    def test_an_argmax_only_sync_computes_no_top_logits(self):
+        backend = FakeBackend(depth=0)
+        s = Session(backend)
+        first = s.sync(PROMPT, argmax_only=True)
+        self.assertEqual(backend.start_modes, [False], "the engine is asked for no top-k")
+        self.assertEqual(s.frontier.top, ())
+        with self.assertRaises(RefusedError):
+            s.top_logits(8)
+        # The tokens do not depend on it.
+        self.assertEqual(first, Session(FakeBackend(depth=0)).sync(PROMPT))
+
+    def test_argmax_only_runs_are_the_serial_stream_at_every_depth(self):
+        want = serial_stream(64)
+        for depth in range(0, IMPLEMENTED_DEPTH + 1):
+            backend = FakeBackend(depth=depth)
+            s = Session(backend)
+            seed = s.sync(PROMPT, argmax_only=True)
+            rounds, frontiers = s.spec_run(seed, 64)
+            got = []
+            for r, f in zip(rounds, frontiers):
+                got.extend(r[1:])
+                got.append(f)
+            self.assertEqual(got, want, f"depth {depth}")
+            self.assertEqual(backend.start_modes, [False], f"depth {depth}")
+
+    def test_a_sequence_keeps_its_top_k_mode_through_teacher_forcing(self):
+        backend = FakeBackend(depth=0)
+        s = Session(backend)
+        first = s.sync(PROMPT, argmax_only=True)
+        s.eval((first + 1) % 1000 + 20)  # forced: re-prefills
+        self.assertEqual(backend.start_modes, [False, False])
+        with self.assertRaises(RefusedError):
+            s.top_logits(8)
+        # A gate sequence keeps its top-k through the same re-prefill.
+        first = s.sync(PROMPT)
+        s.eval((first + 1) % 1000 + 20)
+        self.assertEqual(backend.start_modes, [False, False, True, True])
+        self.assertEqual(len(s.top_logits(8)[0]), 8)
+
+    def test_invalidate_and_a_plain_sync_restore_the_top_k(self):
+        s = Session(FakeBackend(depth=2))
+        s.sync(PROMPT, max_tokens=1, argmax_only=True)
+        s.invalidate()
+        self.assertFalse(s.argmax_only)
+        first = s.sync(PROMPT)
+        ids, _ = s.top_logits(8)
+        self.assertEqual(ids[0], first)
+
     def test_verbs_refuse_without_a_sequence(self):
         s = Session(FakeBackend(depth=0))
         with self.assertRaises(RefusedError):
@@ -212,6 +260,18 @@ class WireTests(unittest.TestCase):
             self.assertFalse(
                 self.call(conn, reader, {"op": "sync", "tokens": PROMPT, "max_tokens": 0})["ok"]
             )
+            # The timed phases' argmax-only sync: same tokens, no top-k.
+            lean = self.call(conn, reader, {"op": "sync", "tokens": PROMPT, "argmax_only": True})
+            self.assertEqual(lean["token"], seed)
+            run = self.call(conn, reader, {"op": "spec_run", "first_token": seed, "count": 32})
+            self.assertEqual(run["frontiers"][-1], top["ids"][0])
+            self.assertFalse(self.call(conn, reader, {"op": "top_logits", "k": 8})["ok"])
+            self.assertFalse(
+                self.call(conn, reader, {"op": "sync", "tokens": PROMPT, "argmax_only": 1})["ok"]
+            )
+            plain = self.call(conn, reader, {"op": "sync", "tokens": PROMPT, "argmax_only": False})
+            self.assertEqual(plain["token"], seed)
+            self.assertEqual(len(self.call(conn, reader, {"op": "top_logits", "k": 8})["ids"]), 8)
             bad = self.call(conn, reader, {"op": "nope"})
             self.assertFalse(bad["ok"])
             self.assertTrue(self.call(conn, reader, {"op": "bye"})["ok"])

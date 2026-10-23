@@ -10,13 +10,7 @@
 //!
 //! * `prefill(prompt)` / `decode_begin(seed)` / `free_decode_begin(seed, ..)`
 //!   -> `sync(prompt)`; the next token is the argmax of the logits the sync
-//!   leaves behind. `prefill`, `free_decode_begin` and the free-run
-//!   `correctness` reference read nothing but argmaxes, so they sync
-//!   ARGMAX-ONLY ([`EngineSession::sync_argmax_only`]): the engine computes no
-//!   top-k logits for any position of those sequences. Only the
-//!   teacher-forced gates (`correctness_begin`, and `step` behind
-//!   `correctness_step` / `decode_step`) ask for top-8 logits, and they sync
-//!   with them;
+//!   leaves behind;
 //! * `step(input)` -> `eval(input)` then argmax + top-8 logits;
 //!   `correctness_step` and `decode_step` share it;
 //! * `free_decode_run(count)` -> on the SERIAL route, `count` plain evals; on
@@ -86,18 +80,15 @@ pub trait EngineSession: Send {
     /// Synchronize the session to `tokens`; logits for the last position follow.
     fn sync(&mut self, tokens: &[i64]) -> Result<(), String>;
     /// [`EngineSession::sync`] for a caller that needs the frontier token and
-    /// nothing else (a timed prefill): the engine may stop generating at the
-    /// frontier, so no decode runs on after the phase has its answer, and it
-    /// may skip the frontier's top-k logits, which nobody reads.
+    /// nothing after it (a timed prefill): the engine may stop generating at the
+    /// frontier, so no decode runs on after the phase has its answer.
     fn sync_to_frontier(&mut self, tokens: &[i64]) -> Result<(), String> {
-        self.sync_argmax_only(tokens)
+        self.sync(tokens)
     }
-    /// [`EngineSession::sync`] for a caller that reads only argmaxes on this
-    /// sequence (the free run, the free-run correctness reference): the engine
-    /// may skip the top-k logits of every position on it, and
-    /// [`EngineSession::top_logits`] is not asked of it. The tokens are the
-    /// same: greedy selection never reads the top-k.
-    fn sync_argmax_only(&mut self, tokens: &[i64]) -> Result<(), String> {
+    /// [`EngineSession::sync`] for a free run (`free_decode_begin`): the phase
+    /// reads tokens only, never [`EngineSession::top_logits`], so the engine
+    /// may skip the top-k logit work for this sequence.
+    fn sync_free_run(&mut self, tokens: &[i64]) -> Result<(), String> {
         self.sync(tokens)
     }
     /// Append and evaluate one token; logits for the new position follow.
@@ -299,7 +290,7 @@ impl Engine for SessionEngine {
         // where the golden stopped (an EOS id), never forcing an exact length.
         let mut s = self.lock();
         let eos = eos_ids(s.eos_token());
-        Self::fault(s.sync_argmax_only(prompt))?;
+        Self::fault(s.sync(prompt))?;
         let mut out = Vec::with_capacity(steps.max(0) as usize);
         let mut next = s.argmax();
         for _ in 0..steps {
@@ -321,9 +312,9 @@ impl Engine for SessionEngine {
     ) -> Result<(i64, EffectiveSpec), EngineError> {
         let mut s = self.lock();
         let depth = Self::resolve(s.mtp_armed(), route, requested_depth)?;
-        // The free run reads argmaxes only (the seed token, then committed
-        // tokens and frontiers), never top-k logits.
-        Self::fault(s.sync_argmax_only(seed))?;
+        // A free run commits tokens and reads no top-k logits on either
+        // route, so the sync says so.
+        Self::fault(s.sync_free_run(seed))?;
         let seed_token = s.argmax();
         drop(s);
         self.free_run = Some(FreeRun {

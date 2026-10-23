@@ -1465,10 +1465,8 @@ mod session {
         /// Offer `spec_run`: run the whole free run in one call, cycle by cycle
         /// through this script's own `eval_speculative`, as the resident does.
         batched_run: bool,
-        /// The live sequence was synced argmax-only. Like the resident, the
-        /// script then has no top-k logits to give: `top_logits` returns
-        /// nothing, which the backend treats as a fault.
-        argmax_only: bool,
+        /// Syncs that came in as `sync_free_run` (no top-k logits wanted).
+        free_run_syncs: u64,
     }
 
     impl Scripted {
@@ -1484,14 +1482,11 @@ mod session {
         fn sync(&mut self, tokens: &[i64]) -> Result<(), String> {
             self.log.push(format!("sync({})", tokens.len()));
             self.context = tokens.to_vec();
-            self.argmax_only = false;
             Ok(())
         }
-        fn sync_argmax_only(&mut self, tokens: &[i64]) -> Result<(), String> {
-            self.log.push(format!("sync_argmax({})", tokens.len()));
-            self.context = tokens.to_vec();
-            self.argmax_only = true;
-            Ok(())
+        fn sync_free_run(&mut self, tokens: &[i64]) -> Result<(), String> {
+            self.free_run_syncs += 1;
+            self.sync(tokens)
         }
         fn eval(&mut self, token: i64) -> Result<(), String> {
             self.log.push(format!("eval({token})"));
@@ -1502,9 +1497,6 @@ mod session {
             self.frontier()
         }
         fn top_logits(&mut self, k: usize) -> Vec<CorrectnessTraceLogit> {
-            if self.argmax_only {
-                return Vec::new();
-            }
             let top = self.frontier();
             (0..k as i64)
                 .map(|i| CorrectnessTraceLogit::new(top + i, 10.0 - i as f64))
@@ -1576,7 +1568,6 @@ mod session {
         fn invalidate(&mut self) {
             self.invalidated += 1;
             self.context.clear();
-            self.argmax_only = false;
         }
     }
 
@@ -1607,7 +1598,7 @@ mod session {
     fn step_is_teacher_forced_and_carries_top8() {
         let session = Arc::new(Mutex::new(Scripted::default()));
         let mut e = engine(&session);
-        assert_eq!(e.decode_begin(&[10, 11, 12]).unwrap(), 13);
+        assert_eq!(e.prefill(&[10, 11, 12]).unwrap(), 13);
         let step = e.step(100).unwrap();
         assert_eq!(
             step.token, 101,
@@ -1640,6 +1631,29 @@ mod session {
             (r.drafted_total, r.accepted_total, r.committed_total),
             (0, 0, 5)
         );
+    }
+
+    /// Only `free_decode_begin` syncs without top-k logits: a free run reads
+    /// tokens only, on either route. Every other opener still gets them.
+    #[test]
+    fn only_a_free_run_syncs_without_top_logits() {
+        for route in [Route::Serial, Route::Mtp] {
+            let session = Arc::new(Mutex::new(Scripted {
+                mtp_armed: true,
+                ..Default::default()
+            }));
+            let mut e = engine(&session);
+            e.free_decode_begin(&[1, 2, 3], route, None).unwrap();
+            e.free_decode_run(4).unwrap();
+            assert_eq!(session.lock().unwrap().free_run_syncs, 1, "{route:?}");
+        }
+        let session = Arc::new(Mutex::new(Scripted::default()));
+        let mut e = engine(&session);
+        e.prefill(&[1, 2, 3]).unwrap();
+        e.decode_begin(&[1, 2, 3]).unwrap();
+        e.correctness_begin(&[1, 2, 3]).unwrap();
+        e.correctness_freerun(&[1, 2, 3], 2).unwrap();
+        assert_eq!(session.lock().unwrap().free_run_syncs, 0);
     }
 
     #[test]
@@ -1983,87 +1997,6 @@ mod session {
         assert_eq!(out, vec![3, 4, 5]);
     }
 
-    /// TOP-K ONLY WHERE IT IS READ. The phases that read nothing but argmaxes
-    /// (the timed prefill, the free run, the free-run correctness reference)
-    /// sync argmax-only, so the engine skips the top-k on every step of them.
-    /// The teacher-forced gates sync with top-k, because every one of their
-    /// steps reports top-8 logits. The script refuses top-k on an argmax-only
-    /// sequence, as the resident does, so a phase that asked for it would fail
-    /// here.
-    #[test]
-    fn only_the_teacher_forced_gates_sync_with_top_logits() {
-        let session = Arc::new(Mutex::new(Scripted {
-            mtp_armed: true,
-            batched_run: true,
-            ..Default::default()
-        }));
-        let resp = run(
-            session.clone(),
-            &[
-                r#"{"id":1,"kind":"prefill","prompt_tokens":[1,2,3]}"#,
-                r#"{"id":2,"kind":"prefill","prompt_tokens":[1,2,3]}"#,
-                r#"{"id":3,"kind":"phase_diagnostics"}"#,
-                r#"{"id":4,"kind":"free_decode_begin","seed_tokens":[1,2,3],"spec":{"mode":"mtp","mtp":{"depth":1}}}"#,
-                r#"{"id":5,"kind":"free_decode_run","count":6}"#,
-                r#"{"id":6,"kind":"phase_diagnostics"}"#,
-                r#"{"id":7,"kind":"free_decode_begin","seed_tokens":[1,2,3]}"#,
-                r#"{"id":8,"kind":"free_decode_run","count":3}"#,
-                r#"{"id":9,"kind":"phase_diagnostics"}"#,
-                r#"{"id":10,"kind":"correctness","prompt_tokens":[1,2,3],"steps":4}"#,
-                r#"{"id":11,"kind":"phase_diagnostics"}"#,
-                r#"{"id":12,"kind":"correctness_begin","prompt_tokens":[1,2,3]}"#,
-                r#"{"id":13,"kind":"correctness_step","token":4}"#,
-                r#"{"id":14,"kind":"correctness_step","token":9}"#,
-                r#"{"id":15,"kind":"phase_diagnostics"}"#,
-                r#"{"id":16,"kind":"decode_begin","seed_tokens":[1,2,3]}"#,
-                r#"{"id":17,"kind":"decode_step","token":4}"#,
-                r#"{"id":18,"kind":"phase_diagnostics"}"#,
-            ],
-        );
-        for r in &resp {
-            assert_eq!(r["ok"], true, "{resp:?}");
-        }
-        assert_eq!(resp[5]["tokens"], serde_json::json!([5, 6, 7, 8, 9, 10]));
-        assert_eq!(resp[10]["tokens"], serde_json::json!([4, 5, 6, 7]));
-        assert_eq!(resp[12]["top_logits"].as_array().unwrap().len(), 8);
-        assert_eq!(resp[14]["top_logits"].as_array().unwrap().len(), 8);
-        assert_eq!(resp[14]["token"], 10, "the forced token is the context");
-        let syncs: Vec<String> = session
-            .lock()
-            .unwrap()
-            .log
-            .iter()
-            .filter(|l| l.starts_with("sync"))
-            .cloned()
-            .collect();
-        assert_eq!(
-            syncs,
-            vec![
-                "sync_argmax(3)", // warm-up prefill
-                "sync_argmax(3)", // timed prefill
-                "sync_argmax(3)", // free run, mtp
-                "sync_argmax(3)", // free run, serial
-                "sync_argmax(3)", // free-run correctness reference
-                "sync(3)",        // correctness_begin: top-8 per step
-                "sync(3)",        // decode_begin: decode_step shares the gate's forward
-            ]
-        );
-    }
-
-    /// The backend refuses a gate step whose engine returned no top-k rather
-    /// than reporting an empty trace: an argmax-only sequence can never pass
-    /// for a gate.
-    #[test]
-    fn a_gate_step_on_an_argmax_only_sequence_is_a_fault() {
-        let session = Arc::new(Mutex::new(Scripted::default()));
-        let mut e = engine(&session);
-        e.prefill(&[1, 2, 3]).unwrap();
-        match e.step(4).unwrap_err() {
-            EngineError::Fault(m) => assert!(m.contains("top logits"), "{m}"),
-            other => panic!("expected a fault, got {other:?}"),
-        }
-    }
-
     #[test]
     fn adapter_loop_emits_raw_counters_only() {
         let session = Arc::new(Mutex::new(Scripted {
@@ -2392,34 +2325,33 @@ mod resident {
         let seen = server.finish();
         assert_eq!(seen[1]["op"], "sync");
         assert_eq!(seen[1]["max_tokens"], 1);
-        assert_eq!(
-            seen[1]["argmax_only"], true,
-            "a prefill reads the frontier token only"
-        );
         assert!(
             seen[2].get("max_tokens").is_none(),
             "a decode or correctness sync is unbounded"
         );
-        assert!(
-            seen[2].get("argmax_only").is_none(),
-            "a plain sync keeps the top-k logits the gates read"
-        );
     }
 
-    /// The free run's sync tells the resident to skip the top-k logits; it is
-    /// unbounded, because the run decodes on from it.
+    /// A free run's sync tells the resident that no top-k logits will be read
+    /// on the sequence; every other sync leaves the field out.
     #[test]
-    fn an_argmax_only_sync_says_so_on_the_wire() {
+    fn a_free_run_sync_drops_top_logits() {
         let server = Server::start(scripted);
         let mut session = server.connect();
-        session.sync_argmax_only(&[1, 2, 3]).unwrap();
+        session.sync_free_run(&[1, 2, 3]).unwrap();
         assert_eq!(session.argmax(), 501);
+        session.sync(&[1, 2, 3]).unwrap();
+        session.sync_to_frontier(&[1, 2, 3]).unwrap();
         drop(session);
         let seen = server.finish();
         assert_eq!(seen[1]["op"], "sync");
         assert_eq!(seen[1]["tokens"], json!([1, 2, 3]));
-        assert_eq!(seen[1]["argmax_only"], true);
-        assert!(seen[1].get("max_tokens").is_none());
+        assert_eq!(seen[1]["top_logits"], false);
+        assert!(
+            seen[1].get("max_tokens").is_none(),
+            "a free run is unbounded"
+        );
+        assert!(seen[2].get("top_logits").is_none());
+        assert!(seen[3].get("top_logits").is_none());
     }
 
     /// A resident that offers `spec_run` in its hello takes the whole free run

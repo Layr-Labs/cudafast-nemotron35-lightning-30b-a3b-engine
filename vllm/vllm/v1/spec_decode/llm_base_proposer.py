@@ -58,6 +58,7 @@ from vllm.v1.spec_decode.utils import (
     next_power_of_2,
 )
 from vllm.v1.utils import CpuGpuBuffer
+from vllm.v1.worker import hostfast
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.utils import AttentionGroup
@@ -1080,6 +1081,10 @@ class SpecDecodeBaseProposer:
     def build_per_group_and_layer_attn_metadata(
         self, common_attn_metadata: CommonAttentionMetadata, draft_index: int = 0
     ) -> tuple[list[object], dict[str, object]]:
+        # LOCAL PATCH (cudafast-nemotron35): hostfast staging guard.
+        guard = self._hostfast_staging_guard()
+        if guard is not None:
+            guard.before()
         per_group_attn_metadata: list[object] = []
         per_layer_attn_metadata: dict[str, object] = {}
         for attn_group in self.draft_attn_groups:
@@ -1089,7 +1094,52 @@ class SpecDecodeBaseProposer:
             per_group_attn_metadata.append(attn_metadata)
             for layer_name in attn_group.layer_names:
                 per_layer_attn_metadata[layer_name] = attn_metadata
+        if guard is not None:
+            guard.after()
         return per_group_attn_metadata, per_layer_attn_metadata
+
+    # LOCAL PATCH (cudafast-nemotron35): hostfast S2 (v1/worker/hostfast.py).
+    # Set by the model runner before propose(): per request, the rejected
+    # draft tokens of the step being drafted for, on the CPU.
+    hostfast_num_rejected_cpu: Any = None
+    _hostfast_guard: "hostfast.StagingGuard | None" = None
+
+    def _hostfast_draft_seq_lens(
+        self,
+        verify_seq_lens_cpu: torch.Tensor | None,
+        batch_size: int,
+        gpu_seq_lens: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """The first single-token draft step's seq_lens (before its position
+        update) on the CPU, or None to keep the GPU readback, which waits for
+        the verify, the rejection and draft step 0 (S2)."""
+        num_rejected_cpu = self.hostfast_num_rejected_cpu
+        if not hostfast.S2 or num_rejected_cpu is None:
+            return None
+        out = hostfast.draft_seq_lens(
+            verify_seq_lens_cpu,
+            num_rejected_cpu(),
+            batch_size,
+            self.max_model_len,
+            self.num_speculative_tokens,
+        )
+        if out is None:
+            hostfast.note_fallback("draft")
+        elif hostfast.CHECK:
+            hostfast.check_seq_lens("draft", out, gpu_seq_lens)
+        return out
+
+    def _hostfast_staging_guard(self) -> "hostfast.StagingGuard | None":
+        """The drafter's builders reuse pinned host staging every step; with
+        S1/S2 gone nothing else orders those writes after the previous step's
+        host-to-device copies."""
+        if not (hostfast.S1 or hostfast.S2):
+            return None
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        if self._hostfast_guard is None:
+            self._hostfast_guard = hostfast.StagingGuard()
+        return self._hostfast_guard
 
     def model_returns_tuple(self) -> bool:
         if self.method == "mtp":

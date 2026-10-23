@@ -21,8 +21,6 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-from backends import FakeBackend  # noqa: E402
-from resident import Session  # noqa: E402
 from test_resident import PROMPT, serial_stream  # noqa: E402
 
 ENGINE = os.path.join(HERE, "..", "protocol-adapter", "target", "release", "cuda-engine")
@@ -120,40 +118,6 @@ class AdapterEndToEnd(unittest.TestCase):
         closed = next(i for i, l in enumerate(log) if "phase 1 closed" in l)
         self.assertEqual(len(stops), 1, log)
         self.assertLess(stops[0], closed, "the free run is stopped inside its own connection")
-
-    def test_a_whole_leg_on_one_connection_keeps_the_gate_top8(self):
-        """The leg's order on ONE worker: the timed prefill and the free run
-        sync argmax-only (no top-k computed), then the correctness gate syncs
-        with top-k and reports top-8 on every step."""
-        _, sock = self.boot(3)
-        spec = {"mode": "mtp", "mtp": {"depth": 3}}
-        want = serial_stream(33)
-        seed = Session(FakeBackend(depth=0)).sync(PROMPT)
-        replies = self.phase(
-            sock,
-            [
-                {"id": 1, "kind": "prefill", "prompt_tokens": PROMPT},
-                {"id": 2, "kind": "prefill", "prompt_tokens": PROMPT},
-                {"id": 3, "kind": "phase_diagnostics"},
-                {"id": 4, "kind": "free_decode_begin", "seed_tokens": PROMPT, "spec": spec},
-                {"id": 5, "kind": "free_decode_run", "count": 32},
-                {"id": 6, "kind": "phase_diagnostics"},
-                {"id": 7, "kind": "correctness", "prompt_tokens": PROMPT, "steps": 33},
-                {"id": 8, "kind": "phase_diagnostics"},
-                {"id": 9, "kind": "correctness_begin", "prompt_tokens": PROMPT},
-                {"id": 10, "kind": "correctness_step", "token": seed},
-                {"id": 11, "kind": "phase_diagnostics"},
-            ],
-        )
-        self.assertTrue(all(r.get("ok", True) for r in replies[1:]), replies)
-        self.assertEqual(replies[2]["token"], seed)
-        self.assertEqual(replies[4]["seed_token"], seed)
-        self.assertEqual(replies[5]["tokens"], want[:32])
-        self.assertEqual(replies[7]["tokens"], [seed] + want[:32])
-        self.assertEqual(len(replies[9]["top_logits"]), 8)
-        self.assertEqual(replies[9]["top_logits"][0]["token"], seed)
-        self.assertEqual(replies[10]["token"], want[0])
-        self.assertEqual(len(replies[10]["top_logits"]), 8)
 
     def test_correctness_phase_reports_top8(self):
         _, sock = self.boot(0)

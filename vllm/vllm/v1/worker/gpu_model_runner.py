@@ -210,7 +210,7 @@ from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
-from vllm.v1.worker import mamba_utils
+from vllm.v1.worker import hostfast, mamba_utils
 from vllm.v1.worker.block_table import SlotMappingMode
 from vllm.v1.worker.cp_utils import (
     check_attention_cp_compatibility,
@@ -2295,6 +2295,7 @@ class GPUModelRunner(
         num_scheduled_tokens: dict[str, int] | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         slot_mappings: dict[int, torch.Tensor] | None = None,
+        exact_seq_lens_cpu: torch.Tensor | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         Returns:
@@ -2376,7 +2377,10 @@ class GPUModelRunner(
 
         if self.use_async_spec_decode:
             # GPU tensors are authoritative in async mode.
-            seq_lens_cpu = None
+            # LOCAL PATCH (cudafast-nemotron35): unless execute_model computed
+            # the exact values on the CPU (hostfast S1); None keeps the lazy
+            # GPU readback.
+            seq_lens_cpu = exact_seq_lens_cpu
             num_computed_tokens_cpu = None
 
         # Compute mm_prefix bidirectional ranges before building
@@ -4388,6 +4392,10 @@ class GPUModelRunner(
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     slot_mappings=slot_mappings_by_group,
+                    # LOCAL PATCH (cudafast-nemotron35): hostfast S1.
+                    exact_seq_lens_cpu=self._hostfast_verify_seq_lens(
+                        num_reqs, num_reqs_padded if pad_attn else num_reqs
+                    ),
                 )
             )
 
@@ -4992,8 +5000,60 @@ class GPUModelRunner(
 
         counts_cpu = self.valid_sampled_token_count_cpu
         assert counts_cpu is not None
+        if not sampled_count_event.query():
+            # LOCAL PATCH (cudafast-nemotron35): the CPU is about to wait for
+            # the GPU; collect the young GC generations in that shadow.
+            hostfast.gc_in_shadow()
         sampled_count_event.synchronize()
         return counts_cpu[: prev_sampled_token_ids.shape[0]].tolist()
+
+    # LOCAL PATCH (cudafast-nemotron35): hostfast S1/S2 (v1/worker/hostfast.py).
+    # The draft-token counts of the batch the drafter is proposing for, set by
+    # propose_draft_token_ids for hostfast_num_rejected_cpu.
+    _hostfast_num_draft_tokens: list[int] | None = None
+
+    def _hostfast_verify_seq_lens(
+        self, num_reqs: int, num_reqs_padded: int
+    ) -> torch.Tensor | None:
+        """The seq_lens ``_prepare_inputs`` just computed on the GPU, computed
+        on the CPU from the same host inputs, for the attention builders of
+        this step (async spec decode only). None keeps the stock lazy GPU
+        readback, which waits for every kernel already queued (S1)."""
+        if not (self.use_async_spec_decode and hostfast.S1):
+            return None
+        optimistic = self.optimistic_seq_lens_cpu[:num_reqs_padded]
+        if (
+            self.valid_sampled_token_count_gpu is None
+            or not self.input_batch.prev_req_id_to_index
+        ):
+            # _prepare_inputs copied the CPU num_computed_tokens to the GPU.
+            exact: torch.Tensor | None = optimistic.clone()
+        else:
+            # _prepare_inputs ran update_num_computed_tokens_for_batch_change
+            # on these prev_positions, prev_num_draft_tokens and valid counts.
+            exact = hostfast.exact_verify_seq_lens(
+                optimistic,
+                num_reqs,
+                self.prev_positions.np,
+                self.prev_num_draft_tokens.np,
+                self._get_valid_sampled_token_count(),
+            )
+        if exact is None:
+            hostfast.note_fallback("verify")
+        elif hostfast.CHECK:
+            hostfast.check_seq_lens("verify", exact, self.seq_lens[:num_reqs_padded])
+        return exact
+
+    def hostfast_num_rejected_cpu(self) -> torch.Tensor | None:
+        """Per request, the draft tokens the rejection sampler of the step
+        being drafted for rejected, on the CPU (hostfast S2). Waits only for
+        that step's valid-count copy, not for the drafter's first pass."""
+        num_draft_tokens = self._hostfast_num_draft_tokens
+        if num_draft_tokens is None:
+            return None
+        return hostfast.num_rejected_tokens(
+            num_draft_tokens, self._get_valid_sampled_token_count()
+        )
 
     def _get_spec_decode_draft_probs(
         self, spec_decode_metadata: SpecDecodeMetadata
@@ -5042,6 +5102,9 @@ class GPUModelRunner(
         num_spec_tokens_to_schedule = scheduler_output.num_spec_tokens_to_schedule
         self._draft_probs = None
         self._draft_prob_req_ids = None
+        # LOCAL PATCH (cudafast-nemotron35): hostfast S2; set again below only
+        # where the padded drafter batch prepares its inputs.
+        self._hostfast_num_draft_tokens = None
         if spec_config.method == "ngram":
             from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
@@ -5261,6 +5324,13 @@ class GPUModelRunner(
                         common_attn_metadata,
                         spec_decode_metadata,
                         valid_sampled_tokens_count,
+                    )
+                    # LOCAL PATCH (cudafast-nemotron35): hostfast S2.
+                    self._hostfast_num_draft_tokens = (
+                        spec_decode_metadata.num_draft_tokens
+                    )
+                    self.drafter.hostfast_num_rejected_cpu = (
+                        self.hostfast_num_rejected_cpu
                     )
                     total_num_tokens = common_attn_metadata.num_actual_tokens
                     # When padding the batch, token_indices is just a range

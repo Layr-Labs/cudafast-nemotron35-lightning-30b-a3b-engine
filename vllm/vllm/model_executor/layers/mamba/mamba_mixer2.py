@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 from vllm.config import CacheConfig, ModelConfig, get_current_vllm_config
+from vllm.config.mamba import MambaBackendEnum
 from vllm.distributed import (
     divide,
     get_tensor_model_parallel_rank,
@@ -32,6 +33,12 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_update,
 )
 from vllm.model_executor.layers.mamba.ops.layernorm_gated import rms_norm_gated
+from vllm.model_executor.layers.mamba.ops.mamba_ssm_spec_replay import (
+    selective_state_update_spec_replay,
+    spec_replay_enabled,
+    spec_replay_ring_len,
+    spec_replay_supported,
+)
 from vllm.model_executor.layers.mamba.ops.selective_state_update_replayssm_output_only import (  # noqa: E501
     selective_state_update_replayssm_output_only,
 )
@@ -525,6 +532,26 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 "_decode_state_offsets",
                 torch.arange(1 + self.num_spec, dtype=torch.int32).unsqueeze(0),
                 persistent=False,
+            )
+        # LOCAL PATCH (cudafast-nemotron35): spec-decode verifies keep one
+        # anchor state plus a ring of token inputs instead of storing the state
+        # of every draft position (ops/mamba_ssm_spec_replay.py). Only for the
+        # Triton SSU without stochastic rounding, ReplaySSM or prefix caching;
+        # VLLM_MAMBA_SPEC_REPLAY=0 restores the reference kernel.
+        self.use_spec_replay = (
+            self.num_spec > 0
+            and spec_replay_enabled()
+            and not self.use_replayssm
+            and self.mamba_config.backend == MambaBackendEnum.TRITON
+            and not self.mamba_config.enable_stochastic_rounding
+            and (cache_config is None or cache_config.mamba_cache_mode == "none")
+        )
+        self.spec_replay_ring_len = spec_replay_ring_len(self.num_spec)
+        self._spec_replay_ok: bool | None = None
+        if self.use_spec_replay:
+            logger.info_once(
+                "Mamba2 spec decode: anchor-state replay (ring of %d tokens).",
+                self.spec_replay_ring_len,
             )
 
         # Pre-compute sizes for forward pass
@@ -1083,6 +1110,38 @@ class MambaMixer2(MambaBase, PluggableLayer):
                         self.mamba_config.stochastic_rounding_philox_rounds
                     ),
                 )
+            elif (
+                self.use_spec_replay
+                and num_accepted_tokens is not None
+                and not is_mamba_cache_all
+                and self._spec_replay_ready(
+                    ssm_state,
+                    hidden_states_d,
+                    dt_d,
+                    A_d,
+                    B_d,
+                    dt_bias,
+                    state_indices_tensor_d,
+                )
+            ):
+                selective_state_update_spec_replay(
+                    ssm_state,
+                    hidden_states_d,
+                    dt_d,
+                    A_d,
+                    B_d,
+                    C_d,
+                    D_d,
+                    dt_bias,
+                    dt_softplus=True,
+                    state_batch_indices=state_indices_tensor_d,
+                    out=preallocated_ssm_out_d,
+                    num_accepted_tokens=num_accepted_tokens,
+                    cu_seqlens=query_start_loc_d,
+                    seq_lens=attn_metadata.seq_lens,
+                    ring_len=self.spec_replay_ring_len,
+                    is_blackwell=self.is_blackwell,
+                )
             else:
                 selective_state_update(
                     ssm_state,
@@ -1101,6 +1160,31 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     cu_seqlens=query_start_loc_d,
                     is_blackwell=self.is_blackwell,
                 )
+
+    def _spec_replay_ready(
+        self,
+        ssm_state: torch.Tensor,
+        x: torch.Tensor,
+        dt: torch.Tensor,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        dt_bias: torch.Tensor,
+        state_indices: torch.Tensor,
+    ) -> bool:
+        """Whether the replay kernel can serve this layer's verifies. The
+        dtypes, strides and slot layout it checks are fixed once the cache is
+        bound, so it is decided on the first spec decode and cached."""
+        if self._spec_replay_ok is None:
+            self._spec_replay_ok = spec_replay_supported(
+                ssm_state, x, dt, A, B, dt_bias, state_indices,
+                self.spec_replay_ring_len,
+            )
+            if not self._spec_replay_ok:
+                logger.warning_once(
+                    "Mamba2 spec decode: anchor-state replay unsupported for "
+                    "this layout; using the reference kernel."
+                )
+        return self._spec_replay_ok
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         assert self.model_config is not None

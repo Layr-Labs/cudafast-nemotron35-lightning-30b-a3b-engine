@@ -151,6 +151,15 @@ def _try_get_optimal_ssm_config_cached(
         cfg = configs[closest]
         return cfg["BLOCK_SIZE_M"], cfg["num_warps"]
 
+    if (
+        (headdim, dstate, _canonical_cache_dtype(cache_dtype)) == (64, 128, "float32")
+        and current_platform.is_device_capability(121)
+    ):
+        # GB10 (sm_121) when the device-name lookup above found no file: the
+        # entry the bundled GB10 file holds, and the one the H100 and B200
+        # float32 files hold for this shape.
+        return 4, 1
+
     return _get_default_ssm_launch_config(dstate, is_blackwell)
 
 

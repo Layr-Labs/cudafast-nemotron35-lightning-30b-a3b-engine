@@ -90,6 +90,29 @@ FP4_DTYPE = torch.uint8
 
 logger = init_logger(__name__)
 
+# FULL CUDA graphs for uniform spec-decode verify batches on archs without
+# trtllm-gen attention (SM12x, e.g. GB10). The verify rows (1 + k per request)
+# run FlashInfer's native prefill kernel; a CUDA-graph-mode prefill wrapper
+# plans the same CTA tile and the same KV split as the dynamic wrapper (graph
+# mode only forces the partial-output + merge path, and a one-chunk merge is a
+# plain copy), so the attention output is unchanged while the whole verify
+# forward can replay as one graph instead of ~30 pieces with eager Mamba and
+# attention ops in between.
+SPEC_VERIFY_FULL_CUDAGRAPH = True
+
+
+def _spec_verify_full_cudagraph(vllm_config: VllmConfig) -> bool:
+    spec = vllm_config.speculative_config
+    return (
+        SPEC_VERIFY_FULL_CUDAGRAPH
+        and spec is not None
+        and (spec.num_speculative_tokens or 0) > 0
+        and not vllm_config.attention_config.use_non_causal
+        and vllm_config.parallel_config.decode_context_parallel_size == 1
+        and not current_platform.is_device_capability(90)
+    )
+
+
 trtllm_workspace_buffer = None
 
 
@@ -842,6 +865,22 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.paged_kv_indices = self._make_buffer(max_num_pages)
         self.paged_kv_last_page_len = self._make_buffer(max_num_reqs)
 
+        # Uniform spec-decode verify batches under FULL CUDA graphs: one
+        # CUDA-graph-mode native prefill wrapper per request count.
+        self._spec_q_len = 1 + num_spec_tokens
+        self._spec_prefill_cudagraph = (
+            self.enable_cuda_graph
+            and num_spec_tokens > 0
+            and not self.use_trtllm_decode_attention
+            and not self.use_dcp
+            and not self.is_kvcache_nvfp4
+            and _spec_verify_full_cudagraph(vllm_config)
+        )
+        self._spec_prefill_max_reqs = max_num_reqs
+        self._spec_prefill_wrappers_cudagraph: dict[
+            int, BatchPrefillWithPagedKVCacheWrapper
+        ] = {}
+
     # Keep SM90 prefill/decode Q dtype selection in one place.
     def get_q_data_type(self, is_prefill: bool) -> torch.dtype:
         # The user sets --attention-config.disable_flashinfer_q_quantization
@@ -932,8 +971,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # trtllm-gen only supports causal attention.
         if has_trtllm_support and not vllm_config.attention_config.use_non_causal:
             return AttentionCGSupport.UNIFORM_BATCH
-        else:
-            return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+        if _spec_verify_full_cudagraph(vllm_config):
+            # Uniform verify batches use a CUDA-graph-mode native prefill
+            # wrapper (see FlashInferMetadataBuilder._get_spec_prefill_wrapper).
+            return AttentionCGSupport.UNIFORM_BATCH
+        return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
 
     def _get_workspace_buffer(self):
         if self._workspace_buffer is None:
@@ -1009,6 +1051,30 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 )
         assert self._prefill_wrapper is not None
         return self._prefill_wrapper
+
+    def _get_spec_prefill_wrapper(
+        self, num_reqs: int
+    ) -> BatchPrefillWithPagedKVCacheWrapper:
+        """A CUDA-graph-mode native prefill wrapper for `num_reqs` uniform
+        verify requests. Its index buffers are the builder's persistent ones
+        (plan() refreshes them in place), so a captured graph reads every
+        replay's metadata at fixed addresses."""
+        wrapper = self._spec_prefill_wrappers_cudagraph.get(num_reqs)
+        if wrapper is None:
+            wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                self._get_workspace_buffer(),
+                get_kv_cache_layout(),
+                use_cuda_graph=True,
+                qo_indptr_buf=torch.zeros(
+                    num_reqs + 1, dtype=torch.int32, device=self.device
+                ),
+                paged_kv_indptr_buf=self.paged_kv_indptr.gpu[: num_reqs + 1],
+                paged_kv_indices_buf=self.paged_kv_indices.gpu,
+                paged_kv_last_page_len_buf=self.paged_kv_last_page_len.gpu[:num_reqs],
+                backend="auto",
+            )
+            self._spec_prefill_wrappers_cudagraph[num_reqs] = wrapper
+        return wrapper
 
     def _get_decode_wrapper(self, batch_size: int, use_cudagraph: bool = False):
         if use_cudagraph:
@@ -1388,7 +1454,19 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     max_seq_len=max_seq_len,
                 )
             else:
-                prefill_wrapper = self._get_prefill_wrapper(causal=attn_metadata.causal)
+                if (
+                    self._spec_prefill_cudagraph
+                    and attn_metadata.causal
+                    and num_decodes == 0
+                    and num_prefills <= self._spec_prefill_max_reqs
+                    and num_prefill_tokens == num_prefills * self._spec_q_len
+                    and common_attn_metadata.max_query_len == self._spec_q_len
+                ):
+                    prefill_wrapper = self._get_spec_prefill_wrapper(num_prefills)
+                else:
+                    prefill_wrapper = self._get_prefill_wrapper(
+                        causal=attn_metadata.causal
+                    )
                 # Slicing CPU buffers that are only needed for FI native prefills
                 paged_kv_last_page_len_prefill_cpu = self.paged_kv_last_page_len.cpu[
                     prefill_start:num_reqs

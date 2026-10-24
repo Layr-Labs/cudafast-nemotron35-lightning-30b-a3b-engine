@@ -269,6 +269,9 @@ class NemotronHMoE(nn.Module):
         if self._smallk_early_router:
             # not a submodule: weight names and loading stay as they are
             object.__setattr__(self.experts, "_smallk_gate", self.gate)
+            # target-model gates honour smallk.verify_rows (masked trailing verify rows reuse the
+            # last valid row's experts); the MTP layer's gate ("mtp.layers.N") never does
+            self.gate._smallk_row_mask = "mtp" not in prefix.split(".")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape

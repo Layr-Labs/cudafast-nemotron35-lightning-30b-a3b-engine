@@ -15,11 +15,21 @@ arch=${arch// /}
 arch=${arch%+PTX}
 sm=${arch/./}
 "$nvcc" --version | tail -n 2
+rm -f "$out/libmarlinx.so"  # the fallback below tests for this build's output, not a stale one
 # No --use_fast_math: the reductions must stay plain IEEE fp32 adds and multiplies.
 "$nvcc" -O3 -std=c++17 -shared -Xcompiler -fPIC -lineinfo \
   -gencode "arch=compute_${sm},code=sm_${sm}" \
   -Xptxas -v \
-  -o "$out/libmarlinx.so" "$here/csrc/marlinx.cu" 2>&1
+  -o "$out/libmarlinx.so" "$here/csrc/marlinx.cu" 2>&1 || true
+# If the L2 prefetch-size hint does not assemble, build the plain load (-DMARLINX_NO_L2HINT: the
+# record's source).
+if ! test -f "$out/libmarlinx.so"; then
+  echo "marlinx: build with the L2 hint failed; rebuilding with -DMARLINX_NO_L2HINT" >&2
+  "$nvcc" -O3 -std=c++17 -shared -Xcompiler -fPIC -lineinfo \
+    -gencode "arch=compute_${sm},code=sm_${sm}" \
+    -Xptxas -v -DMARLINX_NO_L2HINT \
+    -o "$out/libmarlinx.so" "$here/csrc/marlinx.cu" 2>&1 || true
+fi
 test -f "$out/libmarlinx.so" || { echo "marlinx: build failed" >&2; exit 1; }
 cp "$here/py/__init__.py" "$out/__init__.py"
 echo "marlinx: built $out/libmarlinx.so for sm_${sm}"

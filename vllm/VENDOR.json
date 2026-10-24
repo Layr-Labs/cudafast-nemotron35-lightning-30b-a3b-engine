@@ -162,6 +162,18 @@
     {
       "file": "harness/kernels/marlinx/{csrc/marlinx.cu,py/__init__.py,README.md,tests/marlinx_zs_exact.py}",
       "why": "Shared expert down projection (3712->2688, ReLU^2 input): read only the k rows whose activation is nonzero in some row, from a byte-preserving k-row-major copy of the Marlin weight; the lane rebuilds Marlin's exact weight word, so dequant, MMA, segments and fp32 reductions are unchanged. Bit-exact vs stock Marlin on all 23 layers (4416 synthetic + 1380 real-activation cases, CUDA graph replay). MARLINX_ZS=0 disables."
+    },
+    {
+      "file": "vllm/model_executor/layers/fused_moe/experts/humming_zskip.py; vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py; harness/kernels/zskip",
+      "why": "zskip for prefill: on 15 sparse MoE layers (ZSKIP_PREFILL_LAYERS; 17-31 and the last layer keep humming), the routed w2 of calls over 8 tokens runs the zero-row-skipping kernel on the promoted swap repack, re-aligned to 32-row expert blocks (config 405: four 8-row MMAs share each dequantised weight fragment, block activations staged once per CTA in shared memory, -0 guard at the end with a dense redo). humming's indexed w2 is batch invariant, so the output equals humming's bit for bit (161 real prefill calls: 7 public prompts x 23 layers; load-time 40-token self-check). ZSKIP_PREFILL=0 disables."
+    },
+    {
+      "file": "models/nemotron_h_mtp_kernels.py;models/nemotron_h_mtp_compact.py",
+      "why": "IndependentnextcombinationonFULLverifiedf29. Usefulpendingb5616630-9603-44d1-a221-a7b2b4ec1d7d exactkernel767d84d4887d46e4de7b6fe5ae6b77f7f520ea4c selectsroutertop3of6 sortedweights, unchangedoriginalweightvalues/norenormalization, originalpinnedBF16head+shared/target/verifyremain. Owncompactdispatch nowadmitsTOPK1..6 plus2sharedslots insteadhardcoded6+2; h/ids/weight/countshapesand_compactgrid/_downTOPKderivedfromstaticnumel. Original_compact and_down bodies/numerics/sparseKorder untouched; top6originalshape/specializationunchanged. Thiskeepscurrenttranspose/sparsefastpathfor5slotsinsteaddecliningtocostlyfallback. Proposalquality/acceptance/runtimetradeoffunvalidated; noheadformat/requantization. Originalscreenrestored: whole4bebe05d-89f8-408a-ae6f-a8abd81e1f98later2.07691891640319 below1001by0.323percent; no isolatedpositiveevidence, notcarriedasnextbaseline/method. No9f7bnew605/705/mask/pruningcodeasbaseline. Alllocalworkstaticonly; officialremoteexecutiononly; preservebestf29."
+    },
+    {
+      "file": "harness/kernels/{zskip,marlinx}/{csrc/*.cu,build.sh}",
+      "why": "Usefulpendingeaa618c1-e321-41d7-b625-e5d9afdd29ab selectedONLYL2sectorsizehintmethod: zskipweightu32L2::64B/scalesv2L2::128B,sharedMarlinZSweightu32L2::64B, fallbackbuilddefinesrestoreplainloadsifhintdoesnotassemble. Exacteaahelpertext/currentFP4bytes/math unchanged; noneofeaaPDL/launchattrs/lazyjoins/newprefetchwindows imported. Onfullf29 +newtop3compactcompatiblecombination. Cacheeffectunmeasured, traffic/evictioncouldregress; noDRAM/speedclaim, remoteonlycompilation/execution. Wholeb561latercorrect2.07720589953464negativevs1001/f29notadoptedbaseline; top3methodrecomposedwithownfixedcompactadmissionasexplicitnewexperiment."
     }
   ]
 }

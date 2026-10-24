@@ -15,12 +15,17 @@ arch=${arch// /}
 arch=${arch%+PTX}
 sm=${arch/./}
 "$nvcc" --version | tail -n 2
+rm -f "$out/libzskip.so"
 # No --use_fast_math: the epilogue's flush-to-zero multiplies (humming is NVRTC-compiled with
 # --use_fast_math) are written as explicit mul.rn.ftz.f32; nothing else in the kernel is fp32.
+# Selected L2-size hints only; no PDL launch changes in this combination.
+for flags in "" "-DZSKIP_NO_L2HINT"; do
 "$nvcc" -O3 -std=c++17 -shared -Xcompiler -fPIC -lineinfo \
   -gencode "arch=compute_${sm},code=sm_${sm}" \
-  -Xptxas -v \
+  -Xptxas -v $flags \
   -o "$out/libzskip.so" "$here/csrc/zskip.cu" "$here/csrc/gather.cu" 2>&1 | grep -v '^$' || true
+  test -f "$out/libzskip.so" && break
+done
 test -f "$out/libzskip.so" || { echo "zskip: build failed" >&2; exit 1; }
 cp "$here/py/__init__.py" "$out/__init__.py"
 echo "zskip: built $out/libzskip.so for sm_${sm}"

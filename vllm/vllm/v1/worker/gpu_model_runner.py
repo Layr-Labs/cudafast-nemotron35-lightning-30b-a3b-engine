@@ -4469,13 +4469,29 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
+            fresh_graph = getattr(self, "_fresh_prefill_graph", None)
+            use_fresh_graph = (
+                fresh_graph is not None
+                and num_tokens_unpadded == num_tokens_padded == 496
+                and num_reqs == 1 and max_num_scheduled_tokens == 496
+                and self.input_batch.num_computed_tokens_cpu[0] == 0
+                and self.input_batch.num_prompt_tokens[0] == 496
+                and not use_spec_decode and not self.use_aux_hidden_state_outputs
+                and intermediate_tensors is None and inputs_embeds is None
+                and not model_kwargs and not has_encoder_input
             )
+            fresh_logits = None
+            if use_fresh_graph:
+                model_output, fresh_logits = fresh_graph.replay(
+                    attn_metadata, slot_mappings, input_ids, positions)
+            else:
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4504,7 +4520,8 @@ class GPUModelRunner(
                     )
 
                 sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
+                logits = (fresh_logits if fresh_logits is not None else
+                          self.model.compute_logits(sample_hidden_states))
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -6985,6 +7002,10 @@ class GPUModelRunner(
                 )
                 torch.accelerator.synchronize()
 
+            # A separate whole-forward graph keeps native decode dispatch and
+            # dynamic compilation ranges unchanged.
+            self._capture_fresh_prefill_graph()
+
             # Capture encoder CUDA graphs if enabled
             if self.encoder_cudagraph_manager is not None:
                 encoder_graph_pool = current_platform.graph_pool_handle()
@@ -7017,6 +7038,53 @@ class GPUModelRunner(
             cuda_graph_size / (1 << 30),
         )
         return cuda_graph_size
+
+    def _capture_fresh_prefill_graph(self):
+        if not (
+            self.model_config.hf_config.model_type == "nemotron_h"
+            and self.scheduler_config.max_num_seqs == 1
+            and self.parallel_config.tensor_parallel_size == 1
+            and self.parallel_config.pipeline_parallel_size == 1
+            and self.num_spec_tokens == 3
+            and not self.use_aux_hidden_state_outputs
+        ):
+            return
+        from vllm.v1.worker.prefill_graph import FreshPrefillGraph
+
+        started = time.perf_counter()
+        # Synthetic data only. No user request exists during capture_model.
+        self.input_ids.gpu[:496].zero_()
+        self.positions[:496].copy_(torch.arange(496, device=self.device))
+        self.optimistic_seq_lens_cpu.zero_()
+        self.optimistic_seq_lens_cpu[0] = 496
+        self.seq_lens.copy_(self.optimistic_seq_lens_cpu, non_blocking=True)
+        self.query_start_loc.cpu[0] = 0
+        self.query_start_loc.cpu[1] = 496
+        self.query_start_loc.copy_to_gpu(2)
+        old_prompt = self.input_batch.num_prompt_tokens[0].copy()
+        old_computed = self.input_batch.num_computed_tokens_cpu[0].copy()
+        self.input_batch.num_prompt_tokens[0] = 496
+        self.input_batch.num_computed_tokens_cpu[0] = 0
+        self.input_batch.block_table.commit_block_table(1)
+        grouped_slots, slots = self._get_slot_mappings(
+            num_tokens_padded=496, num_reqs_padded=1,
+            num_tokens_unpadded=496, ubatch_slices=None)
+        for mapping in grouped_slots.values():
+            mapping.fill_(-1)
+        try:
+            metadata, _ = self._build_attention_metadata(
+                num_tokens=496, num_reqs=1, max_query_len=496,
+                slot_mappings=grouped_slots,
+                exact_seq_lens_cpu=self.optimistic_seq_lens_cpu[:1],
+            )
+            self._fresh_prefill_graph = FreshPrefillGraph(
+                self, metadata, slots, self.input_ids.gpu[:496],
+                self.positions[:496])
+        finally:
+            self.input_batch.num_prompt_tokens[0] = old_prompt
+            self.input_batch.num_computed_tokens_cpu[0] = old_computed
+        logger.info("Fresh 496 whole-forward graph captured in %.3f s; pool=%s",
+                    time.perf_counter() - started, self._fresh_prefill_graph.pool)
 
     def _warmup_and_capture(
         self,

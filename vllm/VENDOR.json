@@ -70,6 +70,10 @@
     {
       "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py; vllm/model_executor/models/nemotron_h_mtp.py; vllm/v1/spec_decode/llm_base_proposer.py",
       "why": "Drafter-only greedy head over the shared NVFP4 lm_head: partial-K screen on 64 of 168 fp4 groups (chosen at load from weights only), top-32 per 2048-row chunk, full-K fp32 rescore with bf16 rounding and lowest-id ties. Load-time copies of the checkpoint's own lm_head bytes and scales; the target's lm_head, logits and verification are untouched. VLLM_MTP_SCREEN=0 restores the stock draft head."
+    },
+    {
+      "file": "vllm/v1/worker/prefill_graph.py, vllm/v1/worker/gpu_model_runner.py, vllm/v1/attention/backends/flashinfer.py",
+      "why": "Capture an input-independent whole-forward CUDA graph at boot for fresh single-request 496-token prefill, with native FlashInfer planning and fully refreshed request buffers; other lengths and target formats remain unchanged. (ArthurOstapenko c1e4b913, restored after the graft of 4e916237 dropped it.)"
     }
   ]
 }

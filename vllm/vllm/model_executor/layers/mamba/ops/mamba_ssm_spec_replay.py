@@ -32,7 +32,11 @@ Bit-exactness: every state update is the reference's fp32 expression
 (``dA = fast_exp(A * dt)``, ``dB = B * dt``, ``state * dA + dB * x``) on the
 same 16-bit inputs in the same order, and fp32 stores and loads are exact, so
 the state entering each verify and every output row equal the reference's.
-The launch configuration (BLOCK_SIZE_M, num_warps, grid) is the reference's.
+The original kernel's launch configuration (BLOCK_SIZE_M, num_warps, grid)
+is the reference's. A narrow sm121 depth-3 specialization below pairs two
+separate original 4x128 state chains in one warp and shares head/group reads.
+It preserves the source recurrence and separate reduction operand shapes;
+that is not proof of device bit equality or a performance improvement.
 Slots 2..d are never touched, and slot 1 holds the ring instead of a state; no
 code path reads those slots in mamba_cache_mode "none" except the reference
 kernel's next-verify load, which this kernel replaces.
@@ -40,6 +44,7 @@ kernel's next-verify load, which this kernel replaces.
 ``VLLM_MAMBA_SPEC_REPLAY=0`` restores the reference kernel.
 """
 
+import functools
 import os
 
 import torch
@@ -49,6 +54,7 @@ from vllm.model_executor.layers.mamba.ops.mamba_ssm import (
     try_get_optimal_ssm_config,
 )
 from vllm.model_executor.layers.mamba.ops.triton_helpers import fast_exp
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
@@ -330,6 +336,277 @@ def _selective_scan_update_spec_replay_kernel(
             z_ptr += stride_z_batch
 
 
+@triton.heuristics({"HAS_DT_BIAS": lambda args: args["dt_bias_ptr"] is not None})
+@triton.heuristics({"HAS_D": lambda args: args["D_ptr"] is not None})
+@triton.heuristics({"HAS_Z": lambda args: args["z_ptr"] is not None})
+@triton.heuristics(
+    {"STORE_REPLAYED": lambda args: args["replayed_ptr"] is not None}
+)
+@triton.heuristics(
+    {"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])}
+)
+@triton.jit(do_not_specialize=["N"])
+def _selective_scan_update_spec_replay_pair_kernel(
+    state_ptr,
+    ring_ptr,
+    x_ptr,
+    dt_ptr,
+    dt_bias_ptr,
+    A_ptr,
+    B_ptr,
+    C_ptr,
+    D_ptr,
+    z_ptr,
+    out_ptr,
+    state_batch_indices_ptr,
+    null_block_id,
+    num_accepted_tokens_ptr,
+    cu_seqlens_ptr,
+    seq_lens_ptr,
+    replayed_ptr,
+    N,
+    nheads,
+    dim,
+    dstate,
+    nheads_ngroups_ratio,
+    ngroups,
+    ring_len,
+    stride_state_batch,
+    stride_state_head,
+    stride_state_dim,
+    stride_state_dstate,
+    stride_ring_batch,
+    stride_x_batch,
+    stride_x_head,
+    stride_x_dim,
+    stride_dt_batch,
+    stride_dt_head,
+    stride_dt_dim,
+    stride_dt_bias_head,
+    stride_dt_bias_dim,
+    stride_A_head,
+    stride_A_dim,
+    stride_A_dstate,
+    stride_B_batch,
+    stride_B_group,
+    stride_B_dstate,
+    stride_C_batch,
+    stride_C_group,
+    stride_C_dstate,
+    stride_D_head,
+    stride_D_dim,
+    stride_z_batch,
+    stride_z_head,
+    stride_z_dim,
+    stride_out_batch,
+    stride_out_head,
+    stride_out_dim,
+    stride_state_indices_batch,
+    stride_state_indices_T,
+    DT_SOFTPLUS: tl.constexpr,
+    TIE_HDIM: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    HAS_DT_BIAS: tl.constexpr,
+    HAS_D: tl.constexpr,
+    HAS_Z: tl.constexpr,
+    STORE_REPLAYED: tl.constexpr,
+    BLOCK_SIZE_DSTATE: tl.constexpr,
+):
+    # Keep two independent original microtiles, never an 8x128 reduction.
+    tl.static_assert(TIE_HDIM)
+    tl.static_assert(BLOCK_SIZE_M == 4)
+    tl.static_assert(BLOCK_SIZE_DSTATE == 128)
+
+    pid_m = tl.program_id(axis=0)
+    pid_b = tl.program_id(axis=1)
+    pid_h = tl.program_id(axis=2)
+
+    bos = tl.load(cu_seqlens_ptr + pid_b).to(tl.int64)
+    eos = tl.load(cu_seqlens_ptr + pid_b + 1).to(tl.int64)
+    seq_len = eos - bos
+    if seq_len == 0:
+        return
+
+    num_accepted = tl.load(num_accepted_tokens_ptr + pid_b).to(tl.int64)
+    num_replay = tl.maximum(num_accepted - 1, 0)
+    pos0 = tl.load(seq_lens_ptr + pid_b).to(tl.int64) - seq_len
+
+    state_batch_indices_ptr += pid_b * stride_state_indices_batch
+    state_batch_idx = tl.load(state_batch_indices_ptr).to(tl.int64)
+    ring_batch_idx = tl.load(state_batch_indices_ptr + stride_state_indices_T).to(
+        tl.int64
+    )
+    state_ptr += state_batch_idx * stride_state_batch + pid_h * stride_state_head
+    ring_ok = ring_batch_idx != null_block_id
+    ring_base = ring_ptr + ring_batch_idx * stride_ring_batch
+    ring_x_base = ring_base + pid_h * dim
+    ring_B_base = ring_base + ring_len * nheads * dim
+    ring_B_base += (pid_h // nheads_ngroups_ratio) * dstate
+    ring_dt_base = ring_base + ring_len * (nheads * dim + ngroups * dstate) + pid_h
+    ring_stride_x = nheads * dim
+    ring_stride_B = ngroups * dstate
+    ring_stride_dt = nheads
+    # The second state tile does not add another scalar/vector writer.
+    is_dt_writer = pid_m == 0
+    is_B_writer = (pid_m == 0) & ((pid_h % nheads_ngroups_ratio) == 0)
+
+    x_ptr += bos * stride_x_batch + pid_h * stride_x_head
+    dt_ptr += bos * stride_dt_batch + pid_h * stride_dt_head
+    if HAS_DT_BIAS:
+        dt_bias_ptr += pid_h * stride_dt_bias_head
+    A_ptr += pid_h * stride_A_head
+    B_ptr += bos * stride_B_batch + (pid_h // nheads_ngroups_ratio) * stride_B_group
+    C_ptr += bos * stride_C_batch + (pid_h // nheads_ngroups_ratio) * stride_C_group
+    if HAS_Z:
+        z_ptr += bos * stride_z_batch + pid_h * stride_z_head
+    out_ptr += bos * stride_out_batch + pid_h * stride_out_head
+
+    offs_m0 = pid_m * (2 * BLOCK_SIZE_M) + tl.arange(0, BLOCK_SIZE_M)
+    offs_m1 = offs_m0 + BLOCK_SIZE_M
+    offs_n = tl.arange(0, BLOCK_SIZE_DSTATE)
+    state_ptrs0 = state_ptr + (
+        offs_m0[:, None] * stride_state_dim + offs_n[None, :] * stride_state_dstate
+    )
+    state_ptrs1 = state_ptr + (
+        offs_m1[:, None] * stride_state_dim + offs_n[None, :] * stride_state_dstate
+    )
+    mask0 = (offs_m0[:, None] < dim) & (offs_n[None, :] < dstate)
+    mask0 &= state_batch_idx != null_block_id
+    mask1 = (offs_m1[:, None] < dim) & (offs_n[None, :] < dstate)
+    mask1 &= state_batch_idx != null_block_id
+    state0 = tl.load(state_ptrs0, mask=mask0, other=0.0).to(tl.float32)
+    state1 = tl.load(state_ptrs1, mask=mask1, other=0.0).to(tl.float32)
+
+    if HAS_D:
+        D_ptr += pid_h * stride_D_head
+        D_ptrs0 = D_ptr + offs_m0 * stride_D_dim
+        D_ptrs1 = D_ptr + offs_m1 * stride_D_dim
+
+    for i_r in range(num_replay):
+        ring_pos = ((pos0 - num_replay + i_r) % ring_len + ring_len) % ring_len
+        x0 = tl.load(
+            ring_x_base + ring_pos * ring_stride_x + offs_m0,
+            mask=(offs_m0 < dim) & ring_ok,
+            other=0.0,
+        ).to(tl.float32)
+        x1 = tl.load(
+            ring_x_base + ring_pos * ring_stride_x + offs_m1,
+            mask=(offs_m1 < dim) & ring_ok,
+            other=0.0,
+        ).to(tl.float32)
+        dt = tl.load(
+            ring_dt_base + ring_pos * ring_stride_dt, mask=ring_ok, other=0.0
+        ).to(tl.float32)
+        if HAS_DT_BIAS:
+            dt += tl.load(dt_bias_ptr).to(tl.float32)
+        if DT_SOFTPLUS:
+            dt = softplus(dt)
+        A = tl.load(A_ptr).to(tl.float32)
+        dA = fast_exp(A * dt)
+        B = tl.load(
+            ring_B_base + ring_pos * ring_stride_B + offs_n,
+            mask=(offs_n < dstate) & ring_ok,
+            other=0.0,
+        ).to(tl.float32)
+        dB = B * dt
+        state0 = state0 * dA + dB * x0[:, None]
+        state1 = state1 * dA + dB * x1[:, None]
+
+    if STORE_REPLAYED:
+        replayed_base = replayed_ptr + ((pid_b * nheads + pid_h) * dim) * dstate
+        replayed_ptrs0 = (
+            replayed_base + offs_m0[:, None] * dstate + offs_n[None, :]
+        )
+        replayed_ptrs1 = (
+            replayed_base + offs_m1[:, None] * dstate + offs_n[None, :]
+        )
+        tl.store(replayed_ptrs0, state0, mask=mask0)
+        tl.store(replayed_ptrs1, state1, mask=mask1)
+
+    for i_t in range(seq_len):
+        x_ptrs0 = x_ptr + offs_m0 * stride_x_dim
+        x_ptrs1 = x_ptr + offs_m1 * stride_x_dim
+        B_ptrs = B_ptr + offs_n * stride_B_dstate
+        C_ptrs = C_ptr + offs_n * stride_C_dstate
+        if HAS_Z:
+            z_ptrs0 = z_ptr + offs_m0 * stride_z_dim
+            z_ptrs1 = z_ptr + offs_m1 * stride_z_dim
+        out_ptrs0 = out_ptr + offs_m0 * stride_out_dim
+        out_ptrs1 = out_ptr + offs_m1 * stride_out_dim
+
+        x_raw0 = tl.load(x_ptrs0, mask=offs_m0 < dim, other=0.0)
+        x_raw1 = tl.load(x_ptrs1, mask=offs_m1 < dim, other=0.0)
+        x0 = x_raw0.to(tl.float32)
+        x1 = x_raw1.to(tl.float32)
+        dt_raw = tl.load(dt_ptr)
+        dt = dt_raw.to(tl.float32)
+        if HAS_DT_BIAS:
+            dt += tl.load(dt_bias_ptr).to(tl.float32)
+        if DT_SOFTPLUS:
+            dt = softplus(dt)
+        A = tl.load(A_ptr).to(tl.float32)
+        dA = fast_exp(A * dt)
+
+        B_raw = tl.load(B_ptrs, mask=offs_n < dstate, other=0.0)
+        B = B_raw.to(tl.float32)
+        C = tl.load(C_ptrs, mask=offs_n < dstate, other=0.0).to(tl.float32)
+        if HAS_D:
+            D0 = tl.load(D_ptrs0, mask=offs_m0 < dim, other=0.0).to(tl.float32)
+            D1 = tl.load(D_ptrs1, mask=offs_m1 < dim, other=0.0).to(tl.float32)
+        if HAS_Z:
+            z0 = tl.load(z_ptrs0, mask=offs_m0 < dim, other=0.0).to(tl.float32)
+            z1 = tl.load(z_ptrs1, mask=offs_m1 < dim, other=0.0).to(tl.float32)
+
+        dB = B * dt
+        state0 = state0 * dA + dB * x0[:, None]
+        state1 = state1 * dA + dB * x1[:, None]
+
+        if i_t == 0:
+            tl.store(state_ptrs0, state0.to(state_ptrs0.dtype.element_ty), mask=mask0)
+            tl.store(state_ptrs1, state1.to(state_ptrs1.dtype.element_ty), mask=mask1)
+        else:
+            ring_pos = ((pos0 + i_t) % ring_len + ring_len) % ring_len
+            tl.store(
+                ring_x_base + ring_pos * ring_stride_x + offs_m0,
+                x_raw0,
+                mask=(offs_m0 < dim) & ring_ok,
+            )
+            tl.store(
+                ring_x_base + ring_pos * ring_stride_x + offs_m1,
+                x_raw1,
+                mask=(offs_m1 < dim) & ring_ok,
+            )
+            tl.store(
+                ring_dt_base + ring_pos * ring_stride_dt,
+                dt_raw,
+                mask=ring_ok & is_dt_writer,
+            )
+            tl.store(
+                ring_B_base + ring_pos * ring_stride_B + offs_n,
+                B_raw,
+                mask=(offs_n < dstate) & ring_ok & is_B_writer,
+            )
+
+        out0 = tl.sum(state0 * C[None, :], axis=1)
+        out1 = tl.sum(state1 * C[None, :], axis=1)
+        if HAS_D:
+            out0 += x0 * D0
+            out1 += x1 * D1
+        if HAS_Z:
+            out0 *= z0 * tl.sigmoid(z0)
+            out1 *= z1 * tl.sigmoid(z1)
+        tl.store(out_ptrs0, out0, mask=offs_m0 < dim)
+        tl.store(out_ptrs1, out1, mask=offs_m1 < dim)
+
+        x_ptr += stride_x_batch
+        dt_ptr += stride_dt_batch
+        B_ptr += stride_B_batch
+        C_ptr += stride_C_batch
+        out_ptr += stride_out_batch
+        if HAS_Z:
+            z_ptr += stride_z_batch
+
+
 def _normalize(state, x, dt, A, B, C, D, z, dt_bias, out, state_batch_indices):
     """The reference wrapper's shape normalization (mamba_ssm.py)."""
     if state.dim() == 3:
@@ -395,6 +672,132 @@ def spec_replay_supported(
     ngroups = B.shape[1]
     ring_elems = ring_len * spec_replay_ring_elems(nheads, dim, ngroups, dstate)
     return ring_elems <= 2 * nheads * dim * dstate
+
+
+@functools.cache
+def _pair_device_supported(device_index: int) -> bool:
+    return current_platform.is_device_capability(121, device_id=device_index)
+
+
+def _tensor_byte_span(tensor: torch.Tensor) -> tuple[int, int] | None:
+    """Conservative view bounds, without reading any device tensor values."""
+    if tensor.layout != torch.strided or tensor.numel() == 0:
+        return None
+    last_element = 0
+    for size, stride in zip(tensor.shape, tensor.stride()):
+        if stride < 0:
+            return None
+        last_element += (size - 1) * stride
+    start = tensor.data_ptr()
+    return start, start + (last_element + 1) * tensor.element_size()
+
+
+def _spans_overlap(lhs: tuple[int, int], rhs: tuple[int, int]) -> bool:
+    return lhs[0] < rhs[1] and rhs[0] < lhs[1]
+
+
+def _paired_replay_supported(
+    state, x, dt, A, B, C, D, dt_bias, z, out,
+    state_batch_indices, num_accepted_tokens, cu_seqlens, seq_lens,
+    ring_len, dt_softplus, block_size_m, num_warps, replayed_out,
+) -> bool:
+    """A narrow metadata-only specialization; every miss uses original replay."""
+    if (
+        state.device.type != "cuda"
+        or state.device.index is None
+        or block_size_m != 4
+        or num_warps != 1
+        or ring_len != 8
+        or dt_softplus is not True
+        or z is not None
+        or state.ndim != 4
+        or state.shape[0] < 2
+        or state.shape[1:] != (64, 64, 128)
+        or x.shape != (4, 64, 64)
+        or dt.shape != x.shape
+        or B.shape != (4, 8, 128)
+        or C.shape != B.shape
+        or A.shape != (64, 64, 128)
+        or D.shape != (64, 64)
+        or dt_bias.shape != (64, 64)
+        or out.shape != x.shape
+        or state_batch_indices.shape != (1, 4)
+        or num_accepted_tokens.shape != (1,)
+        or cu_seqlens.shape != (2,)
+        or seq_lens.ndim != 1
+        or seq_lens.shape[0] < 1
+    ):
+        return False
+    tensors = (
+        state, x, dt, A, B, C, D, dt_bias, out,
+        state_batch_indices, num_accepted_tokens, cu_seqlens, seq_lens,
+    )
+    if replayed_out is not None:
+        tensors += (replayed_out,)
+    if any(t.device != state.device for t in tensors):
+        return False
+    if not _pair_device_supported(state.device.index):
+        return False
+    if state.dtype != torch.float32 or A.dtype != torch.float32:
+        return False
+    if any(t.dtype != torch.bfloat16 for t in (x, dt, B, C, D, dt_bias, out)):
+        return False
+    if any(
+        t.dtype != torch.int32
+        for t in (state_batch_indices, num_accepted_tokens, cu_seqlens, seq_lens)
+    ):
+        return False
+    if (
+        state.stride()[1:] != (8192, 128, 1)
+        or state.stride(0) < 64 * 64 * 128
+        or A.stride() != (1, 0, 0)
+        or D.stride() != (1, 0)
+        or dt_bias.stride() != (1, 0)
+        or dt.stride()[1:] != (1, 0)
+        or dt.stride(0) < 64
+        or x.stride()[1:] != (64, 1)
+        or x.stride(0) < 4096
+        or B.stride()[1:] != (128, 1)
+        or B.stride(0) < 1024
+        or C.stride()[1:] != (128, 1)
+        or C.stride(0) < 1024
+        or out.stride()[1:] != (64, 1)
+        or out.stride(0) < 4096
+        or state_batch_indices.stride(1) != 1
+        or state_batch_indices.stride(0) < 4
+        or num_accepted_tokens.stride(0) != 1
+        or cu_seqlens.stride(0) != 1
+        or seq_lens.stride(0) != 1
+    ):
+        return False
+    if replayed_out is not None and (
+        replayed_out.shape != (1, 64, 64, 128)
+        or replayed_out.dtype != torch.float32
+        or not replayed_out.is_contiguous()
+    ):
+        return False
+
+    # Anchor/ring are intentional self read/write aliases within state.
+    # Other writes may not alias a live input/parameter/integer metadata view.
+    # Read-only x/B/C may share storage; compare addressed spans, not identity.
+    reads = (x, dt, A, B, C, D, dt_bias, state_batch_indices,
+             num_accepted_tokens, cu_seqlens, seq_lens)
+    writes = (state, out)
+    if replayed_out is not None:
+        writes += (replayed_out,)
+    read_spans = tuple(_tensor_byte_span(t) for t in reads)
+    write_spans = tuple(_tensor_byte_span(t) for t in writes)
+    if any(span is None for span in (*read_spans, *write_spans)):
+        return False
+    for i, write_span in enumerate(write_spans):
+        if any(_spans_overlap(write_span, read_span) for read_span in read_spans):
+            return False
+        if any(
+            _spans_overlap(write_span, other_span)
+            for other_span in write_spans[i + 1:]
+        ):
+            return False
+    return True
 
 
 def selective_state_update_spec_replay(
@@ -475,6 +878,77 @@ def selective_state_update_spec_replay(
     )
 
     with torch.accelerator.device_index(x.device.index):
+        if _paired_replay_supported(
+            state, x, dt, A, B, C, D, dt_bias, z, out,
+            state_batch_indices, num_accepted_tokens, cu_seqlens, seq_lens,
+            ring_len, dt_softplus, BLOCK_SIZE_M, num_warps, replayed_out,
+        ):
+            pair_grid = lambda META: (
+                triton.cdiv(dim, 2 * META["BLOCK_SIZE_M"]), N, nheads
+            )
+            _selective_scan_update_spec_replay_pair_kernel[pair_grid](
+                state,
+                ring,
+                x,
+                dt,
+                dt_bias,
+                A,
+                B,
+                C,
+                D,
+                z,
+                out,
+                state_batch_indices,
+                null_block_id,
+                num_accepted_tokens,
+                cu_seqlens,
+                seq_lens,
+                replayed_out,
+                N,
+                nheads,
+                dim,
+                dstate,
+                nheads // ngroups,
+                ngroups,
+                ring_len,
+                state.stride(0),
+                state.stride(1),
+                state.stride(2),
+                state.stride(3),
+                ring.stride(0),
+                x.stride(0),
+                x.stride(1),
+                x.stride(2),
+                dt.stride(0),
+                dt.stride(1),
+                dt.stride(2),
+                dt_bias.stride(0),
+                dt_bias.stride(1),
+                A.stride(0),
+                A.stride(1),
+                A.stride(2),
+                B.stride(0),
+                B.stride(1),
+                B.stride(2),
+                C.stride(0),
+                C.stride(1),
+                C.stride(2),
+                D.stride(0),
+                D.stride(1),
+                z_strides[0],
+                z_strides[1],
+                z_strides[2],
+                out.stride(0),
+                out.stride(1),
+                out.stride(2),
+                state_batch_indices.stride(0),
+                state_batch_indices.stride(1),
+                DT_SOFTPLUS=dt_softplus,
+                TIE_HDIM=True,
+                BLOCK_SIZE_M=BLOCK_SIZE_M,
+                num_warps=num_warps,
+            )
+            return
         _selective_scan_update_spec_replay_kernel[grid](
             state,
             ring,

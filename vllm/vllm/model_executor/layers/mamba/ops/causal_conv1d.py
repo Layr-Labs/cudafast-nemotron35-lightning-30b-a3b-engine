@@ -10,6 +10,11 @@ import functools
 import numpy as np
 import torch
 
+from vllm.model_executor.layers.mamba.ops.mamba_ssm import softplus
+from vllm.model_executor.layers.mamba.ops.mamba_ssm_spec_replay import (
+    spec_replay_params_offset,
+)
+from vllm.model_executor.layers.mamba.ops.triton_helpers import fast_exp
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
@@ -774,6 +779,12 @@ def _causal_conv1d_update_kernel(
     block_idx_last_scheduled_token,  # (batch,)
     initial_state_idx,  # (batch,)
     o_ptr,  # (batch, dim, seqlen)
+    params_state_ptr,
+    params_ring_ptr,
+    params_dt_ptr,
+    params_A_ptr,
+    params_bias_ptr,
+    params_seq_lens_ptr,
     # Matrix dimensions
     batch: int,
     dim: tl.constexpr,
@@ -793,6 +804,13 @@ def _causal_conv1d_update_kernel(
     stride_o_seq: tl.constexpr,
     stride_o_dim: tl.constexpr,
     stride_o_token: tl.int64,
+    stride_params_state_batch: tl.constexpr,
+    stride_params_ring_batch: tl.constexpr,
+    stride_params_dt_token: tl.constexpr,
+    stride_params_dt_head: tl.constexpr,
+    stride_params_A_head: tl.constexpr,
+    stride_params_bias_head: tl.constexpr,
+    stride_params_seq_lens: tl.constexpr,
     # others
     null_block_id: tl.constexpr,
     # Meta-parameters
@@ -806,6 +824,10 @@ def _causal_conv1d_update_kernel(
     HAS_NULL_BLOCK: tl.constexpr,
     BLOCK_N: tl.constexpr,
     launch_pdl: tl.constexpr,
+    PRECOMPUTE_PARAMS: tl.constexpr,
+    PARAM_RING_LEN: tl.constexpr,
+    PARAM_OFFSET_F32: tl.constexpr,
+    PARAM_CURRENT_ROWS: tl.constexpr,
 ):
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
@@ -858,6 +880,65 @@ def _causal_conv1d_update_kernel(
         if launch_pdl:
             tl.extra.cuda.gdc_launch_dependents()
         return
+
+    if PRECOMPUTE_PARAMS:
+        # Only the first 32 (128-channel) conv CTAs own x heads. Each
+        # computes two distinct head scalars, instead of the SSU's 16 row
+        # CTAs repeating the same nonlinear work for every head.
+        param_head = tl.program_id(1) * 2 + tl.arange(0, 2)
+        if tl.program_id(1) < 32:
+            ring_slot = tl.load(
+                conv_state_indices_ptr + idx_seq * stride_state_indices + 1
+            ).to(tl.int64)
+            if ring_slot != null_block_id:
+                params_base = (
+                    params_state_ptr + ring_slot * stride_params_state_batch
+                    + PARAM_OFFSET_F32
+                )
+                dt_bias = tl.load(
+                    params_bias_ptr + param_head * stride_params_bias_head
+                ).to(tl.float32)
+                A = tl.load(
+                    params_A_ptr + param_head * stride_params_A_head
+                ).to(tl.float32)
+                # Same bos/eos, acceptance and pos0 as the replay kernel.
+                num_replay = tl.maximum(
+                    tl.load(num_accepted_tokens_ptr + idx_seq).to(tl.int64) - 1,
+                    0,
+                )
+                pos0 = (
+                    tl.load(params_seq_lens_ptr + idx_seq * stride_params_seq_lens)
+                    .to(tl.int64) - seqlen
+                )
+                ring_dt_base = (
+                    params_ring_ptr + ring_slot * stride_params_ring_batch
+                    + PARAM_RING_LEN * (64 * 64 + 8 * 128) + param_head
+                )
+                for i_r in range(num_replay):
+                    ring_pos = (
+                        (pos0 - num_replay + i_r) % PARAM_RING_LEN + PARAM_RING_LEN
+                    ) % PARAM_RING_LEN
+                    dt = tl.load(ring_dt_base + ring_pos * 64).to(tl.float32)
+                    dt += dt_bias
+                    dt = softplus(dt)
+                    dA = fast_exp(A * dt)
+                    params = params_base + (
+                        (PARAM_CURRENT_ROWS + i_r) * 64 + param_head
+                    ) * 2
+                    tl.store(params, dt)
+                    tl.store(params + 1, dA)
+                for i_t in range(seqlen):
+                    dt = tl.load(
+                        params_dt_ptr
+                        + (query_start_index + i_t) * stride_params_dt_token
+                        + param_head * stride_params_dt_head
+                    ).to(tl.float32)
+                    dt += dt_bias
+                    dt = softplus(dt)
+                    dA = fast_exp(A * dt)
+                    params = params_base + (i_t * 64 + param_head) * 2
+                    tl.store(params, dt)
+                    tl.store(params + 1, dA)
 
     if IS_SPEC_DECODING:
         # The rolling of conv state:
@@ -1115,6 +1196,12 @@ def causal_conv1d_update(
     initial_state_idx: torch.Tensor | None = None,
     validate_data=False,
     out: torch.Tensor | None = None,
+    replay_params_state: torch.Tensor | None = None,
+    replay_params_dt: torch.Tensor | None = None,
+    replay_params_A: torch.Tensor | None = None,
+    replay_params_dt_bias: torch.Tensor | None = None,
+    replay_params_seq_lens: torch.Tensor | None = None,
+    replay_params_ring_len: int = 0,
 ):
     """
     x: Input tensor which can take the following shapes:
@@ -1154,6 +1241,10 @@ def causal_conv1d_update(
             indices 0 and 3
     out: optional output tensor with the same shape as `x`. When omitted,
         the input is overwritten.
+    replay_params_*: optional, jointly gated spec-replay scalar precomputation.
+        The existing conv launch writes current and replayed FP32 (dt, dA)
+        into unused slot-1 space after the raw BF16 ring. No history, conv
+        output rounding or state recurrence is changed.
     """
     if validate_data:
         assert null_block_id is not None
@@ -1237,6 +1328,36 @@ def causal_conv1d_update(
     if batch == 1 and dim % 128 == 0 and _is_sm121():
         block_n = 128
 
+    precompute_params = replay_params_state is not None
+    if precompute_params:
+        # The caller has applied spec_replay_params_supported to both sides.
+        # These assertions make a partial producer/consumer wiring fail
+        # loudly rather than leave a consumer reading stale scratch.
+        assert block_n == 128 and batch == 1 and dim == 6144
+        assert query_start_loc is not None and num_accepted_tokens is not None
+        assert replay_params_dt is not None and replay_params_A is not None
+        assert replay_params_dt_bias is not None
+        assert replay_params_seq_lens is not None
+        assert replay_params_state.dtype == torch.float32
+        assert replay_params_dt.dtype == torch.bfloat16
+        params_ring = replay_params_state.view(replay_params_dt.dtype)
+        params_offset = spec_replay_params_offset(
+            64, 64, 8, 128, replay_params_ring_len
+        )
+        params_strides = (
+            replay_params_state.stride(0),
+            params_ring.stride(0),
+            replay_params_dt.stride(0),
+            replay_params_dt.stride(1),
+            replay_params_A.stride(0),
+            replay_params_dt_bias.stride(0),
+            replay_params_seq_lens.stride(0),
+        )
+    else:
+        params_ring = None
+        params_offset = 0
+        params_strides = (0, 0, 0, 0, 0, 0, 0)
+
     def grid(META):
         return (
             batch,
@@ -1255,6 +1376,12 @@ def causal_conv1d_update(
         block_idx_last_scheduled_token,
         initial_state_idx,
         out,
+        replay_params_state,
+        params_ring,
+        replay_params_dt,
+        replay_params_A,
+        replay_params_dt_bias,
+        replay_params_seq_lens,
         # Matrix dimensions
         batch,
         dim,
@@ -1274,6 +1401,7 @@ def causal_conv1d_update(
         stride_o_seq,
         stride_o_dim,
         stride_o_token,
+        *params_strides,
         # others
         null_block_id,
         # META
@@ -1287,6 +1415,10 @@ def causal_conv1d_update(
         HAS_NULL_BLOCK=null_block_id is not None,
         BLOCK_N=block_n,
         launch_pdl=current_platform.is_arch_support_pdl(),
+        PRECOMPUTE_PARAMS=precompute_params,
+        PARAM_RING_LEN=replay_params_ring_len,
+        PARAM_OFFSET_F32=params_offset,
+        PARAM_CURRENT_ROWS=max_query_len,
     )
     if unsqueeze:
         out = out.squeeze(-1)

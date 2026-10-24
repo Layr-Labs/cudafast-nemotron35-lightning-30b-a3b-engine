@@ -52,6 +52,9 @@ def _load():
             ctypes.c_void_p,  # stream
         ]
         lib.marlinx_gemm.restype = ctypes.c_int
+        if hasattr(lib, "marlinx_gemm_zs"):
+            lib.marlinx_gemm_zs.argtypes = lib.marlinx_gemm.argtypes + [ctypes.c_void_p]
+            lib.marlinx_gemm_zs.restype = ctypes.c_int
         if hasattr(lib, "marlinx_gemm_relu2"):
             lib.marlinx_gemm_relu2.argtypes = lib.marlinx_gemm.argtypes
             lib.marlinx_gemm_relu2.restype = ctypes.c_int
@@ -123,24 +126,54 @@ def prepare(layer) -> bool:
     if ok:
         ok = _init()
     layer._marlinx_ok = ok
+    layer._marlinx_zs = None
+    if ok and ZS_ENABLED and (n, k) == ZS_SHAPE and hasattr(_lib, "marlinx_gemm_zs"):
+        layer._marlinx_zs = zs_repack(w, n, k)
     return ok
+
+
+# Zero-row skip for the shared expert down projection (its input is ReLU^2,
+# mostly exact zeros): a k-row-major copy of the Marlin weight lets the kernel
+# read only the k rows whose activation is nonzero in some row (see csrc).
+ZS_ENABLED = os.environ.get("MARLINX_ZS", "1") != "0"
+ZS_SHAPE = (2688, 3712)
+# bit offsets inside Marlin's word for k = 2t, 2t+1, 2t+8, 2t+9: (feature g, feature g+8)
+_ZS_POS = ((0, 8), (16, 24), (4, 12), (20, 28))
+
+
+@torch.no_grad()
+def zs_repack(w: torch.Tensor, n: int, k: int) -> torch.Tensor:
+    """[K/16][16][N/64][8] u32 from Marlin's [K/16][2N] int32 weight; byte j of
+    word (kb, kr, half column, g) = feature 16j+g | feature 16j+g+8 << 4 at k row kr."""
+    q = w.view(k // 16, n // 128, 2, 8, 4, 4).to(torch.int64) & 0xFFFFFFFF  # kb, col, h, g, t, j
+    out = torch.zeros(k // 16, 16, n // 64, 8, dtype=torch.int64, device=w.device)
+    shifts = (torch.arange(4, device=w.device) * 8).view(1, 1, 1, 1, 4)
+    for s, (pg, pg8) in enumerate(_ZS_POS):
+        byte = ((q >> pg) & 15) | (((q >> pg8) & 15) << 4)  # kb, col, h, g, t, j
+        word = (byte << shifts).sum(-1)  # kb, col, h, g, t
+        for t in range(4):
+            kr = (2 * t, 2 * t + 1, 2 * t + 8, 2 * t + 9)[s]
+            out[:, kr] = word[..., t].reshape(k // 16, n // 64, 8)
+    out = out - (out >= (1 << 31)).to(torch.int64) * (1 << 32)
+    return out.to(torch.int32).contiguous()
 
 
 def gemm(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
          global_scale: torch.Tensor, n: int, k: int, depth: int = DEPTH,
-         relu2: bool = False) -> torch.Tensor:
+         relu2: bool = False, zs: torch.Tensor | None = None) -> torch.Tensor:
     """out[M, n] for a 2-D bf16 x[M, k] (1 <= M <= 8); no guard beyond the C side's."""
     lib = _load()
     assert lib is not None, _load_error
     m = x.shape[0]
     out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
     op = lib.marlinx_gemm_relu2 if relu2 else lib.marlinx_gemm
-    rc = op(
+    args = (
         x.data_ptr(), x.stride(0), m,
         weight.data_ptr(), weight_scale.data_ptr(), global_scale.data_ptr(),
         out.data_ptr(), n, n, k, _sm_count(x.device), depth,
         torch.cuda.current_stream(x.device).cuda_stream,
     )
+    rc = lib.marlinx_gemm_zs(*args, zs.data_ptr()) if zs is not None else op(*args)
     if rc != 0:
         raise RuntimeError(f"marlinx_gemm failed: {rc} (M={m} N={n} K={k} depth={depth})")
     return out
@@ -167,7 +200,8 @@ def maybe_apply(layer, x: torch.Tensor) -> torch.Tensor | None:
     if not _ready and not _init():
         return None
     n = layer.output_size_per_partition
-    out = gemm(x2, layer.weight, layer.weight_scale, layer.weight_global_scale, n, k)
+    out = gemm(x2, layer.weight, layer.weight_scale, layer.weight_global_scale, n, k,
+               zs=getattr(layer, "_marlinx_zs", None))
     return out.reshape(*x.shape[:-1], n)
 
 

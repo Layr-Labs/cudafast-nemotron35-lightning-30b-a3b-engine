@@ -210,6 +210,14 @@
     {
       "file": "harness/kernels/l2pf/py/__init__.py",
       "why": "Carry useful04706ad7-c4e8-44b9-b8ba-77f14d8b8adf MoE-window immutable prefetch default6to12MB. Its complete official2.19195352041462 is within0.1% of fulla484, but only budget mechanism is combined here on higherfulla484. Prefix pair/SSM combination unverified."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "Compose previously explored sixteen-group BF16 native draft coarse screen with full confidence-prefix 7fac1f9 parent; only CASCADE_FRAC_GROUPS32to16. Keep 256 survivors/chunk, 64-group refine, full-K candidate dot, top3 experts, stop0.4, target verifier and every target numerical format unchanged. Current-parent paired measurements determine eligibility; earlier pre-prefix carrier measurements not reused as a score."
+    },
+    {
+      "file": "harness/vllm_resident/test_ssd_prefill_fused.py",
+      "why": "Existing test-only SSD cache signature and os namespace repair, no runtime edits."
     }
   ]
 }

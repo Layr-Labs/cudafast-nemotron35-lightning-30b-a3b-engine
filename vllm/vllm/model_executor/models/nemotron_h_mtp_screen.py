@@ -51,7 +51,7 @@ logger = init_logger(__name__)
 SCREEN_FRAC_GROUPS = 64  # of 168 groups: 1024 of 2688 hidden dims (512 bytes per row)
 SCREEN_CHUNK = 2048
 SCREEN_PER = 32
-CASCADE_FRAC_GROUPS = 32
+CASCADE_FRAC_GROUPS = 16
 CASCADE_PER = 256
 
 

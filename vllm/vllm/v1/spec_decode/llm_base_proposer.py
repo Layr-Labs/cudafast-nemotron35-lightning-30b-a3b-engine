@@ -65,9 +65,6 @@ from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
 
-# Protect asynchronous H2D sources; switchable for in-process cost screening.
-PINNED_SOURCE_GUARDS = True
-
 
 class SpecDecodeBaseProposer:
     def __init__(
@@ -1201,16 +1198,6 @@ class SpecDecodeBaseProposer:
         is not sampled and comes from `request.get_token_id()` instead. This is denoted
         the "backup" token id. It also counts rejected tokens via `sampled_token_ids`.
         """
-        event = None
-        if PINNED_SOURCE_GUARDS:
-            # The previous backup H2D may still be behind async work,
-            # including startup paths without a valid-count wait. Protect its
-            # pinned CPU source before reusing it.
-            event = getattr(self, "_backup_tokens_h2d_event", None)
-            if event is None:
-                event = self._backup_tokens_h2d_event = torch.cuda.Event()
-            else:
-                event.synchronize()
         # Precompute backup token IDs for discarded requests.
         num_reqs = gpu_input_batch.num_reqs
         for i in range(num_reqs):
@@ -1218,8 +1205,6 @@ class SpecDecodeBaseProposer:
                 gpu_input_batch.req_ids[i]
             ].get_token_id(gpu_input_batch.num_tokens_no_spec[i] - 1)
         self.backup_next_token_ids.copy_to_gpu(num_reqs)
-        if event is not None:
-            event.record()
         backup_tokens_gpu = self.backup_next_token_ids.gpu
 
         batch_size, num_tokens = sampled_token_ids.shape

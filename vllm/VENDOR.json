@@ -60,12 +60,12 @@
       "why": "the tuned routed experts padded K to a multiple of 128, so the down projection's K 1856 became 1920 and every w2 tile streamed and multiplied two all-zero 32-wide K blocks; K now pads only to humming's BF16 pack granule (32), the smallest it accepts. Each element keeps the same K blocks in the same order; the dropped steps were mma(+0, +0, acc), which only turned an acc of -0 into +0, and a signed zero changes no later value's magnitude, logit or token"
     },
     {
-      "file": "harness/protocol-adapter/src/resident.rs; harness/protocol-adapter/src/tests.rs; vllm/vllm/model_executor/models/nemotron_h_mtp.py; vllm/vllm/model_executor/models/nemotron_h_mtp_kernels.py; vllm/vllm/v1/spec_decode/llm_base_proposer.py; vllm/vllm/v1/worker/gpu_model_runner.py",
-      "why": "rkit rebased pack: 10-nlp.diff, 20-relu2.diff, 40-guards.diff. Drafter relu2 can change last bits; target arithmetic and frozen formats unchanged. In-process base consumes hostov when reported."
+      "file": "vllm/v1/sample/rejection_sampler.py",
+      "why": "Guarded row-first greedy argmax (from submission 89d14785) with a new fused GPU acceptance kernel. Preserves torch.argmax tie/NaN behavior and falls back for active processors, requested logprobs, stochastic or synthetic sampling; independently checked over 1044 GPU cases. Resident warmup exercises both logprob and raw-token request paths on synthetic input."
     },
     {
-      "file": "vllm/model_executor/models/nemotron_h_mtp.py",
-      "why": "Pin the MTP predictor to ONE Inductor combo-kernel choice in its own compilation context: combined kernels, never benchmarked (combo_kernels=True, benchmark_combo_kernel=False; VLLM_MTP_COMBO=off pins separate kernels, =bench restores the timed pick). Drafter reduction order is fixed across boots, with target compilation settings and frozen formats unchanged."
+      "file": "vllm/model_executor/layers/mamba/ops/ssd_combined.py; vllm/model_executor/layers/mamba/ops/ssd_prefill_fused.py",
+      "why": "Reuse submission a1004ac4-ecbd-4de9-8ce7-aecdd509c380: two-stage GB10 Mamba prefill, retaining the existing cumsum and final-state gather. Fuses state formation with FP32 state passing and shares CB formation across eight heads. Guarded shapes preserve BF16 inputs and FP32 boundaries; unsupported cases use the original stages."
     }
   ]
 }

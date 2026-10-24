@@ -124,8 +124,6 @@ class VllmBackend:
     def __init__(self, cfg: VllmConfig):
         from vllm import EngineArgs, LLMEngine, SamplingParams
         from vllm.sampling_params import RequestOutputKind
-        from vllm.usage.usage_lib import UsageContext
-        from vllm.v1.executor.abstract import Executor
 
         spec = None
         if cfg.depth > 0:
@@ -159,18 +157,7 @@ class VllmBackend:
             safetensors_load_strategy="eager",
             disable_log_stats=True,
         )
-        # Drive the single-request engine directly, preserving the factory's
-        # context and executor. Its default-on multiprocessing environment
-        # flag would override from_engine_args(enable_multiprocessing=False).
-        usage_context = UsageContext.ENGINE_CONTEXT
-        engine_config = args.create_engine_config(usage_context)
-        self._engine = LLMEngine(
-            vllm_config=engine_config,
-            executor_class=Executor.get_class(engine_config),
-            log_stats=not args.disable_log_stats,
-            usage_context=usage_context,
-            multiprocess_mode=False,
-        )
+        self._engine = LLMEngine.from_engine_args(args)
         # Startup is done: keep this process's threads on the fastest cores
         # too (the engine core pins its own the same way). VLLM_HOSTFAST_PIN=0
         # disables; it changes no computation.
@@ -208,8 +195,8 @@ class VllmBackend:
 
     def _warm_up(self) -> None:
         prompt = [(i * 7919) % 30000 + 1000 for i in range(self.WARMUP_PROMPT_TOKENS)]
-        for _ in range(self.WARMUP_ROUNDS):
-            self.start(prompt)
+        for round_index in range(self.WARMUP_ROUNDS):
+            self.start(prompt, logprobs=(round_index == 0))
             for _ in range(self.WARMUP_DECODE_STEPS):
                 self.step()
             self.abort()

@@ -126,7 +126,8 @@ class RejectionSampler(nn.Module):
         assert metadata.max_spec_len <= MAX_SPEC_LEN
 
         if (
-            logits.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            logits.is_cuda
+            and logits.dtype in (torch.float16, torch.bfloat16, torch.float32)
             and self._can_use_greedy_argmax(sampling_metadata)
         ):
             return self._greedy_argmax_sample(logits, metadata)
@@ -242,42 +243,27 @@ class RejectionSampler(nn.Module):
     def _greedy_argmax_sample(
         self, logits: torch.Tensor, metadata: SpecDecodeMetadata
     ) -> SamplerOutput:
-        # BF16/FP16 values are exactly representable in FP32. Without active
-        # processors, widening does not change their order or ties. Reduce
-        # the original rows once, then gather IDs instead of vocabulary rows.
-        # torch.argmax retains its first-index tie rule on each row.
-        row_argmax = logits.argmax(dim=-1)
-        target_argmax = row_argmax[metadata.target_logits_indices].contiguous()
-        bonus_token_ids = (
-            row_argmax[metadata.bonus_logits_indices]
-            .to(torch.int32)
-            .unsqueeze(-1)
-            .contiguous()
-        )
+        # Keep torch.argmax's exact first-index and NaN behavior. Gather only
+        # token IDs and fuse acceptance plus placeholder initialization.
+        row_ids = logits.argmax(dim=-1)
         batch_size = len(metadata.num_draft_tokens)
-        output_token_ids = torch.full(
+        output = torch.empty(
             (batch_size, metadata.max_spec_len + 1),
-            PLACEHOLDER_TOKEN_ID,
             dtype=torch.int32,
             device=logits.device,
         )
-        # Keep the existing exact-equality acceptance and first-rejection
-        # recovery kernel, including the zero-draft and bonus-token cases.
-        rejection_greedy_sample_kernel[(batch_size,)](
-            output_token_ids,
-            metadata.cu_num_draft_tokens,
+        _greedy_ids_accept_kernel[(batch_size,)](
+            row_ids,
+            metadata.target_logits_indices,
+            metadata.bonus_logits_indices,
             metadata.draft_token_ids,
-            target_argmax,
-            bonus_token_ids,
-            None,
-            metadata.max_spec_len,
-            None,
-            None,
-            SYNTHETIC_MODE=False,
+            metadata.cu_num_draft_tokens,
+            output,
+            DEPTH=metadata.max_spec_len,
+            BLOCK=triton.next_power_of_2(metadata.max_spec_len + 1),
+            num_warps=1,
         )
-        return SamplerOutput(
-            sampled_token_ids=output_token_ids, logprobs_tensors=None
-        )
+        return SamplerOutput(sampled_token_ids=output, logprobs_tensors=None)
 
     def _get_logprobs_tensors(
         self,
@@ -1030,3 +1016,35 @@ def sample_recovered_tokens_kernel(
 
     recovered_id = tl.minimum(recovered_id, vocab_size - 1)
     tl.store(output_token_ids_ptr + token_idx, recovered_id)
+
+
+@triton.jit
+def _greedy_ids_accept_kernel(
+    row_ids,
+    targets,
+    bonuses,
+    drafts,
+    cumulative,
+    output,
+    DEPTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    request = tl.program_id(0)
+    start = tl.load(cumulative + request - 1, request > 0, other=0)
+    end = tl.load(cumulative + request)
+    count = end - start
+    pos = tl.arange(0, BLOCK)
+    target_rows = tl.load(targets + start + pos, pos < count, other=0)
+    target_ids = tl.load(row_ids + target_rows, pos < count, other=-1).to(tl.int32)
+    draft_ids = tl.load(drafts + start + pos, pos < count, other=-1)
+    first_rejection = tl.min(
+        tl.where((pos < count) & (draft_ids != target_ids), pos, count), 0
+    )
+    bonus_row = tl.load(bonuses + request)
+    bonus = tl.load(row_ids + bonus_row).to(tl.int32)
+    value = tl.where(
+        (pos < count) & (pos <= first_rejection),
+        target_ids,
+        tl.where((pos == count) & (first_rejection == count), bonus, -1),
+    )
+    tl.store(output + request * (DEPTH + 1) + pos, value, pos <= DEPTH)

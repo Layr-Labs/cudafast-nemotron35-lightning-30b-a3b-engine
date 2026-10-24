@@ -2331,7 +2331,8 @@ mod resident {
         );
     }
 
-    /// Free runs and timed prefill omit top-k; correctness still requests it.
+    /// A free run's sync tells the resident that no top-k logits will be read
+    /// on the sequence; every other sync leaves the field out.
     #[test]
     fn a_free_run_sync_drops_top_logits() {
         let server = Server::start(scripted);
@@ -2350,7 +2351,7 @@ mod resident {
             "a free run is unbounded"
         );
         assert!(seen[2].get("top_logits").is_none());
-        assert_eq!(seen[3]["top_logits"], false);
+        assert!(seen[3].get("top_logits").is_none());
     }
 
     /// A resident that offers `spec_run` in its hello takes the whole free run

@@ -37,23 +37,26 @@ except ImportError:
     _zskip = None
 
 ENABLED = os.environ.get("ZSKIP", "1") != "0"
-# kernel v4 (warp per 64-column tile, weights as the MMA A operand) on the "swap" repack
-LAYOUT = "swap"
-CONFIG = 100
+# kernel down4 config 113 (one warp per 128-column pair, ring of 3 groups, weights as the MMA A
+# operand) on the "swap2" repack (one 64-byte segment per k row and warp)
+LAYOUT = "swap2"
+CONFIG = 113
 MAX_TOKENS = 8
-# Prefill: MoE layers whose relu^2 activations are sparse enough for the skip to beat humming's
-# 64-row blocks on GB10 (measured per layer on prefill-length calls; the others lose). Layer 51,
-# the last, is left out: the boot prefill graph routes all its rows through one row's experts.
+# Prefill: config 212 (two 8-row n-blocks per warp share each dequantised weight fragment) on a
+# block-16 alignment of the call. Measured per layer on prefill-length calls it beats humming's
+# 64-row blocks on every MoE layer (nemo-exec-zsvm). Layer 51, the last, is left out: the boot
+# prefill graph routes all its rows through one row's experts.
 PREFILL_ENABLED = ENABLED and os.environ.get("ZSKIP_PREFILL", "1") != "0"
 PREFILL_LAYERS = frozenset(
     int(v)
     for v in os.environ.get(
-        "ZSKIP_PREFILL_LAYERS", "1,3,6,8,10,13,15,34,36,38,40,43,45,47,49"
+        "ZSKIP_PREFILL_LAYERS",
+        "1,3,6,8,10,13,15,17,20,22,24,27,29,31,34,36,38,40,43,45,47,49",
     ).split(",")
     if v.strip()
 )
-PREFILL_CONFIG = 405
-PREFILL_BM = 32
+PREFILL_CONFIG = 212
+PREFILL_BM = 16
 PREFILL_MAX_TOKENS = 4096
 TOP_K = 6
 HIDDEN = 2688
@@ -203,7 +206,7 @@ def _self_check(layer: torch.nn.Module) -> bool:
         out = torch.empty_like(ref)
         if m > MAX_TOKENS:
             sorted_ids, expert_ids, ntp = _align(topk_ids, PREFILL_BM)
-            cfg, mb = PREFILL_CONFIG, sorted_ids.numel() // PREFILL_BM
+            cfg, mb = PREFILL_CONFIG, expert_ids.numel()
         else:
             cfg, mb = CONFIG, m * TOP_K
         _zskip.down(
@@ -280,7 +283,7 @@ def maybe_down(
             outputs,
             mode=_zskip.SKIP,
             config=PREFILL_CONFIG,
-            max_blocks=sorted_ids.numel() // PREFILL_BM,
+            max_blocks=expert_ids.numel(),
         )
         return True
     _zskip.down(

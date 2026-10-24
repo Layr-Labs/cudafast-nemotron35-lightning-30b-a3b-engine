@@ -182,6 +182,10 @@
     {
       "file": "vllm/model_executor/models/nemotron_h_mtp_kernels.py",
       "why": "Drafter-only: in the MTP layer's single-row MoE the draft pass evaluates the three routed experts with the highest router weight (from the router's existing selection, ordered by weight) instead of all six; the MTP router, shared expert and head weights are unchanged and the target decides every emitted token. MTP_DRAFT_TOPK=0 keeps all six. Carried unchanged from i34-9 b5616630-9603-44d1-a221-a7b2b4ec1d7d."
+    },
+    {
+      "file": "harness/kernels/zskip; vllm/model_executor/layers/fused_moe/experts/humming_zskip.py; vllm/model_executor/layers/quantization/utils/humming_utils.py",
+      "why": "zskip kernel update: decode (1..8 tokens) runs config 113 (one warp per 128-column pair, register ring of 3) on the swap2 repack (the two 64-column tiles of a pair interleaved per lane: one 64-byte segment per k row and warp); the 496-token prefill runs config 212 (two 8-row n-blocks per warp share each dequantised weight fragment) on a block-16 alignment of the call, on every MoE layer but 51. Same arithmetic as humming per output element (bit-identical on all 23 layers for M = 1..8 and 496, captured prompts and decode windows, adversarial activations); measured on the same inputs: prefill 26.5 vs 29.7 ms (main's config 405 on 15 layers) over the 22 full layers, decode 71.2 vs 79.2 us per 5-row call. Both kernels of a call keep main's programmatic dependent launch (ZSKIP_PDL=0 turns it off). routed_sparse is no longer repacked while zskip is active (ZSKIP=0 brings it back)."
     }
   ]
 }

@@ -509,6 +509,9 @@ class NemotronHMTP(nn.Module, SupportsPP):
 
     def process_weights_after_loading(self) -> None:
         prepare_mtp_relu2(self.model)
+        from .nemotron_h_mtp_packed import prepare_mtp_packed
+
+        prepare_mtp_packed(self.model)
 
     def prepare_draft_head_screen(self):
         """The drafter's greedy head over the shared NVFP4 lm_head (see

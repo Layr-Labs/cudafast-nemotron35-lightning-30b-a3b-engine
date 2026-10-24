@@ -11,8 +11,12 @@ those rows only ever multiply exact zeros. See harness/kernels/zskip/README.md f
 arithmetic and the evidence.
 
 It serves calls of 1 to 8 tokens on the layers humming_tuned_moe.py tunes (unpadded experts,
-block_m 16, BF16 activations, no input scale); with ZSKIP=0 routed_sparse serves them, and
-humming the prefill. The repack keeps every byte of the checkpoint tensors next to humming's own
+block_m 16, BF16 activations, no input scale); with ZSKIP=0 routed_sparse serves them.
+
+Prefill (more than 8 tokens): on the MoE layers in PREFILL_LAYERS it also serves the w2 GEMM,
+with the call re-aligned to expert blocks of 32 rows (config PREFILL_CONFIG: four 8-row MMAs
+share each dequantised weight fragment). humming's indexed w2 is batch invariant, so the output
+is the same bits whatever the block size. Other layers (and ZSKIP_PREFILL=0) keep humming. The repack keeps every byte of the checkpoint tensors next to humming's own
 copy (about 357 MB per layer). ZSKIP=0 in the environment disables it.
 """
 
@@ -37,6 +41,24 @@ ENABLED = os.environ.get("ZSKIP", "1") != "0"
 LAYOUT = "swap"
 CONFIG = 100
 MAX_TOKENS = 8
+# Prefill: MoE layers whose relu^2 activations are sparse enough for the skip to beat humming's
+# 64-row blocks on GB10 (measured per layer on prefill-length calls; the others lose). Layer 51,
+# the last, is left out: the boot prefill graph routes all its rows through one row's experts.
+PREFILL_ENABLED = ENABLED and os.environ.get("ZSKIP_PREFILL", "1") != "0"
+PREFILL_LAYERS = frozenset(
+    int(v)
+    for v in os.environ.get(
+        "ZSKIP_PREFILL_LAYERS", "1,3,6,8,10,13,15,34,36,38,40,43,45,47,49"
+    ).split(",")
+    if v.strip()
+)
+PREFILL_CONFIG = 405
+PREFILL_BM = 32
+PREFILL_MAX_TOKENS = 4096
+PREFILL_REUSE = os.environ.get("ZSKIP_PREFILL_REUSE", "1") != "0"
+PREFILL_REUSE_CONFIG = 605
+PREFILL_WARP_LOCAL = os.environ.get("ZSKIP_PREFILL_WARP_LOCAL", "1") != "0"
+PREFILL_WARP_CONFIG = 705
 TOP_K = 6
 HIDDEN = 2688
 INTER = 1856
@@ -89,13 +111,54 @@ def finalize(layer: torch.nn.Module) -> None:
         layer.zskip_w2 = None
         return
     _zskip.scratch(gs.device)
+    layer.zskip_prefill = PREFILL_ENABLED and _layer_index(layer) in PREFILL_LAYERS
     if not _self_check(layer):
         layer.zskip_w2 = None
         return
     logger.info_once("zskip: zero-row-skipping routed down projection enabled for <= 8 tokens")
+    layer.zskip_prefill_reuse = False
+    layer.zskip_prefill_warp = False
+    if layer.zskip_prefill and PREFILL_REUSE:
+        try:
+            layer.zskip_prefill_reuse = _self_check(layer, reuse=True)
+        except Exception as exc:  # original405 remains available
+            logger.warning_once("zskip: M64 reuse check failed (%r); keep405", exc)
+    if layer.zskip_prefill_reuse and PREFILL_WARP_LOCAL:
+        try:
+            layer.zskip_prefill_warp = _self_check(layer, reuse=True, warp_local=True)
+        except Exception as exc:  # checked605 remains available
+            logger.warning_once("zskip: warp-local check failed (%r); keep605", exc)
+    if layer.zskip_prefill:
+        logger.info_once(
+            "zskip: prefill routed down projection enabled on layers %s",
+            ",".join(map(str, sorted(PREFILL_LAYERS))),
+        )
 
 
-def _self_check(layer: torch.nn.Module) -> bool:
+def _layer_index(layer: torch.nn.Module) -> int:
+    import re
+
+    m = re.search(r"layers\.(\d+)\.", str(getattr(layer, "layer_name", "")))
+    return int(m.group(1)) if m else -1
+
+
+def _align(topk_ids: torch.Tensor, block_size: int):
+    from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+        moe_align_block_size,
+    )
+
+    return moe_align_block_size(
+        topk_ids=topk_ids,
+        block_size=block_size,
+        num_experts=NUM_EXPERTS,
+        expert_map=None,
+        ignore_invalid_experts=True,
+    )
+
+
+def _self_check(
+    layer: torch.nn.Module, reuse: bool = False, warp_local: bool = False,
+) -> bool:
     """Load-time guard: humming's w2 and zskip on deterministic 4- and 8-token calls, bitwise."""
     import json
 
@@ -123,8 +186,12 @@ def _self_check(layer: torch.nn.Module) -> bool:
         }
     )
     ok = True
-    for m in (4, MAX_TOKENS):
-        ids = [[(17 * t + 29 * i) % NUM_EXPERTS for i in range(TOP_K)] for t in range(m)]
+    prefill = bool(getattr(layer, "zskip_prefill", False))
+    cases = (((40, False), (80, True)) if reuse else
+             tuple((m, False) for m in (4, MAX_TOKENS) + ((40,) if prefill else ())))
+    for m, same_experts in cases:
+        ids = [[((0 if same_experts else 17 * t) + 29 * i) % NUM_EXPERTS
+                for i in range(TOP_K)] for t in range(m)]
         ids[1][0] = ids[0][0]  # one block with two rows
         topk_ids = torch.tensor(ids, dtype=torch.int32, device=dev)
         gen = torch.Generator(device=dev)
@@ -155,6 +222,13 @@ def _self_check(layer: torch.nn.Module) -> bool:
             tuning_config=json.dumps(configs[1]),
         )
         out = torch.empty_like(ref)
+        if m > MAX_TOKENS:
+            sorted_ids, expert_ids, ntp = _align(topk_ids, 64 if reuse else PREFILL_BM)
+            cfg = (PREFILL_WARP_CONFIG if warp_local else
+                   PREFILL_REUSE_CONFIG if reuse else PREFILL_CONFIG)
+            mb = sorted_ids.numel() // PREFILL_BM
+        else:
+            cfg, mb = CONFIG, m * TOP_K
         _zskip.down(
             act,
             sorted_ids,
@@ -163,8 +237,8 @@ def _self_check(layer: torch.nn.Module) -> bool:
             layer.zskip_w2,
             out,
             mode=_zskip.SKIP,
-            config=CONFIG,
-            max_blocks=m * TOP_K,
+            config=cfg,
+            max_blocks=mb,
         )
         ok = ok and torch.equal(out.view(torch.int16), ref.view(torch.int16))
     if not ok:
@@ -173,6 +247,21 @@ def _self_check(layer: torch.nn.Module) -> bool:
             getattr(layer, "layer_name", "?"),
         )
     return ok
+
+
+def _existing_alignment(inputs: torch.Tensor, kwargs: dict[str, Any]) -> bool:
+    """Static admission only: existing M64 arrays remain read-only for both GEMMs."""
+    names = ("sorted_ids", "expert_ids", "num_tokens_padded")
+    arrays = tuple(kwargs.get(name) for name in names)
+    if not all(isinstance(t, torch.Tensor) for t in arrays):
+        return False
+    ids, experts, ntp = arrays
+    return (all(t.dtype == torch.int32 and t.is_contiguous()
+                and t.device == inputs.device for t in arrays)
+            and ids.ndim == experts.ndim == 1 and ntp.numel() == 1
+            and ids.numel() >= inputs.shape[0]
+            and experts.numel() * 64 >= ids.numel()
+            and ids.numel() // PREFILL_BM <= _zskip.MAX_BLOCKS)
 
 
 def maybe_down(
@@ -184,12 +273,22 @@ def maybe_down(
     top_k: int,
     block_m: int | None,
     moe_kwargs: dict[str, Any],
+    topk_ids: torch.Tensor | None = None,
 ) -> bool:
     """Runs the w2 GEMM with zskip and returns True, or returns False (caller runs humming)."""
     packed = getattr(layer, "zskip_w2", None)
     if packed is None or not ENABLED:
         return False
-    if not (1 <= num_tokens <= MAX_TOKENS) or top_k != TOP_K or block_m != 16:
+    prefill = num_tokens > MAX_TOKENS
+    if prefill:
+        if (
+            not getattr(layer, "zskip_prefill", False)
+            or num_tokens > PREFILL_MAX_TOKENS
+            or topk_ids is None
+            or top_k != TOP_K
+        ):
+            return False
+    elif not (1 <= num_tokens <= MAX_TOKENS) or top_k != TOP_K or block_m != 16:
         return False
     if input_scale is not None or inputs.dtype != torch.bfloat16 or outputs.dtype != torch.bfloat16:
         return False
@@ -208,6 +307,30 @@ def maybe_down(
         or outputs.stride(0) % 2
     ):
         return False
+    if prefill:
+        if (block_m == 64 and getattr(layer, "zskip_prefill_reuse", False)
+                and _existing_alignment(inputs, moe_kwargs)):
+            _zskip.down(
+                inputs, moe_kwargs["sorted_ids"], moe_kwargs["expert_ids"],
+                moe_kwargs["num_tokens_padded"], packed, outputs,
+                mode=_zskip.SKIP,
+                config=(PREFILL_WARP_CONFIG if layer.zskip_prefill_warp else PREFILL_REUSE_CONFIG),
+                max_blocks=moe_kwargs["sorted_ids"].numel() // PREFILL_BM,
+            )
+            return True
+        sorted_ids, expert_ids, ntp = _align(topk_ids, PREFILL_BM)
+        _zskip.down(
+            inputs,
+            sorted_ids,
+            expert_ids,
+            ntp,
+            packed,
+            outputs,
+            mode=_zskip.SKIP,
+            config=PREFILL_CONFIG,
+            max_blocks=sorted_ids.numel() // PREFILL_BM,
+        )
+        return True
     _zskip.down(
         inputs,
         moe_kwargs["sorted_ids"],

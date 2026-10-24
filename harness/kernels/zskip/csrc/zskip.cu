@@ -40,7 +40,7 @@ namespace zskip {
 constexpr int K = 1856;           // intermediate size (down K)
 constexpr int N = 2688;           // hidden size (down N)
 constexpr int G = K / 16;         // 116 k16 groups
-constexpr int RMAX = 8;           // valid rows per expert block (<= 8 tokens)
+constexpr int RMAX = 64;          // valid rows per expert block (block_m 16 decode .. 64 prefill)
 constexpr int WARP_COLS = 32;
 constexpr int NWARPS_TOTAL = N / WARP_COLS;  // 84
 
@@ -173,14 +173,15 @@ __device__ __forceinline__ void cp_async_wait_dyn(int n) {
 //   RMAX); u16 mask[128] (bit b of group g: k = 16g + b nonzero in some valid row); u16 rbase[128]
 //   (active rows before group g); u16 gbase[128] (active groups before g); u16 act_g[128] (active
 //   groups in order); u16 act_k[K] (active k in order).
-constexpr int BI_HDR = 64;
+constexpr int BI_HDR = 320;
 constexpr int BI_MASK = BI_HDR;
 constexpr int BI_RBASE = BI_MASK + 256;
 constexpr int BI_GBASE = BI_RBASE + 256;
 constexpr int BI_ACTG = BI_GBASE + 256;
 constexpr int BI_ACTK = BI_ACTG + 256;
 constexpr int BI_USED = BI_ACTK + K * 2;  // 4800
-constexpr int BI_BYTES = 4864;
+constexpr int BI_BYTES = 5120;
+static_assert(BI_USED <= BI_BYTES, "block info");
 
 struct BlockHdr {
   int nrows, nact, nag, expert;
@@ -269,6 +270,7 @@ __device__ __forceinline__ void build_lists(uint8_t* dst, int nrows_valid, const
 
 // one CTA per expert block (grid = max_blocks): rows, masks and lists into p.ws; block 0 also
 // resets the work queue of the main kernel (launched next on the same stream)
+template <int BM, int CAP, int EXPERT_DIV = 1>
 __global__ void __launch_bounds__(128) prep_kernel(const Params p) {
   const int tid = threadIdx.x, lane = tid & 31;
   const int mb = blockIdx.x;
@@ -277,7 +279,7 @@ __global__ void __launch_bounds__(128) prep_kernel(const Params p) {
   __shared__ int s_rows[RMAX];
   __shared__ int s_nrows;
   if (mb == 0 && tid == 0) *p.queue = 0;
-  if (mb * 16 >= *p.num_tokens_padded) {
+  if (mb * BM >= *p.num_tokens_padded) {
     if (tid == 0) {
       h->nrows = 0;
       h->nact = 0;
@@ -286,25 +288,38 @@ __global__ void __launch_bounds__(128) prep_kernel(const Params p) {
     return;
   }
   if (tid < 32) {
-    const unsigned id = lane < 16 ? static_cast<unsigned>(p.sorted_ids[mb * 16 + lane]) : 0xFFFFFFFFu;
-    const bool valid = lane < 16 && id < static_cast<unsigned>(p.shape_m);
-    const unsigned ball = __ballot_sync(0xFFFFFFFFu, valid);
-    const int rank = __popc(ball & ((1u << lane) - 1u));
-    const bool keep = valid && rank < RMAX;
-    if (lane < 16) h->pos_row[lane] = static_cast<int8_t>(keep ? rank : RMAX);
-    if (keep) {
-      s_rows[rank] = static_cast<int>(id);
-      h->rows[rank] = static_cast<int>(id);
+    int base = 0;
+#pragma unroll
+    for (int c = 0; c < (BM + 31) / 32; ++c) {
+      const int pos = 32 * c + lane;
+      const unsigned id = pos < BM ? static_cast<unsigned>(p.sorted_ids[mb * BM + pos]) : 0xFFFFFFFFu;
+      const bool valid = pos < BM && id < static_cast<unsigned>(p.shape_m);
+      const unsigned ball = __ballot_sync(0xFFFFFFFFu, valid);
+      const int rank = base + __popc(ball & ((1u << lane) - 1u));
+      const bool keep = valid && rank < CAP;
+      if (pos < 16) h->pos_row[pos] = static_cast<int8_t>(keep ? rank : RMAX);
+      if (keep) {
+        s_rows[rank] = static_cast<int>(id);
+        h->rows[rank] = static_cast<int>(id);
+      }
+      base += __popc(ball);
     }
     if (lane == 0) {
-      const int n = __popc(ball);
-      s_nrows = n < RMAX ? n : RMAX;
+      const int n = base;
+      s_nrows = n < CAP ? n : CAP;
       h->nrows = s_nrows;
-      h->expert = p.expert_ids[mb];
-      if (n > RMAX && p.stats) atomicAdd(p.stats + 1, 1);
+      // A 64-row source block supplies two 32-row children; ids stay in place.
+      h->expert = p.expert_ids[mb / EXPERT_DIV];
+      if (n > CAP && p.stats) atomicAdd(p.stats + 1, 1);
     }
   }
   __syncthreads();
+  if constexpr (EXPERT_DIV == 2) {
+    if (s_nrows == 0) {
+      if (tid == 0) { h->nact = 0; h->nag = 0; }
+      return;  // empty half of originalM64 padding: no activation scan
+    }
+  }
   const bool dense = p.mode == DENSE || p.mode == LOADONLY_DENSE;
   build_lists<128>(bi, s_nrows, p, s_rows, dense);
 }
@@ -639,13 +654,13 @@ __device__ __forceinline__ uint32_t ldg_u32_l1(const void* p) {  // activations:
   return v;
 }
 
-template <int WPC, int R>
+template <int WPC, int R, int NH, int BM>
 __global__ void __launch_bounds__(WPC * 32) down4_kernel(const Params p) {
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   const int g8 = lane >> 2, t = lane & 3;
   const int mb = blockIdx.y;
   const int T = blockIdx.x * WPC + warp;  // 64-column tile, 0..41
-  if (mb * 16 >= *p.num_tokens_padded) return;
+  if (mb * BM >= *p.num_tokens_padded) return;
   const uint8_t* bi = p.ws + (long long)mb * BI_BYTES;
   const BlockHdr* hdr = reinterpret_cast<const BlockHdr*>(bi);
   const int nrows = hdr->nrows;
@@ -655,16 +670,18 @@ __global__ void __launch_bounds__(WPC * 32) down4_kernel(const Params p) {
   const uint16_t* gact = reinterpret_cast<const uint16_t*>(bi + BI_ACTG);
   const bool math = p.mode == DENSE || p.mode == SKIP;
   bool dense = p.mode == DENSE || p.mode == LOADONLY_DENSE;
-  const __nv_bfloat16* xrow = g8 < nrows ? p.A + (long long)hdr->rows[g8] * p.lda : nullptr;
+  const __nv_bfloat16* xrow[NH];
+#pragma unroll
+  for (int h = 0; h < NH; ++h) xrow[h] = g8 + 8 * h < nrows ? p.A + (long long)hdr->rows[g8 + 8 * h] * p.lda : nullptr;
   const uint8_t* wbase = p.W + e * p.w_expert + T * 32 + g8 * 4;
   const uint8_t* sbase = p.S + e * p.s_expert + T * 64 + g8 * 8;
   // the k-slot pair of this lane in a group: rows 2t, 2t+1 (low k) and 2t+8, 2t+9 (high k)
   const int kr[4] = {2 * t, 2 * t + 1, 2 * t + 8, 2 * t + 9};
 
-  float acc[4][4];
+  float acc[NH][4][4];
   for (int pass = 0; pass < 2; ++pass) {
     const int nsteps = dense ? G : hdr->nag;
-    uint32_t wq[R][4], xb[R][2], mk[R];
+    uint32_t wq[R][4], xb[R][NH][2], mk[R];
     uint2 sq[R];
     auto load = [&](int slot, int j) {
       if (j < nsteps) {
@@ -676,8 +693,11 @@ __global__ void __launch_bounds__(WPC * 32) down4_kernel(const Params p) {
           wq[slot][h] = ((m >> kr[h]) & 1u) ? ldg_u32(wbase + (long long)(kb + kr[h]) * p.w_k) : 0u;
         }
         sq[slot] = ldg_u64(sbase + (long long)grp * p.s_g);
-        xb[slot][0] = xrow ? ldg_u32_l1(xrow + kb + 2 * t) : 0u;
-        xb[slot][1] = xrow ? ldg_u32_l1(xrow + kb + 8 + 2 * t) : 0u;
+#pragma unroll
+        for (int h = 0; h < NH; ++h) {
+          xb[slot][h][0] = xrow[h] ? ldg_u32_l1(xrow[h] + kb + 2 * t) : 0u;
+          xb[slot][h][1] = xrow[h] ? ldg_u32_l1(xrow[h] + kb + 8 + 2 * t) : 0u;
+        }
         mk[slot] = m;
       } else {
         mk[slot] = 0u;
@@ -686,7 +706,10 @@ __global__ void __launch_bounds__(WPC * 32) down4_kernel(const Params p) {
 #pragma unroll
     for (int c = 0; c < 4; ++c) {
 #pragma unroll
-      for (int i = 0; i < 4; ++i) acc[c][i] = 0.0f;
+      for (int i = 0; i < 4; ++i) {
+#pragma unroll
+        for (int h = 0; h < NH; ++h) acc[h][c][i] = 0.0f;
+      }
     }
 #pragma unroll
     for (int i = 0; i < R; ++i) load(i, i);
@@ -698,7 +721,9 @@ __global__ void __launch_bounds__(WPC * 32) down4_kernel(const Params p) {
           const uint32_t m = mk[i];
           const uint32_t w0 = wq[i][0], w1 = wq[i][1], w2 = wq[i][2], w3 = wq[i][3];
           const uint2 sc = sq[i];
-          const uint32_t b0 = xb[i][0], b1 = xb[i][1];
+          uint32_t bx[NH][2];
+#pragma unroll
+          for (int h = 0; h < NH; ++h) { bx[h][0] = xb[i][h][0]; bx[h][1] = xb[i][h][1]; }
           load(i, j0 + i + R);
           if (math) {
             const uint32_t m01 = (m >> (2 * t)) & 3u;
@@ -722,13 +747,19 @@ __global__ void __launch_bounds__(WPC * 32) down4_kernel(const Params p) {
               const uint32_t a1 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x01 << 8), kExp124), shi) & keep01;
               const uint32_t a2 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x23 << 12), kExp124), slo) & keep23;
               const uint32_t a3 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x23 << 8), kExp124), shi) & keep23;
-              mma_bf16(acc[c], a0, a1, a2, a3, b0, b1);
+#pragma unroll
+              for (int h = 0; h < NH; ++h)
+                if (h == 0 || nrows > 8 * h) mma_bf16(acc[h][c], a0, a1, a2, a3, bx[h][0], bx[h][1]);
             }
             if (!dense) {
 #pragma unroll
               for (int c = 0; c < 4; ++c) {
 #pragma unroll
-                for (int q = 0; q < 4; ++q) neg0 |= __float_as_uint(acc[c][q]) == 0x80000000u;
+                for (int q = 0; q < 4; ++q) {
+#pragma unroll
+                  for (int h = 0; h < NH; ++h)
+                    if (h == 0 || nrows > 8 * h) neg0 |= __float_as_uint(acc[h][c][q]) == 0x80000000u;
+                }
               }
             }
           }
@@ -748,15 +779,666 @@ __global__ void __launch_bounds__(WPC * 32) down4_kernel(const Params p) {
     const int col = T * 64 + 16 * c + g8;
 #pragma unroll
     for (int q = 0; q < 4; ++q) {
-      const int tok = 2 * t + (q & 1);
       const int cc = col + ((q >> 1) ? 8 : 0);
-      if (tok < nrows) {
-        const uint32_t v = to_bf16x2(mul_ftz(acc[c][q], gs4), 0.0f);  // humming's cvt.rn.bf16x2.f32
-        reinterpret_cast<uint16_t*>(p.C)[(long long)hdr->rows[tok] * p.ldc + cc] = static_cast<uint16_t>(v);
+#pragma unroll
+      for (int h = 0; h < NH; ++h) {
+        const int tok = 8 * h + 2 * t + (q & 1);
+        if (tok < nrows) {
+          const uint32_t v = to_bf16x2(mul_ftz(acc[h][c][q], gs4), 0.0f);
+          reinterpret_cast<uint16_t*>(p.C)[(long long)hdr->rows[tok] * p.ldc + cc] = static_cast<uint16_t>(v);
+        }
       }
     }
   }
 }
+
+
+// v6: down4 with the -0 guard moved to the end. With skipped rows read as +0, every step keeps
+// the accumulator equal to stock's or both zero (the two differ at most in the sign of a zero), so
+// a nonzero final accumulator equals stock's. A warp whose valid outputs include an exact zero
+// (either sign) recomputes its tile in DENSE mode, as down4 does for a -0 seen at any step.
+template <int WPC, int R, int NH, int BM>
+__global__ void __launch_bounds__(WPC * 32) down6_kernel(const Params p) {
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int g8 = lane >> 2, t = lane & 3;
+  const int mb = blockIdx.y;
+  const int T = blockIdx.x * WPC + warp;  // 64-column tile, 0..41
+  if (mb * BM >= *p.num_tokens_padded) return;
+  const uint8_t* bi = p.ws + (long long)mb * BI_BYTES;
+  const BlockHdr* hdr = reinterpret_cast<const BlockHdr*>(bi);
+  const int nrows = hdr->nrows;
+  if (nrows == 0 || p.mode == SETUPONLY) return;
+  const int e = hdr->expert;
+  const uint16_t* gmask = reinterpret_cast<const uint16_t*>(bi + BI_MASK);
+  const uint16_t* gact = reinterpret_cast<const uint16_t*>(bi + BI_ACTG);
+  const bool math = p.mode == DENSE || p.mode == SKIP;
+  bool dense = p.mode == DENSE || p.mode == LOADONLY_DENSE;
+  const __nv_bfloat16* xrow[NH];
+#pragma unroll
+  for (int h = 0; h < NH; ++h) xrow[h] = g8 + 8 * h < nrows ? p.A + (long long)hdr->rows[g8 + 8 * h] * p.lda : nullptr;
+  const uint8_t* wbase = p.W + e * p.w_expert + T * 32 + g8 * 4;
+  const uint8_t* sbase = p.S + e * p.s_expert + T * 64 + g8 * 8;
+  // the k-slot pair of this lane in a group: rows 2t, 2t+1 (low k) and 2t+8, 2t+9 (high k)
+  const int kr[4] = {2 * t, 2 * t + 1, 2 * t + 8, 2 * t + 9};
+
+  float acc[NH][4][4];
+  for (int pass = 0; pass < 2; ++pass) {
+    const int nsteps = dense ? G : hdr->nag;
+    uint32_t wq[R][4], xb[R][NH][2], mk[R];
+    uint2 sq[R];
+    auto load = [&](int slot, int j) {
+      if (j < nsteps) {
+        const int grp = dense ? j : gact[j];
+        const uint32_t m = dense ? 0xFFFFu : gmask[grp];
+        const int kb = 16 * grp;
+#pragma unroll
+        for (int h = 0; h < 4; ++h) {
+          wq[slot][h] = ((m >> kr[h]) & 1u) ? ldg_u32(wbase + (long long)(kb + kr[h]) * p.w_k) : 0u;
+        }
+        sq[slot] = ldg_u64(sbase + (long long)grp * p.s_g);
+#pragma unroll
+        for (int h = 0; h < NH; ++h) {
+          xb[slot][h][0] = xrow[h] ? ldg_u32_l1(xrow[h] + kb + 2 * t) : 0u;
+          xb[slot][h][1] = xrow[h] ? ldg_u32_l1(xrow[h] + kb + 8 + 2 * t) : 0u;
+        }
+        mk[slot] = m;
+      } else {
+        mk[slot] = 0u;
+      }
+    };
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+#pragma unroll
+        for (int h = 0; h < NH; ++h) acc[h][c][i] = 0.0f;
+      }
+    }
+#pragma unroll
+    for (int i = 0; i < R; ++i) load(i, i);
+    bool neg0 = false;
+    for (int j0 = 0; j0 < nsteps; j0 += R) {
+#pragma unroll
+      for (int i = 0; i < R; ++i) {
+        if (j0 + i < nsteps) {
+          const uint32_t m = mk[i];
+          const uint32_t w0 = wq[i][0], w1 = wq[i][1], w2 = wq[i][2], w3 = wq[i][3];
+          const uint2 sc = sq[i];
+          uint32_t bx[NH][2];
+#pragma unroll
+          for (int h = 0; h < NH; ++h) { bx[h][0] = xb[i][h][0]; bx[h][1] = xb[i][h][1]; }
+          load(i, j0 + i + R);
+          if (math) {
+            const uint32_t m01 = (m >> (2 * t)) & 3u;
+            const uint32_t m23 = (m >> (2 * t + 8)) & 3u;
+            const uint32_t keep01 = ((m01 & 1u) ? 0x0000FFFFu : 0u) | ((m01 & 2u) ? 0xFFFF0000u : 0u);
+            const uint32_t keep23 = ((m23 & 1u) ? 0x0000FFFFu : 0u) | ((m23 & 2u) ? 0xFFFF0000u : 0u);
+            // scales: byte 2c + h of sc -> column 16c + g8 + 8h; humming's fp8 bit placement, x 2^120
+            const uint32_t s01 = hmul2_u32(fp8_to_bf16x2(((sc.x << 8) & 0x0000FF00u) | ((sc.x << 16) & 0xFF000000u)), kExp120);
+            const uint32_t s23 = hmul2_u32(fp8_to_bf16x2(((sc.x >> 8) & 0x0000FF00u) | (sc.x & 0xFF000000u)), kExp120);
+            const uint32_t s45 = hmul2_u32(fp8_to_bf16x2(((sc.y << 8) & 0x0000FF00u) | ((sc.y << 16) & 0xFF000000u)), kExp120);
+            const uint32_t s67 = hmul2_u32(fp8_to_bf16x2(((sc.y >> 8) & 0x0000FF00u) | (sc.y & 0xFF000000u)), kExp120);
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+              const uint32_t sp = c == 0 ? s01 : (c == 1 ? s23 : (c == 2 ? s45 : s67));
+              const uint32_t slo = __byte_perm(sp, 0, 0x1010);  // column g8 (h = 0)
+              const uint32_t shi = __byte_perm(sp, 0, 0x3232);  // column g8 + 8 (h = 1)
+              const uint32_t sel = c | (c << 4) | ((c + 4) << 8) | ((c + 4) << 12);
+              const uint32_t x01 = __byte_perm(w0, w1, sel);  // bytes: w0[c], w0[c], w1[c], w1[c]
+              const uint32_t x23 = __byte_perm(w2, w3, sel);
+              const uint32_t a0 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x01 << 12), kExp124), slo) & keep01;
+              const uint32_t a1 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x01 << 8), kExp124), shi) & keep01;
+              const uint32_t a2 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x23 << 12), kExp124), slo) & keep23;
+              const uint32_t a3 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x23 << 8), kExp124), shi) & keep23;
+#pragma unroll
+              for (int h = 0; h < NH; ++h)
+                if (h == 0 || nrows > 8 * h) mma_bf16(acc[h][c], a0, a1, a2, a3, bx[h][0], bx[h][1]);
+            }
+          }
+        }
+      }
+    }
+    if (math && !dense) {
+#pragma unroll
+      for (int c = 0; c < 4; ++c)
+#pragma unroll
+        for (int q = 0; q < 4; ++q)
+#pragma unroll
+          for (int h = 0; h < NH; ++h)
+            if (8 * h + 2 * t + (q & 1) < nrows) neg0 |= (__float_as_uint(acc[h][c][q]) & 0x7FFFFFFFu) == 0u;
+    }
+    if (!__any_sync(0xFFFFFFFFu, neg0) || dense || !math) break;
+    // a -0 accumulator appeared: recompute this warp's tile with every row loaded
+    if (lane == 0 && p.stats) atomicAdd(p.stats + 0, 1);
+    dense = true;
+  }
+  if (!math) return;
+
+  const float gs4 = mul_ftz(p.GS[e], 4.0f);
+#pragma unroll
+  for (int c = 0; c < 4; ++c) {
+    const int col = T * 64 + 16 * c + g8;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      const int cc = col + ((q >> 1) ? 8 : 0);
+#pragma unroll
+      for (int h = 0; h < NH; ++h) {
+        const int tok = 8 * h + 2 * t + (q & 1);
+        if (tok < nrows) {
+          const uint32_t v = to_bf16x2(mul_ftz(acc[h][c][q], gs4), 0.0f);
+          reinterpret_cast<uint16_t*>(p.C)[(long long)hdr->rows[tok] * p.ldc + cc] = static_cast<uint16_t>(v);
+        }
+      }
+    }
+  }
+}
+
+
+// ---------------------------------------------------------------------------
+// v5 (prefill): down4's arithmetic, element for element (same fragments, same mma order, same
+// -0 dense redo), but each warp stages its operands through a shared-memory ring of S active
+// groups with cp.async: the active k rows of its 64-column tile (32 bytes each, inactive rows are
+// not copied and read as 0), the tile's 64 scale bytes and the 32-byte k16 slices of the block's
+// activation rows (rows past nrows are zero-filled). S groups of loads are in flight per warp
+// without holding them in registers.
+__device__ __forceinline__ void cp16(void* smem, const void* gmem, bool valid) {
+  const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(gmem), "r"(valid ? 16 : 0));
+}
+__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+template <int N_>
+__device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N_)); }
+
+template <int NH>
+struct Stage5 {
+  static constexpr int W_BYTES = 512, S_BYTES = 64, A_BYTES = 8 * NH * 32;
+  static constexpr int BYTES = W_BYTES + S_BYTES + A_BYTES;
+};
+
+template <int WPC, int S, int NH, int BM>
+__global__ void __launch_bounds__(WPC * 32) down5_kernel(const Params p) {
+  extern __shared__ __align__(16) uint8_t smem5[];
+  using ST = Stage5<NH>;
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int g8 = lane >> 2, t = lane & 3;
+  const int mb = blockIdx.y;
+  const int T = blockIdx.x * WPC + warp;  // 64-column tile, 0..41
+  if (mb * BM >= *p.num_tokens_padded) return;
+  const uint8_t* bi = p.ws + (long long)mb * BI_BYTES;
+  const BlockHdr* hdr = reinterpret_cast<const BlockHdr*>(bi);
+  const int nrows = hdr->nrows;
+  if (nrows == 0 || p.mode == SETUPONLY) return;
+  const int e = hdr->expert;
+  const uint16_t* gmask = reinterpret_cast<const uint16_t*>(bi + BI_MASK);
+  const uint16_t* gact = reinterpret_cast<const uint16_t*>(bi + BI_ACTG);
+  const bool math = p.mode == DENSE || p.mode == SKIP;
+  bool dense = p.mode == DENSE || p.mode == LOADONLY_DENSE;
+  uint8_t* ring = smem5 + warp * S * ST::BYTES;
+  const uint8_t* wtile = p.W + e * p.w_expert + T * 32;
+  const uint8_t* stile = p.S + e * p.s_expert + T * 64;
+  // copy roles: weights lane -> (row l/2, half l%2); scales lanes 0..3; activations 2*NH chunks... per lane
+  const int crow = lane >> 1, chalf = lane & 1;
+  const __nv_bfloat16* arow[(16 * NH + 31) / 32];
+  bool aval[(16 * NH + 31) / 32];
+#pragma unroll
+  for (int i = 0; i < (16 * NH + 31) / 32; ++i) {
+    const int c = lane + 32 * i, ts = c >> 1;
+    aval[i] = c < 16 * NH && ts < nrows;
+    arow[i] = aval[i] ? p.A + (long long)hdr->rows[ts] * p.lda + 8 * (c & 1) : p.A;
+  }
+  const int kr[4] = {2 * t, 2 * t + 1, 2 * t + 8, 2 * t + 9};
+
+  float acc[NH][4][4];
+  for (int pass = 0; pass < 2; ++pass) {
+    const int nsteps = dense ? G : hdr->nag;
+    auto issue = [&](int j) {
+      if (j < nsteps) {
+        uint8_t* st = ring + (j % S) * ST::BYTES;
+        const int grp = dense ? j : gact[j];
+        const uint32_t m = dense ? 0xFFFFu : gmask[grp];
+        const int kb = 16 * grp;
+        if ((m >> crow) & 1u) cp16(st + crow * 32 + chalf * 16, wtile + (long long)(kb + crow) * p.w_k + chalf * 16, true);
+        if (lane < 4) cp16(st + ST::W_BYTES + lane * 16, stile + (long long)grp * p.s_g + lane * 16, true);
+#pragma unroll
+        for (int i = 0; i < (16 * NH + 31) / 32; ++i) {
+          const int c = lane + 32 * i;
+          if (c < 16 * NH) cp16(st + ST::W_BYTES + ST::S_BYTES + c * 16, arow[i] + kb, aval[i]);
+        }
+      }
+      cp_commit();
+    };
+#pragma unroll
+    for (int c = 0; c < 4; ++c)
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int h = 0; h < NH; ++h) acc[h][c][i] = 0.0f;
+    __syncwarp();
+#pragma unroll
+    for (int i = 0; i < S - 1; ++i) issue(i);
+    bool neg0 = false;
+    for (int j = 0; j < nsteps; ++j) {
+      cp_wait<S - 2>();
+      __syncwarp();
+      const uint8_t* st = ring + (j % S) * ST::BYTES;
+      const int grp = dense ? j : gact[j];
+      const uint32_t m = dense ? 0xFFFFu : gmask[grp];
+      uint32_t w[4];
+#pragma unroll
+      for (int h = 0; h < 4; ++h)
+        w[h] = ((m >> kr[h]) & 1u) ? *reinterpret_cast<const uint32_t*>(st + kr[h] * 32 + g8 * 4) : 0u;
+      const uint2 sc = *reinterpret_cast<const uint2*>(st + ST::W_BYTES + g8 * 8);
+      uint32_t bx[NH][2];
+#pragma unroll
+      for (int h = 0; h < NH; ++h) {
+        const uint8_t* ar = st + ST::W_BYTES + ST::S_BYTES + (g8 + 8 * h) * 32;
+        bx[h][0] = *reinterpret_cast<const uint32_t*>(ar + 4 * t);
+        bx[h][1] = *reinterpret_cast<const uint32_t*>(ar + 16 + 4 * t);
+      }
+      __syncwarp();
+      issue(j + S - 1);
+      if (math) {
+        const uint32_t w0 = w[0], w1 = w[1], w2 = w[2], w3 = w[3];
+        const uint32_t m01 = (m >> (2 * t)) & 3u;
+        const uint32_t m23 = (m >> (2 * t + 8)) & 3u;
+        const uint32_t keep01 = ((m01 & 1u) ? 0x0000FFFFu : 0u) | ((m01 & 2u) ? 0xFFFF0000u : 0u);
+        const uint32_t keep23 = ((m23 & 1u) ? 0x0000FFFFu : 0u) | ((m23 & 2u) ? 0xFFFF0000u : 0u);
+        const uint32_t s01 = hmul2_u32(fp8_to_bf16x2(((sc.x << 8) & 0x0000FF00u) | ((sc.x << 16) & 0xFF000000u)), kExp120);
+        const uint32_t s23 = hmul2_u32(fp8_to_bf16x2(((sc.x >> 8) & 0x0000FF00u) | (sc.x & 0xFF000000u)), kExp120);
+        const uint32_t s45 = hmul2_u32(fp8_to_bf16x2(((sc.y << 8) & 0x0000FF00u) | ((sc.y << 16) & 0xFF000000u)), kExp120);
+        const uint32_t s67 = hmul2_u32(fp8_to_bf16x2(((sc.y >> 8) & 0x0000FF00u) | (sc.y & 0xFF000000u)), kExp120);
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+          const uint32_t sp = c == 0 ? s01 : (c == 1 ? s23 : (c == 2 ? s45 : s67));
+          const uint32_t slo = __byte_perm(sp, 0, 0x1010);
+          const uint32_t shi = __byte_perm(sp, 0, 0x3232);
+          const uint32_t sel = c | (c << 4) | ((c + 4) << 8) | ((c + 4) << 12);
+          const uint32_t x01 = __byte_perm(w0, w1, sel);
+          const uint32_t x23 = __byte_perm(w2, w3, sel);
+          const uint32_t a0 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x01 << 12), kExp124), slo) & keep01;
+          const uint32_t a1 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x01 << 8), kExp124), shi) & keep01;
+          const uint32_t a2 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x23 << 12), kExp124), slo) & keep23;
+          const uint32_t a3 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x23 << 8), kExp124), shi) & keep23;
+#pragma unroll
+          for (int h = 0; h < NH; ++h)
+            if (h == 0 || nrows > 8 * h) mma_bf16(acc[h][c], a0, a1, a2, a3, bx[h][0], bx[h][1]);
+        }
+        if (!dense) {
+#pragma unroll
+          for (int c = 0; c < 4; ++c)
+#pragma unroll
+            for (int q = 0; q < 4; ++q)
+#pragma unroll
+              for (int h = 0; h < NH; ++h)
+                if (h == 0 || nrows > 8 * h) neg0 |= __float_as_uint(acc[h][c][q]) == 0x80000000u;
+        }
+      }
+    }
+    cp_wait<0>();
+    __syncwarp();
+    if (!__any_sync(0xFFFFFFFFu, neg0) || dense || !math) break;
+    if (lane == 0 && p.stats) atomicAdd(p.stats + 0, 1);
+    dense = true;
+  }
+  if (!math) return;
+  const float gs4 = mul_ftz(p.GS[e], 4.0f);
+#pragma unroll
+  for (int c = 0; c < 4; ++c) {
+    const int col = T * 64 + 16 * c + g8;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      const int cc = col + ((q >> 1) ? 8 : 0);
+#pragma unroll
+      for (int h = 0; h < NH; ++h) {
+        const int tok = 8 * h + 2 * t + (q & 1);
+        if (tok < nrows) {
+          const uint32_t v = to_bf16x2(mul_ftz(acc[h][c][q], gs4), 0.0f);
+          reinterpret_cast<uint16_t*>(p.C)[(long long)hdr->rows[tok] * p.ldc + cc] = static_cast<uint16_t>(v);
+        }
+      }
+    }
+  }
+}
+
+// v7: down6 with the block's activation slice of each active group staged once per CTA in shared
+// memory (cp.async, ring of R+1 groups, one barrier per group) and read by every warp of the CTA,
+// instead of each 64-column warp re-reading it from L2. Same fragments and order as down4/down6.
+template <int WPC, int R, int NH, int BM, bool WarpLocal = false>
+__global__ void __launch_bounds__(WPC * 32) down7_kernel(const Params p) {
+  __shared__ __align__(16) uint8_t abuf[WarpLocal ? WPC : 1][R + 1][8 * NH * 32];
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int g8 = lane >> 2, t = lane & 3;
+  const int mb = blockIdx.y;
+  const int T = blockIdx.x * WPC + warp;  // 64-column tile, 0..41
+  if (mb * BM >= *p.num_tokens_padded) return;
+  const uint8_t* bi = p.ws + (long long)mb * BI_BYTES;
+  const BlockHdr* hdr = reinterpret_cast<const BlockHdr*>(bi);
+  const int nrows = hdr->nrows;
+  if (nrows == 0 || p.mode == SETUPONLY) return;
+  const int e = hdr->expert;
+  const uint16_t* gmask = reinterpret_cast<const uint16_t*>(bi + BI_MASK);
+  const uint16_t* gact = reinterpret_cast<const uint16_t*>(bi + BI_ACTG);
+  const bool math = p.mode == DENSE || p.mode == SKIP;
+  bool dense = p.mode == DENSE || p.mode == LOADONLY_DENSE;
+  // WarpLocal: each warp owns its activation ring. Two 16-byte copies per
+  // lane at NH4 replace the cross-warp copy role and per-group CTA barrier.
+  const int ac = threadIdx.x;
+  const bool a_on = ac < 16 * NH;
+  const bool a_val = a_on && (ac >> 1) < nrows;
+  const __nv_bfloat16* a_src = a_val ? p.A + (long long)hdr->rows[ac >> 1] * p.lda + 8 * (ac & 1) : p.A;
+  uint8_t (*ring)[8 * NH * 32] = abuf[WarpLocal ? warp : 0];
+  const uint8_t* wbase = p.W + e * p.w_expert + T * 32 + g8 * 4;
+  const uint8_t* sbase = p.S + e * p.s_expert + T * 64 + g8 * 8;
+  // the k-slot pair of this lane in a group: rows 2t, 2t+1 (low k) and 2t+8, 2t+9 (high k)
+  const int kr[4] = {2 * t, 2 * t + 1, 2 * t + 8, 2 * t + 9};
+
+  float acc[NH][4][4];
+  for (int pass = 0; pass < 2; ++pass) {
+    const int nsteps = dense ? G : hdr->nag;
+    uint32_t wq[R][4], mk[R];
+    uint2 sq[R];
+    auto load = [&](int slot, int j) {
+      if (j < nsteps) {
+        const int grp = dense ? j : gact[j];
+        const uint32_t m = dense ? 0xFFFFu : gmask[grp];
+        const int kb = 16 * grp;
+#pragma unroll
+        for (int h = 0; h < 4; ++h) {
+          wq[slot][h] = ((m >> kr[h]) & 1u) ? ldg_u32(wbase + (long long)(kb + kr[h]) * p.w_k) : 0u;
+        }
+        sq[slot] = ldg_u64(sbase + (long long)grp * p.s_g);
+        mk[slot] = m;
+      } else {
+        mk[slot] = 0u;
+      }
+    };
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+#pragma unroll
+        for (int h = 0; h < NH; ++h) acc[h][c][i] = 0.0f;
+      }
+    }
+    auto issue_a = [&](int j) {
+      if constexpr (WarpLocal) {
+        if (j < nsteps) {
+          const int grp = dense ? j : gact[j];
+#pragma unroll
+          for (int c = lane; c < 16 * NH; c += 32) {
+            const bool valid = (c >> 1) < nrows;
+            const __nv_bfloat16* src = valid
+                ? p.A + (long long)hdr->rows[c >> 1] * p.lda + 8 * (c & 1) + 16 * grp
+                : p.A;
+            cp16(&ring[j % (R + 1)][c * 16], src, valid);
+          }
+        }
+      } else {
+        if (j < nsteps && a_on) {
+          const int grp = dense ? j : gact[j];
+          cp16(&ring[j % (R + 1)][ac * 16], a_src + 16 * grp, a_val);
+        }
+      }
+      cp_commit();
+    };
+    if constexpr (WarpLocal) __syncwarp();
+    else __syncthreads();
+#pragma unroll
+    for (int i = 0; i < R; ++i) { load(i, i); issue_a(i); }
+    bool neg0 = false;
+    for (int j0 = 0; j0 < nsteps; j0 += R) {
+#pragma unroll
+      for (int i = 0; i < R; ++i) {
+        if (j0 + i < nsteps) {
+          const uint32_t m = mk[i];
+          const uint32_t w0 = wq[i][0], w1 = wq[i][1], w2 = wq[i][2], w3 = wq[i][3];
+          const uint2 sc = sq[i];
+          cp_wait<R - 1>();
+          if constexpr (WarpLocal) __syncwarp();
+          else __syncthreads();
+          uint32_t bx[NH][2];
+          const uint8_t* ab = ring[(j0 + i) % (R + 1)];
+#pragma unroll
+          for (int h = 0; h < NH; ++h) {
+            bx[h][0] = *reinterpret_cast<const uint32_t*>(ab + (g8 + 8 * h) * 32 + 4 * t);
+            bx[h][1] = *reinterpret_cast<const uint32_t*>(ab + (g8 + 8 * h) * 32 + 16 + 4 * t);
+          }
+          issue_a(j0 + i + R);
+          load(i, j0 + i + R);
+          if (math) {
+            const uint32_t m01 = (m >> (2 * t)) & 3u;
+            const uint32_t m23 = (m >> (2 * t + 8)) & 3u;
+            const uint32_t keep01 = ((m01 & 1u) ? 0x0000FFFFu : 0u) | ((m01 & 2u) ? 0xFFFF0000u : 0u);
+            const uint32_t keep23 = ((m23 & 1u) ? 0x0000FFFFu : 0u) | ((m23 & 2u) ? 0xFFFF0000u : 0u);
+            // scales: byte 2c + h of sc -> column 16c + g8 + 8h; humming's fp8 bit placement, x 2^120
+            const uint32_t s01 = hmul2_u32(fp8_to_bf16x2(((sc.x << 8) & 0x0000FF00u) | ((sc.x << 16) & 0xFF000000u)), kExp120);
+            const uint32_t s23 = hmul2_u32(fp8_to_bf16x2(((sc.x >> 8) & 0x0000FF00u) | (sc.x & 0xFF000000u)), kExp120);
+            const uint32_t s45 = hmul2_u32(fp8_to_bf16x2(((sc.y << 8) & 0x0000FF00u) | ((sc.y << 16) & 0xFF000000u)), kExp120);
+            const uint32_t s67 = hmul2_u32(fp8_to_bf16x2(((sc.y >> 8) & 0x0000FF00u) | (sc.y & 0xFF000000u)), kExp120);
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+              const uint32_t sp = c == 0 ? s01 : (c == 1 ? s23 : (c == 2 ? s45 : s67));
+              const uint32_t slo = __byte_perm(sp, 0, 0x1010);  // column g8 (h = 0)
+              const uint32_t shi = __byte_perm(sp, 0, 0x3232);  // column g8 + 8 (h = 1)
+              const uint32_t sel = c | (c << 4) | ((c + 4) << 8) | ((c + 4) << 12);
+              const uint32_t x01 = __byte_perm(w0, w1, sel);  // bytes: w0[c], w0[c], w1[c], w1[c]
+              const uint32_t x23 = __byte_perm(w2, w3, sel);
+              const uint32_t a0 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x01 << 12), kExp124), slo) & keep01;
+              const uint32_t a1 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x01 << 8), kExp124), shi) & keep01;
+              const uint32_t a2 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x23 << 12), kExp124), slo) & keep23;
+              const uint32_t a3 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x23 << 8), kExp124), shi) & keep23;
+#pragma unroll
+              for (int h = 0; h < NH; ++h)
+                if (h == 0 || nrows > 8 * h) mma_bf16(acc[h][c], a0, a1, a2, a3, bx[h][0], bx[h][1]);
+            }
+          }
+        }
+      }
+    }
+    if (math && !dense) {
+#pragma unroll
+      for (int c = 0; c < 4; ++c)
+#pragma unroll
+        for (int q = 0; q < 4; ++q)
+#pragma unroll
+          for (int h = 0; h < NH; ++h)
+            if (8 * h + 2 * t + (q & 1) < nrows) neg0 |= (__float_as_uint(acc[h][c][q]) & 0x7FFFFFFFu) == 0u;
+    }
+    cp_wait<0>();
+    if (!__syncthreads_or(neg0 ? 1 : 0) || dense || !math) break;
+    // a -0 accumulator appeared: recompute this warp's tile with every row loaded
+    if (lane == 0 && p.stats) atomicAdd(p.stats + 0, 1);
+    dense = true;
+  }
+  if (!math) return;
+
+  const float gs4 = mul_ftz(p.GS[e], 4.0f);
+#pragma unroll
+  for (int c = 0; c < 4; ++c) {
+    const int col = T * 64 + 16 * c + g8;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      const int cc = col + ((q >> 1) ? 8 : 0);
+#pragma unroll
+      for (int h = 0; h < NH; ++h) {
+        const int tok = 8 * h + 2 * t + (q & 1);
+        if (tok < nrows) {
+          const uint32_t v = to_bf16x2(mul_ftz(acc[h][c][q], gs4), 0.0f);
+          reinterpret_cast<uint16_t*>(p.C)[(long long)hdr->rows[tok] * p.ldc + cc] = static_cast<uint16_t>(v);
+        }
+      }
+    }
+  }
+}
+
+
+
+// v8: down7 on the "swapc" layout: per expert, 64-column tile and k16 group, the 16 k rows (32 bytes
+// each, the same bytes as "swap") are one contiguous 512-byte block and the 64 scale bytes another.
+// Each lane loads 16 bytes (row lane/2) with one vector load when that row is active and the warp
+// redistributes them through shared memory into down4's per-lane words. Same fragments and order.
+__device__ __forceinline__ uint4 ldg_v4(const void* p) {
+  uint4 v;
+  asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];\n" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
+  return v;
+}
+template <int WPC, int R, int NH, int BM>
+__global__ void __launch_bounds__(WPC * 32) down8_kernel(const Params p) {
+  __shared__ __align__(16) uint8_t abuf[R + 1][8 * NH * 32];
+  __shared__ __align__(16) uint8_t tbuf[WPC][576];
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int g8 = lane >> 2, t = lane & 3;
+  const int mb = blockIdx.y;
+  const int T = blockIdx.x * WPC + warp;  // 64-column tile, 0..41
+  if (mb * BM >= *p.num_tokens_padded) return;
+  const uint8_t* bi = p.ws + (long long)mb * BI_BYTES;
+  const BlockHdr* hdr = reinterpret_cast<const BlockHdr*>(bi);
+  const int nrows = hdr->nrows;
+  if (nrows == 0 || p.mode == SETUPONLY) return;
+  const int e = hdr->expert;
+  const uint16_t* gmask = reinterpret_cast<const uint16_t*>(bi + BI_MASK);
+  const uint16_t* gact = reinterpret_cast<const uint16_t*>(bi + BI_ACTG);
+  const bool math = p.mode == DENSE || p.mode == SKIP;
+  bool dense = p.mode == DENSE || p.mode == LOADONLY_DENSE;
+  // activation copy role: chunk c = threadIdx.x (16 bytes: token slot c / 2, k half c % 2)
+  const int ac = threadIdx.x;
+  const bool a_on = ac < 16 * NH;
+  const bool a_val = a_on && (ac >> 1) < nrows;
+  const __nv_bfloat16* a_src = a_val ? p.A + (long long)hdr->rows[ac >> 1] * p.lda + 8 * (ac & 1) : p.A;
+  const uint8_t* wbase = p.W + e * p.w_expert + T * p.w_tile + lane * 16;
+  const uint8_t* sbase = p.S + e * p.s_expert + T * p.s_tile + (lane & 3) * 16;
+  uint8_t* tb = tbuf[warp];
+  // the k-slot pair of this lane in a group: rows 2t, 2t+1 (low k) and 2t+8, 2t+9 (high k)
+  const int kr[4] = {2 * t, 2 * t + 1, 2 * t + 8, 2 * t + 9};
+
+  float acc[NH][4][4];
+  for (int pass = 0; pass < 2; ++pass) {
+    const int nsteps = dense ? G : hdr->nag;
+    uint4 wv[R], sv[R];
+    uint32_t mk[R];
+    auto load = [&](int slot, int j) {
+      if (j < nsteps) {
+        const int grp = dense ? j : gact[j];
+        const uint32_t m = dense ? 0xFFFFu : gmask[grp];
+        const int kb = 16 * grp;
+        wv[slot] = ((m >> (lane >> 1)) & 1u) ? ldg_v4(wbase + (long long)grp * 512) : make_uint4(0u, 0u, 0u, 0u);
+        if (lane < 4) sv[slot] = ldg_v4(sbase + (long long)grp * p.s_g);
+        mk[slot] = m;
+      } else {
+        mk[slot] = 0u;
+      }
+    };
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+#pragma unroll
+        for (int h = 0; h < NH; ++h) acc[h][c][i] = 0.0f;
+      }
+    }
+    auto issue_a = [&](int j) {
+      if (j < nsteps && a_on) {
+        const int grp = dense ? j : gact[j];
+        cp16(&abuf[j % (R + 1)][ac * 16], a_src + 16 * grp, a_val);
+      }
+      cp_commit();
+    };
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < R; ++i) { load(i, i); issue_a(i); }
+    bool neg0 = false;
+    for (int j0 = 0; j0 < nsteps; j0 += R) {
+#pragma unroll
+      for (int i = 0; i < R; ++i) {
+        if (j0 + i < nsteps) {
+          const uint32_t m = mk[i];
+          *reinterpret_cast<uint4*>(tb + lane * 16) = wv[i];
+          if (lane < 4) *reinterpret_cast<uint4*>(tb + 512 + lane * 16) = sv[i];
+          __syncwarp();
+          const uint32_t w0 = ((m >> kr[0]) & 1u) ? *reinterpret_cast<const uint32_t*>(tb + kr[0] * 32 + g8 * 4) : 0u;
+          const uint32_t w1 = ((m >> kr[1]) & 1u) ? *reinterpret_cast<const uint32_t*>(tb + kr[1] * 32 + g8 * 4) : 0u;
+          const uint32_t w2 = ((m >> kr[2]) & 1u) ? *reinterpret_cast<const uint32_t*>(tb + kr[2] * 32 + g8 * 4) : 0u;
+          const uint32_t w3 = ((m >> kr[3]) & 1u) ? *reinterpret_cast<const uint32_t*>(tb + kr[3] * 32 + g8 * 4) : 0u;
+          const uint2 sc = *reinterpret_cast<const uint2*>(tb + 512 + g8 * 8);
+          __syncwarp();
+          cp_wait<R - 1>();
+          __syncthreads();
+          uint32_t bx[NH][2];
+          const uint8_t* ab = abuf[(j0 + i) % (R + 1)];
+#pragma unroll
+          for (int h = 0; h < NH; ++h) {
+            bx[h][0] = *reinterpret_cast<const uint32_t*>(ab + (g8 + 8 * h) * 32 + 4 * t);
+            bx[h][1] = *reinterpret_cast<const uint32_t*>(ab + (g8 + 8 * h) * 32 + 16 + 4 * t);
+          }
+          issue_a(j0 + i + R);
+          load(i, j0 + i + R);
+          if (math) {
+            const uint32_t m01 = (m >> (2 * t)) & 3u;
+            const uint32_t m23 = (m >> (2 * t + 8)) & 3u;
+            const uint32_t keep01 = ((m01 & 1u) ? 0x0000FFFFu : 0u) | ((m01 & 2u) ? 0xFFFF0000u : 0u);
+            const uint32_t keep23 = ((m23 & 1u) ? 0x0000FFFFu : 0u) | ((m23 & 2u) ? 0xFFFF0000u : 0u);
+            // scales: byte 2c + h of sc -> column 16c + g8 + 8h; humming's fp8 bit placement, x 2^120
+            const uint32_t s01 = hmul2_u32(fp8_to_bf16x2(((sc.x << 8) & 0x0000FF00u) | ((sc.x << 16) & 0xFF000000u)), kExp120);
+            const uint32_t s23 = hmul2_u32(fp8_to_bf16x2(((sc.x >> 8) & 0x0000FF00u) | (sc.x & 0xFF000000u)), kExp120);
+            const uint32_t s45 = hmul2_u32(fp8_to_bf16x2(((sc.y << 8) & 0x0000FF00u) | ((sc.y << 16) & 0xFF000000u)), kExp120);
+            const uint32_t s67 = hmul2_u32(fp8_to_bf16x2(((sc.y >> 8) & 0x0000FF00u) | (sc.y & 0xFF000000u)), kExp120);
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+              const uint32_t sp = c == 0 ? s01 : (c == 1 ? s23 : (c == 2 ? s45 : s67));
+              const uint32_t slo = __byte_perm(sp, 0, 0x1010);  // column g8 (h = 0)
+              const uint32_t shi = __byte_perm(sp, 0, 0x3232);  // column g8 + 8 (h = 1)
+              const uint32_t sel = c | (c << 4) | ((c + 4) << 8) | ((c + 4) << 12);
+              const uint32_t x01 = __byte_perm(w0, w1, sel);  // bytes: w0[c], w0[c], w1[c], w1[c]
+              const uint32_t x23 = __byte_perm(w2, w3, sel);
+              const uint32_t a0 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x01 << 12), kExp124), slo) & keep01;
+              const uint32_t a1 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x01 << 8), kExp124), shi) & keep01;
+              const uint32_t a2 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x23 << 12), kExp124), slo) & keep23;
+              const uint32_t a3 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x23 << 8), kExp124), shi) & keep23;
+#pragma unroll
+              for (int h = 0; h < NH; ++h)
+                if (h == 0 || nrows > 8 * h) mma_bf16(acc[h][c], a0, a1, a2, a3, bx[h][0], bx[h][1]);
+            }
+          }
+        }
+      }
+    }
+    if (math && !dense) {
+#pragma unroll
+      for (int c = 0; c < 4; ++c)
+#pragma unroll
+        for (int q = 0; q < 4; ++q)
+#pragma unroll
+          for (int h = 0; h < NH; ++h)
+            if (8 * h + 2 * t + (q & 1) < nrows) neg0 |= (__float_as_uint(acc[h][c][q]) & 0x7FFFFFFFu) == 0u;
+    }
+    cp_wait<0>();
+    if (!__syncthreads_or(neg0 ? 1 : 0) || dense || !math) break;
+    // a -0 accumulator appeared: recompute this warp's tile with every row loaded
+    if (lane == 0 && p.stats) atomicAdd(p.stats + 0, 1);
+    dense = true;
+  }
+  if (!math) return;
+
+  const float gs4 = mul_ftz(p.GS[e], 4.0f);
+#pragma unroll
+  for (int c = 0; c < 4; ++c) {
+    const int col = T * 64 + 16 * c + g8;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      const int cc = col + ((q >> 1) ? 8 : 0);
+#pragma unroll
+      for (int h = 0; h < NH; ++h) {
+        const int tok = 8 * h + 2 * t + (q & 1);
+        if (tok < nrows) {
+          const uint32_t v = to_bf16x2(mul_ftz(acc[h][c][q], gs4), 0.0f);
+          reinterpret_cast<uint16_t*>(p.C)[(long long)hdr->rows[tok] * p.ldc + cc] = static_cast<uint16_t>(v);
+        }
+      }
+    }
+  }
+}
+
+
 
 // ---------------------------------------------------------------------------
 // Device probes of the tensor-core semantics the skip relies on.
@@ -941,15 +1623,69 @@ using namespace zskip;
 
 static int g_sms = 0;
 
-template <int WPC, int R>
+template <int WPC, int R, int NH, int BM>
 static int launch4(const Params& p, cudaStream_t stream) {
-  prep_kernel<<<p.max_blocks, 128, 0, stream>>>(p);
-  down4_kernel<WPC, R><<<dim3(42 / WPC, p.max_blocks), WPC * 32, 0, stream>>>(p);
+  prep_kernel<BM, 8 * NH><<<p.max_blocks, 128, 0, stream>>>(p);
+  down4_kernel<WPC, R, NH, BM><<<dim3(42 / WPC, p.max_blocks), WPC * 32, 0, stream>>>(p);
   return (int)cudaGetLastError();
 }
 
-// v4 config id, warps per CTA, ring depth (active groups in flight per warp)
-#define ZSKIP4_CONFIGS(X) X(100, 2, 4) X(101, 2, 8) X(102, 3, 8) X(103, 6, 4) X(104, 6, 8) X(105, 7, 8) X(106, 2, 12) X(107, 1, 8)
+// v4 config id, warps per CTA, ring depth (active groups in flight per warp), 8-row MMA halves per
+// block (rows per block cap = 8 NH), moe_align block size. 100..107: decode (<= 8 tokens, block 16);
+// 120..: prefill (block_m 16 / 32 / 64, every valid row of the block)
+#define ZSKIP4_CONFIGS(X) X(100, 2, 4, 1, 16) X(101, 2, 8, 1, 16) X(102, 3, 8, 1, 16) X(103, 6, 4, 1, 16) \
+  X(104, 6, 8, 1, 16) X(105, 7, 8, 1, 16) X(106, 2, 12, 1, 16) X(107, 1, 8, 1, 16)                          \
+  X(120, 2, 4, 2, 16) X(121, 2, 4, 4, 32) X(122, 2, 4, 8, 64) X(123, 1, 4, 8, 64) X(124, 3, 4, 8, 64)        \
+  X(125, 2, 2, 8, 64) X(126, 6, 4, 8, 64) X(127, 2, 8, 4, 32)                                             \
+  X(130, 1, 4, 2, 16) X(131, 1, 8, 2, 16) X(132, 2, 8, 2, 16) X(133, 3, 4, 2, 16) X(134, 3, 8, 2, 16)         \
+  X(135, 6, 4, 2, 16) X(136, 6, 8, 2, 16) X(137, 7, 4, 2, 16) X(138, 2, 2, 2, 16) X(139, 1, 2, 2, 16)         \
+  X(141, 1, 4, 4, 32) X(142, 1, 2, 4, 32)                                                    \
+  X(143, 1, 1, 4, 32) X(144, 2, 2, 4, 32) X(145, 3, 2, 4, 32) X(146, 1, 1, 8, 64) X(147, 1, 2, 8, 64)         \
+  X(148, 1, 1, 2, 16) X(149, 7, 2, 4, 32) X(150, 6, 2, 4, 32) X(151, 2, 1, 4, 32) X(152, 1, 3, 4, 32)
+
+template <int WPC, int S, int NH, int BM>
+static int launch5(const Params& p, cudaStream_t stream) {
+  constexpr int SM = WPC * S * Stage5<NH>::BYTES;
+  static bool attr = false;
+  if (!attr) {
+    if (SM > 48 * 1024 &&
+        cudaFuncSetAttribute(down5_kernel<WPC, S, NH, BM>, cudaFuncAttributeMaxDynamicSharedMemorySize, SM) != cudaSuccess)
+      return -5;
+    attr = true;
+  }
+  prep_kernel<BM, 8 * NH><<<p.max_blocks, 128, 0, stream>>>(p);
+  down5_kernel<WPC, S, NH, BM><<<dim3(42 / WPC, p.max_blocks), WPC * 32, SM, stream>>>(p);
+  return (int)cudaGetLastError();
+}
+template <int WPC, int R, int NH, int BM>
+static int launch6(const Params& p, cudaStream_t stream) {
+  prep_kernel<BM, 8 * NH><<<p.max_blocks, 128, 0, stream>>>(p);
+  down6_kernel<WPC, R, NH, BM><<<dim3(42 / WPC, p.max_blocks), WPC * 32, 0, stream>>>(p);
+  return (int)cudaGetLastError();
+}
+template <int WPC, int R, int NH, int BM, int EXPERT_DIV = 1, bool WarpLocal = false>
+static int launch7(const Params& p, cudaStream_t stream) {
+  prep_kernel<BM, 8 * NH, EXPERT_DIV><<<p.max_blocks, 128, 0, stream>>>(p);
+  down7_kernel<WPC, R, NH, BM, WarpLocal><<<dim3(42 / WPC, p.max_blocks), WPC * 32, 0, stream>>>(p);
+  return (int)cudaGetLastError();
+}
+#define ZSKIP7_CONFIGS(X) X(400, 2, 2, 4, 32) X(401, 3, 2, 4, 32) X(402, 6, 2, 4, 32) X(403, 7, 2, 4, 32) \
+  X(404, 14, 2, 4, 32) X(405, 6, 4, 4, 32) X(406, 7, 4, 4, 32) X(407, 6, 3, 4, 32) X(408, 14, 3, 4, 32)   \
+  X(409, 6, 2, 2, 16) X(410, 7, 2, 2, 16) X(411, 6, 2, 8, 64) X(412, 3, 4, 4, 32) X(413, 21, 2, 4, 32)
+template <int WPC, int R, int NH, int BM>
+static int launch8(const Params& p, cudaStream_t stream) {
+  prep_kernel<BM, 8 * NH><<<p.max_blocks, 128, 0, stream>>>(p);
+  down8_kernel<WPC, R, NH, BM><<<dim3(42 / WPC, p.max_blocks), WPC * 32, 0, stream>>>(p);
+  return (int)cudaGetLastError();
+}
+#define ZSKIP8_CONFIGS(X) X(500, 2, 2, 4, 32) X(501, 6, 2, 4, 32) X(502, 6, 4, 4, 32) X(503, 6, 3, 4, 32) \
+  X(504, 3, 4, 4, 32) X(505, 7, 2, 4, 32) X(506, 2, 4, 4, 32) X(507, 6, 2, 2, 16) X(508, 3, 2, 4, 32) X(509, 6, 6, 4, 32)
+#define ZSKIP6_CONFIGS(X) X(300, 2, 2, 4, 32) X(301, 1, 2, 4, 32) X(302, 2, 4, 4, 32) X(303, 3, 2, 4, 32) \
+  X(304, 1, 4, 4, 32) X(305, 2, 1, 4, 32) X(306, 6, 2, 4, 32) X(307, 2, 2, 2, 16) X(308, 1, 2, 8, 64) X(309, 2, 3, 4, 32)
+// v5 config id, warps per CTA, smem ring stages, 8-row halves, block size
+#define ZSKIP5_CONFIGS(X) X(200, 2, 4, 4, 32) X(201, 2, 6, 4, 32) X(202, 2, 8, 4, 32) X(203, 1, 8, 4, 32) \
+  X(204, 3, 6, 4, 32) X(205, 3, 8, 4, 32) X(206, 2, 12, 4, 32) X(207, 1, 12, 4, 32) X(208, 6, 4, 4, 32)   \
+  X(209, 1, 6, 4, 32) X(210, 2, 6, 2, 16) X(211, 1, 8, 2, 16) X(212, 2, 6, 8, 64) X(213, 1, 6, 8, 64)
 
 template <int W, int RB, int NR, int QB, int NQ>
 static int launch3(const Params& p, cudaStream_t stream, int ctas_per_sm) {
@@ -967,7 +1703,7 @@ static int launch3(const Params& p, cudaStream_t stream, int ctas_per_sm) {
     cudaDeviceGetAttribute(&g_sms, cudaDevAttrMultiProcessorCount, dev);
   }
   const int per_sm = ctas_per_sm > 0 ? min(ctas_per_sm, occ) : occ;
-  prep_kernel<<<p.max_blocks, 128, 0, stream>>>(p);
+  prep_kernel<16, 8><<<p.max_blocks, 128, 0, stream>>>(p);
   down3_kernel<W, RB, NR, QB, NQ><<<g_sms * per_sm, W * 32, L::BYTES, stream>>>(p);
   return (int)cudaGetLastError();
 }
@@ -983,27 +1719,29 @@ extern "C" {
 int zskip_init(void) {
   cudaFuncAttributes attr;
   cudaError_t e;
-#define X(ID, W_, RB_, NR_, QB_, NQ_)                                                                   \
-  if ((e = cudaFuncGetAttributes(&attr, down3_kernel<W_, RB_, NR_, QB_, NQ_>)) != cudaSuccess) return (int)e; \
-  if ((e = cudaFuncSetAttribute(down3_kernel<W_, RB_, NR_, QB_, NQ_>,                               \
-                                cudaFuncAttributeMaxDynamicSharedMemorySize,                        \
-                                Layout3<W_, RB_, NR_, QB_, NQ_>::BYTES)) != cudaSuccess)             \
-    return (int)e;
-  ZSKIP_CONFIGS(X)
-#undef X
-  if ((e = cudaFuncGetAttributes(&attr, prep_kernel)) != cudaSuccess) return (int)e;
-#define X4(ID, W_, R_) \
-  if ((e = cudaFuncGetAttributes(&attr, down4_kernel<W_, R_>)) != cudaSuccess) return (int)e;
+#define X4(ID, W_, R_, NH_, BM_) \
+  if ((e = cudaFuncGetAttributes(&attr, down4_kernel<W_, R_, NH_, BM_>)) != cudaSuccess) return (int)e;
   ZSKIP4_CONFIGS(X4)
 #undef X4
-  if ((e = cudaFuncGetAttributes(&attr, probe_kernel)) != cudaSuccess) return (int)e;
-  if ((e = cudaFuncGetAttributes(&attr, epi_kernel)) != cudaSuccess) return (int)e;
+  if ((e = cudaFuncGetAttributes(&attr, prep_kernel<16, 8>)) != cudaSuccess) return (int)e;
+  if ((e = cudaFuncGetAttributes(&attr, prep_kernel<32, 32, 2>)) != cudaSuccess) return (int)e;
+  if ((e = cudaFuncGetAttributes(&attr, down7_kernel<6, 4, 4, 32>)) != cudaSuccess) return (int)e;
+  if ((e = cudaFuncGetAttributes(&attr, down7_kernel<6, 4, 4, 32, true>)) != cudaSuccess) return (int)e;
   return 0;
 }
 
 // info[0] = registers, [1] = dynamic smem bytes, [2] = warps, [3] = CTAs per SM; 0, or -2 for an unknown id
 int zskip_config(int id, int* info) {
+  // 605 uses the exact405 arithmetic kernel; only its metadata producer differs.
+  if (id == 605) id = 405;
   cudaFuncAttributes attr;
+  if (id == 705) {
+    if (cudaFuncGetAttributes(&attr, down7_kernel<6, 4, 4, 32, true>) != cudaSuccess) return -1;
+    info[0] = attr.numRegs; info[1] = 0; info[2] = 6;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &info[3], down7_kernel<6, 4, 4, 32, true>, 192, 0) != cudaSuccess) return -1;
+    return 0;
+  }
 #define X(ID, W_, RB_, NR_, QB_, NQ_)                                                                 \
   if (id == ID) {                                                                                     \
     if (cudaFuncGetAttributes(&attr, down3_kernel<W_, RB_, NR_, QB_, NQ_>) != cudaSuccess) return -1; \
@@ -1017,13 +1755,13 @@ int zskip_config(int id, int* info) {
   }
   ZSKIP_CONFIGS(X)
 #undef X
-#define X4(ID, W_, R_)                                                               \
+#define X4(ID, W_, R_, NH_, BM_)                                                     \
   if (id == ID) {                                                                    \
-    if (cudaFuncGetAttributes(&attr, down4_kernel<W_, R_>) != cudaSuccess) return -1; \
+    if (cudaFuncGetAttributes(&attr, down4_kernel<W_, R_, NH_, BM_>) != cudaSuccess) return -1; \
     info[0] = attr.numRegs;                                                          \
     info[1] = 0;                                                                     \
     info[2] = W_;                                                                    \
-    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&info[3], down4_kernel<W_, R_>, W_ * 32, 0) != cudaSuccess) \
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&info[3], down4_kernel<W_, R_, NH_, BM_>, W_ * 32, 0) != cudaSuccess) \
       return -1;                                                                     \
     return 0;                                                                        \
   }
@@ -1064,14 +1802,33 @@ int zskip_down(const void* A, long long lda, int shape_m, const int* sorted_ids,
   if (max_blocks <= 0) return 0;
   if ((lda % 8) || (ldc % 2)) return -3;
   cudaStream_t st = reinterpret_cast<cudaStream_t>(stream);
+  // Split the caller's existing M64 metadata without sorting or allocating.
+  if (config == 605) return launch7<6, 4, 4, 32, 2>(p, st);
+  if (config == 705) return launch7<6, 4, 4, 32, 2, true>(p, st);
 #define X(ID, W_, RB_, NR_, QB_, NQ_) \
   if (config == ID) return launch3<W_, RB_, NR_, QB_, NQ_>(p, st, ctas_per_sm);
   ZSKIP_CONFIGS(X)
 #undef X
-#define X4(ID, W_, R_) \
-  if (config == ID) return launch4<W_, R_>(p, st);
+#define X4(ID, W_, R_, NH_, BM_) \
+  if (config == ID) return launch4<W_, R_, NH_, BM_>(p, st);
   ZSKIP4_CONFIGS(X4)
 #undef X4
+#define X5(ID, W_, S_, NH_, BM_) \
+  if (config == ID) return launch5<W_, S_, NH_, BM_>(p, st);
+  ZSKIP5_CONFIGS(X5)
+#undef X5
+#define X6(ID, W_, R_, NH_, BM_) \
+  if (config == ID) return launch6<W_, R_, NH_, BM_>(p, st);
+  ZSKIP6_CONFIGS(X6)
+#undef X6
+#define X7(ID, W_, R_, NH_, BM_) \
+  if (config == ID) return launch7<W_, R_, NH_, BM_>(p, st);
+  ZSKIP7_CONFIGS(X7)
+#undef X7
+#define X8(ID, W_, R_, NH_, BM_) \
+  if (config == ID) return launch8<W_, R_, NH_, BM_>(p, st);
+  ZSKIP8_CONFIGS(X8)
+#undef X8
   return -2;
 }
 

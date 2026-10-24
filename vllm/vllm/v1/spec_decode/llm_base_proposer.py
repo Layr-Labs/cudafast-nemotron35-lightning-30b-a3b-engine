@@ -561,7 +561,19 @@ class SpecDecodeBaseProposer:
         per_group_attn_metadata, per_layer_attn_metadata = (
             self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
         )
-        num_rejected_cpu = self._copy_num_rejected_to_cpu(num_rejected_tokens_gpu)
+        # Async MTP already copied this cycle's valid sample counts on a
+        # separate stream before preparing these inputs. Reuse those counts
+        # after the first draft forward has been queued instead of copying
+        # their derived rejection counts again on the default stream. Keep
+        # the old copy at its original position for every ineligible batch.
+        reuse_rejected_counts = self._can_reuse_rejected_counts(
+            common_attn_metadata, num_rejected_tokens_gpu, batch_size
+        )
+        num_rejected_cpu = (
+            None
+            if reuse_rejected_counts
+            else self._copy_num_rejected_to_cpu(num_rejected_tokens_gpu)
+        )
 
         cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
             self._determine_batch_execution_and_padding(num_tokens)
@@ -701,11 +713,26 @@ class SpecDecodeBaseProposer:
             # Invalidate the CPU-side shadows to avoid H<>D sync.
             common_attn_metadata._seq_lens_cpu = None
             common_attn_metadata._num_computed_tokens_cpu = None
+            if reuse_rejected_counts:
+                common_attn_metadata._seq_lens_cpu = self._hostfast_draft_seq_lens(
+                    seq_lens_cpu, batch_size, common_attn_metadata.seq_lens
+                )
+                # With S2 enabled, build_per_group_and_layer_attn_metadata's
+                # StagingGuard already orders every plan's pinned-buffer
+                # writes. The legacy copy/plan events below are unnecessary
+                # when this independent CPU shadow is available.
+                if common_attn_metadata._seq_lens_cpu is None:
+                    # A missing current-cycle count must never reuse a prior
+                    # request's shadow. Copy the live GPU counts instead.
+                    num_rejected_cpu = self._copy_num_rejected_to_cpu(
+                        num_rejected_tokens_gpu
+                    )
             # The draft plan reads seq_lens_cpu; deriving it from the copied
             # counts waits for the first pass to start, not to finish. The
             # bound keeps the step kernel's seq_lens update an exact +1.
             if (
-                num_rejected_cpu is not None
+                common_attn_metadata._seq_lens_cpu is None
+                and num_rejected_cpu is not None
                 and seq_lens_cpu is not None
                 and seq_lens_cpu.shape == num_rejected_cpu.shape
                 and seq_lens_cpu.dtype == num_rejected_cpu.dtype
@@ -819,6 +846,44 @@ class SpecDecodeBaseProposer:
         if draft_probs_list is not None:
             self._last_draft_probs = torch.stack(draft_probs_list, dim=1).contiguous()
         return draft_token_ids
+
+    def _can_reuse_rejected_counts(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        num_rejected_tokens_gpu: torch.Tensor | None,
+        batch_size: int,
+    ) -> bool:
+        """Whether the current MTP batch has an exact host-count source.
+
+        This inspects only host metadata. Calling the count provider here
+        would wait before the first draft forward is launched, losing its
+        overlap with the already queued valid-count copy.
+        """
+        seq_lens_cpu = common_attn_metadata._seq_lens_cpu
+        return (
+            hostfast.S2
+            and self.method == "mtp"
+            and self.vllm_config.scheduler_config.async_scheduling is True
+            and self.num_speculative_tokens > 1
+            and not self.parallel_drafting
+            and callable(self.hostfast_num_rejected_cpu)
+            and PIN_MEMORY
+            and not torch.cuda.is_current_stream_capturing()
+            and num_rejected_tokens_gpu is not None
+            and num_rejected_tokens_gpu.shape == (batch_size,)
+            and num_rejected_tokens_gpu.dtype == torch.int32
+            and batch_size <= self.max_batch_size
+            and seq_lens_cpu is not None
+            and seq_lens_cpu.shape == (batch_size,)
+            and seq_lens_cpu.dtype == torch.int32
+            and common_attn_metadata.max_seq_len + self.num_speculative_tokens
+            < self.max_model_len
+            and bool(self.draft_attn_groups)
+            and all(
+                group.backend.get_name() == "FLASHINFER"
+                for group in self.draft_attn_groups
+            )
+        )
 
     def _copy_num_rejected_to_cpu(
         self, num_rejected_tokens_gpu: torch.Tensor | None
@@ -1114,7 +1179,7 @@ class SpecDecodeBaseProposer:
         update) on the CPU, or None to keep the GPU readback, which waits for
         the verify, the rejection and draft step 0 (S2)."""
         num_rejected_cpu = self.hostfast_num_rejected_cpu
-        if not hostfast.S2 or num_rejected_cpu is None:
+        if not hostfast.S2 or not callable(num_rejected_cpu):
             return None
         out = hostfast.draft_seq_lens(
             verify_seq_lens_cpu,

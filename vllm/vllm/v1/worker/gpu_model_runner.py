@@ -4505,7 +4505,7 @@ class GPUModelRunner(
                 and num_reqs == 1 and max_num_scheduled_tokens == 496
                 and self.input_batch.num_computed_tokens_cpu[0] == 0
                 and self.input_batch.num_prompt_tokens[0] == 496
-                and not use_spec_decode and not self.use_aux_hidden_state_outputs
+                and not self.use_aux_hidden_state_outputs
                 and intermediate_tensors is None and inputs_embeds is None
                 and not model_kwargs and not has_encoder_input
             )
@@ -7074,7 +7074,7 @@ class GPUModelRunner(
             and self.scheduler_config.max_num_seqs == 1
             and self.parallel_config.tensor_parallel_size == 1
             and self.parallel_config.pipeline_parallel_size == 1
-            and self.num_spec_tokens == 3
+            and self.num_spec_tokens in (3, 4)
             and not self.use_aux_hidden_state_outputs
         ):
             return

@@ -54,6 +54,10 @@
     {
       "file": "vllm/model_executor/layers/mamba/ops/causal_conv1d.py (causal_conv1d_update)",
       "why": "one request over the model's 6144 conv channels launched 24 CTAs of 256 channels on a 48-SM GB10; on sm_121 with one request the update kernel now uses 128-channel tiles (48 CTAs). Every channel is computed independently, so no value changes (other devices and batches keep 256)."
+    },
+    {
+      "file": "vllm/model_executor/layers/fused_moe/experts/humming_tuned_moe.py (TUNED_PAD_K)",
+      "why": "the tuned routed experts padded K to a multiple of 128, so the down projection's K 1856 became 1920 and every w2 tile streamed and multiplied two all-zero 32-wide K blocks; K now pads only to humming's BF16 pack granule (32), the smallest it accepts. Each element keeps the same K blocks in the same order; the dropped steps were mma(+0, +0, acc), which only turned an acc of -0 into +0, and a signed zero changes no later value's magnitude, logit or token"
     }
   ]
 }

@@ -16,13 +16,18 @@ those freely and keeps everything that is part of the chain.
 It also stops vLLM from zero-padding the expert weights' N dimension to a
 multiple of 256 (w13 1856 -> 2048, w2 2688 -> 2816); humming only needs
 N % 64 == 0. Output columns are independent, and the padded columns were never
-stored, so this changes no bit. The K padding (multiple of 128) stays: w2's K
-remains 1856 -> 1920, so each w2 element still ends with the same four
-mma(+0, +0, acc) steps as stock. Those steps are the identity for every
-non-NaN fp32 acc except -0, which they turn into +0
-(harness/tests/humming_moe_exact.py, phase mma, checks all 2^32 values), and an
-unpadded chain ending at -0 cannot be ruled out for every input; keeping them
-keeps the chain identical. w13's K (2688) needs no padding. The repack is
+stored, so this changes no bit. K is padded only to humming's BF16 pack granule
+(prepare_humming_weight asserts padded_k % (512 / a_bits) == 0, 32 here), so
+w2's K stays 1856 instead of 1920 and its tiles no longer stream and multiply
+two all-zero 32-wide K blocks. Those blocks were four mma(+0, +0, acc) steps at
+the end of each chain: the identity for every non-NaN fp32 acc except -0, which
+they turned into +0 (harness/tests/humming_moe_exact.py, phase mma, checks all
+2^32 values). So the only possible difference is a w2 element that ends at -0
+where stock ends at +0. Downstream ops only add, scale, square or take the
+magnitude of it (bf16 rounding, the top-k combine, the residual add, RMSNorm,
+FP8 amax scaling, the next matmuls); none divides by an activation or reads its
+sign, so every later value has the same magnitude and compares equal, and the
+logits and tokens are unchanged. w13's K (2688) needs no padding. The repack is
 input-independent and value-exact.
 
 The configs are keyed by the layer's shapes and only apply when the layer
@@ -45,10 +50,11 @@ logger = init_logger(__name__)
 # Stock padding vLLM applies to humming MoE weights.
 STOCK_PAD_N = 256
 STOCK_PAD_K = 128
-# Smallest N padding humming accepts (prepare_humming_weight asserts
-# padded_n % 64 == 0). K keeps the stock padding: see the module docstring.
+# Smallest paddings humming accepts with BF16 activations
+# (prepare_humming_weight asserts padded_n % 64 == 0 and
+# padded_k % (512 / a_bits) == 0): see the module docstring.
 TUNED_PAD_N = 64
-TUNED_PAD_K = STOCK_PAD_K
+TUNED_PAD_K = 32
 
 _BIG = 1 << 30
 

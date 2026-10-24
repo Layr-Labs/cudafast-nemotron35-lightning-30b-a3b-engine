@@ -94,6 +94,10 @@
     {
       "file": "vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py, vllm/model_executor/layers/fused_moe/moe_align_block_size.py (opt-in)",
       "why": "smallk's fused sigmoid top-k + moe_align kernel (bit-identical to ops.grouped_topk and the two align kernels for <= 32 ids) is off by default: the routing chain overlaps the shared-expert GEMMs, so shortening it gave no end-to-end gain (SMALLK_TOPK=1 SMALLK_ALIGN=1 enable it)"
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "Retain complete highestceb4274c-8eab-404c-a37e-99bd74c52a42, including42d5bbf8-efda-4b9a-9265-75687c0711f4 single boot-captured screen graph and its own existingfixed-divisor implementation; port ae98b095-4cfd-4d97-bfbf-4a3209f1e6ec nativeE2M1 paircvt with +0canonicalization, unchangedFP32dotlayout/stages2 and fusedBF16max/globalminID selector. Fresh scalarselectoroutput copied into existinggraphoutput; everygreedyreturn clones. Fuse liveBF16→existingownedFP32 _h.copy_ directly, eliminating temporaryfloat conversion, no candidate/group/pruning change. Existinggraph fixedserialscope remains; capture/exactbits/speedunverified locally, allruntime officialremote."
     }
   ]
 }

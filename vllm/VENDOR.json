@@ -110,6 +110,10 @@
     {
       "file": "vllm/v1/worker/prefill_fast.py, vllm/v1/worker/gpu_model_runner.py, vllm/model_executor/layers/mamba/mamba_mixer2.py, vllm/model_executor/layers/mamba/ops/prefill_state_copy.py, vllm/model_executor/layers/fused_moe/router/gate_linear.py, harness/kernels/routerbig",
       "why": "Compose dadon submission 03487090-f839-440b-8b4a-60295374154f (commit 21f55ad0facc8b68dd5934c169f06d069d2f8260): spinning copy-completion event, prefill-only Mamba metadata reuse, single final-state copy, and cuBLAS-order FP32 router for 480/496/512 rows. Preserve native FP8 and routed activation fusion. Compiler failures propagate."
+    },
+    {
+      "file": "vllm/model_executor/layers/mamba/ops/ssd_prefill_fused.py, ssd_combined.py, mamba_mixer2.py",
+      "why": "On complete accepted31d30b53-14a9-44ec-bb99-bae7b70873a4, fuse the terminal FP32 state cache store into the existing prefill state recurrence. All chunk boundaries and CB scan arithmetic remain; eligible single nonempty sequence stores the same final registers to its cache row and omits the separate state-copy kernel. Full31 spin, metadata reuse, routerbig, native FP8 and activation fusion remain. Original single-copy fallback, cache-all and CPU paths remain. No local execution; first runtime validation is official remote."
     }
   ]
 }

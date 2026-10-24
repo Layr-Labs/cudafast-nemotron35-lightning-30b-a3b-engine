@@ -255,10 +255,25 @@ __device__ __forceinline__ int column_first_cut(const Params& p, int col) {
   return cut < p.k_tiles ? cut : p.k_tiles;
 }
 
+// Programmatic dependent launch (sm_90+): identical computation; the kernel
+// may start while its predecessor drains, and signals dependents when its
+// global reads are done. Enabled by marlinx_set_pdl(1) (the Python side).
+__device__ __forceinline__ void mx_pdl_wait() {
+#if __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.wait;");
+#endif
+}
+__device__ __forceinline__ void mx_pdl_launch_dependents() {
+#if __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+
 // One 64-feature half column (`unit`) per CTA of 4 warps; warp w runs Marlin's
 // warp-row chain w through a register ring of P k16 blocks.
 template <int P, bool Relu2 = false, bool ZS = false>
 __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
+  mx_pdl_wait();
   __shared__ float red[2][3][16][32];
   __shared__ uint16_t zmask[ZS ? 512 : 1];
   const int unit = blockIdx.x;
@@ -370,6 +385,8 @@ __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
       }
     }
   }
+  // All global reads are complete: let the next grid launch now (PDL).
+  mx_pdl_launch_dependents();
   if (!w) write_out<Relu2>(p, col, h, lane, R);
 }
 
@@ -395,8 +412,27 @@ __global__ void hog_kernel(const uint4* __restrict__ src, long long n16, unsigne
   if (x == 0x9e3779b9u) sink[0] = x + (unsigned)(uintptr_t)hog_smem;
 }
 
+static int g_pdl = 0;  // marlinx_set_pdl: launch the gemm with programmatic dependent launch
+
 template <int P, bool Relu2 = false, bool ZS = false>
 static int launch(const Params& p, cudaStream_t stream) {
+#ifndef MARLINX_NO_PDL
+  if (g_pdl) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(2 * p.n_tiles);
+    cfg.blockDim = dim3(128);
+    cfg.dynamicSmemBytes = 0;
+    cfg.stream = stream;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = attr;
+    cfg.numAttrs = 1;
+    cudaError_t e = cudaLaunchKernelEx(&cfg, gemm_kernel<P, Relu2, ZS>, p);
+    if (e == cudaSuccess) return 0;
+    cudaGetLastError();  // clear; fall through to the plain launch
+  }
+#endif
   gemm_kernel<P, Relu2, ZS><<<2 * p.n_tiles, 128, 0, stream>>>(p);
   return (int)cudaGetLastError();
 }
@@ -429,6 +465,14 @@ int marlinx_regs(int depth) {
     default: return -1;
   }
   return e == cudaSuccess ? attr.numRegs : -1;
+}
+
+// Enable (1) or disable (0) programmatic dependent launch for every gemm
+// launch. Returns the previous value.
+int marlinx_set_pdl(int on) {
+  const int prev = marlinx::g_pdl;
+  marlinx::g_pdl = on ? 1 : 0;
+  return prev;
 }
 
 // out[M, N] = Marlin NVFP4 GEMM of A[M, K]. sms is the SM count Marlin uses as

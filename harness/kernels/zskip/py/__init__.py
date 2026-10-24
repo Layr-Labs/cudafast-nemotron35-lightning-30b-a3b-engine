@@ -111,7 +111,9 @@ def config_info(config: int) -> dict:
 
 
 BI_BYTES = 4864
-MAX_BLOCKS = 64
+# 512: prefill-sized calls (humming_zskip.py PZ, <= 512 tokens, 8-row blocks: at most
+# (512 * 6 + 128 * 7) / 8 = 496 blocks); only the workspace size depends on it.
+MAX_BLOCKS = 512
 _scratch: dict = {}
 
 

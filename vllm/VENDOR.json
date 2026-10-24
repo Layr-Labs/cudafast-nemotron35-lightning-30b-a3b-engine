@@ -133,7 +133,7 @@
     },
     {
       "file": "vllm/model_executor/models/nemotron_h_mtp_compact.py, nemotron_h_mtp_kernels.py",
-      "why": "Carried from jacklightChen 73d42dd1-a764-48c2-b125-55a43407a3a7 onto 4d5563f. Drafter-only: compact the 8 BF16 post-ReLU2 slots (6 routed, 2 shared) to their nonzero values and ascending original K indices, then run the down projection over that compact domain against the existing finite-checked exact BF16 transpose. Target model, routing, up projections and strict greedy verification unchanged; drafter FP32 reduction tree differs, so proposals may differ while committed tokens stay the target's. Shape guard and unsupported shapes keep the dense zero-load kernel."
+      "why": "Carried from jacklightChen 73d42dd1-a764-48c2-b125-55a43407a3a7 onto 4d5563f. Drafter-only: compact the 8 BF16 post-ReLU2 slots (6 routed, 2 shared) to their nonzero values and ascending original K indices, then run the down projection over that compact domain against the existing finite-checked exact BF16 transpose. Target model, routing, up projections and strict greedy verification unchanged; drafter FP32 reduction tree differs, so proposals may differ while committed tokens stay the target's. Shape guard and unsupported shapes keep the dense zero-load kernel. Default off (MTP_RELU2_COMPACT=1 restores): off runs the dense zero-load kernel."
     },
     {
       "file": "vllm/model_executor/models/nemotron_h_mtp.py, vllm/v1/spec_decode/llm_base_proposer.py",
@@ -162,6 +162,10 @@
     {
       "file": "harness/kernels/marlinx/{csrc/marlinx.cu,py/__init__.py,README.md,tests/marlinx_zs_exact.py}",
       "why": "Shared expert down projection (3712->2688, ReLU^2 input): read only the k rows whose activation is nonzero in some row, from a byte-preserving k-row-major copy of the Marlin weight; the lane rebuilds Marlin's exact weight word, so dequant, MMA, segments and fp32 reductions are unchanged. Bit-exact vs stock Marlin on all 23 layers (4416 synthetic + 1380 real-activation cases, CUDA graph replay). MARLINX_ZS=0 disables."
+    },
+    {
+      "file": "vllm/model_executor/layers/fused_moe/experts/humming_zskip.py, fused_humming_moe.py, harness/kernels/zskip/py/__init__.py",
+      "why": "PZ: calls of 9 to 512 tokens (the 496-token prefill) run the routed down projection through the zskip kernel from dadon submission a1c083d7 (config 100, kernel unchanged) instead of humming's prefill config: the call builds its own 8-row moe_align_block_size layout and widens each 8-row block to a 16-slot block padded with the id shape_m, since the kernel keeps at most 8 valid rows per block. Same per-element fp32 chain as batch-invariant humming (humming_tuned_moe.py docstring, zskip README). Per layer only after a load-time bitwise comparison with humming's prefill config (M = 496: random routing, one expert set, dense, -0/subnormal mix; M = 9); any failure keeps humming for the rest of the load. zskip MAX_BLOCKS 64 -> 512 (workspace only). ZSKIP_PREFILL=0 disables."
     }
   ]
 }

@@ -813,6 +813,7 @@ class HummingIndexedExperts(HummingExpertsBase):
             topk_ids.size(1),
             getattr(self, "_moe_block_size", None),
             moe_kwargs2,
+            topk_ids=topk_ids,
         )
         sparse_weights = getattr(self.layer, "routed_sparse_down", None)
         if (

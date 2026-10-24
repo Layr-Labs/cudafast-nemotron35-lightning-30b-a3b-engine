@@ -94,6 +94,10 @@
     {
       "file": "vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py, vllm/model_executor/layers/fused_moe/moe_align_block_size.py (opt-in)",
       "why": "smallk's fused sigmoid top-k + moe_align kernel (bit-identical to ops.grouped_topk and the two align kernels for <= 32 ids) is off by default: the routing chain overlaps the shared-expert GEMMs, so shortening it gave no end-to-end gain (SMALLK_TOPK=1 SMALLK_ALIGN=1 enable it)"
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "On entirehighest100549d4-51c4-4f56-b3ca-2604731ab8a4 (allvendor-orderGEMMs/earlyrouterretained), port native E2M1pair/+0 canonicalization andfusedBF16/globalminID/NaNselector via38a23bfc-13d8-4b35-ba04-c20221ce65a7, originalsourceae98b095-4cfd-4d97-bfbf-4a3209f1e6ec. Add guardedconstexprINDEX32addressarithmetic idea from17ee62e9-3a69-478c-9845-d99c4b1ef1d1 publicexperiment39; metadata boundsincludeinactiveBRtail andbothweight/scale extents<2^31, elseoldint64addresspath. Keywordbindingonly, nofloatdot/reduction/format/geometrychange. KeepSCREEN_PER32/CASCADE_PER256 andTOPK/ALIGNoff; noadaslots, nowider87orCCA. ec3priornativecombohadinfrastructureTEARDOWNexit75noscore, notperformance/correctnessevidence. Newnative+addresscompositionunverified, allruntimeofficialremoteonly."
     }
   ]
 }

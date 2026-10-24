@@ -81,7 +81,7 @@
     },
     {
       "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py",
-      "why": "Cascade the accepted 4e916237-ea0f-48f5-8cd6-503252f54bc8 draft screen: 32 importance-ranked groups score the complete vocabulary, keep 256 per 2048-row chunk, recompute original 64-group scores for those candidates, then retain 32 per original chunk for the unchanged full-K rescore/BF16/min-ID chain. The wider intermediate set is informed by the negative smaller-screen evidence of b27645a4-0e5b-477b-9502-933cb2eb8a79, without an assumed recall guarantee. New buffers contain exact input-independent NVFP4 byte/scale subsets. No target/native-MTP weights, formats or verification changes. Additional proposal pruning and gathered partial-score lowering can change drafts; recall, exact-token result and speed require official remote validation. VLLM_MTP_SCREEN_CASCADE=0 retains the original single screen."
+      "why": "Cascade the accepted 4e916237-ea0f-48f5-8cd6-503252f54bc8 draft screen: 32 importance-ranked groups score the complete vocabulary, keep 512 per 2048-row chunk, recompute original 64-group scores for those candidates, then retain 32 per original chunk for the unchanged full-K rescore/BF16/min-ID chain. The wider intermediate set is informed by the negative smaller-screen evidence of b27645a4-0e5b-477b-9502-933cb2eb8a79, without an assumed recall guarantee. New buffers contain exact input-independent NVFP4 byte/scale subsets. No target/native-MTP weights, formats or verification changes. Additional proposal pruning and gathered partial-score lowering can change drafts; recall, exact-token result and speed require official remote validation. VLLM_MTP_SCREEN_CASCADE=0 retains the original single screen."
     },
     {
       "file": "vllm/model_executor/layers/fused_moe/router/gate_linear.py (+ harness/kernels/smallk)",
@@ -94,6 +94,10 @@
     {
       "file": "vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py, vllm/model_executor/layers/fused_moe/moe_align_block_size.py (opt-in)",
       "why": "smallk's fused sigmoid top-k + moe_align kernel (bit-identical to ops.grouped_topk and the two align kernels for <= 32 ids) is off by default: the routing chain overlaps the shared-expert GEMMs, so shortening it gave no end-to-end gain (SMALLK_TOPK=1 SMALLK_ALIGN=1 enable it)"
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "Widen the drafter's coarse keeper from 256 to 512 rows per 2048-row chunk (the 32-group screen over the whole vocabulary is unchanged; 16384 to 32768 rows carry into the 64-group refine, +9.0 MiB per draft step). The refine stage then ranks a superset of the previous candidate pool, so the true argmax is dropped by the coarse filter less often; the final full-K fp32 rescore, bf16 rounding and lowest-id tie rule are unchanged and the target still verifies every committed token. Draft-only proposal change; no target weights, formats or verification."
     }
   ]
 }

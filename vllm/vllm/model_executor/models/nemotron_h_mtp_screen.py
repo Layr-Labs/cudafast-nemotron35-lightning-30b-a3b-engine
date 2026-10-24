@@ -44,7 +44,7 @@ SCREEN_FRAC_GROUPS = 64  # of 168 groups: 1024 of 2688 hidden dims (512 bytes pe
 SCREEN_CHUNK = 2048
 SCREEN_PER = 32
 CASCADE_FRAC_GROUPS = 32
-CASCADE_PER = 256
+CASCADE_PER = 512
 
 
 def screen_enabled() -> bool:

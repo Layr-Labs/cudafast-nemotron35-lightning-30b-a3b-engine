@@ -114,6 +114,22 @@
     {
       "file": "vllm/model_executor/layers/quantization/utils/humming_utils.py; vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py; harness/kernels/routed_sparse",
       "why": "Byte-exact NVFP4 down-weight packing at load and small-token sparse-sector kernel. Per-call masks skip weight reads only for exact-zero activation sectors, retaining ascending BF16 MMA, FP32 accumulation and original global-scale/RN epilogue. Existing Humming handles unsupported calls and prefill."
+    },
+    {
+      "file": "vllm/model_executor/layers/fused_moe/experts/humming_zskip.py; vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py; vllm/model_executor/layers/quantization/utils/humming_utils.py; harness/kernels/zskip",
+      "why": "zskip: routed-expert w2 for 1..8 tokens without loading the weight k rows whose relu^2 activations are exactly zero in every row routed to the expert. Load-time k-row-major repack of the checkpoint w2 (every byte kept, one k row of a 64-column tile = one 32-byte sector); per call a prep kernel builds each expert block's 16-bit masks and active-group list from that call's activations. Same dequantised bf16 weights (humming's bit placement, x2^124, x scale), one mma.sync.m16n8k16 per k16 group in ascending order from +0 per output (weights as the A operand), skipped rows as +0, empty groups' MMAs omitted, humming's mul.rn.ftz + cvt.rn.bf16x2 epilogue; a -0 accumulator makes the warp recompute densely. Bit-identical to humming on all 23 layers (real decode windows, synthetic, adversarial) and checked against humming at load (4 and 8 tokens); humming keeps prefill. ZSKIP=0 restores routed_sparse."
+    },
+    {
+      "file": "vllm/model_executor/layers/fused_moe/runner/shared_experts.py",
+      "why": "Retain complete highest valid5f31f929-693d-463d-b6ce-6bcb8e00884a early shared launch/join source exact91b9f547c89e4c53893bb6ab2d4288633b0d93b5. Same mechanism as creditedfd75aab7-ddbe-405f-8b78-4dc578d7539f, with only getenv killflag removal/docstring delta versus reviewedfdsource. Input wait/record_stream and join-before-output preserved, no duplicate launch; global shared-stream disable/NO_OVERLAP paths retain fallback. New terminalcache/gatednorm composition runtime unverified; no local execution."
+    },
+    {
+      "file": "vllm/model_executor/layers/mamba/ops/ssd_prefill_fused.py, ssd_combined.py, mamba_mixer2.py",
+      "why": "On complete accepted31d30b53-14a9-44ec-bb99-bae7b70873a4, fuse the terminal FP32 state cache store into the existing prefill state recurrence. All chunk boundaries and CB scan arithmetic remain; eligible single nonempty sequence stores the same final registers to its cache row and omits the separate state-copy kernel. Full31 spin, metadata reuse, routerbig, native FP8 and activation fusion remain. Original single-copy fallback, cache-all and CPU paths remain. No local execution; first runtime validation is official remote."
+    },
+    {
+      "file": "models/nemotron_shared_up.py, models/nemotron_h.py; harness/kernels/marlinx/{csrc/marlinx.cu,py/__init__.py}",
+      "why": "New single-device prepared Marlin shared-expert up projection epilogue fuses ReLU squared for BF16 M1..8,N3712,K2688. Original GEMM BF16 rounding occurs first, then explicit RN FP32 square and RN BF16 output with canonical NaN; original Marlin accumulation, weights/scales/layout, dense/head/down ABI and unfused instantiations retained. Tensor-only opaque custom op has a full Marlin+activation fallback and fake schema; other sizes and unprepared/bias/TP paths retain original layer/activation. Source-only; no local execution."
     }
   ]
 }

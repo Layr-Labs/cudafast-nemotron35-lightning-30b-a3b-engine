@@ -23,6 +23,9 @@ from vllm.model_executor.layers.fused_moe.experts.humming_tuned_moe import (
     relu2_bf16,
     tuned_moe_configs,
 )
+from vllm.model_executor.layers.fused_moe.experts.humming_zskip import (
+    maybe_down as maybe_zskip_down,
+)
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size,
 )
@@ -653,6 +656,7 @@ class HummingIndexedExperts(HummingExpertsBase):
             )
             moe_block_size = 64
 
+        self._moe_block_size = moe_block_size
         sorted_ids, expert_ids, num_tokens_padded = moe_align_block_size(
             topk_ids=topk_ids,
             block_size=moe_block_size,
@@ -772,10 +776,23 @@ class HummingIndexedExperts(HummingExpertsBase):
         )
 
         down_output = buffers["down_output"].view(-1, hidden_states.size(-1))
+        # LOCAL PATCH (cudafast-nemotron35): zskip computes humming's w2 output
+        # for <= 4 tokens without loading the weight rows whose activations
+        # are zero (humming_zskip.py); otherwise routed_sparse or humming runs.
+        sparse_done = expert_map is None and maybe_zskip_down(
+            self.layer,
+            inputs,
+            input_scale,
+            down_output,
+            topk_ids.size(0),
+            topk_ids.size(1),
+            getattr(self, "_moe_block_size", None),
+            moe_kwargs2,
+        )
         sparse_weights = getattr(self.layer, "routed_sparse_down", None)
-        sparse_done = False
         if (
-            sparse_weights is not None
+            not sparse_done
+            and sparse_weights is not None
             and input_scale is None
             and expert_map is None
             and _humming_batch_invariant()

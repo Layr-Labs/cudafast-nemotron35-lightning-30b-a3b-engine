@@ -42,6 +42,9 @@ struct Params {
   int n_tiles, k_tiles;    // N/128, K/128
   int part1_cols;          // columns reduced by a single Marlin block
   int iters;               // Marlin stripe length (k-tiles per block) in part 2
+#ifndef MARLINX_NO_KSKIP
+  const uint32_t* BK;      // KSkip only: k-row repack of B (py/kskip_layout.py), [K/16][2N] u32
+#endif
 };
 
 __device__ __forceinline__ uint4 ld_stream_v4(const uint4* p) {
@@ -232,9 +235,55 @@ __device__ __forceinline__ int column_first_cut(const Params& p, int col) {
   return cut < p.k_tiles ? cut : p.k_tiles;
 }
 
+#ifndef MARLINX_NO_KSKIP
+// KSkip (shared expert down, N 2688 K 3712): the weights come from BK, the load-time k-row
+// repack of B (py/kskip_layout.py; every nibble kept). BK u32 ((kb*(N/64) + unit)*16 + r)*8 + g
+// holds k row r of the 64-feature unit for lanes 4g + t: byte j = nibble of feature 16j+g |
+// nibble of feature 16j+g+8 << 4. Lane (g, t) loads k rows 2t, 2t+1, 2t+8, 2t+9 (q[0..3]) and
+// rebuilds the exact crown int4 word j with kskip_word; every Marlin operation after that is
+// unchanged. A k row whose activation is +-0 in every row of the call is not loaded (q = 0):
+// its nibbles dequantise to +0, the +0 * scale products stay +0, and they only meet +-0
+// activations in the MMA (see the -0 guard in gemm_kernel).
+__device__ __forceinline__ uint32_t kskip_word(uint32_t r0, uint32_t r1, uint32_t r8, uint32_t r9,
+                                               int j) {
+  const int s = 8 * j;
+  return ((r0 >> s) & 0xFu) | (((r8 >> s) & 0xFu) << 4) | (((r0 >> (s + 4)) & 0xFu) << 8) |
+         (((r8 >> (s + 4)) & 0xFu) << 12) | (((r1 >> s) & 0xFu) << 16) | (((r9 >> s) & 0xFu) << 20) |
+         (((r1 >> (s + 4)) & 0xFu) << 24) | (((r9 >> (s + 4)) & 0xFu) << 28);
+}
+
+__device__ __forceinline__ uint4 kskip_words(const uint32_t (&q)[4]) {
+  uint4 v;
+  v.x = kskip_word(q[0], q[1], q[2], q[3], 0);
+  v.y = kskip_word(q[0], q[1], q[2], q[3], 1);
+  v.z = kskip_word(q[0], q[1], q[2], q[3], 2);
+  v.w = kskip_word(q[0], q[1], q[2], q[3], 3);
+  return v;
+}
+
+// Loads one k16 block's four BK words of this lane. a = this lane's activation words of the
+// block (ra layout: a[0] = k 2t | 2t+1 << 16, a[1] = k 2t+8 | 2t+9 << 16, token lane >> 2, 0 for
+// rows >= M). Must be called by the whole warp. tm = 0x11111111 << t selects the lanes 4g + t.
+__device__ __forceinline__ void kskip_load(uint32_t (&q)[4], const uint32_t* kp,
+                                           const uint32_t (&a)[2], uint32_t tm, bool full) {
+  const uint32_t b0 = __ballot_sync(0xFFFFFFFFu, (a[0] & 0x7FFFu) != 0u);
+  const uint32_t b1 = __ballot_sync(0xFFFFFFFFu, (a[0] & 0x7FFF0000u) != 0u);
+  const uint32_t b8 = __ballot_sync(0xFFFFFFFFu, (a[1] & 0x7FFFu) != 0u);
+  const uint32_t b9 = __ballot_sync(0xFFFFFFFFu, (a[1] & 0x7FFF0000u) != 0u);
+  q[0] = (full || (b0 & tm)) ? ld_nc_u32(kp) : 0u;
+  q[1] = (full || (b1 & tm)) ? ld_nc_u32(kp + 8) : 0u;
+  q[2] = (full || (b8 & tm)) ? ld_nc_u32(kp + 64) : 0u;
+  q[3] = (full || (b9 & tm)) ? ld_nc_u32(kp + 72) : 0u;
+}
+
+#endif
 // One 64-feature half column (`unit`) per CTA of 4 warps; warp w runs Marlin's
 // warp-row chain w through a register ring of P k16 blocks.
+#ifndef MARLINX_NO_KSKIP
+template <int P, bool Relu2 = false, bool KSkip = false>
+#else
 template <int P, bool Relu2 = false>
+#endif
 __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
   __shared__ float red[2][3][16][32];
   const int unit = blockIdx.x;
@@ -255,6 +304,106 @@ __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
   const uint32_t* Ap =
       reinterpret_cast<const uint32_t*>(p.A + (arow ? (long long)tok * p.lda : 0)) + (lane & 3);
 
+#ifndef MARLINX_NO_KSKIP
+  if constexpr (KSkip) {
+    // Same chains, blocks, MMAs, segment folds and epilogue as below; only the weight words come
+    // from BK (kskip_load / kskip_words). The activations run P blocks ahead of the weights (ring
+    // na, cursor la) because a block's weight loads depend on its activations. Pass 0 skips the
+    // all-zero k rows; if any accumulator of the CTA ever reads -0 (the case the MMA equality
+    // argument excludes), pass 1 recomputes the whole CTA with every row loaded.
+    const long long nK = 2LL * p.N;  // BK u32 per k16 row
+    const uint32_t* Kp = p.BK + 128LL * unit + 16 * (lane & 3) + tok;
+    const uint32_t tm = 0x11111111u << (lane & 3);
+    const int total = 2 * p.k_tiles;
+    float acc[4][4];
+    float R[4][4];
+    for (int pass = 0; pass < 2; ++pass) {
+      const bool full = pass != 0;
+      uint32_t rq[P][4];
+      uint2 rs[P];
+      uint32_t ra[P][2];
+      uint32_t na[P][2];
+      Cursor ld, cs, la;
+      cursor_init(ld, first_cut, p.k_tiles, p.iters);
+      cs = ld;
+      la = ld;
+#pragma unroll
+      for (int s = 0; s < P; ++s) {
+        if (s < total) {
+          const int kb = 8 * la.tau + 2 * w + la.k;
+          ra[s][0] = arow ? ld_nc_u32(Ap + 8 * kb) : 0u;
+          ra[s][1] = arow ? ld_nc_u32(Ap + 8 * kb + 4) : 0u;
+          cursor_next(la, p.iters);
+        }
+      }
+#pragma unroll
+      for (int s = 0; s < P; ++s) {
+        if (s < total) {
+          const int kb = 8 * ld.tau + 2 * w + ld.k;
+          kskip_load(rq[s], Kp + kb * nK, ra[s], tm, full);
+          rs[s] = ld_nc_v2(Sp + kb * nS);
+          cursor_next(ld, p.iters);
+        }
+      }
+#pragma unroll
+      for (int s = 0; s < P; ++s) {
+        if (s + P < total) {
+          const int kb = 8 * la.tau + 2 * w + la.k;
+          na[s][0] = arow ? ld_nc_u32(Ap + 8 * kb) : 0u;
+          na[s][1] = arow ? ld_nc_u32(Ap + 8 * kb + 4) : 0u;
+          cursor_next(la, p.iters);
+        }
+      }
+#pragma unroll
+      for (int j = 0; j < 4; ++j)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+          acc[j][e] = 0.0f;
+          R[j][e] = 0.0f;
+        }
+      bool first_seg = true;
+      int par = 0;
+      bool neg0 = false;
+      for (int base = 0; base < total; base += P) {
+#pragma unroll
+        for (int s = 0; s < P; ++s) {
+          const int i = base + s;
+          if (i < total) {
+            block_mma(kskip_words(rq[s]), rs[s], ra[s], acc);
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+#pragma unroll
+              for (int e = 0; e < 4; ++e) neg0 |= __float_as_uint(acc[j][e]) == 0x80000000u;
+            const bool seg_end = cursor_next(cs, p.iters);
+            if (i + P < total) {
+              ra[s][0] = na[s][0];
+              ra[s][1] = na[s][1];
+              const int kb = 8 * ld.tau + 2 * w + ld.k;
+              kskip_load(rq[s], Kp + kb * nK, ra[s], tm, full);
+              rs[s] = ld_nc_v2(Sp + kb * nS);
+              cursor_next(ld, p.iters);
+              if (i + 2 * P < total) {
+                const int kb2 = 8 * la.tau + 2 * w + la.k;
+                na[s][0] = arow ? ld_nc_u32(Ap + 8 * kb2) : 0u;
+                na[s][1] = arow ? ld_nc_u32(Ap + 8 * kb2 + 4) : 0u;
+                cursor_next(la, p.iters);
+              }
+            }
+            if (seg_end) {  // uniform across the CTA: every chain has the same length
+              close_segment(red, par, w, lane, acc, R, first_seg);
+              first_seg = false;
+              par ^= 1;
+            }
+          }
+        }
+      }
+      if (!__syncthreads_or(neg0 ? 1 : 0) || full) break;
+    }
+    if (!w) write_out<Relu2>(p, col, h, lane, R);
+    return;
+  }
+
+#endif
   uint4 rb[P];
   uint2 rs[P];
   uint32_t ra[P][2];
@@ -342,6 +491,14 @@ static int launch(const Params& p, cudaStream_t stream) {
   return (int)cudaGetLastError();
 }
 
+#ifndef MARLINX_NO_KSKIP
+template <int P>
+static int launch_kskip(const Params& p, cudaStream_t stream) {
+  gemm_kernel<P, false, true><<<2 * p.n_tiles, 128, 0, stream>>>(p);
+  return (int)cudaGetLastError();
+}
+
+#endif
 }  // namespace marlinx
 
 extern "C" {
@@ -431,6 +588,59 @@ int marlinx_gemm_relu2(const void* A, long long lda, int M, const void* B, const
   return marlinx_gemm_impl(A, lda, M, B, S, GS, C, ldc, N, K, sms, depth, stream, true);
 }
 
+#ifndef MARLINX_NO_KSKIP
+// Loads the KSkip kernels (call outside CUDA graph capture). Returns 0 or a cudaError_t value.
+// Separate from marlinx_init so that a failure here only disables KSkip.
+int marlinx_kskip_init(void) {
+  cudaFuncAttributes attr;
+  cudaError_t e;
+  if ((e = cudaFuncGetAttributes(&attr, marlinx::gemm_kernel<4, false, true>)) != cudaSuccess) return (int)e;
+  if ((e = cudaFuncGetAttributes(&attr, marlinx::gemm_kernel<8, false, true>)) != cudaSuccess) return (int)e;
+  return 0;
+}
+
+// marlinx_gemm for the shared expert down projection (N 2688, K 3712 only) with the KSkip
+// kernel: BK is the k-row repack of B (py/__init__.py _kskip_repack). Same output bits as
+// marlinx_gemm (checked at load time). Returns 0, a cudaError_t value, or a negative code.
+int marlinx_gemm_kskip(const void* A, long long lda, int M, const void* B, const void* BK,
+                       const void* S, const void* GS, void* C, long long ldc, int N, int K,
+                       int sms, int depth, void* stream) {
+  if (M < 1 || M > 8) return -1;
+  if (N != 2688 || K != 3712) return -7;
+  if (sms <= 0) return -3;
+  if (lda % 8 || (reinterpret_cast<uintptr_t>(A) & 15)) return -4;
+  if (BK == nullptr || (reinterpret_cast<uintptr_t>(BK) & 31)) return -8;
+  marlinx::Params p;
+  p.A = static_cast<const __nv_bfloat16*>(A);
+  p.lda = lda;
+  p.M = M;
+  p.B = static_cast<const uint4*>(B);
+  p.S = static_cast<const uint2*>(S);
+  p.GS = static_cast<const float*>(GS);
+  p.C = static_cast<__nv_bfloat16*>(C);
+  p.ldc = ldc;
+  p.N = N;
+  p.K = K;
+  p.n_tiles = N / 128;
+  p.k_tiles = K / 128;
+  // Marlin's stripe partition with parallel = 1 and grid = sms (as marlinx_gemm_impl).
+  int part2 = p.n_tiles;
+  if (p.n_tiles > sms) {
+    part2 = p.n_tiles % sms;
+    if (part2 * 3 <= sms) part2 += sms;
+  }
+  p.part1_cols = p.n_tiles - part2;
+  p.iters = (p.k_tiles * part2 + sms - 1) / sms;
+  p.BK = static_cast<const uint32_t*>(BK);
+  cudaStream_t st = static_cast<cudaStream_t>(stream);
+  switch (depth) {
+    case 4: return marlinx::launch_kskip<4>(p, st);
+    case 8: return marlinx::launch_kskip<8>(p, st);
+    default: return -5;
+  }
+}
+
+#endif
 // Streams nbytes from src with blocks x threads, reserving smem bytes of
 // shared memory per CTA. Returns 0 or a cudaError_t value.
 int marlinx_hog(int blocks, int threads, int smem, const void* src, long long nbytes, void* sink,

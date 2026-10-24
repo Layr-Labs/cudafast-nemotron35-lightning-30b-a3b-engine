@@ -21,6 +21,15 @@ sm=${arch/./}
   -gencode "arch=compute_${sm},code=sm_${sm}" \
   -Xptxas -v \
   -o "$out/libzskip.so" "$here/csrc/zskip.cu" "$here/csrc/gather.cu" 2>&1 | grep -v '^$' || true
+# If the fused-prep kernel does not build, build once more without it (-DZSKIP_NO_FUSED removes
+# every fused line: the crown source; humming_zskip.py then keeps the crown config).
+if ! test -f "$out/libzskip.so"; then
+  echo "zskip: fused build failed; rebuilding with -DZSKIP_NO_FUSED" >&2
+  "$nvcc" -O3 -std=c++17 -shared -Xcompiler -fPIC -lineinfo \
+    -gencode "arch=compute_${sm},code=sm_${sm}" \
+    -Xptxas -v -DZSKIP_NO_FUSED \
+    -o "$out/libzskip.so" "$here/csrc/zskip.cu" "$here/csrc/gather.cu" 2>&1 | grep -v '^$' || true
+fi
 test -f "$out/libzskip.so" || { echo "zskip: build failed" >&2; exit 1; }
 cp "$here/py/__init__.py" "$out/__init__.py"
 echo "zskip: built $out/libzskip.so for sm_${sm}"

@@ -133,7 +133,7 @@
     },
     {
       "file": "vllm/model_executor/models/nemotron_h_mtp_compact.py, nemotron_h_mtp_kernels.py",
-      "why": "Carried from jacklightChen 73d42dd1-a764-48c2-b125-55a43407a3a7 onto 4d5563f. Drafter-only: compact the 8 BF16 post-ReLU2 slots (6 routed, 2 shared) to their nonzero values and ascending original K indices, then run the down projection over that compact domain against the existing finite-checked exact BF16 transpose. Target model, routing, up projections and strict greedy verification unchanged; drafter FP32 reduction tree differs, so proposals may differ while committed tokens stay the target's. Shape guard and unsupported shapes keep the dense zero-load kernel."
+      "why": "Carried from jacklightChen 73d42dd1-a764-48c2-b125-55a43407a3a7 onto 4d5563f. Drafter-only: compact the 8 BF16 post-ReLU2 slots (6 routed, 2 shared) to their nonzero values and ascending original K indices, then run the down projection over that compact domain against the existing finite-checked exact BF16 transpose. Target model, routing, up projections and strict greedy verification unchanged; drafter FP32 reduction tree differs, so proposals may differ while committed tokens stay the target's. Shape guard and unsupported shapes keep the dense zero-load kernel. Default off (MTP_RELU2_COMPACT=1 restores): off runs the dense zero-load kernel."
     },
     {
       "file": "vllm/model_executor/models/nemotron_h_mtp.py, vllm/v1/spec_decode/llm_base_proposer.py",

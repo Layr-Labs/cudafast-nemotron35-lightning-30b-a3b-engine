@@ -11,7 +11,13 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
-_ENABLED = os.environ.get("MTP_RELU2_COMPACT", "1") != "0"
+# LOCAL PATCH (c8 R4): default off. Measured on the box, this compaction alone was
+# -0.26% composite on 73d42dd1 (the other part of that run measured 0 on bd082483).
+# 83376611's +1.98% came from its pair 3 only, read here as a1c083d7's pair-3
+# outlier returning to normal. Off = relu2_down's _mtp_moe_zero_down_kernel path
+# (the pre-83376611 drafter); MTP_RELU2_COMPACT=1 restores the compaction.
+# Drafter only: committed tokens stay the target's greedy choice.
+_ENABLED = os.environ.get("MTP_RELU2_COMPACT", "0") != "0"
 
 
 @triton.jit

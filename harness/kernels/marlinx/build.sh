@@ -16,10 +16,20 @@ arch=${arch%+PTX}
 sm=${arch/./}
 "$nvcc" --version | tail -n 2
 # No --use_fast_math: the reductions must stay plain IEEE fp32 adds and multiplies.
+# If the KSkip kernel does not build, build once more without it (-DMARLINX_NO_KSKIP removes
+# every KSkip line: the crown kernel, and py/__init__.py then never selects KSkip).
 "$nvcc" -O3 -std=c++17 -shared -Xcompiler -fPIC -lineinfo \
   -gencode "arch=compute_${sm},code=sm_${sm}" \
   -Xptxas -v \
-  -o "$out/libmarlinx.so" "$here/csrc/marlinx.cu" 2>&1
+  -o "$out/libmarlinx.so" "$here/csrc/marlinx.cu" 2>&1 || {
+  echo "marlinx: KSkip build failed; rebuilding with -DMARLINX_NO_KSKIP" >&2
+  rm -f "$out/libmarlinx.so"
+  "$nvcc" -O3 -std=c++17 -shared -Xcompiler -fPIC -lineinfo \
+    -gencode "arch=compute_${sm},code=sm_${sm}" \
+    -Xptxas -v -DMARLINX_NO_KSKIP \
+    -o "$out/libmarlinx.so" "$here/csrc/marlinx.cu" 2>&1
+}
 test -f "$out/libmarlinx.so" || { echo "marlinx: build failed" >&2; exit 1; }
 cp "$here/py/__init__.py" "$out/__init__.py"
+cp "$here/py/kskip_layout.py" "$out/kskip_layout.py"
 echo "marlinx: built $out/libmarlinx.so for sm_${sm}"

@@ -71,6 +71,37 @@ __device__ __forceinline__ uint32_t ld_nc_u32(const uint32_t* p) {
   return r;
 }
 
+#ifndef MARLINX_NO_PDL
+__device__ __forceinline__ void pdl_wait() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+}
+__device__ __forceinline__ void pdl_launch_dependents() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+}
+#endif
+
+// Activations can be the preceding grid's output. PDL uses coherent loads
+// after its memory-clobbering wait, including the activation-derived ZS mask.
+template <bool PDL>
+__device__ __forceinline__ uint32_t ld_activation_u32(const uint32_t* p) {
+  if constexpr (!PDL) return ld_nc_u32(p);
+  uint32_t r;
+  asm volatile("ld.global.u32 %0, [%1];" : "=r"(r) : "l"(p) : "memory");
+  return r;
+}
+template <bool PDL>
+__device__ __forceinline__ uint4 ld_activation_v4(const uint4* p) {
+  if constexpr (!PDL) return __ldg(p);
+  uint4 r;
+  asm volatile("ld.global.v4.u32 {%0,%1,%2,%3}, [%4];"
+               : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p) : "memory");
+  return r;
+}
+
 __device__ __forceinline__ __nv_bfloat162 as_bf162(uint32_t v) {
   return *reinterpret_cast<__nv_bfloat162*>(&v);
 }
@@ -257,7 +288,7 @@ __device__ __forceinline__ int column_first_cut(const Params& p, int col) {
 
 // One 64-feature half column (`unit`) per CTA of 4 warps; warp w runs Marlin's
 // warp-row chain w through a register ring of P k16 blocks.
-template <int P, bool Relu2 = false, bool ZS = false>
+template <int P, bool Relu2 = false, bool ZS = false, bool PDL = false>
 __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
   __shared__ float red[2][3][16][32];
   __shared__ uint16_t zmask[ZS ? 512 : 1];
@@ -283,6 +314,29 @@ __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
   uint2 rs[P];
   uint32_t ra[P][2];
 
+  Cursor ld, cs;
+  cursor_init(ld, first_cut, p.k_tiles, p.iters);
+  cs = ld;
+  const int total = 2 * p.k_tiles;
+#ifndef MARLINX_NO_PDL
+  if constexpr (PDL) {
+    // B/S are immutable checkpoint tensors. Z is also a weight-only repack,
+    // but which Z rows are read depends on A: defer ALL Z/mask reads to wait.
+    // Preload only scales for ZS, weights and scales for dense/fused-up/head.
+    Cursor pre = ld;
+#pragma unroll
+    for (int s = 0; s < P; ++s) {
+      if (s < total) {
+        const int kb = 8 * pre.tau + 2 * w + pre.k;
+        if constexpr (!ZS) rb[s] = ld_stream_v4(Bp + kb * nB);
+        rs[s] = ld_nc_v2(Sp + kb * nS);
+        cursor_next(pre, p.iters);
+      }
+    }
+    pdl_wait();
+  }
+#endif
+
   // Zero-row skip: bit k of zmask[kb] is set when activation column 16*kb + k
   // is nonzero in some row m < M; only those weight rows are read.
   const int t4 = lane & 3;
@@ -293,7 +347,7 @@ __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
       uint32_t m = 0;
       for (int r = 0; r < p.M; ++r) {
         const uint4* ar = reinterpret_cast<const uint4*>(p.A + (long long)r * p.lda + 16 * kb);
-        const uint4 v0 = __ldg(ar), v1 = __ldg(ar + 1);
+        const uint4 v0 = ld_activation_v4<PDL>(ar), v1 = ld_activation_v4<PDL>(ar + 1);
         const uint32_t v[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
 #pragma unroll
         for (int i = 0; i < 8; ++i)
@@ -318,19 +372,14 @@ __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
     }
   };
 
-  Cursor ld, cs;
-  cursor_init(ld, first_cut, p.k_tiles, p.iters);
-  cs = ld;
-  const int total = 2 * p.k_tiles;
-
 #pragma unroll
   for (int s = 0; s < P; ++s) {
     if (s < total) {
       const int kb = 8 * ld.tau + 2 * w + ld.k;
-      rb[s] = load_b(kb);
-      rs[s] = ld_nc_v2(Sp + kb * nS);
-      ra[s][0] = arow ? ld_nc_u32(Ap + 8 * kb) : 0u;
-      ra[s][1] = arow ? ld_nc_u32(Ap + 8 * kb + 4) : 0u;
+      if constexpr (!PDL || ZS) rb[s] = load_b(kb);
+      if constexpr (!PDL) rs[s] = ld_nc_v2(Sp + kb * nS);
+      ra[s][0] = arow ? ld_activation_u32<PDL>(Ap + 8 * kb) : 0u;
+      ra[s][1] = arow ? ld_activation_u32<PDL>(Ap + 8 * kb + 4) : 0u;
       cursor_next(ld, p.iters);
     }
   }
@@ -358,8 +407,8 @@ __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
           const int kb = 8 * ld.tau + 2 * w + ld.k;
           rb[s] = load_b(kb);
           rs[s] = ld_nc_v2(Sp + kb * nS);
-          ra[s][0] = arow ? ld_nc_u32(Ap + 8 * kb) : 0u;
-          ra[s][1] = arow ? ld_nc_u32(Ap + 8 * kb + 4) : 0u;
+          ra[s][0] = arow ? ld_activation_u32<PDL>(Ap + 8 * kb) : 0u;
+          ra[s][1] = arow ? ld_activation_u32<PDL>(Ap + 8 * kb + 4) : 0u;
           cursor_next(ld, p.iters);
         }
         if (seg_end) {  // uniform across the CTA: every chain has the same length
@@ -370,6 +419,11 @@ __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
       }
     }
   }
+#ifndef MARLINX_NO_PDL
+  // Every thread has waited, and every CTA triggers. Only this grid's C
+  // epilogue remains; a dependent must wait before reading any of C.
+  if constexpr (PDL) pdl_launch_dependents();
+#endif
   if (!w) write_out<Relu2>(p, col, h, lane, R);
 }
 
@@ -396,7 +450,24 @@ __global__ void hog_kernel(const uint4* __restrict__ src, long long n16, unsigne
 }
 
 template <int P, bool Relu2 = false, bool ZS = false>
-static int launch(const Params& p, cudaStream_t stream) {
+static int launch(const Params& p, cudaStream_t stream, bool pdl) {
+#ifndef MARLINX_NO_PDL
+  if (pdl) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(2 * p.n_tiles);
+    cfg.blockDim = dim3(128);
+    cfg.dynamicSmemBytes = 0;
+    cfg.stream = stream;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = attr;
+    cfg.numAttrs = 1;
+    cudaError_t rc = cudaLaunchKernelEx(&cfg, gemm_kernel<P, Relu2, ZS, true>, p);
+    if (rc != cudaSuccess) { cudaGetLastError(); return (int)rc; }
+    return (int)cudaGetLastError();
+  }
+#endif
   gemm_kernel<P, Relu2, ZS><<<2 * p.n_tiles, 128, 0, stream>>>(p);
   return (int)cudaGetLastError();
 }
@@ -419,6 +490,21 @@ int marlinx_init(void) {
   return 0;
 }
 
+#ifndef MARLINX_NO_PDL
+// Optional ABI; initialize every PDL specialization before graph capture.
+int marlinx_init_pdl(void) {
+  cudaFuncAttributes attr;
+  cudaError_t e;
+  if ((e = cudaFuncGetAttributes(&attr, marlinx::gemm_kernel<4, false, false, true>)) != cudaSuccess) return (int)e;
+  if ((e = cudaFuncGetAttributes(&attr, marlinx::gemm_kernel<8, false, false, true>)) != cudaSuccess) return (int)e;
+  if ((e = cudaFuncGetAttributes(&attr, marlinx::gemm_kernel<4, true, false, true>)) != cudaSuccess) return (int)e;
+  if ((e = cudaFuncGetAttributes(&attr, marlinx::gemm_kernel<8, true, false, true>)) != cudaSuccess) return (int)e;
+  if ((e = cudaFuncGetAttributes(&attr, marlinx::gemm_kernel<4, false, true, true>)) != cudaSuccess) return (int)e;
+  if ((e = cudaFuncGetAttributes(&attr, marlinx::gemm_kernel<8, false, true, true>)) != cudaSuccess) return (int)e;
+  return 0;
+}
+#endif
+
 // Registers per thread of gemm_kernel<depth> (depth 4 or 8), or -1.
 int marlinx_regs(int depth) {
   cudaFuncAttributes attr;
@@ -436,7 +522,7 @@ int marlinx_regs(int depth) {
 // a negative code for unsupported arguments.
 static int marlinx_gemm_impl(const void* A, long long lda, int M, const void* B, const void* S,
                  const void* GS, void* C, long long ldc, int N, int K, int sms, int depth,
-                 void* stream, bool relu2, const void* Z = nullptr) {
+                 void* stream, bool relu2, const void* Z = nullptr, bool pdl = false) {
   if (M < 1 || M > 8) return -1;
   if (N <= 0 || K <= 0 || N % 128 || K % 128) return -2;
   if (sms <= 0) return -3;
@@ -467,22 +553,22 @@ static int marlinx_gemm_impl(const void* A, long long lda, int M, const void* B,
   if (relu2) {
     if (N != 3712 || K != 2688) return -6;
     switch (depth) {
-      case 4: return marlinx::launch<4, true>(p, st);
-      case 8: return marlinx::launch<8, true>(p, st);
+      case 4: return marlinx::launch<4, true>(p, st, pdl);
+      case 8: return marlinx::launch<8, true>(p, st, pdl);
       default: return -5;
     }
   }
   if (Z) {
     if (N != 2688 || K != 3712 || (K >> 4) > 512) return -7;
     switch (depth) {
-      case 4: return marlinx::launch<4, false, true>(p, st);
-      case 8: return marlinx::launch<8, false, true>(p, st);
+      case 4: return marlinx::launch<4, false, true>(p, st, pdl);
+      case 8: return marlinx::launch<8, false, true>(p, st, pdl);
       default: return -5;
     }
   }
   switch (depth) {
-    case 4: return marlinx::launch<4>(p, st);
-    case 8: return marlinx::launch<8>(p, st);
+    case 4: return marlinx::launch<4>(p, st, pdl);
+    case 8: return marlinx::launch<8>(p, st, pdl);
     default: return -5;
   }
 }
@@ -509,6 +595,25 @@ int marlinx_gemm_zs(const void* A, long long lda, int M, const void* B, const vo
   if (!Z) return -8;
   return marlinx_gemm_impl(A, lda, M, B, S, GS, C, ldc, N, K, sms, depth, stream, false, Z);
 }
+
+#ifndef MARLINX_NO_PDL
+int marlinx_gemm_pdl(const void* A, long long lda, int M, const void* B, const void* S,
+                 const void* GS, void* C, long long ldc, int N, int K, int sms, int depth,
+                 void* stream) {
+  return marlinx_gemm_impl(A, lda, M, B, S, GS, C, ldc, N, K, sms, depth, stream, false, nullptr, true);
+}
+int marlinx_gemm_relu2_pdl(const void* A, long long lda, int M, const void* B, const void* S,
+                 const void* GS, void* C, long long ldc, int N, int K, int sms, int depth,
+                 void* stream) {
+  return marlinx_gemm_impl(A, lda, M, B, S, GS, C, ldc, N, K, sms, depth, stream, true, nullptr, true);
+}
+int marlinx_gemm_zs_pdl(const void* A, long long lda, int M, const void* B, const void* S,
+                 const void* GS, void* C, long long ldc, int N, int K, int sms, int depth,
+                 void* stream, const void* Z) {
+  if (!Z) return -8;
+  return marlinx_gemm_impl(A, lda, M, B, S, GS, C, ldc, N, K, sms, depth, stream, false, Z, true);
+}
+#endif
 
 // Streams nbytes from src with blocks x threads, reserving smem bytes of
 // shared memory per CTA. Returns 0 or a cudaError_t value.

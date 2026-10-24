@@ -16,18 +16,13 @@ those freely and keeps everything that is part of the chain.
 It also stops vLLM from zero-padding the expert weights' N dimension to a
 multiple of 256 (w13 1856 -> 2048, w2 2688 -> 2816); humming only needs
 N % 64 == 0. Output columns are independent, and the padded columns were never
-stored, so this changes no bit. K is padded only to humming's BF16 pack granule
-(prepare_humming_weight asserts padded_k % (512 / a_bits) == 0, 32 here), so
-w2's K stays 1856 instead of 1920 and its tiles no longer stream and multiply
-two all-zero 32-wide K blocks. Those blocks were four mma(+0, +0, acc) steps at
-the end of each chain: the identity for every non-NaN fp32 acc except -0, which
-they turned into +0 (harness/tests/humming_moe_exact.py, phase mma, checks all
-2^32 values). So the only possible difference is a w2 element that ends at -0
-where stock ends at +0. Downstream ops only add, scale, square or take the
-magnitude of it (bf16 rounding, the top-k combine, the residual add, RMSNorm,
-FP8 amax scaling, the next matmuls); none divides by an activation or reads its
-sign, so every later value has the same magnitude and compares equal, and the
-logits and tokens are unchanged. w13's K (2688) needs no padding. The repack is
+stored, so this changes no bit. The K padding (multiple of 128) stays: w2's K
+remains 1856 -> 1920, so each w2 element still ends with the same four
+mma(+0, +0, acc) steps as stock. Those steps are the identity for every
+non-NaN fp32 acc except -0, which they turn into +0
+(harness/tests/humming_moe_exact.py, phase mma, checks all 2^32 values), and an
+unpadded chain ending at -0 cannot be ruled out for every input; keeping them
+keeps the chain identical. w13's K (2688) needs no padding. The repack is
 input-independent and value-exact.
 
 The configs are keyed by the layer's shapes and only apply when the layer
@@ -50,11 +45,10 @@ logger = init_logger(__name__)
 # Stock padding vLLM applies to humming MoE weights.
 STOCK_PAD_N = 256
 STOCK_PAD_K = 128
-# Smallest paddings humming accepts with BF16 activations
-# (prepare_humming_weight asserts padded_n % 64 == 0 and
-# padded_k % (512 / a_bits) == 0): see the module docstring.
+# Smallest N padding humming accepts (prepare_humming_weight asserts
+# padded_n % 64 == 0). K keeps the stock padding: see the module docstring.
 TUNED_PAD_N = 64
-TUNED_PAD_K = 32
+TUNED_PAD_K = STOCK_PAD_K
 
 _BIG = 1 << 30
 
@@ -254,6 +248,58 @@ try:
         bits = tl.where(y != y, nan_bits, bits)
         tl.store(y_ptr + offs, bits, mask=mask)
 
+    @triton.jit
+    def _small_moe_align_kernel(
+        topk_ptr,
+        sorted_ptr,
+        expert_ptr,
+        padded_ptr,
+        N: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        ROUTES: tl.constexpr,
+        SORTED: tl.constexpr,
+    ):
+        # A single CTA owns every output location. Initialize padding first,
+        # then overwrite the real routes after a CTA-wide memory barrier.
+        # N < num_experts, so the normal wrapper allocates N * BLOCK_M ids.
+        pad_offs = tl.arange(0, SORTED)
+        tl.store(sorted_ptr + pad_offs, N, mask=pad_offs < N * BLOCK_M)
+        route = tl.arange(0, ROUTES)
+        tl.store(expert_ptr + route, -1, mask=route < N)
+
+        expert = tl.load(topk_ptr + route, mask=route < N, other=128).to(tl.int32)
+        valid = route < N
+        same = expert[:, None] == expert[None, :]
+        # Stable rank within an expert: exactly the flattened route order.
+        rank = tl.sum(
+            (same & (route[None, :] < route[:, None]) & valid[None, :]).to(
+                tl.int32
+            ),
+            axis=1,
+        )
+        count = tl.sum((same & valid[None, :]).to(tl.int32), axis=1)
+        first = valid & (rank == 0)
+        padded = tl.cdiv(count, BLOCK_M) * BLOCK_M
+        # Integer prefix by expert id. This fuses histogram, prefix, stable
+        # scatter and padding without atomics or a device-wide barrier.
+        before = tl.sum(
+            tl.where(
+                first[None, :] & (expert[None, :] < expert[:, None]),
+                padded[None, :],
+                0,
+            ),
+            axis=1,
+        )
+        total = tl.sum(tl.where(first, padded, 0), axis=0)
+        tl.store(padded_ptr, total)
+        tl.debug_barrier()
+        tl.store(sorted_ptr + before + rank, route, mask=valid)
+        tl.store(
+            expert_ptr + (before + rank) // BLOCK_M,
+            expert,
+            mask=valid & (rank % BLOCK_M == 0),
+        )
+
     _HAVE_TRITON = True
 except Exception:  # noqa: BLE001
     _HAVE_TRITON = False
@@ -278,3 +324,53 @@ def relu2_bf16(input: torch.Tensor, output: torch.Tensor) -> bool:
         input, output.view(torch.int16), n, BLOCK=block, num_warps=4
     )
     return True
+
+
+def small_humming_moe_align(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+    expert_map: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """One-CTA alignment for tuned single-stream decode/verify shapes.
+
+    Only integer metadata changes. Expert order is ascending, including the
+    single-token case. Each expert's flattened
+    route ids are stable and padded with the stock sentinel N.
+    GEMM operands and each output element's MMA chain stay unchanged.
+    Prefill, EP and all untuned shapes retain the general alignment kernel.
+    """
+    if os.environ.get("VLLM_HUMMING_ALIGN_FAST", "1") == "0":
+        return None
+    if (
+        expert_map is not None
+        or num_experts != TUNED_NUM_EXPERTS
+        or block_size != 16
+        or topk_ids.ndim != 2
+        or topk_ids.shape[1] != 6
+        or not 1 <= topk_ids.shape[0] <= 8
+        or not topk_ids.is_contiguous()
+        or topk_ids.dtype not in (torch.int32, torch.int64)
+        or topk_ids.device.type != "cuda"
+    ):
+        return None
+    if not _HAVE_TRITON:
+        return None
+    n = topk_ids.numel()
+    sorted_ids = torch.empty(
+        (n * block_size,), dtype=torch.int32, device=topk_ids.device
+    )
+    expert_ids = torch.empty((n,), dtype=torch.int32, device=topk_ids.device)
+    num_tokens_padded = torch.empty((1,), dtype=torch.int32, device=topk_ids.device)
+    _small_moe_align_kernel[(1,)](
+        topk_ids,
+        sorted_ids,
+        expert_ids,
+        num_tokens_padded,
+        N=n,
+        BLOCK_M=block_size,
+        ROUTES=triton.next_power_of_2(n),
+        SORTED=triton.next_power_of_2(n * block_size),
+        num_warps=4,
+    )
+    return sorted_ids, expert_ids, num_tokens_padded

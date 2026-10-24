@@ -210,6 +210,14 @@
     {
       "file": "harness/kernels/l2pf/py/__init__.py",
       "why": "Carry useful04706ad7-c4e8-44b9-b8ba-77f14d8b8adf MoE-window immutable prefetch default6to12MB. Its complete official2.19195352041462 is within0.1% of fulla484, but only budget mechanism is combined here on higherfulla484. Prefix pair/SSM combination unverified."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "Drafter-only, bit-identical drafts: the cascaded draft screen reads h at its column indices inside the coarse and refine dot kernels (no gathered copies of h), forms the refine rows as first-stage top-k index + chunk offset and the full-K rows and the select kernel's token ids as the second stage's picks among them (no offset add, no candidate gather), and writes the token straight into the captured output (no copy): five fewer kernels per draft pass. Same elements, same row ids, same arithmetic. A load-time bitwise check of every stage against the unfolded path keeps the unfolded path on any difference; VLLM_MTP_SCREEN_FOLD=0 restores it."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_kernels.py",
+      "why": "Drafter-only router tail: a one-row MTP MoE call uses the row itself (row_src[0] can only be 0) instead of an index_select, and the top-_DRAFT_TOPK selection is one kernel (rank = weights above plus equal ones at a lower slot, scattered below KEEP) instead of torch.sort + slice + index_select. The same experts in the same descending order for distinct weights; MTP_TOPK_KEEP_KERNEL=0 restores the sort."
     }
   ]
 }

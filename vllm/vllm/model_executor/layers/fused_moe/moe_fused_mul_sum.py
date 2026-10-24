@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import functools
+
 import torch
 from torch._subclasses.fake_tensor import FakeTensor
 
@@ -63,6 +65,11 @@ def moe_fused_mul_sum_kernel(
     )
 
 
+@functools.cache
+def _is_sm12x() -> bool:
+    return current_platform.is_device_capability_family(120)
+
+
 def _heuristic_config(
     num_tokens: int,
     top_k: int,
@@ -113,6 +120,12 @@ def _heuristic_config(
         max_block_k = 1024
     BLOCK_K = min(triton.next_power_of_2(size), max_block_k)
     BLOCK_K = max(BLOCK_K, 256)
+    if num_tokens <= 16 and not is_fp32 and _is_sm12x():
+        # LOCAL PATCH (vllm/VENDOR.json): GB10 has 48 SMs. At 4 rows and a
+        # 2688-wide hidden size, 512-wide K tiles launch 24 CTAs and leave the
+        # last tile 75% masked; 128-wide tiles launch 84 with no tail. Each
+        # output element still sums its own top_k products in the same order.
+        BLOCK_K = 128
 
     total = BLOCK_M * BLOCK_K
     if is_fp32:

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import sys
 
 import torch
 
@@ -62,6 +63,9 @@ def _load():
         if hasattr(lib, "marlinx_gemm_zs"):
             lib.marlinx_gemm_zs.argtypes = lib.marlinx_gemm.argtypes + [ctypes.c_void_p]
             lib.marlinx_gemm_zs.restype = ctypes.c_int
+        if hasattr(lib, "marlinx_gemm_zs_rows"):
+            lib.marlinx_gemm_zs_rows.argtypes = lib.marlinx_gemm.argtypes + [ctypes.c_void_p, ctypes.c_void_p]
+            lib.marlinx_gemm_zs_rows.restype = ctypes.c_int
         if hasattr(lib, "marlinx_gemm_relu2"):
             lib.marlinx_gemm_relu2.argtypes = lib.marlinx_gemm.argtypes
             lib.marlinx_gemm_relu2.restype = ctypes.c_int
@@ -69,7 +73,7 @@ def _load():
                                     ctypes.c_longlong, ctypes.c_void_p, ctypes.c_void_p]
         lib.marlinx_hog.restype = ctypes.c_int
         _ops = {"gemm": lib.marlinx_gemm}
-        for mode in ("relu2", "zs"):
+        for mode in ("relu2", "zs", "zs_rows"):
             op = getattr(lib, "marlinx_gemm_" + mode, None)
             if op is not None:
                 _ops[mode] = op
@@ -81,6 +85,9 @@ def _load():
                     "relu2": lib.marlinx_gemm_relu2_pdl,
                     "zs": lib.marlinx_gemm_zs_pdl,
                 }
+                rows_pdl = getattr(lib, "marlinx_gemm_zs_rows_pdl", None)
+                if rows_pdl is not None and "zs_rows" in _ops:
+                    ops_pdl["zs_rows"] = rows_pdl
             except AttributeError:  # old library or MARLINX_NO_PDL build
                 init_pdl = None
             if init_pdl is not None:
@@ -189,16 +196,41 @@ def zs_repack(w: torch.Tensor, n: int, k: int) -> torch.Tensor:
     return out.to(torch.int32).contiguous()
 
 
+def _live_verify_rows(device) -> torch.Tensor | None:
+    """smallk's verify-row count when the model installed it, else None.
+
+    The buffer is the same one the router and the sampler already capture.
+    A missing buffer (or VROWS_ALL) leaves the zero-skip mask over every row.
+    """
+    smallk = sys.modules.get("smallk")
+    if smallk is None or not hasattr(smallk, "live_verify_rows"):
+        return None
+    buf = smallk.live_verify_rows(device)
+    if buf is None or buf.dtype != torch.int32 or buf.numel() != 1:
+        return None
+    return buf
+
+
 def gemm(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
          global_scale: torch.Tensor, n: int, k: int, depth: int = DEPTH,
-         relu2: bool = False, zs: torch.Tensor | None = None) -> torch.Tensor:
-    """out[M, n] for a 2-D bf16 x[M, k] (1 <= M <= 8); no guard beyond the C side's."""
+         relu2: bool = False, zs: torch.Tensor | None = None,
+         vrows: torch.Tensor | None = None) -> torch.Tensor:
+    """out[M, n] for a 2-D bf16 x[M, k] (1 <= M <= 8); no guard beyond the C side's.
+
+    vrows (device int32 scalar) is only meaningful with zs: the skip mask is
+    built from rows < min(M, *vrows). Rows at or past that count are left
+    unspecified. Without the zs_rows entry point, vrows is ignored.
+    """
     global _pdl_active
     lib = _load()
     assert lib is not None, _load_error
     m = x.shape[0]
     out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
     mode = "zs" if zs is not None else "relu2" if relu2 else "gemm"
+    if mode == "zs" and vrows is not None and "zs_rows" in _ops and (not _pdl_active or "zs_rows" in _ops_pdl):
+        mode = "zs_rows"
+    else:
+        vrows = None
     use_pdl = _pdl_active
     op = _ops_pdl[mode] if use_pdl else _ops[mode]
     args = (
@@ -209,6 +241,8 @@ def gemm(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
     )
     if zs is not None:
         args += (zs.data_ptr(),)
+    if vrows is not None:
+        args += (vrows.data_ptr(),)
     rc = op(*args)
     if rc and use_pdl and not torch.cuda.is_current_stream_capturing():
         # Match fp8small: only rejected eager launches retry, never capture.
@@ -240,8 +274,10 @@ def maybe_apply(layer, x: torch.Tensor) -> torch.Tensor | None:
     if not _ready and not _init():
         return None
     n = layer.output_size_per_partition
+    zs = getattr(layer, "_marlinx_zs", None)
+    vrows = _live_verify_rows(x2.device) if zs is not None else None
     out = gemm(x2, layer.weight, layer.weight_scale, layer.weight_global_scale, n, k,
-               zs=getattr(layer, "_marlinx_zs", None))
+               zs=zs, vrows=vrows)
     return out.reshape(*x.shape[:-1], n)
 
 

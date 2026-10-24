@@ -114,6 +114,14 @@
     {
       "file": "vllm/model_executor/layers/quantization/utils/humming_utils.py; vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py; harness/kernels/routed_sparse",
       "why": "Byte-exact NVFP4 down-weight packing at load and small-token sparse-sector kernel. Per-call masks skip weight reads only for exact-zero activation sectors, retaining ascending BF16 MMA, FP32 accumulation and original global-scale/RN epilogue. Existing Humming handles unsupported calls and prefill."
+    },
+    {
+      "file": "harness/kernels/smallk; vllm/config/vllm.py; mtp-head.manifest.json",
+      "why": "New depth4 experiment pairs exact5 single-sequence capture with an M5 specialization of existing independent FP32 smallk router chains. ExistingM4 instantiations unchanged; Pythononly adds fixedM5,N128,K2688 with separatekill. ActualM5 cuBLAS reduction equivalence and token correctness are unproved until officialremote. Reconsider depth4 only in new sparse expert regime and with M5router, not as a repeat/adoption of negative63a1a1a2-411f-4d21-8234-25bd98d23b06. Exactgraph preservation idea credited to63; original smallk algorithm inherited100549d4-51c4-4f56-b3ca-2604731ab8a4 through fullBD. No local execution."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py; vllm/v1/spec_decode/llm_base_proposer.py",
+      "why": "Compose useful pending b3c47ce9-c861-4101-a206-c31bd770492e exact2file source fdf6144542980efaa97e1bce3ef3b1e90c8264bf: fixedperdraftslot screen graphs, directslot outputs and onefinalclone instead ofperstepclones/stack, retaining scalarcoarse/refine/fullrescore arithmetic and eagerfallback. Supportsdepth2..8 andbatch1, so compatiblewithnewdepth4. Sourcecredits earlierada3602f-5169-4eae-ace3-d84996e78daf; no olderwhole carrier imported. Authorlocalmeasurements notours/official; newcombo remoteunverified."
     }
   ]
 }

@@ -15,11 +15,19 @@ arch=${arch// /}
 arch=${arch%+PTX}
 sm=${arch/./}
 "$nvcc" --version | tail -n 2
+rm -f "$out/libmarlinx.so"
 # No --use_fast_math: the reductions must stay plain IEEE fp32 adds and multiplies.
 "$nvcc" -O3 -std=c++17 -shared -Xcompiler -fPIC -lineinfo \
   -gencode "arch=compute_${sm},code=sm_${sm}" \
   -Xptxas -v \
-  -o "$out/libmarlinx.so" "$here/csrc/marlinx.cu" 2>&1
+  -o "$out/libmarlinx.so" "$here/csrc/marlinx.cu" 2>&1 || true
+if ! test -f "$out/libmarlinx.so"; then
+  echo "marlinx: PDL build failed; rebuilding with -DMARLINX_NO_PDL" >&2
+  "$nvcc" -O3 -std=c++17 -shared -Xcompiler -fPIC -lineinfo \
+    -gencode "arch=compute_${sm},code=sm_${sm}" \
+    -Xptxas -v -DMARLINX_NO_PDL \
+    -o "$out/libmarlinx.so" "$here/csrc/marlinx.cu" 2>&1 || true
+fi
 test -f "$out/libmarlinx.so" || { echo "marlinx: build failed" >&2; exit 1; }
 cp "$here/py/__init__.py" "$out/__init__.py"
 echo "marlinx: built $out/libmarlinx.so for sm_${sm}"

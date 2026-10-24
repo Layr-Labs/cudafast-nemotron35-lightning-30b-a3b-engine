@@ -59,6 +59,9 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.models.nemotron_shared_up import maybe_shared_up_relu2
+from vllm.model_executor.models.nemotron_shared_chain import (
+    maybe_shared_chain, prepare_shared_chain,
+)
 from vllm.model_executor.models.interfaces import (
     EagleModelMixin,
     HasInnerState,
@@ -135,6 +138,9 @@ class NemotronHMLP(nn.Module):
         self.act_fn = ReLUSquaredActivation()
 
     def forward(self, x: torch.Tensor):
+        chained = maybe_shared_chain(self, x)
+        if chained is not None:
+            return chained
         fused = maybe_shared_up_relu2(self.up_proj, x)
         if fused is None:
             x, _ = self.up_proj(x)
@@ -991,6 +997,12 @@ class NemotronHForCausalLM(
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
+
+    def process_weights_after_loading(self) -> None:
+        # Model-level hook runs after all linear quant methods finalized weights.
+        for layer in self.modules():
+            if isinstance(layer, NemotronHMLP):
+                prepare_shared_chain(layer)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self, skip_prefixes=["mtp"])

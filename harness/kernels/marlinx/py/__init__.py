@@ -65,6 +65,14 @@ def _load():
         if hasattr(lib, "marlinx_gemm_relu2"):
             lib.marlinx_gemm_relu2.argtypes = lib.marlinx_gemm.argtypes
             lib.marlinx_gemm_relu2.restype = ctypes.c_int
+        if hasattr(lib, "marlinx_shared_chain") and hasattr(lib, "marlinx_init_masks"):
+            P, I, LL = ctypes.c_void_p, ctypes.c_int, ctypes.c_longlong
+            lib.marlinx_init_masks.argtypes = [I]
+            lib.marlinx_init_masks.restype = I
+            lib.marlinx_shared_chain.argtypes = [
+                P, LL, I, P, P, P, P, P, P, P, P, P, P, P, I, I, P, I,
+            ]
+            lib.marlinx_shared_chain.restype = I
         lib.marlinx_hog.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
                                     ctypes.c_longlong, ctypes.c_void_p, ctypes.c_void_p]
         lib.marlinx_hog.restype = ctypes.c_int
@@ -286,3 +294,44 @@ def maybe_apply_relu2(x, weight, weight_scale, global_scale, n, k):
         return None
     out = gemm(x2, weight, weight_scale, global_scale, n, k, relu2=True)
     return out.reshape(*x.shape[:-1], n)
+
+
+_masks_ready: bool | None = None
+
+
+def init_shared_masks() -> bool:
+    """Optional feature admission, only outside graph capture."""
+    global _masks_ready
+    if _masks_ready is not None:
+        return _masks_ready
+    if torch.cuda.is_current_stream_capturing():
+        return False
+    if (not _init() or not hasattr(_lib, "marlinx_shared_chain")
+            or not hasattr(_lib, "marlinx_init_masks")):
+        _masks_ready = False
+        return False
+    _masks_ready = _lib.marlinx_init_masks(int(_pdl_active)) == 0
+    return _masks_ready
+
+
+def shared_chain(x, up_w, up_s, up_gs, down_w, down_s, down_gs, zs,
+                 verify_rows=None):
+    """Current-call activation/mask storage; every value is produced before use."""
+    assert _masks_ready and _lib is not None
+    m = x.shape[0]
+    activation = torch.empty((m, 3712), dtype=torch.bfloat16, device=x.device)
+    output = torch.empty((m, 2688), dtype=torch.bfloat16, device=x.device)
+    masks = torch.empty(3712 // 16, dtype=torch.int32, device=x.device)
+    rc = _lib.marlinx_shared_chain(
+        x.data_ptr(), x.stride(0), m,
+        up_w.data_ptr(), up_s.data_ptr(), up_gs.data_ptr(),
+        down_w.data_ptr(), down_s.data_ptr(), down_gs.data_ptr(), zs.data_ptr(),
+        activation.data_ptr(), output.data_ptr(), masks.data_ptr(),
+        verify_rows.data_ptr() if verify_rows is not None else 0,
+        _sm_count(x.device), DEPTH, torch.cuda.current_stream(x.device).cuda_stream,
+        int(_pdl_active),
+    )
+    # Up may already have launched. Surface production errors; do not retry.
+    if rc:
+        raise RuntimeError(f"marlinx_shared_chain failed: {rc} (M={m})")
+    return activation, output, masks

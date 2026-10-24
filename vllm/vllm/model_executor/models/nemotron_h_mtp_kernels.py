@@ -77,7 +77,10 @@ def mtp_pdl() -> bool:
 # of a verify at the kept depth, i.e. the target's. The stop flag is only ever set
 # inside the proposer's draft loop. MTP_DEPTH_GATE=0 disables.
 DEPTH_GATE = os.environ.get("MTP_DEPTH_GATE", "1") != "0"
-DEPTH_THETA = float(os.environ.get("MTP_DEPTH_THETA", "0.4"))
+DEPTH_THETA = float(os.environ.get("MTP_DEPTH_THETA", "0.5"))
+# Keep top3 for the first two proposals, top2 only for the active late suffix.
+# Device state makes the policy replayable inside the existing fixed CUDA graph.
+_STAGE_ROUTED = os.environ.get("MTP_STAGE_ROUTED", "1") != "0"
 _GATE: torch.Tensor | None = None  # int32 [stop, kept drafts, draft loop active]
 _GATE_START: torch.Tensor | None = None  # [0, 0, 1] on the gate's device (no H2D per cycle)
 
@@ -409,6 +412,7 @@ def _mtp_moe_up_kernel(
     gate_ptr=None,
     GATED: tl.constexpr = False,
     launch_pdl: tl.constexpr = False,
+    LATE_TOP2: tl.constexpr = False,
 ):
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
@@ -419,26 +423,36 @@ def _mtp_moe_up_kernel(
     offs_n = pid_n * BN + tl.arange(0, BN)
     offs_k = tl.arange(0, BK)
     nmask = offs_n < I
-    # weight-load mask: off once the depth gate stopped the draft loop (zeros out)
-    wn = nmask
-    if GATED:
-        wn = nmask & (tl.load(gate_ptr) == 0)
-    if j < TOPK:
-        e = tl.load(ids_ptr + j).to(tl.int64)
-        wbase = w13_ptr + e * stride_we + offs_n[:, None].to(tl.int64) * stride_wn
+    omit = False
+    if LATE_TOP2 and GATED and TOPK == 3:
+        active = tl.load(gate_ptr + 2, volatile=True)
+        kept = tl.load(gate_ptr + 1, volatile=True)
+        omit = (j == 2) & (active != 0) & (kept >= 2)
+    if omit:
+        # Every producer CTA still triggered dependents above. Write positive
+        # zeros before the existing zero-load down consumes this expert slot.
+        tl.store(h_ptr + j * I + offs_n, 0.0, mask=nmask)
     else:
-        rows = (j - TOPK) * I + offs_n
-        wbase = ws_ptr + rows[:, None].to(tl.int64) * stride_wsn
-    acc = tl.zeros((BN, BK), dtype=tl.float32)
-    for k0 in range(0, K, BK):
-        kk = k0 + offs_k
-        kmask = kk < K
-        w = _load_w(wbase + kk[None, :], wn[:, None] & kmask[None, :], EVICT)
-        x = tl.load(x_ptr + kk, mask=kmask, other=0.0)
-        acc += w.to(tl.float32) * x[None, :].to(tl.float32)
-    h = tl.maximum(tl.sum(acc, axis=1), 0.0)
-    h = h * h
-    tl.store(h_ptr + j * I + offs_n, h.to(h_ptr.dtype.element_ty), mask=nmask)
+        # weight-load mask: off once the depth gate stopped the draft loop (zeros out)
+        wn = nmask
+        if GATED:
+            wn = nmask & (tl.load(gate_ptr) == 0)
+        if j < TOPK:
+            e = tl.load(ids_ptr + j).to(tl.int64)
+            wbase = w13_ptr + e * stride_we + offs_n[:, None].to(tl.int64) * stride_wn
+        else:
+            rows = (j - TOPK) * I + offs_n
+            wbase = ws_ptr + rows[:, None].to(tl.int64) * stride_wsn
+        acc = tl.zeros((BN, BK), dtype=tl.float32)
+        for k0 in range(0, K, BK):
+            kk = k0 + offs_k
+            kmask = kk < K
+            w = _load_w(wbase + kk[None, :], wn[:, None] & kmask[None, :], EVICT)
+            x = tl.load(x_ptr + kk, mask=kmask, other=0.0)
+            acc += w.to(tl.float32) * x[None, :].to(tl.float32)
+        h = tl.maximum(tl.sum(acc, axis=1), 0.0)
+        h = h * h
+        tl.store(h_ptr + j * I + offs_n, h.to(h_ptr.dtype.element_ty), mask=nmask)
 
 
 @triton.jit
@@ -755,6 +769,7 @@ def mtp_moe_row(
         BK=_MOE_UP_BK,
         gate_ptr=gate,
         GATED=gated,
+        LATE_TOP2=_STAGE_ROUTED,
         num_warps=_MOE_UP_WARPS,
         num_stages=_MOE_UP_STAGES,
         launch_pdl=mtp_pdl(),

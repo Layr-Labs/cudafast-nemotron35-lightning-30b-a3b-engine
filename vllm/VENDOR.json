@@ -210,6 +210,22 @@
     {
       "file": "harness/kernels/l2pf/py/__init__.py",
       "why": "Carry useful04706ad7-c4e8-44b9-b8ba-77f14d8b8adf MoE-window immutable prefetch default6to12MB. Its complete official2.19195352041462 is within0.1% of fulla484, but only budget mechanism is combined here on higherfulla484. Prefix pair/SSM combination unverified."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_kernels.py, harness/kernels/pzskip/csrc/pzskip.cu, vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
+      "why": "Tuning only. MTP_DEPTH_THETA default 0.4 -> 0.5 (the confidence gate stops drafting at a higher top-1 probability; drafts only, the target decides every token). pzskip config 333 (32-row blocks, 384 columns, 2 k16 groups per stage, 3 stages) replaces 322 as the prefill default: same arithmetic, load-time bitwise check per layer with fallback."
+    },
+    {
+      "file": "harness/kernels/marlinx/csrc/marlinx.cu;py/__init__.py;vllm/model_executor/models/nemotron_shared_chain.py;nemotron_h.py",
+      "why": "NEWcurrent-call shared-up/ReLU2/mask/down chain. OriginalBF16 GEMMround/F32ReLU2/BF16 output preserved; warp0ballotsproduceone16featureunionperupgroup withoutatomics. Downreads232preparedmasks intooriginalsharedzmask, preservingallorderedK/dequant/MMA/reduction. OptionalM5existingverifycountlimitsunion andzerosinvaliddownoperands/outputs; coherentcount/maskloadsafterPDLwait. Fullmaskandprefixseparateper-layerbitadmissionagainststockMarlin atofficialload, failedfulloriginalMLP, failedprefixfullmaskchain. No activations cachedacrossrequests."
+    },
+    {
+      "file": "harness/kernels/marlinx/build.sh",
+      "why": "Select reviewedc8ff4551-1e29-4a0c-b46b-ffd6bb624c65 fourfeature-buildfallback structure(8d614fd9dbe02708dd4497fab3b6b5590907bd10), substituting MASKSfeatureforSEGMENTS. PreservePDL ifnewmaskbuildfails, thenmask/noPDL, thenlegacy. Freshnonemptyoutput pluscompilerstatus; no c8ffsegmentedkernels/source selected."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_kernels.py",
+      "why": "Experimental draft-only device-stage routed expert budget: original top3 for first two kept proposals, top2 for active later suffix; explicit zero third-slot up skips its BF16 stream and existing zero-load down omits matching weights. Graph shape, target six experts, confidence lifecycle and weights remain unchanged. MTP_STAGE_ROUTED=0 restores original."
     }
   ]
 }

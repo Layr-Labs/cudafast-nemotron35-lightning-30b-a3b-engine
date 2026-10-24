@@ -45,6 +45,7 @@ SCREEN_CHUNK = 2048
 SCREEN_PER = 32
 CASCADE_FRAC_GROUPS = 32
 CASCADE_PER = 256
+SCREEN_SLOTS = 8
 
 
 def screen_enabled() -> bool:
@@ -235,20 +236,31 @@ class DraftHeadScreen:
         self.graph = None
         self._h = torch.empty(k, dtype=torch.float32, device=device)
         self._out = torch.empty(1, dtype=torch.int64, device=device)
+        self.slots = torch.empty(SCREEN_SLOTS, dtype=torch.int64, device=device)
+        self._slot_graphs: list[torch.cuda.CUDAGraph | None] = [None] * SCREEN_SLOTS
         if device.type == "cuda" and screen_graph_enabled():
             try:
                 self._h.zero_()
                 for _ in range(2):
                     self._out.copy_(self._greedy_row(self._h))
                 torch.cuda.synchronize(device)
+                pool = torch.cuda.graph_pool_handle()
                 self.graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(
-                    self.graph, pool=torch.cuda.graph_pool_handle()
-                ):
+                with torch.cuda.graph(self.graph, pool=pool):
                     self._out.copy_(self._greedy_row(self._h))
-                torch.cuda.synchronize(device)
+                for slot in range(SCREEN_SLOTS):
+                    dst = self.slots[slot : slot + 1]
+                    for _ in range(2):
+                        dst.copy_(self._greedy_row(self._h))
+                    torch.cuda.synchronize(device)
+                    g = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(g, pool=pool):
+                        dst.copy_(self._greedy_row(self._h))
+                    torch.cuda.synchronize(device)
+                    self._slot_graphs[slot] = g
             except Exception as exc:
                 self.graph = None
+                self._slot_graphs = [None] * SCREEN_SLOTS
                 logger.warning("MTP draft-head screen graph disabled: %s", exc)
         logger.info(
             "MTP draft-head screen: %d of %d groups, %d candidates, cascade=%s, graph=%s",
@@ -299,10 +311,27 @@ class DraftHeadScreen:
     def greedy(self, hidden: torch.Tensor) -> torch.Tensor:
         """Draft ids [B] for hidden [B, K] (B is small; one pass per row)."""
         if self.graph is not None and hidden.shape[0] == 1:
-            self._h.copy_(hidden[0].float())
+            self._h.copy_(hidden[0])
             self.graph.replay()
             return self._out.clone()
         out = []
         for i in range(hidden.shape[0]):
             out.append(self._greedy_row(hidden[i].float().contiguous()))
         return torch.stack(out)
+
+    def greedy_into(self, hidden: torch.Tensor, slot: int) -> torch.Tensor:
+        """Draft id for the single row hidden[0], left in slots[slot:slot + 1].
+
+        The id lands in the buffer the next step reads, so the caller neither
+        clones it nor stacks the per-step results. Same arithmetic as
+        `greedy`: the capture holds `_greedy_row` verbatim, and the fallback
+        runs it eagerly into the same slot.
+        """
+        dst = self.slots[slot : slot + 1]
+        graph = self._slot_graphs[slot] if 0 <= slot < SCREEN_SLOTS else None
+        if graph is not None and hidden.shape[0] == 1:
+            self._h.copy_(hidden[0])
+            graph.replay()
+            return dst
+        dst.copy_(self._greedy_row(hidden[0].float().contiguous()))
+        return dst

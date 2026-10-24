@@ -432,10 +432,14 @@ class SpecDecodeBaseProposer:
 
         self.cudagraph_dispatcher.initialize_cudagraph_keys(eagle_cudagraph_mode)
 
-    def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _greedy_sample(
+        self, hidden_states: torch.Tensor, slot: int | None = None
+    ) -> torch.Tensor:
         """Greedy-sample draft tokens from hidden states."""
         screen = getattr(self, "_draft_head_screen", None)
         if screen is not None:
+            if slot is not None:
+                return screen.greedy_into(hidden_states, slot)
             return screen.greedy(hidden_states)
         if self.use_local_argmax_reduction:
             return self.model.get_top_tokens(hidden_states)
@@ -479,9 +483,10 @@ class SpecDecodeBaseProposer:
         self,
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata,
+        slot: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if not self._enable_probabilistic_draft_probs or sampling_metadata.all_greedy:
-            return self._greedy_sample(hidden_states), None
+            return self._greedy_sample(hidden_states, slot), None
         logits = self.model.compute_logits(hidden_states)
         if self.use_heterogeneous_vocab:
             assert self.vocab_mapping is not None
@@ -532,6 +537,13 @@ class SpecDecodeBaseProposer:
         self.num_speculative_tokens = num_speculative_tokens
         self._last_draft_probs = None
         batch_size = common_attn_metadata.batch_size()
+        screen = getattr(self, "_draft_head_screen", None)
+        slot_ids = (
+            screen is not None
+            and hasattr(screen, "greedy_into")
+            and batch_size == 1
+            and 1 < self.num_speculative_tokens <= len(screen.slots)
+        )
 
         if self.method in ("eagle3", "dflash"):
             model = self.model
@@ -668,7 +680,7 @@ class SpecDecodeBaseProposer:
             self.positions[:batch_size] = positions
 
         draft_token_ids, draft_probs = self._sample_draft_tokens(
-            sample_hidden_states, sampling_metadata
+            sample_hidden_states, sampling_metadata, 0 if slot_ids else None
         )
         draft_probs_list = None if draft_probs is None else [draft_probs]
 
@@ -731,8 +743,11 @@ class SpecDecodeBaseProposer:
         for token_index in range(self.num_speculative_tokens - 1):
             # Update the inputs.
             # cast to int32 is crucial when eagle model is compiled.
-            # tensor.argmax() returns int64 by default.
-            input_ids = draft_token_ids_list[-1].int()
+            input_ids = (
+                draft_token_ids_list[-1].int()
+                if self.supports_mm_inputs
+                else draft_token_ids_list[-1]
+            )
 
             if self.use_heterogeneous_vocab:
                 # Map target token IDs to draft vocab space (TLI algorithm)
@@ -810,7 +825,9 @@ class SpecDecodeBaseProposer:
 
             hidden_states = hidden_states[:batch_size]
             draft_token_ids, draft_probs = self._sample_draft_tokens(
-                last_hidden_states[:batch_size], sampling_metadata
+                last_hidden_states[:batch_size],
+                sampling_metadata,
+                token_index + 1 if slot_ids else None,
             )
             if draft_probs is not None:
                 assert draft_probs_list is not None
@@ -821,7 +838,12 @@ class SpecDecodeBaseProposer:
             set_moe_row_src(max(num_input_tokens, input_batch_size), None)
 
         # [batch_size, num_speculative_tokens]
-        draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
+        if slot_ids and draft_probs_list is None:
+            draft_token_ids = screen.slots[: self.num_speculative_tokens].clone().view(
+                batch_size, self.num_speculative_tokens
+            )
+        else:
+            draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
         if draft_probs_list is not None:
             self._last_draft_probs = torch.stack(draft_probs_list, dim=1).contiguous()
         return draft_token_ids

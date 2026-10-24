@@ -1,30 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Greedy draft-token head for the Nemotron-H MTP drafter: partial-K screen
-plus a full-K rescore of the survivors.
+"""Greedy draft-token head for the Nemotron-H MTP drafter: cascaded partial-K
+screens plus a full-K rescore of the survivors.
 
 DRAFTER ONLY. The target's lm_head, logits and verification are untouched;
 the drafter's lm_head is the target's shared NVFP4 head (131072 x 2688, about
 198 MB), and the drafter reads all of it three times per depth-3 cycle only to
 take one argmax per draft. This replaces that argmax:
 
-1. screen: score every vocabulary row on a fixed subset of the hidden
-   dimensions (whole NVFP4 16-element groups, chosen at load time from the
-   weights alone: the groups with the largest sum over k of
-   final_norm_gamma[k]^2 * ||W[:, k]||^2), in fp32;
-2. keep the top SCREEN_PER rows of every SCREEN_CHUNK-row chunk;
-3. rescore those rows on the full K in fp32, round to bf16 as the stock head
+1. screen every vocabulary row on the 32 most important whole NVFP4
+   16-element groups, chosen once from weight-only importance, in fp32;
+2. keep the top CASCADE_PER rows of every SCREEN_CHUNK-row chunk;
+3. rescore those candidates on the original 64 importance groups and keep
+   the top SCREEN_PER candidates of each original chunk;
+4. rescore those rows on the full K in fp32, round to bf16 as the stock head
    does, and take the maximum with the lowest token id among equals (the rule
    torch.argmax applies to the stock bf16 logits).
 
+Importance is sum over k of final_norm_gamma[k]^2 * ||W[:, k]||^2. Both group
+sets are selected by importance rank before being sorted back into K order.
 The screen and the full copy are built once from the pinned checkpoint's own
 lm_head tensors (raw NVFP4 bytes, fp8 group scales, fp32 global scale): an
 input-independent load-time repack, no format change, no new weights. The
-proposal can differ from the stock head's argmax only when the stock argmax
-falls outside the survivors or when a bf16 tie resolves differently; both
-only change which draft is proposed. The target's verification still decides
+proposal can differ when either screen removes a candidate or the rescore's
+different fp32 accumulation changes rounded logits. The target's verification decides
 every committed token, and the timed window is still checked against its oracle.
 
+VLLM_MTP_SCREEN_CASCADE=0 restores the original 64-group single screen.
 VLLM_MTP_SCREEN=0 restores the stock head.
 """
 
@@ -41,6 +43,8 @@ logger = init_logger(__name__)
 SCREEN_FRAC_GROUPS = 64  # of 168 groups: 1024 of 2688 hidden dims (512 bytes per row)
 SCREEN_CHUNK = 2048
 SCREEN_PER = 32
+CASCADE_FRAC_GROUPS = 32
+CASCADE_PER = 256
 
 
 def screen_enabled() -> bool:
@@ -136,6 +140,10 @@ class DraftHeadScreen:
         ng = k // 16
         assert w.dtype == torch.uint8 and s.shape == (n, ng), (w.shape, s.shape)
         assert n % SCREEN_CHUNK == 0
+        self.cascade = os.environ.get("VLLM_MTP_SCREEN_CASCADE", "1") != "0"
+        if self.cascade:
+            assert 0 < CASCADE_FRAC_GROUPS < SCREEN_FRAC_GROUPS <= ng
+            assert SCREEN_PER <= CASCADE_PER <= SCREEN_CHUNK
         # Weight-only importance of each 16-element group.
         lut = torch.tensor(
             [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6]
@@ -147,8 +155,8 @@ class DraftHeadScreen:
             vals = vals * s[r0:r0 + 16384].float().repeat_interleave(16, 1)
             colsq += (vals.double() ** 2).sum(0)
         imp = colsq if gamma is None else colsq * gamma.double() ** 2
-        groups = imp.view(ng, 16).sum(1).argsort(descending=True)[:SCREEN_FRAC_GROUPS]
-        groups = groups.sort().values
+        ranked_groups = imp.view(ng, 16).sum(1).argsort(descending=True)
+        groups = ranked_groups[:SCREEN_FRAC_GROUPS].sort().values
         cols = (groups[:, None] * 16 + torch.arange(16)[None, :]).reshape(-1)
         self.gscale = g
         self.n = n
@@ -157,6 +165,22 @@ class DraftHeadScreen:
         self.w_scr = w.view(n, ng, 8)[:, groups, :].reshape(n, -1).to(device).contiguous()
         self.s_scr = s[:, groups].to(device).contiguous()
         self.cols = cols.to(device)
+        if self.cascade:
+            # Select by importance rank, not the first half of K-sorted groups.
+            coarse_groups = ranked_groups[:CASCADE_FRAC_GROUPS].sort().values
+            coarse_cols = (
+                coarse_groups[:, None] * 16 + torch.arange(16)[None, :]
+            ).reshape(-1)
+            self.w_coarse = (
+                w.view(n, ng, 8)[:, coarse_groups, :]
+                .reshape(n, -1).to(device).contiguous()
+            )
+            self.s_coarse = s[:, coarse_groups].to(device).contiguous()
+            self.coarse_cols = coarse_cols.to(device)
+            self.refine_scores = torch.empty(
+                (n // SCREEN_CHUNK) * CASCADE_PER,
+                dtype=torch.float32, device=device,
+            )
         self.chunk_off = (
             torch.arange(n // SCREEN_CHUNK, device=device) * SCREEN_CHUNK
         )[:, None]
@@ -166,8 +190,8 @@ class DraftHeadScreen:
         )
         self.big = torch.tensor(1 << 30, dtype=torch.int64, device=device)
         logger.info(
-            "MTP draft-head screen: %d of %d groups, %d candidates per draft",
-            SCREEN_FRAC_GROUPS, ng, self.cand_logits.numel(),
+            "MTP draft-head screen: %d of %d groups, %d candidates, cascade=%s",
+            SCREEN_FRAC_GROUPS, ng, self.cand_logits.numel(), self.cascade,
         )
 
     def greedy(self, hidden: torch.Tensor) -> torch.Tensor:
@@ -175,12 +199,34 @@ class DraftHeadScreen:
         out = []
         for i in range(hidden.shape[0]):
             h = hidden[i].float().contiguous()
-            hs = h.index_select(0, self.cols)
-            _rows_dot(hs, self.w_scr, self.s_scr, None, self.gscale, self.scores, False)
-            cand = (
-                self.scores.view(-1, SCREEN_CHUNK).topk(SCREEN_PER, dim=-1).indices
-                + self.chunk_off
-            ).reshape(-1)
+            if self.cascade:
+                hc = h.index_select(0, self.coarse_cols)
+                _rows_dot(
+                    hc, self.w_coarse, self.s_coarse, None,
+                    self.gscale, self.scores, False,
+                )
+                coarse_cand = (
+                    self.scores.view(-1, SCREEN_CHUNK)
+                    .topk(CASCADE_PER, dim=-1).indices + self.chunk_off
+                )
+                hs = h.index_select(0, self.cols)
+                _rows_dot(
+                    hs, self.w_scr, self.s_scr, coarse_cand.reshape(-1),
+                    self.gscale, self.refine_scores, True,
+                )
+                # Scores retain the [original chunk, coarse candidate] layout.
+                # Gather global IDs; adding chunk_off here would offset twice.
+                refined = self.refine_scores.view(-1, CASCADE_PER).topk(
+                    SCREEN_PER, dim=-1
+                ).indices
+                cand = coarse_cand.gather(1, refined).reshape(-1)
+            else:
+                hs = h.index_select(0, self.cols)
+                _rows_dot(hs, self.w_scr, self.s_scr, None, self.gscale, self.scores, False)
+                cand = (
+                    self.scores.view(-1, SCREEN_CHUNK).topk(SCREEN_PER, dim=-1).indices
+                    + self.chunk_off
+                ).reshape(-1)
             _rows_dot(h, self.w_full, self.s_full, cand, self.gscale, self.cand_logits, True)
             v = self.cand_logits.to(torch.bfloat16)
             best = v.max()

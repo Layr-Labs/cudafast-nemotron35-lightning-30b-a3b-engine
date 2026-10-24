@@ -8,7 +8,7 @@ the drafter's lm_head is the target's shared NVFP4 head (131072 x 2688, about
 198 MB), and the drafter reads all of it three times per depth-3 cycle only to
 take one argmax per draft. This replaces that argmax:
 
-1. screen every vocabulary row on the 32 most important whole NVFP4
+1. screen every vocabulary row on the CASCADE_FRAC_GROUPS most important whole NVFP4
    16-element groups, chosen once from weight-only importance, in fp32;
 2. keep the top CASCADE_PER rows of every SCREEN_CHUNK-row chunk;
 3. rescore those candidates on the original 64 importance groups and keep
@@ -43,7 +43,7 @@ logger = init_logger(__name__)
 SCREEN_FRAC_GROUPS = 64  # of 168 groups: 1024 of 2688 hidden dims (512 bytes per row)
 SCREEN_CHUNK = 2048
 SCREEN_PER = 32
-CASCADE_FRAC_GROUPS = 32
+CASCADE_FRAC_GROUPS = 16
 CASCADE_PER = 256
 
 

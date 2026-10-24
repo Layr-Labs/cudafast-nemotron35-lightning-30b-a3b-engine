@@ -94,6 +94,10 @@
     {
       "file": "vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py, vllm/model_executor/layers/fused_moe/moe_align_block_size.py (opt-in)",
       "why": "smallk's fused sigmoid top-k + moe_align kernel (bit-identical to ops.grouped_topk and the two align kernels for <= 32 ids) is off by default: the routing chain overlaps the shared-expert GEMMs, so shortening it gave no end-to-end gain (SMALLK_TOPK=1 SMALLK_ALIGN=1 enable it)"
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "Research candidate narrows only the coarse native-MTP draft screen from 32 to 16 weight-only importance groups, retaining 256 survivors/chunk, 64-group refinement and full-K BF16/min-ID final selection. BB64 loop, BR64/BR16, four warps and FP32 expressions are unchanged. Byte-preserving slab/interleaved repacks were exact but slower and retired. Target and checkpoint values/formats are unchanged; proposal agreement is not guaranteed; the official oracle remains authoritative."
     }
   ]
 }

@@ -2,6 +2,8 @@
 
 Keep every nonzero ReLU2 activation, including NaNs, in original K order.
 The compact reduction has a different FP32 tree from the existing drafter.
+Supports one to six routed experts plus the original two shared experts;
+this includes the current top-three draft policy.
 Proposal quality, exact-token acceptance and throughput need remote validation.
 """
 
@@ -90,12 +92,15 @@ def maybe_down(h, packed, ids, weights, y, routed_scale):
     if not _ENABLED:
         return False
     w2, sd = packed
+    topk = ids.numel()
+    slots = topk + 2
     if (
-        h.dtype != torch.bfloat16 or h.shape != (8, 1856)
+        not 1 <= topk <= 6
+        or h.dtype != torch.bfloat16 or h.shape != (slots, 1856)
         or w2.dtype != torch.bfloat16 or w2.shape != (128, 1856, 2688)
         or sd.dtype != torch.bfloat16 or sd.shape != (2, 1856, 2688)
-        or weights.dtype != torch.float32 or weights.numel() != 6
-        or ids.dtype not in (torch.int32, torch.int64) or ids.numel() != 6
+        or weights.dtype != torch.float32 or weights.numel() != topk
+        or ids.dtype not in (torch.int32, torch.int64)
         or y.dtype != torch.bfloat16 or y.ndim != 2
         or not 1 <= y.shape[0] <= 8 or y.shape[1] != 2688
         or not all(t.is_contiguous() for t in (h, w2, sd, ids, weights, y))
@@ -105,15 +110,15 @@ def maybe_down(h, packed, ids, weights, y, routed_scale):
         return False
     indices = torch.empty(h.shape, dtype=torch.int32, device=h.device)
     values = torch.empty_like(h)
-    counts = torch.empty(8, dtype=torch.int32, device=h.device)
-    _compact[(8,)](
+    counts = torch.empty(slots, dtype=torch.int32, device=h.device)
+    _compact[(slots,)](
         h, indices, values, counts, I=1856, BLOCK=2048, num_warps=4,
         launch_pdl=mtp_pdl(),
     )
     _down[(triton.cdiv(2688, 32),)](
         indices, values, counts, w2, sd, ids, weights, y,
         M=y.shape[0], H=2688, I=1856, ROUTED_SCALE=routed_scale,
-        TOPK=6, S=2, BN=32, BK=64, num_warps=4, num_stages=2,
+        TOPK=topk, S=2, BN=32, BK=64, num_warps=4, num_stages=2,
         launch_pdl=mtp_pdl(),
     )
     return True

@@ -45,7 +45,7 @@ except ImportError:
     _pzskip = None
 PZ_ENABLED = os.environ.get("PZSKIP", "1") != "0"
 # config 322: 32-row expert blocks (sparser union masks than humming's 64-row blocks), 384 columns
-PZ_CONFIG = int(os.environ.get("PZSKIP_CONFIG", "322"))
+PZ_CONFIG = int(os.environ.get("PZSKIP_CONFIG", "333"))
 PZ_BLOCK_M = 64  # humming's prefill bucket that pzskip replaces
 PZ_MAX_TOKENS = 8192
 

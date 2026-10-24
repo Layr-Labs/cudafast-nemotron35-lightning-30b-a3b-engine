@@ -210,6 +210,30 @@
     {
       "file": "harness/kernels/l2pf/py/__init__.py",
       "why": "Carry useful04706ad7-c4e8-44b9-b8ba-77f14d8b8adf MoE-window immutable prefetch default6to12MB. Its complete official2.19195352041462 is within0.1% of fulla484, but only budget mechanism is combined here on higherfulla484. Prefix pair/SSM combination unverified."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_kernels.py, harness/kernels/pzskip/csrc/pzskip.cu, vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
+      "why": "Tuning only. MTP_DEPTH_THETA default 0.4 -> 0.5 (the confidence gate stops drafting at a higher top-1 probability; drafts only, the target decides every token). pzskip config 333 (32-row blocks, 384 columns, 2 k16 groups per stage, 3 stages) replaces 322 as the prefill default: same arithmetic, load-time bitwise check per layer with fallback."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp.py;nemotron_h_mtp_kernels.py;nemotron_h_mtp_packed.py",
+      "why": "Select only3d51cab6-7079-4fb2-98e4-f2a238077897 exactC2losslessBF16storage and maskedPDLcomputedrafter code. Baselineentire927, no oldwhole3d/F3e, no oldF3etop2/startnorm. Exhaustivebitvalidationbeforefreedsource; originalBF16mathformats restoredinregister. Fullofficialremotevalidationrequired."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_compact.py",
+      "why": "NEWenableexistingorderednonzero drafterdowncompactionfor1..6routed+2shared experts, includingactualdefaulttop3. Previousguard acceptedonly6routed so currenttop3fellthrough. Originalorderedpacking/reductionmath retained, graph shapesstatic, finite BF16transpose fallback andMTP_RELU2_COMPACT control retained. Proposalreductiontreecanchangevsfallback; remoteoracle decides."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_packed.py:load_packed",
+      "why": "NEWmetadata-firstrawescape bypass: RI first, SM/EX/BASE reads onlyon codednonrawweights; rawescapedblocksreadonlyRAW aftermetadata. Originalbitreconstruction/maskedinvalid/GATEDPDL preserved. Remoteexhaustivedecodercheck stillrunsbeforefreeingBF16source. Savingsdependescape distribution, measuredgainunknown."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp.py;nemotron_h_mtp_packed.py",
+      "why": "NEWpackactive projected EHhiddenhalf(2688x2688), notunusedfulleh_proj. Buildonlyafteroriginaltable/bf16halfready, exhaustivebitvalidation, retainedBF16fallback; one-rowpackedkeepGEMV consumes originalBF16bits/FP32tree withnormalcachehint. Otherrowshapescall originalkeep op. hpart BF16round beforeoriginalF32tableadd unchanged. FullEHmatrix/tableunchanged, no memoryreductionclaimforretainedfallback, no localexecution."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py;nemotron_h_mtp_kernels.py(routertail)",
+      "why": "Select usefulpendingf1262849-e1cf-49ac-aa8c-4ed615b4382a screenfolds androutertail only, sourcea335badfdff3fb3e729340f24421abe08d779558. Exactscreenfile with remoteperstagebitcheck/fallback, exactnewrouterkernel+sortfallback andM1gathercut. Whole51aa/PZ333/theta0.5+C2/EHhalf/compact retained. No wholef126, Inductoroverride/lazyanchor/targetattnpack/gatefixup copied. Newcombinationunverified."
     }
   ]
 }

@@ -71,9 +71,17 @@ def _start_projection(
     if embeds_projected:
         # W_h (14.5 MB) is read by every draft pass of a cycle; ordinary loads
         # let it stay in L2 between passes while the rest stream evict-first.
-        h_part = torch.ops.vllm.mtp_small_linear_keep(
-            previous_hidden_states_normed, layer.eh_w_h
-        )
+        if hasattr(layer, "_mtp_eh_pk_sm"):
+            h_part = torch.ops.vllm.mtp_packed_linear_keep(
+                previous_hidden_states_normed,
+                layer._mtp_eh_pk_sm, layer._mtp_eh_pk_ex,
+                layer._mtp_eh_pk_base, layer._mtp_eh_pk_ri, layer._mtp_eh_pk_raw,
+                layer.eh_w_h.shape[0], layer.eh_w_h.shape[1], layer.eh_w_h,
+            )
+        else:
+            h_part = torch.ops.vllm.mtp_small_linear_keep(
+                previous_hidden_states_normed, layer.eh_w_h
+            )
         return (h_part.float() + inputs_embeds).to(h_part.dtype)
     inputs_embeds_normed = layer.enorm(inputs_embeds)
     # Fuse via concatenation and linear projection
@@ -411,6 +419,9 @@ class NemotronHMultiTokenPredictor(nn.Module):
             torch.backends.cuda.matmul.allow_tf32 = tf32
         del w_e
         layer.register_buffer("eh_w_h", w[:, hidden:].contiguous(), persistent=False)
+        from .nemotron_h_mtp_packed import prepare_eh_hidden_packed
+
+        prepare_eh_hidden_packed(layer)
         self.register_buffer("eh_table", table, persistent=False)
         return True
 
@@ -509,6 +520,9 @@ class NemotronHMTP(nn.Module, SupportsPP):
 
     def process_weights_after_loading(self) -> None:
         prepare_mtp_relu2(self.model)
+        from .nemotron_h_mtp_packed import prepare_mtp_packed
+
+        prepare_mtp_packed(self.model)
 
     def prepare_draft_head_screen(self):
         """The drafter's greedy head over the shared NVFP4 lm_head (see

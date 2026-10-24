@@ -932,14 +932,16 @@ class NemotronHForCausalLM(
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
-    def set_last_moe_row_src(self, row_src: torch.Tensor | None) -> bool:
+    def set_last_moe_row_src(
+        self, row_src: torch.Tensor | None, *, last_tile_only: bool = False
+    ) -> bool:
         """Route every row of the last layer's MoE through row `row_src` (a
         1-element GPU index tensor), or restore per-row routing with None.
 
-        Only for a forward whose caller reads that row of the output alone.
-        The last MoE layer is the model's last layer, so its output reaches
-        only norm_f, a per-row RMSNorm. Returns False when the last layer is
-        not an MoE on this rank.
+        The target reads that row after per-row norm_f; other final hidden
+        rows can still feed the drafter. last_tile_only is reserved for
+        FreshPrefillGraph's M496/row-495 call. Returns False when the last
+        layer is not an MoE on this rank.
         """
         # A tuple, so nn.Module does not register the runner a second time.
         cached = getattr(self, "_last_moe_runner", None)
@@ -957,6 +959,12 @@ class NemotronHForCausalLM(
         if runner is None:
             return False
         runner.keep_m_row_src = row_src
+        # Only the fresh M496 graph requests this mode: its selected row
+        # is 495. Other callers retain full-M expert evaluation. Clearing
+        # row_src also clears the mode, including on capture exceptions.
+        runner.routed_experts.prefill_last_tile_only = (
+            row_src is not None and last_tile_only
+        )
         return True
 
     def forward(

@@ -21,6 +21,7 @@ def moe_fused_mul_sum_kernel(
     size: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    MIN_OUTPUT_ROW: tl.constexpr,
 ):
     pid_k = tl.program_id(0)
     pid_m = tl.program_id(1)
@@ -28,7 +29,8 @@ def moe_fused_mul_sum_kernel(
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
 
-    m_mask = offs_m < num_tokens
+    output_m_mask = offs_m < num_tokens
+    m_mask = output_m_mask & (offs_m >= MIN_OUTPUT_ROW)
     k_mask = offs_k < size
     mask = m_mask[:, None] & k_mask[None, :]
 
@@ -59,7 +61,8 @@ def moe_fused_mul_sum_kernel(
     tl.store(
         out_ptrs,
         acc.to(outputs_ptr.dtype.element_ty),
-        mask=mask,
+        # Uncomputed rows are defined zeros, never uninitialized reads.
+        mask=output_m_mask[:, None] & k_mask[None, :],
     )
 
 
@@ -138,6 +141,7 @@ def moe_fused_mul_sum(
     outputs: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
     expert_map: torch.Tensor | None = None,
+    min_output_row: int = 0,
 ) -> torch.Tensor:
     """
     Fused kernel for MoE (Mixture of Experts) to perform weighted summation
@@ -167,6 +171,8 @@ def moe_fused_mul_sum(
     assert topk_weights.dtype in (torch.float32, torch.float16, torch.bfloat16)
 
     num_tokens, top_k, size = inputs.shape
+    assert 0 <= min_output_row <= num_tokens
+    assert min_output_row == 0 or expert_map is None
     output_shape = (num_tokens, size)
     if outputs is None:
         outputs = torch.empty(output_shape, dtype=inputs.dtype, device=inputs.device)
@@ -195,6 +201,7 @@ def moe_fused_mul_sum(
             size,
             BLOCK_M,
             BLOCK_K,
+            min_output_row,
             num_warps=num_warps,
             num_stages=num_stages,
         )

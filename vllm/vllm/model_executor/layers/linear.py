@@ -218,6 +218,14 @@ class UnquantizedLinearMethod(LinearMethodBase):
             from vllm.model_executor.layers.utils import dispatch_cpu_unquantized_gemm
 
             dispatch_cpu_unquantized_gemm(layer, remove_weight=True)
+        elif current_platform.is_cuda():
+            # LOCAL PATCH (cudafast-nemotron35): lossless 12-bit copy of the
+            # target attention projections for 2..8-row calls (attn_pack12.py).
+            try:
+                from vllm.model_executor.layers.attn_pack12 import maybe_pack
+            except ImportError:  # no Gluon in this Triton: keep F.linear
+                return
+            maybe_pack(layer)
 
     def apply(
         self,

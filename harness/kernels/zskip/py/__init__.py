@@ -127,7 +127,7 @@ def config_info(config: int) -> dict:
     if rc != 0:
         raise ValueError(f"zskip config {config}: {rc}")
     return {"regs": info[0], "smem": info[1], "warps": info[2], "ctas_per_sm": info[3],
-            "shape": CONFIGS.get(config) or CONFIGS4.get(config)}
+            "shape": (1, 3, 1, 16) if config in (113, 118) else CONFIGS.get(config) or CONFIGS4.get(config)}
 
 
 BI_BYTES = 5120
@@ -215,6 +215,25 @@ def repack(w2_weight: torch.Tensor, w2_weight_scale: torch.Tensor, w2_global_sca
 
 
 @torch.no_grad()
+def to_swap2(pk: Packed, chunk: int = 16) -> Packed:
+    """dadon 12f98e36: interleave paired swap tiles, preserving every weight/scale byte.
+
+    Keep pk alive for pzskip and configs 108/100. This additional input-independent
+    buffer costs about 357 MB per layer. Chunk temporaries bound load-time peak use.
+    """
+    assert pk.layout == "swap"
+    E = pk.w.shape[0]
+    W, S = torch.empty_like(pk.w), torch.empty_like(pk.s)
+    for e0 in range(0, E, chunk):
+        e1 = min(E, e0 + chunk)
+        W[e0:e1] = pk.w[e0:e1].reshape(e1-e0, K, N//128, 2, 8, 4).permute(
+            0, 1, 2, 4, 3, 5).reshape(e1-e0, K, N//2)
+        S[e0:e1] = pk.s[e0:e1].reshape(e1-e0, G, N//128, 2, 8, 8).permute(
+            0, 1, 2, 4, 3, 5).reshape(e1-e0, G, N)
+    return Packed(W, S, pk.gs, "swap2", (K*(N//2), 64, N//2, G*N, 128, N))
+
+
+@torch.no_grad()
 def to_swapc(pk: Packed) -> Packed:
     """swap -> swapc: per expert, 64-column tile and k16 group, the 16 k rows (32 bytes each) and
     the 64 scale bytes contiguous. Same bytes, input-independent."""
@@ -236,6 +255,8 @@ def down(a: torch.Tensor, sorted_ids: torch.Tensor, expert_ids: torch.Tensor, nu
     assert lib is not None, _load_error
     if config is None:
         config = 100
+    if (config in (113, 118)) != (packed.layout == "swap2"):
+        raise ValueError("configs 113/118 require swap2; legacy configs require their original layout")
     shape_m = a.shape[0]
     assert a.dtype == torch.bfloat16 and a.shape[1] == K and a.stride(1) == 1
     assert out.dtype == torch.bfloat16 and out.shape[1] == N and out.stride(1) == 1 and out.shape[0] >= shape_m

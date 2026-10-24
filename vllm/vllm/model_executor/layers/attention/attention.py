@@ -843,12 +843,16 @@ def unified_attention_with_output(
     # of the following projection's weight into L2 on a side stream while the
     # (latency-bound) attention kernel runs, then rejoin. Moves no value.
     ahead = _l2pf.AHEAD.get(layer_name) if _l2pf is not None else None
-    pf = (
-        ahead is not None
-        and query.shape[0] <= 8
-        and _l2pf.ATTN_BYTES > 0
-        and _l2pf.prefetch(ahead.weight, max_bytes=_l2pf.ATTN_BYTES)
-    )
+    pf = ahead is not None and query.shape[0] <= 8 and _l2pf.ATTN_BYTES > 0
+    if pf:
+        # A projection packed by attn_pack12 reads its 8-bit and 4-bit planes
+        # at 2..8 rows: spend the same bytes on the same leading rows of both.
+        pk_sm = getattr(ahead, "_apk12_sm", None)
+        if pk_sm is not None and query.shape[0] >= 2:
+            pf = _l2pf.prefetch(pk_sm, max_bytes=_l2pf.ATTN_BYTES * 2 // 3)
+            _l2pf.prefetch(ahead._apk12_ex, max_bytes=_l2pf.ATTN_BYTES // 3)
+        else:
+            pf = _l2pf.prefetch(ahead.weight, max_bytes=_l2pf.ATTN_BYTES)
     self.impl.forward(
         self,
         query,

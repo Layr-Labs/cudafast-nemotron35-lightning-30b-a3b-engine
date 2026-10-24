@@ -95,6 +95,15 @@ def default_unquantized_gemm(
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
 ):
+    # LOCAL PATCH (cudafast-nemotron35): target attention projections packed by
+    # layers/attn_pack12.py go through its custom op, which picks the packed
+    # small-M MMA at 2..8 rows on the real M and F.linear otherwise.
+    sm = getattr(layer, "_apk12_sm", None)
+    if sm is not None and bias is None:
+        return torch.ops.vllm.attn_pk12_linear(
+            x, sm, layer._apk12_ex, layer._apk12_base, layer._apk12_ri,
+            layer._apk12_raw, weight,
+        )
     return torch.nn.functional.linear(x, weight, bias)
 
 

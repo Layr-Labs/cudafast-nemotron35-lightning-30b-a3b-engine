@@ -161,7 +161,7 @@
     },
     {
       "file": "harness/kernels/marlinx/{csrc/marlinx.cu,py/__init__.py,README.md,tests/marlinx_zs_exact.py}",
-      "why": "Shared expert down projection (3712->2688, ReLU^2 input): read only the k rows whose activation is nonzero in some row, from a byte-preserving k-row-major copy of the Marlin weight; the lane rebuilds Marlin's exact weight word, so dequant, MMA, segments and fp32 reductions are unchanged. Bit-exact vs stock Marlin on all 23 layers (4416 synthetic + 1380 real-activation cases, CUDA graph replay). MARLINX_ZS=0 disables."
+      "why": "Shared expert down projection (3712->2688, ReLU^2 input): read only the k rows whose activation is nonzero in some row, from a byte-preserving k-row-major copy of the Marlin weight; the lane rebuilds Marlin's exact weight word, so dequant, MMA, segments and fp32 reductions are unchanged. Bit-exact vs stock Marlin on all 23 layers (4416 synthetic + 1380 real-activation cases, CUDA graph replay). MARLINX_ZS=0 disables. Optional programmatic dependent launch adds weight/scale-only ring preloads before griddepcontrol.wait (ZS preloads scales only; activation-derived masks and selected Z reads follow the wait), coherent activation reads after it, and launch_dependents before the unchanged final BF16 epilogue. No global workspace or reduction locks; the same CTA-local segment reductions, K order and fused ReLU2 rounding remain. MARLINX_PDL=0 disables; optional ABI, eager rejected-launch fallback, no retry in capture, and MARLINX_NO_PDL build fallback follow fp8small. CPU-reviewed port; CUDA compilation, byte-exact M1-8 graph/chain tests and emitted-token gates still required on Spark."
     },
     {
       "file": "vllm/model_executor/layers/fused_moe/experts/humming_zskip.py; vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py; harness/kernels/zskip",
@@ -194,6 +194,50 @@
     {
       "file": "harness/kernels/pzskip/{csrc/pzskip.cu,py/__init__.py,build.sh,tests/exact.py}, vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
       "why": "Prefill routed down only (humming block_m 64 calls, 9..8192 tokens): pzskip skips the w2 weight rows whose relu^2 input is zero in every row of humming's 64-row expert block, with zskip's fp32 chain and bf16 epilogue, so outputs are bitwise equal to humming. Load-time 496-token bitwise check per layer; on a mismatch the layer keeps config 405 / humming. PZSKIP=0 disables."
+    },
+    {
+      "file": "harness/kernels/zskip/csrc/zskip_pair.cuh, zskip.cu, py/__init__.py, build.sh; vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
+      "why": "Port dadon 12f98e36-35d1-41c0-ba8d-8fd101ffeee1 (31889a414e3f4b414b7aaca41f28daad6b4c0919) decode c113: swap2 paired 64-column tiles, one warp, ring 3. Compose fkiene bc524594 fused prep as c118, retaining c113, checked c108/c100 and all original load-time/prefill checks. Additional byte-preserving swap2 w2 copy leaves pzskip and c405 unchanged. Per-layer bitwise M4/M5/M8 guard, crowded routing and signed/empty zeros; ZSKIP_DADON=0 disables. Static CPU-only port: not CUDA-compiled, GPU-checked or timed locally."
+    },
+    {
+      "file": "harness/kernels/smallk/csrc/smallk.cu",
+      "why": "PDL ordering audit: the router GEMM, top-k, align and route kernels read their predecessor's output through pointers passed through an empty asm after griddepcontrol.wait (after_wait), with plain loads. A __restrict__ (noalias) pointer's loads may legally be moved above the wait's memory clobber, and __ldg / non-coherent loads assume the data is read-only for the whole kernel, which a PDL grid that starts before its producer has finished cannot assume. Same addresses, same values, same arithmetic."
+    },
+    {
+      "file": "vllm/model_executor/layers/mamba/ops/mamba_ssm_spec_replay.py (lazy anchor); harness/tests/mamba_spec_replay_exact.py",
+      "why": "Spec-replay verify writes the 2 MiB fp32 anchor state per Mamba layer only when the replay distance reaches T (VLLM_MAMBA_KANCHOR_T, default 8; 0 restores writing it every verify) instead of every verify, replaying the committed tokens since the anchor from the ring (ring_len >= T + 2d). One header per state row in slot 1 after the ring holds the anchor position and a 32-bit hash of the raw bits of all of that row's anchor words; a program uses its rows' headers only if they agree on the position and every row's hash equals the hash of the row it just loaded from slot 0, so any other writer of slot 0 (prefill, reference kernel) falls back to the reference relation A = P - num_accepted. Same per-token fp32 update on the same 16-bit inputs in the same order: state and outputs bit-identical; about 2/3 fewer anchor writes at depth 4"
+    },
+    {
+      "file": "vllm/model_executor/layers/attn_pack12.py",
+      "why": "Target attention only: a lossless 12-bit copy of the six attention layers' fused QKV (4608x2688) and output projection (2688x4096), used for 2..8-row calls (the depth-4 verify) through the custom op attn_pk12_linear. Codec and small-M MMA kernel carried unchanged from ArthurOstapenko b7a45bfa-1f1b-428c-b000-2f70137c65bd (MTP_PACK12); its tile (BM16/BN64/BK128, 4 warps, MMA v2) is the one ivanfioravanti b9787b23-bf9c-41eb-aab3-4342f5b4349f measured bit-identical to cuBLAS at M=2..8 on these shapes. Boot guard: every decoded bit equals the original, and the packed kernel equals F.linear bit for bit at every M in 2..8 on synthetic inputs, else the path is off for all layers. The original BF16 weights stay resident, so M=1, the 496-token prefill and every fallback keep the original cuBLAS call. ATTN_PACK12=0 restores it."
+    },
+    {
+      "file": "vllm/model_executor/layers/utils.py",
+      "why": "default_unquantized_gemm routes layers carrying attn_pack12 planes to torch.ops.vllm.attn_pk12_linear (dispatch on the real M inside the op)."
+    },
+    {
+      "file": "vllm/model_executor/layers/linear.py",
+      "why": "UnquantizedLinearMethod.process_weights_after_loading calls attn_pack12.maybe_pack on CUDA (target attention projections only; MTP prefixes excluded)."
+    },
+    {
+      "file": "vllm/model_executor/layers/attention/attention.py",
+      "why": "The l2pf attention-window prefetch reads the same 3 MB from the packed 8-bit and 4-bit planes (2:1) when the following projection is packed and the call has 2..8 rows."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "Drafter-only, bit-identical drafts: the cascaded draft screen reads h at its column indices inside the coarse and refine dot kernels (no gathered copies of h), forms the refine rows as first-stage top-k index + chunk offset and the full-K rows and the select kernel's token ids as the second stage's picks among them (no offset add, no candidate gather), and writes the token straight into the captured output (no copy): five fewer kernels per draft pass. Same elements, same row ids, same arithmetic. A load-time bitwise check of every stage against the unfolded path keeps the unfolded path on any difference; VLLM_MTP_SCREEN_FOLD=0 restores it."
+    },
+    {
+      "file": "vllm/v1/worker/gpu_model_runner.py",
+      "why": "Depth gate verify fix-up: the draft slots at or past the verify-row count become -1 and the count is reset to VROWS_ALL in one tiny kernel (barrier between the read and the reset) instead of arange/sub/compare/full_like/where plus a fill after the sampler, which never reads the count. Same integer logic; the eager path stays for any other shape."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_kernels.py",
+      "why": "Drafter-only router tail: a one-row MTP MoE call uses the row itself (row_src[0] can only be 0) instead of an index_select, and the top-_DRAFT_TOPK selection is one kernel (rank = weights above plus equal ones at a lower slot, scattered below KEEP) instead of torch.sort + slice + index_select. The same experts in the same descending order for distinct weights; MTP_TOPK_KEEP_KERNEL=0 restores the sort."
+    },
+    {
+      "file": "harness/kernels/l2pf/py/__init__.py",
+      "why": "L2PF_MOE_MB default 6 -> 12 (dadon 04706ad7-c4e8-44b9-b8ba-77f14d8b8adf, measured on f89867f): the zskip-window prefetch of the next in_proj covers 12 MB. Prefetch only; no value changes."
     }
   ]
 }

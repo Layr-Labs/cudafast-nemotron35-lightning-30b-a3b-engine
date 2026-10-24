@@ -120,6 +120,7 @@ from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.tracing import instrument
+from vllm.triton_utils import tl, triton
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
@@ -265,18 +266,41 @@ def _verify_rows_buffer(logits: torch.Tensor | None) -> torch.Tensor | None:
     return smallk.live_verify_rows(logits.device)
 
 
+@triton.jit
+def _reject_unverified_kernel(draft_ptr, out_ptr, vrows_ptr, n, reset, BLOCK: tl.constexpr):
+    # out[i] = -1 where i >= vrows - 1, else draft[i]; then vrows = reset (after the
+    # barrier, so every thread has read the old count first).
+    i = tl.arange(0, BLOCK)
+    m = i < n
+    v = tl.load(vrows_ptr)
+    d = tl.load(draft_ptr + i, mask=m, other=0)
+    tl.store(out_ptr + i, tl.where(i >= v - 1, -1, d), mask=m)
+    tl.debug_barrier()
+    tl.store(vrows_ptr, reset)
+
+
 def _reject_unverified_drafts(
     metadata: SpecDecodeMetadata, vrows: torch.Tensor
-) -> SpecDecodeMetadata:
+) -> tuple[SpecDecodeMetadata, bool]:
     """Draft slots at or past vrows - 1 set to -1 (rejected), for the one-request
     batch the depth gate serves; a larger batch never has the count lowered
-    (nemotron_h_mtp_kernels.depth_gate_begin), so it is left as is."""
+    (nemotron_h_mtp_kernels.depth_gate_begin), so it is left as is. Also returns
+    whether vrows was already reset to VROWS_ALL (by the one masking kernel; the
+    rejection sampler never reads it)."""
     if len(metadata.num_draft_tokens) != 1:
-        return metadata
+        return metadata, False
     draft = metadata.draft_token_ids
-    slot = torch.arange(draft.numel(), device=draft.device, dtype=torch.int32)
+    n = draft.numel()
+    if draft.is_cuda and draft.is_contiguous() and 0 < n <= 64 and vrows.dtype == torch.int32:
+        out = torch.empty_like(draft)
+        _reject_unverified_kernel[(1,)](
+            draft, out, vrows, n, _smallk_module().VROWS_ALL,
+            BLOCK=triton.next_power_of_2(n), num_warps=1,
+        )
+        return replace(metadata, draft_token_ids=out), True
+    slot = torch.arange(n, device=draft.device, dtype=torch.int32)
     draft = torch.where(slot >= vrows - 1, torch.full_like(draft, -1), draft)
-    return replace(metadata, draft_token_ids=draft)
+    return replace(metadata, draft_token_ids=draft), False
 
 
 def _keep_verify_rows_for(
@@ -3813,8 +3837,9 @@ class GPUModelRunner(
         # which the greedy kernel rejects, emitting row count - 1's own argmax.
         # Then every row is valid again. See nemotron_h_mtp_kernels.py.
         vrows = _verify_rows_buffer(logits)
+        vrows_reset = False
         if vrows is not None:
-            spec_decode_metadata = _reject_unverified_drafts(
+            spec_decode_metadata, vrows_reset = _reject_unverified_drafts(
                 spec_decode_metadata, vrows
             )
         sampler_output = self.rejection_sampler(
@@ -3823,7 +3848,7 @@ class GPUModelRunner(
             logits,
             sampling_metadata,
         )
-        if vrows is not None:
+        if vrows is not None and not vrows_reset:
             vrows.fill_(_smallk_module().VROWS_ALL)
         return sampler_output
 

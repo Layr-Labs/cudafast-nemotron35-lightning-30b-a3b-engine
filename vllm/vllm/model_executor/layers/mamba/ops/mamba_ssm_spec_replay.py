@@ -12,9 +12,10 @@ writes per Mamba layer per verify, of which ``d`` x 2 MiB are never read.
 
 This kernel computes the same thing with one state read and one state write:
 
-* Slot 0 is the anchor. It always holds the state after token 0 of the
-  previous verify, which is exactly what the reference leaves in slot 0 (and,
-  after a prefill, the prefill's final state, also as in the reference).
+* Slot 0 is the anchor. With the lazy anchor off it always holds the state
+  after token 0 of the previous verify, which is exactly what the reference
+  leaves in slot 0 (and, after a prefill, the prefill's final state, also as in
+  the reference); with it on, see "Lazy anchor" below.
 * Slot 1's first ~145 KB hold a ring of the raw kernel inputs (x, B, dt; the
   16-bit values the reference loads) of tokens 1..d of every verify, indexed by
   absolute token position mod ``ring_len``. ``ring_len >= 2d + 1`` makes the
@@ -38,6 +39,31 @@ code path reads those slots in mamba_cache_mode "none" except the reference
 kernel's next-verify load, which this kernel replaces.
 
 ``VLLM_MAMBA_SPEC_REPLAY=0`` restores the reference kernel.
+
+Lazy anchor (K-anchor). Writing the 2 MiB anchor every verify is most of this
+kernel's DRAM traffic. With ``T = VLLM_MAMBA_KANCHOR_T`` (default 8, 0 = off)
+a verify writes it only when the replay distance reaches T; in between the
+anchor keeps an older state and the next verify replays every committed token
+since it from the ring (token 0 is stored in the ring too). It keeps a header
+per state row in slot 1 after the ring: the anchor's absolute
+position A and a 32-bit hash of the raw bits of all dstate words of the row's
+anchor (``_kanchor_row_hash``). A program uses its rows' headers only if they
+all hold the same A, every row's hash equals the hash of the row it just loaded
+from slot 0 and 1 <= P - A <= T + d (P = position of token 0); per-row headers
+keep this independent of BLOCK_SIZE_M. Hashing every word (not a few raw words)
+means a later writer of slot 0 (a new request's prefill reusing the slot) is
+rejected even if some state columns repeat, e.g. constant or zero columns. Otherwise
+slot 0 was last
+written by another path (a prefill or the reference kernel) and the program
+falls back to the reference relation A = P - num_accepted and writes the
+anchor. So the prefill paths need no change. The anchor and header are
+written iff the header is invalid or P - A >= T, so a replay covers at most
+T + d - 1 tokens; ``ring_len >= T + 2d`` keeps the replayed positions
+(A+1..P-1) disjoint from the written ones (P..P+d). Replayed tokens use the
+same per-token update on the same 16-bit ring values in the same order, so
+the state and every output stay bit-identical. Each program reads and writes only
+its own rows' headers and slice, so no program reads what another program of
+the same launch writes.
 """
 
 import os
@@ -82,9 +108,80 @@ def _pdl_enabled() -> bool:
     return _PDL
 
 
+_KANCHOR_OFF = False
+# Set after the first successful lazy-anchor launch: from then on slot 0 may hold an
+# older anchor, which the anchor-every-verify kernel cannot replay from, so a later
+# failure must not fall back.
+_KANCHOR_LAUNCHED = False
+
+
+def _kanchor_disable(exc: Exception) -> None:
+    global _KANCHOR_OFF
+    _KANCHOR_OFF = True
+    import logging
+
+    logging.getLogger(__name__).warning(
+        "spec replay: lazy anchor unavailable (%r); writing the anchor every verify", exc
+    )
+
+
+def kanchor_t() -> int:
+    """Lazy-anchor replay distance T (VLLM_MAMBA_KANCHOR_T, default 8; < 2 is
+    off: the anchor is written every verify)."""
+    if _KANCHOR_OFF:
+        return 0
+    try:
+        t = int(os.environ.get("VLLM_MAMBA_KANCHOR_T", "8"))
+    except ValueError:
+        return 0
+    return t if t >= 2 else 0
+
+
+# Words per state row kept in that row's header after A: the row hash.
+KANCHOR_HDR_WORDS = 1
+
+
+@triton.jit
+def _kanchor_row_hash(state, offs_n, dstate):
+    # 32-bit fingerprint of each row's raw fp32 bits over all dstate columns:
+    # per-word mix with its column index, then a wrapping sum (order-free).
+    # Integer ops on a bitcast copy; no float value is touched.
+    u = state.to(tl.uint32, bitcast=True)
+    k = offs_n.to(tl.uint32) * 0x9E3779B9
+    h = (u ^ k[None, :]) * 0x85EBCA6B
+    h = h ^ (h >> 16)
+    h = h * 0xC2B2AE35
+    h = h ^ (h >> 13)
+    h = tl.where((offs_n < dstate)[None, :], h, 0)
+    return tl.sum(h, axis=1).to(tl.int32, bitcast=True)
+
+
 def spec_replay_ring_len(num_spec: int) -> int:
-    """Ring entries per request: any value >= 2 * num_spec + 1 is hazard-free."""
-    return 2 * (num_spec + 1)
+    """Ring entries per request: any value >= 2 * num_spec + 1 is hazard-free,
+    and >= T + 2 * num_spec with the lazy anchor."""
+    t = kanchor_t()
+    base = 2 * (num_spec + 1)
+    return max(base, t + 2 * num_spec) if t else base
+
+
+def kanchor_plan(
+    t: int,
+    num_spec: int,
+    ring_len: int,
+    nheads: int,
+    dim: int,
+    ngroups: int,
+    dstate: int,
+) -> tuple[int, int, int]:
+    """(T, header offset in 32-bit words within a slot, max replayed tokens)
+    for the lazy anchor, or (0, 0, 0) if it cannot serve this shape."""
+    if t < 2 or KANCHOR_HDR_WORDS > dstate or ring_len < t + 2 * num_spec:
+        return 0, 0, 0
+    ring_halves = ring_len * spec_replay_ring_elems(nheads, dim, ngroups, dstate)
+    hdr_off = ((ring_halves + 1) // 2 + 31) // 32 * 32
+    if hdr_off + nheads * dim * (1 + KANCHOR_HDR_WORDS) > nheads * dim * dstate:
+        return 0, 0, 0
+    return t, hdr_off, t + num_spec - 1
 
 
 def spec_replay_ring_elems(nheads: int, dim: int, ngroups: int, dstate: int) -> int:
@@ -107,6 +204,7 @@ def _selective_scan_update_spec_replay_kernel(
     # Pointers to matrices
     state_ptr,
     ring_ptr,
+    hdr_ptr,
     x_ptr,
     dt_ptr,
     dt_bias_ptr,
@@ -130,6 +228,7 @@ def _selective_scan_update_spec_replay_kernel(
     nheads_ngroups_ratio,
     ngroups,
     ring_len,
+    hdr_off,
     # Strides
     stride_state_batch,
     stride_state_head,
@@ -176,6 +275,9 @@ def _selective_scan_update_spec_replay_kernel(
     HG_RATIO: tl.constexpr = 0,
     CONST_DIV: tl.constexpr = False,
     launch_pdl: tl.constexpr = False,
+    KANCHOR_T: tl.constexpr = 0,
+    RMAX: tl.constexpr = 0,
+    HDR_WORDS: tl.constexpr = 1,
 ):
     # The dt/A of a head are scalars (stride-0 expansion over head_dim); that is
     # the only layout the Mamba2 decode path produces and the only one the
@@ -260,35 +362,92 @@ def _selective_scan_update_spec_replay_kernel(
         D_ptr += pid_h * stride_D_head
         D_ptrs = D_ptr + offs_m * stride_D_dim
 
-    # Replay the accepted tokens 1..num_replay of the previous verify: the
-    # reference's state update on the reference's inputs, no outputs.
-    for i_r in range(num_replay):
-        # Non-negative even for garbage metadata (dummy runs), so the address
-        # always stays inside slot 1's ring.
-        ring_pos = ((pos0 - num_replay + i_r) % rl + rl) % rl
-        x = tl.load(
-            ring_x_base + ring_pos * ring_stride_x + offs_m,
-            mask=(offs_m < dim) & ring_ok,
-            other=0.0,
-        ).to(tl.float32)
-        dt = tl.load(
-            ring_dt_base + ring_pos * ring_stride_dt, mask=ring_ok, other=0.0
-        ).to(tl.float32)
-        if HAS_DT_BIAS:
-            dt += tl.load(dt_bias_ptr).to(tl.float32)
-        if DT_SOFTPLUS:
-            dt = softplus(dt)
-        A = tl.load(A_ptr).to(tl.float32)
-        dA = fast_exp(A * dt)  # scalar, not a matrix
+    # The anchor is written by token 0 below; the lazy anchor may skip it.
+    write_anchor = True
+    if KANCHOR_T > 0:
+        # One header per state row in slot 1, after the ring: [A, hash of
+        # the row's anchor when A was written] (HDR_WORDS = 1 word after A).
+        # Rows, not programs, so the check does not depend on BLOCK_SIZE_M.
+        slot0_ok = state_batch_idx != null_block_id
+        row_ok = (offs_m < dim) & ring_ok
+        hdr_rows = (
+            hdr_ptr
+            + ring_batch_idx * stride_state_batch
+            + hdr_off
+            + (pid_h * dim + offs_m) * (1 + HDR_WORDS)
+        )
+        hdr_pos = tl.load(hdr_rows, mask=row_ok, other=0).to(tl.int64)
+        hdr_hash = tl.load(hdr_rows + 1, mask=row_ok, other=0)
+        row_hash = _kanchor_row_hash(state, offs_n, dstate)
+        differ = tl.where(offs_m < dim, hdr_hash != row_hash, False).to(tl.int32)
+        same = tl.sum(differ, axis=0) == 0
+        lo = tl.min(tl.where(offs_m < dim, hdr_pos, 1 << 40), axis=0)
+        hi = tl.max(tl.where(offs_m < dim, hdr_pos, -(1 << 40)), axis=0)
+        gap = pos0 - hi
+        valid = ring_ok & slot0_ok & same & (lo == hi) & (gap >= 1) & (gap <= RMAX + 1)
+        # Invalid header: slot 0 holds the state after P - num_accepted, as
+        # in the reference; write the anchor so the header becomes valid.
+        num_replay = tl.where(valid, gap - 1, tl.minimum(num_replay, RMAX))
+        write_anchor = (~valid) | (gap >= KANCHOR_T)
+        # Replay the committed tokens A+1..P-1 from the ring with the
+        # reference's state update; unrolled with masked loads so the ring
+        # reads are issued together, and an inactive step keeps the state.
+        for i_r in tl.static_range(RMAX):
+            act = num_replay > i_r
+            ring_pos = ((pos0 - num_replay + i_r) % rl + rl) % rl
+            x = tl.load(
+                ring_x_base + ring_pos * ring_stride_x + offs_m,
+                mask=(offs_m < dim) & ring_ok & act,
+                other=0.0,
+            ).to(tl.float32)
+            dt = tl.load(
+                ring_dt_base + ring_pos * ring_stride_dt, mask=ring_ok & act, other=0.0
+            ).to(tl.float32)
+            if HAS_DT_BIAS:
+                dt += tl.load(dt_bias_ptr).to(tl.float32)
+            if DT_SOFTPLUS:
+                dt = softplus(dt)
+            A = tl.load(A_ptr).to(tl.float32)
+            dA = fast_exp(A * dt)  # scalar, not a matrix
 
-        B = tl.load(
-            ring_B_base + ring_pos * ring_stride_B + offs_n,
-            mask=(offs_n < dstate) & ring_ok,
-            other=0.0,
-        ).to(tl.float32)
+            B = tl.load(
+                ring_B_base + ring_pos * ring_stride_B + offs_n,
+                mask=(offs_n < dstate) & ring_ok & act,
+                other=0.0,
+            ).to(tl.float32)
 
-        dB = B * dt
-        state = state * dA + dB * x[:, None]
+            dB = B * dt
+            state = tl.where(act, state * dA + dB * x[:, None], state)
+    else:
+        # Replay the accepted tokens 1..num_replay of the previous verify: the
+        # reference's state update on the reference's inputs, no outputs.
+        for i_r in range(num_replay):
+            # Non-negative even for garbage metadata (dummy runs), so the address
+            # always stays inside slot 1's ring.
+            ring_pos = ((pos0 - num_replay + i_r) % rl + rl) % rl
+            x = tl.load(
+                ring_x_base + ring_pos * ring_stride_x + offs_m,
+                mask=(offs_m < dim) & ring_ok,
+                other=0.0,
+            ).to(tl.float32)
+            dt = tl.load(
+                ring_dt_base + ring_pos * ring_stride_dt, mask=ring_ok, other=0.0
+            ).to(tl.float32)
+            if HAS_DT_BIAS:
+                dt += tl.load(dt_bias_ptr).to(tl.float32)
+            if DT_SOFTPLUS:
+                dt = softplus(dt)
+            A = tl.load(A_ptr).to(tl.float32)
+            dA = fast_exp(A * dt)  # scalar, not a matrix
+
+            B = tl.load(
+                ring_B_base + ring_pos * ring_stride_B + offs_n,
+                mask=(offs_n < dstate) & ring_ok,
+                other=0.0,
+            ).to(tl.float32)
+
+            dB = B * dt
+            state = state * dA + dB * x[:, None]
 
     if STORE_REPLAYED:
         # Test hook: the state this verify starts from (the reference's slot
@@ -334,8 +493,21 @@ def _selective_scan_update_spec_replay_kernel(
 
         if i_t == 0:
             # The new anchor: the state after token 0, as the reference's slot 0.
-            tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=mask)
-        else:
+            tl.store(
+                state_ptrs,
+                state.to(state_ptrs.dtype.element_ty),
+                mask=mask & write_anchor,
+            )
+            if KANCHOR_T > 0:
+                hdr_ok = ring_ok & slot0_ok & write_anchor
+                tl.store(hdr_rows, pos0.to(tl.int32), mask=(offs_m < dim) & hdr_ok)
+                tl.store(
+                    hdr_rows + 1,
+                    _kanchor_row_hash(state, offs_n, dstate),
+                    mask=(offs_m < dim) & hdr_ok,
+                )
+        # The lazy anchor also keeps token 0's inputs in the ring.
+        if (i_t != 0) | (KANCHOR_T > 0):
             ring_pos = ((pos0 + i_t) % rl + rl) % rl
             tl.store(
                 ring_x_base + ring_pos * ring_stride_x + offs_m,
@@ -465,7 +637,8 @@ def selective_state_update_spec_replay(
     cu_seqlens: (N + 1,)), plus
         seq_lens: (>= N,) total tokens per request including this verify's,
             so token 0 of request b sits at position seq_lens[b] - query_len[b].
-        ring_len: ring entries per request, >= 2 * d + 1.
+        ring_len: ring entries per request, >= 2 * d + 1 (>= T + 2 * d for
+            the lazy anchor, which is off for this call otherwise).
         replayed_out: test hook; if given, an (N, nheads, dim, dstate) fp32
             tensor that receives the state each request starts the verify from.
 
@@ -512,71 +685,95 @@ def selective_state_update_spec_replay(
     BLOCK_SIZE_M, num_warps = try_get_optimal_ssm_config(
         dim, dstate, N, nheads, cache_dtype, is_blackwell
     )
+    # Lazy anchor: headers live in slot 1 after the ring, read as int32.
+    kt, hdr_off, rmax = kanchor_plan(
+        kanchor_t(), max_seqlen - 1, ring_len, nheads, dim, ngroups, dstate
+    )
+    hdr = state.view(torch.int32)
 
     with torch.accelerator.device_index(x.device.index):
-        _selective_scan_update_spec_replay_kernel[grid](
-            state,
-            ring,
-            x,
-            dt,
-            dt_bias,
-            A,
-            B,
-            C,
-            D,
-            z,
-            out,
-            state_batch_indices,
-            null_block_id,
-            num_accepted_tokens,
-            cu_seqlens,
-            seq_lens,
-            replayed_out,
-            N,
-            nheads,
-            dim,
-            dstate,
-            nheads // ngroups,
-            ngroups,
-            ring_len,
-            state.stride(0),
-            state.stride(1),
-            state.stride(2),
-            state.stride(3),
-            ring.stride(0),
-            x.stride(0),
-            x.stride(1),
-            x.stride(2),
-            dt.stride(0),
-            dt.stride(1),
-            dt.stride(2),
-            dt_bias.stride(0),
-            dt_bias.stride(1),
-            A.stride(0),
-            A.stride(1),
-            A.stride(2),
-            B.stride(0),
-            B.stride(1),
-            B.stride(2),
-            C.stride(0),
-            C.stride(1),
-            C.stride(2),
-            D.stride(0),
-            D.stride(1),
-            z_strides[0],
-            z_strides[1],
-            z_strides[2],
-            out.stride(0),
-            out.stride(1),
-            out.stride(2),
-            state_batch_indices.stride(0),
-            state_batch_indices.stride(1),
-            dt_softplus,
-            True,
-            BLOCK_SIZE_M,
-            RING_LEN=ring_len,
-            HG_RATIO=nheads // ngroups,
-            CONST_DIV=_const_div_enabled(),
-            num_warps=num_warps,
-            launch_pdl=_pdl_enabled(),
-        )
+        for _attempt in range(2):
+            try:
+                _selective_scan_update_spec_replay_kernel[grid](
+                    state,
+                    ring,
+                    hdr,
+                    x,
+                    dt,
+                    dt_bias,
+                    A,
+                    B,
+                    C,
+                    D,
+                    z,
+                    out,
+                    state_batch_indices,
+                    null_block_id,
+                    num_accepted_tokens,
+                    cu_seqlens,
+                    seq_lens,
+                    replayed_out,
+                    N,
+                    nheads,
+                    dim,
+                    dstate,
+                    nheads // ngroups,
+                    ngroups,
+                    ring_len,
+                    hdr_off,
+                    state.stride(0),
+                    state.stride(1),
+                    state.stride(2),
+                    state.stride(3),
+                    ring.stride(0),
+                    x.stride(0),
+                    x.stride(1),
+                    x.stride(2),
+                    dt.stride(0),
+                    dt.stride(1),
+                    dt.stride(2),
+                    dt_bias.stride(0),
+                    dt_bias.stride(1),
+                    A.stride(0),
+                    A.stride(1),
+                    A.stride(2),
+                    B.stride(0),
+                    B.stride(1),
+                    B.stride(2),
+                    C.stride(0),
+                    C.stride(1),
+                    C.stride(2),
+                    D.stride(0),
+                    D.stride(1),
+                    z_strides[0],
+                    z_strides[1],
+                    z_strides[2],
+                    out.stride(0),
+                    out.stride(1),
+                    out.stride(2),
+                    state_batch_indices.stride(0),
+                    state_batch_indices.stride(1),
+                    dt_softplus,
+                    True,
+                    BLOCK_SIZE_M,
+                    RING_LEN=ring_len,
+                    HG_RATIO=nheads // ngroups,
+                    CONST_DIV=_const_div_enabled(),
+                    KANCHOR_T=kt,
+                    RMAX=rmax,
+                    HDR_WORDS=KANCHOR_HDR_WORDS,
+                    num_warps=num_warps,
+                    launch_pdl=_pdl_enabled(),
+                )
+                if kt:
+                    global _KANCHOR_LAUNCHED
+                    _KANCHOR_LAUNCHED = True
+                break
+            except Exception as exc:  # noqa: BLE001
+                # The lazy anchor never compiled here: the anchor-every-verify
+                # kernel (T = 0) for the rest of the run; any ring_len >= 2d + 1
+                # is hazard-free for it, so the allocated ring still serves.
+                if kt == 0 or _KANCHOR_LAUNCHED:
+                    raise
+                _kanchor_disable(exc)
+                kt, hdr_off, rmax = 0, 0, 0

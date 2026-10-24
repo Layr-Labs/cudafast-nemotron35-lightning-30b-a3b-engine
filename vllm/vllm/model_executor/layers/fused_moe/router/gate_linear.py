@@ -22,14 +22,6 @@ try:
 except ImportError:
     _smallk = None
 
-# LOCAL PATCH (cudafast-nemotron35): routerbig (harness/kernels/routerbig): the same op at
-# prefill M (496) with the exact summation tree of the cuBLAS split-K kernel torch.mm runs
-# there (12 fma chains of 224 k, added left to right). ROUTERBIG=0 disables it.
-try:
-    import routerbig as _routerbig
-except ImportError:
-    _routerbig = None
-
 
 @PluggableLayer.register("gate_linear")
 class GateLinear(ReplicatedLinear):
@@ -233,10 +225,8 @@ class GateLinear(ReplicatedLinear):
         if self.out_dtype is not None and x.dtype != self.weight.dtype:
             x = x.to(self.weight.dtype)
         if (
-            (
-                (_smallk is not None and _smallk.ROUTER_ON)
-                or (_routerbig is not None and _routerbig.ON)
-            )
+            _smallk is not None
+            and _smallk.ROUTER_ON
             and self.bias is None
             and self.weight.dtype == torch.float32
             and x.dtype == torch.float32
@@ -297,10 +287,6 @@ def smallk_router_gemm_impl(x: torch.Tensor, weight: torch.Tensor) -> torch.Tens
     """Router logits x . weight^T in fp32: smallk for its verified shape, else torch.mm."""
     if _smallk is not None:
         out = _smallk.maybe_router_gemm(x, weight)
-        if out is not None:
-            return out
-    if _routerbig is not None:
-        out = _routerbig.maybe_router_gemm(x, weight)
         if out is not None:
             return out
     return torch.mm(x, weight.t())

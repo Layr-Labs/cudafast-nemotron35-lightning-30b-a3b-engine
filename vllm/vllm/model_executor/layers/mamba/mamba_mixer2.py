@@ -42,7 +42,6 @@ from vllm.model_executor.layers.mamba.ops.mamba_ssm_spec_replay import (
 from vllm.model_executor.layers.mamba.ops.selective_state_update_replayssm_output_only import (  # noqa: E501
     selective_state_update_replayssm_output_only,
 )
-from vllm.model_executor.layers.mamba.ops.prefill_state_copy import final_state_copy
 from vllm.model_executor.layers.mamba.ops.ssd_combined import (
     mamba_chunk_scan_combined_varlen,
 )
@@ -65,7 +64,6 @@ from vllm.utils.torch_utils import (
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadata
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
-from vllm.v1.worker import prefill_fast
 
 logger = init_logger(__name__)
 
@@ -896,15 +894,6 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
             # NOTE: final output is an in-place update of out tensor
             assert preallocated_ssm_out_p is not None
-            # LOCAL PATCH (cudafast-nemotron35): take every chunk's state and copy
-            # the final ones into the cache in one kernel
-            # (ops/prefill_state_copy.py; VLLM_PREFILL_STATE_COPY=0 disables).
-            fused_state_copy = (
-                not is_mamba_cache_all
-                and prefill_fast.STATE_COPY
-                and state_indices_tensor_p is not None
-                and last_chunk_indices_p is not None
-            )
             varlen_states = mamba_chunk_scan_combined_varlen(
                 hidden_states_p.view(
                     num_prefill_tokens, self.num_heads // self.tp_size, self.head_dim
@@ -922,7 +911,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 cu_chunk_seqlens=cu_chunk_seqlen_p,
                 last_chunk_indices=last_chunk_indices_p,
                 initial_states=initial_states,
-                return_intermediate_states=is_mamba_cache_all or fused_state_copy,
+                return_intermediate_states=is_mamba_cache_all,
                 dt_softplus=True,
                 dt_limit=(0.0, float("inf")),
                 out=preallocated_ssm_out_p.view(num_prefill_tokens, -1, self.head_dim),
@@ -1013,18 +1002,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 # - varlen state is a (num_prefills, nheads, headdim, dstate)
                 #   tensor
                 assert state_indices_tensor_p is not None
-                if not (
-                    fused_state_copy
-                    and final_state_copy(
-                        ssm_state,
-                        state_indices_tensor_p,
-                        varlen_states,
-                        last_chunk_indices_p,
-                    )
-                ):
-                    if fused_state_copy:
-                        varlen_states = varlen_states[last_chunk_indices_p]
-                    ssm_state[state_indices_tensor_p] = varlen_states
+                ssm_state[state_indices_tensor_p] = varlen_states
 
         # Process decode requests
         if has_decode:

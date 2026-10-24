@@ -1883,6 +1883,15 @@ class VllmConfig:
                 # de-duplicate and sort the sizes
                 cudagraph_capture_sizes = sorted(set(cudagraph_capture_sizes))
 
+            decode_query_len = 1 + self.num_speculative_tokens
+            if (
+                self.scheduler_config.max_num_seqs == 1
+                and 1 < decode_query_len <= max_num_tokens
+                and decode_query_len not in cudagraph_capture_sizes
+            ):
+                cudagraph_capture_sizes.append(decode_query_len)
+                cudagraph_capture_sizes.sort()
+
             if (
                 self.parallel_config.tensor_parallel_size > 1
                 and self.compilation_config.pass_config.enable_sp

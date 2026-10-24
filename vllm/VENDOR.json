@@ -154,6 +154,10 @@
     {
       "file": "harness/kernels/l2pf, layers/attention/attention.py, layers/mamba/mamba_mixer2.py, models/nemotron_h.py, v1/worker/gpu_model_runner.py",
       "why": "l2pf carried from e-man07 0a731363-6416-4fb9-aa94-b6f5f6e8155e (L2 prefetch of the next bandwidth-bound weight on a side stream during latency-bound windows; moves no value). Changed: the drafter hook prefetches the start projection's hidden half eh_w_h (what a draft pass reads first with the projected-embedding table) instead of eh_proj.weight. Added: a MoE-window hook (fused_humming_moe.py, nemotron_h.py, L2PF_MOE_MB default 6) that prefetches the head of the next Mamba layer's in_proj pack while the latency-bound small-call routed down projection runs, rejoining right after it."
+    },
+    {
+      "file": "harness/kernels/marlinx/{csrc/marlinx.cu,py/__init__.py}",
+      "why": "The shared-expert down projection (N 2688, K 3712) at 1..8 rows skips the weight and scale loads and the MMA of every k16 block whose all 16 activations are zero in every row (its input is the up projection's relu^2). Both 16-byte halves of the block are tested, because the MMA's activation operand takes elements 0..7 from one word pair and 8..15 from the next, so a block is skippable only when all 16 are zero. The mask is built per call inside the kernel from that call's activations; k order, Marlin's segment cuts and the fp32 fold order are unchanged, and a zero block only ever adds +-0 to an accumulator that starts at +0, so every output bit is Marlin's. A NaN e4m3 weight scale, which would turn 0*NaN into +0, rejects the skip; a load-time check compares the skip against stock Marlin on the layer's own tensors at M=1,4,8 with zeros at element positions as well as in whole blocks, and falls back to dense marlinx on any bit difference. M>8 (prefill), the other marlinx shapes and the relu^2 epilogue instantiation are untouched. MARLINX_ZSKIP=0 restores dense marlinx."
     }
   ]
 }

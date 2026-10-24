@@ -84,6 +84,35 @@ marlinx CTAs share SMs with the routed-expert kernel when the shared expert runs
 its aux stream. Weight-dequant, MMA operands and every fp32 add and
 multiply are Marlin's, in Marlin's order.
 
+## Zero-activation k16 blocks (shared-expert down projection)
+
+The shared expert's down projection is the only marlinx shape whose input can be
+zero in whole k16 blocks: it consumes the up projection's `relu^2`, which is `+0`
+wherever the up output is `<= 0`, so a block's 16 activations are often all zero in
+every row of the call. For that shape (`N 2688, K 3712`, `1 <= M <= 8`,
+`marlinx_gemm_skip`) each CTA builds an activation mask over the K/16 = 232 blocks
+(one bit per block: set when some row < M has a nonzero-magnitude bf16 in any of the
+block's 16 activations, read as two 16-byte loads per row, so a block is clear only
+when all 16 of its activations are zero in every row) and
+the warp does not load that block's int4, its scale bytes or its activation words,
+and does not issue its MMA. Every other block, and the whole K order, stays the
+dense one.
+
+Exactness: the omitted MMA is `mma.sync...f32.bf16.bf16.f32` whose B operand (the
+activations) is all zeros, so each product is `0 * w = +-0` and the dot product is
+`+-0`; adding it to an accumulator that starts at `+0` and only changes on a
+nonzero product leaves `acc` bit-identical (a zero accumulator stays `+0`, since
+`+0 + -0 = +0`). `cursor_next` still runs for the omitted block, so the segment
+cuts, the `P = acc0 + (acc1 + (acc3 + acc2))` reduce and the bottom-up
+`R = P + R` fold are unchanged. The one input that could break this is a NaN
+`e4m3` weight scale (`0 * NaN = NaN`, which the skip would turn into `+0`):
+`prepare()` rejects the skip for a layer whose `weight_scale` holds a NaN byte, and
+`py/__init__.py` compares the skip against stock Marlin on the layer's own tensors
+at load time (M = 1, 4, 8, with zeros at scattered element positions, in the first
+half of a block only, in the last half only, and in all 16 of a block), falling back
+to dense marlinx on any bit difference.
+`MARLINX_ZSKIP=0` disables it.
+
 ## Files
 
 - `csrc/marlinx.cu`: the kernel (`gemm_kernel<depth>`, depth 8 by default, 4

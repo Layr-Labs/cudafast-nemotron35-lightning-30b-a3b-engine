@@ -23,7 +23,6 @@ copy (about 357 MB per layer). ZSKIP=0 in the environment disables it.
 from __future__ import annotations
 
 import os
-import sys
 from typing import Any
 
 import torch
@@ -154,16 +153,6 @@ def finalize(layer: torch.nn.Module) -> None:
     layer.zskip_pair_config = None
     if PAIR_ENABLED:
         _prepare_pair(layer)
-    layer.zskip_pair_prefix_ok = False
-    if (getattr(layer, "zskip_pair_w2", None) is not None
-        and os.environ.get("ZSKIP_VERIFY_PREFIX", "1") != "0"
-        and _zskip.prefix_available()):
-        try:
-            layer.zskip_pair_prefix_ok = _pair_check(
-                layer, layer.zskip_pair_w2, layer.zskip_pair_config, prefix=True
-            )
-        except Exception as exc:  # optional prefix; original checked pair remains
-            logger.warning_once("zskip: prefix check unavailable (%r); full pair retained", exc)
 
 
 def _prepare_pair(layer: torch.nn.Module) -> None:
@@ -189,7 +178,7 @@ def _prepare_pair(layer: torch.nn.Module) -> None:
         logger.warning_once("zskip: paired decode unavailable (%r); checked legacy config retained", exc)
 
 
-def _pair_check(layer: torch.nn.Module, packed: Any, config: int, prefix: bool = False) -> bool:
+def _pair_check(layer: torch.nn.Module, packed: Any, config: int) -> bool:
     """Load-time, bitwise against humming: M=4/5/8, independent plus crowded routing.
 
     Compare all slots, including exact negative-zero activations and all-zero groups.
@@ -213,7 +202,7 @@ def _pair_check(layer: torch.nn.Module, packed: Any, config: int, prefix: bool =
         "use_f16_accum": envs.VLLM_HUMMING_USE_F16_ACCUM,
         "gemm_type": GemmType.INDEXED.value,
     })
-    for m in ((5,) if prefix else (4, 5, 8)):
+    for m in (4, 5, 8):
         for crowded in (False, True):
             ids = [[(29*i + (0 if crowded else 17*t)) % NUM_EXPERTS
                     for i in range(TOP_K)] for t in range(m)]
@@ -237,21 +226,12 @@ def _pair_check(layer: torch.nn.Module, packed: Any, config: int, prefix: bool =
                 tuning_config=json.dumps(configs[1]),
             )
             out = torch.empty_like(ref)
-            for count in ((1, 2, 3, 4, 5) if prefix else (None,)):
-                vrows = (torch.tensor([count], dtype=torch.int32, device=dev)
-                         if count is not None else None)
-                _zskip.down(act, sorted_ids, expert_ids, ntp, packed, out,
-                            mode=_zskip.SKIP, config=config, max_blocks=m*TOP_K,
-                            verify_rows=vrows)
-                rows = m*TOP_K if count is None else count*TOP_K
-                if not torch.equal(out[:rows].view(torch.int16), ref[:rows].view(torch.int16)):
-                    logger.warning("zskip: paired prefix=%s config %d differs on %s",
-                                   prefix, config, getattr(layer, "layer_name", "?"))
-                    return False
-                if prefix and not torch.equal(
-                    out[rows:].view(torch.int16), torch.zeros_like(out[rows:]).view(torch.int16)
-                ):
-                    return False
+            _zskip.down(act, sorted_ids, expert_ids, ntp, packed, out,
+                        mode=_zskip.SKIP, config=config, max_blocks=m*TOP_K)
+            if not torch.equal(out.view(torch.int16), ref.view(torch.int16)):
+                logger.warning("zskip: paired config %d differs from humming on %s; legacy retained",
+                               config, getattr(layer, "layer_name", "?"))
+                return False
     return True
 
 
@@ -519,11 +499,6 @@ def maybe_down(
     # M=5 is depth-4 verify. Other shapes keep main's checked decode selection.
     pair = getattr(layer, "zskip_pair_w2", None)
     use_pair = num_tokens == 5 and pair is not None
-    vrows = None
-    if use_pair and getattr(layer, "zskip_pair_prefix_ok", False):
-        smallk = sys.modules.get("smallk")
-        if smallk is not None and hasattr(smallk, "live_verify_rows"):
-            vrows = smallk.live_verify_rows(inputs.device)
     _zskip.down(
         inputs,
         moe_kwargs["sorted_ids"],
@@ -534,7 +509,6 @@ def maybe_down(
         mode=_zskip.SKIP,
         config=layer.zskip_pair_config if use_pair else getattr(layer, "zskip_config", CONFIG),
         max_blocks=rows,
-        verify_rows=vrows,
     )
     return True
 

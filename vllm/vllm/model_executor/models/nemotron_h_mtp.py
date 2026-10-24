@@ -37,6 +37,7 @@ from .nemotron_h import (
 )
 from .nemotron_h_mtp_kernels import (
     install_mtp_small_linear,
+    prepare_mtp_relu2,
     mtp_fast_enabled as _mtp_fast_enabled,
     register_mtp_moe_layer,
 )
@@ -409,6 +410,9 @@ class NemotronHMTP(nn.Module, SupportsPP):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+
+    def process_weights_after_loading(self) -> None:
+        prepare_mtp_relu2(self.model)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)

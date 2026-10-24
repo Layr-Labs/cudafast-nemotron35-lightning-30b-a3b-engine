@@ -43,6 +43,8 @@ struct Params {
   const uint32_t* Z;       // zero-row skip: k-row-major copy of B, [K/16][16][N/64][8] u32 (or null)
   int part1_cols;          // columns reduced by a single Marlin block
   int iters;               // Marlin stripe length (k-tiles per block) in part 2
+  float* partials;          // invocation-local segment partials, or null
+  int max_segments;
 };
 
 __device__ __forceinline__ uint4 ld_stream_v4(const uint4* p) {
@@ -257,7 +259,7 @@ __device__ __forceinline__ int column_first_cut(const Params& p, int col) {
 
 // One 64-feature half column (`unit`) per CTA of 4 warps; warp w runs Marlin's
 // warp-row chain w through a register ring of P k16 blocks.
-template <int P, bool Relu2 = false, bool ZS = false>
+template <int P, bool Relu2 = false, bool ZS = false, bool Segmented = false>
 __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
   __shared__ float red[2][3][16][32];
   __shared__ uint16_t zmask[ZS ? 512 : 1];
@@ -269,6 +271,21 @@ __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
 
   // First internal segment cut of this column (k-tiles), k_tiles if none.
   const int first_cut = column_first_cut(p, col);
+  Cursor ld, cs;
+  cursor_init(ld, first_cut, p.k_tiles, p.iters);
+  if constexpr (Segmented) {
+    // Keep the original bottom-to-top segment ordinal; invalid CTAs return
+    // uniformly before any shared-memory collective.
+    for (int j = 0; j < static_cast<int>(blockIdx.y); ++j) {
+      if (ld.lo == 0) return;
+      ld.hi = ld.lo;
+      ld.lo = ld.lo > p.iters ? ld.lo - p.iters : 0;
+      ld.tau = ld.lo;
+      ld.k = 0;
+    }
+  }
+  cs = ld;
+  const int total = 2 * (Segmented ? ld.hi - ld.lo : p.k_tiles);
 
   const long long nB = p.N >> 1;  // int4 per k16 row
   const long long nS = p.N >> 3;  // uint2 per k16 row
@@ -289,7 +306,9 @@ __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
   const long long zstride = (long long)(p.N >> 6) * 8;  // u32 per k row
   const uint32_t* Zp = ZS ? p.Z + (long long)(2 * col + h) * 8 + (lane >> 2) : nullptr;
   if constexpr (ZS) {
-    for (int kb = threadIdx.x; kb < (p.K >> 4); kb += 128) {
+    const int kb_begin = Segmented ? 8 * ld.lo : 0;
+    const int kb_end = Segmented ? 8 * ld.hi : (p.K >> 4);
+    for (int kb = kb_begin + threadIdx.x; kb < kb_end; kb += 128) {
       uint32_t m = 0;
       for (int r = 0; r < p.M; ++r) {
         const uint4* ar = reinterpret_cast<const uint4*>(p.A + (long long)r * p.lda + 16 * kb);
@@ -317,11 +336,6 @@ __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
       return ld_stream_v4(Bp + kb * nB);
     }
   };
-
-  Cursor ld, cs;
-  cursor_init(ld, first_cut, p.k_tiles, p.iters);
-  cs = ld;
-  const int total = 2 * p.k_tiles;
 
 #pragma unroll
   for (int s = 0; s < P; ++s) {
@@ -370,7 +384,44 @@ __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
       }
     }
   }
-  if (!w) write_out<Relu2>(p, col, h, lane, R);
+  if (!w) {
+    if constexpr (Segmented) {
+      float* tile = p.partials +
+          (static_cast<long long>(unit) * p.max_segments + blockIdx.y) * 512;
+#pragma unroll
+      for (int j = 0; j < 4; ++j)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) tile[(4 * j + e) * 32 + lane] = R[j][e];
+    } else {
+      write_out<Relu2>(p, col, h, lane, R);
+    }
+  }
+}
+
+// Merge only complete original Marlin segments, in the original bottom-up
+// order. Every stored partial is FP32; no reassociation or atomic addition.
+__global__ void __launch_bounds__(32) merge_segments(const Params p) {
+  const int unit = blockIdx.x, lane = threadIdx.x;
+  const int col = unit >> 1, h = unit & 1;
+  const int cut = column_first_cut(p, col);
+  const int count = cut >= p.k_tiles ? 1 :
+      1 + (p.k_tiles - cut + p.iters - 1) / p.iters;
+  const float* tile = p.partials + static_cast<long long>(unit) * p.max_segments * 512;
+  float R[4][4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j)
+#pragma unroll
+    for (int e = 0; e < 4; ++e) R[j][e] = tile[(4 * j + e) * 32 + lane];
+  for (int seg = 1; seg < count; ++seg) {
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        const float pp = tile[seg * 512 + (4 * j + e) * 32 + lane];
+        R[j][e] = __fadd_rn(pp, R[j][e]);
+      }
+  }
+  write_out<false>(p, col, h, lane, R);
 }
 
 // Streaming-read kernel used by the tests as a bandwidth probe and as a
@@ -401,6 +452,16 @@ static int launch(const Params& p, cudaStream_t stream) {
   return (int)cudaGetLastError();
 }
 
+template <int P>
+static int launch_segments(const Params& p, cudaStream_t stream) {
+  const dim3 grid(2 * p.n_tiles, p.max_segments);
+  gemm_kernel<P, false, true, true><<<grid, 128, 0, stream>>>(p);
+  cudaError_t e = cudaGetLastError();
+  if (e != cudaSuccess) return static_cast<int>(e);
+  merge_segments<<<2 * p.n_tiles, 32, 0, stream>>>(p);
+  return static_cast<int>(cudaGetLastError());
+}
+
 }  // namespace marlinx
 
 extern "C" {
@@ -416,6 +477,9 @@ int marlinx_init(void) {
   if ((e = cudaFuncGetAttributes(&attr, marlinx::gemm_kernel<8, true>)) != cudaSuccess) return (int)e;
   if ((e = cudaFuncGetAttributes(&attr, marlinx::hog_kernel<8>)) != cudaSuccess) return (int)e;
   if ((e = cudaFuncGetAttributes(&attr, marlinx::gemm_kernel<8, false, true>)) != cudaSuccess) return (int)e;
+  if ((e = cudaFuncGetAttributes(&attr, marlinx::gemm_kernel<4, false, true, true>)) != cudaSuccess) return (int)e;
+  if ((e = cudaFuncGetAttributes(&attr, marlinx::gemm_kernel<8, false, true, true>)) != cudaSuccess) return (int)e;
+  if ((e = cudaFuncGetAttributes(&attr, marlinx::merge_segments)) != cudaSuccess) return (int)e;
   return 0;
 }
 
@@ -436,7 +500,8 @@ int marlinx_regs(int depth) {
 // a negative code for unsupported arguments.
 static int marlinx_gemm_impl(const void* A, long long lda, int M, const void* B, const void* S,
                  const void* GS, void* C, long long ldc, int N, int K, int sms, int depth,
-                 void* stream, bool relu2, const void* Z = nullptr) {
+                 void* stream, bool relu2, const void* Z = nullptr,
+                 float* partials = nullptr, int max_segments = 0) {
   if (M < 1 || M > 8) return -1;
   if (N <= 0 || K <= 0 || N % 128 || K % 128) return -2;
   if (sms <= 0) return -3;
@@ -463,6 +528,8 @@ static int marlinx_gemm_impl(const void* A, long long lda, int M, const void* B,
   }
   p.part1_cols = p.n_tiles - part2;
   p.iters = (p.k_tiles * part2 + sms - 1) / sms;
+  p.partials = partials;
+  p.max_segments = max_segments;
   cudaStream_t st = static_cast<cudaStream_t>(stream);
   if (relu2) {
     if (N != 3712 || K != 2688) return -6;
@@ -474,6 +541,15 @@ static int marlinx_gemm_impl(const void* A, long long lda, int M, const void* B,
   }
   if (Z) {
     if (N != 2688 || K != 3712 || (K >> 4) > 512) return -7;
+    if (partials) {
+      const int need = 1 + (p.k_tiles + p.iters - 2) / p.iters;
+      if (max_segments < need) return -10;
+      switch (depth) {
+        case 4: return marlinx::launch_segments<4>(p, st);
+        case 8: return marlinx::launch_segments<8>(p, st);
+        default: return -5;
+      }
+    }
     switch (depth) {
       case 4: return marlinx::launch<4, false, true>(p, st);
       case 8: return marlinx::launch<8, false, true>(p, st);
@@ -508,6 +584,16 @@ int marlinx_gemm_zs(const void* A, long long lda, int M, const void* B, const vo
                     void* stream, const void* Z) {
   if (!Z) return -8;
   return marlinx_gemm_impl(A, lda, M, B, S, GS, C, ldc, N, K, sms, depth, stream, false, Z);
+}
+
+// Same native numeric contract; the caller owns all current-call partials.
+int marlinx_gemm_zs_segments(const void* A, long long lda, int M, const void* B,
+                    const void* S, const void* GS, void* C, long long ldc,
+                    int N, int K, int sms, int depth, void* stream, const void* Z,
+                    void* partials, int max_segments) {
+  if (!Z || !partials || max_segments <= 0) return -9;
+  return marlinx_gemm_impl(A, lda, M, B, S, GS, C, ldc, N, K, sms, depth,
+                          stream, false, Z, static_cast<float*>(partials), max_segments);
 }
 
 // Streams nbytes from src with blocks x threads, reserving smem bytes of

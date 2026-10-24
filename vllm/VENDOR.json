@@ -182,6 +182,8 @@
     {
       "file": "vllm/model_executor/models/nemotron_h_mtp_kernels.py",
       "why": "Drafter-only: in the MTP layer's single-row MoE the draft pass evaluates the three routed experts with the highest router weight (from the router's existing selection, ordered by weight) instead of all six; the MTP router, shared expert and head weights are unchanged and the target decides every emitted token. MTP_DRAFT_TOPK=0 keeps all six. Carried unchanged from i34-9 b5616630-9603-44d1-a221-a7b2b4ec1d7d."
-    }
+    },
+    "Full0852152c highest source retained, plus selectedb7a45bfa lossless BF16 storage packing/Gluon registerdecode forMTPonly. Preserve085 top3/no-renorm/oldcompactguard,allPDL/L2/screen/native ancestors. OwnGluon PDL entry wait+trigger atstart, separateUSE_GDC/launch_pdl, biasfree admission, exhaustivecodecandoriginal-vs-packed output checks beforestoragefree. Allruntimeofficialremote, nolocalexec.",
+    "Selectedf8766cda CUB43/40bitkey selector, originalMarlinsegmentparallel/orderedFP32merge, complementaryPZv2config300. Wholef8762.1137472882924317 is+0.77144percentvsitsF29basebut0.47515percentbelownew085, NOTbaseline. All085PDL/L2/top3/int32screen retained; onlynewcompatiblemethods composedwithlosslessMTPpacking. No localexec."
   ]
 }

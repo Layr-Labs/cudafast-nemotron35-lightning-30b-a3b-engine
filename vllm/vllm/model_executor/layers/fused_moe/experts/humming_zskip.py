@@ -36,6 +36,17 @@ try:
 except ImportError:
     _zskip = None
 
+# pzskip (harness/kernels/pzskip): the same zero-row skip for prefill-sized calls (humming's
+# block_m 64 bucket), reading this layer's zskip repack. PZSKIP=0 disables it.
+try:
+    import pzskip as _pzskip
+except ImportError:
+    _pzskip = None
+PZ_ENABLED = os.environ.get("PZSKIP", "1") != "0"
+PZ_CONFIG = int(os.environ.get("PZSKIP_CONFIG", "300"))
+PZ_BLOCK_M = 64
+PZ_MAX_TOKENS = 8192
+
 ENABLED = os.environ.get("ZSKIP", "1") != "0"
 # kernel v4 (warp per 64-column tile, weights as the MMA A operand) on the "swap" repack
 LAYOUT = "swap"
@@ -112,11 +123,86 @@ def finalize(layer: torch.nn.Module) -> None:
         layer.zskip_w2 = None
         return
     logger.info_once("zskip: zero-row-skipping routed down projection enabled for <= 8 tokens")
+    layer.pzskip_ok = False
+    if PZ_ENABLED and _pzskip is not None and _pzskip.available():
+        _pzskip.scratch(gs.device, _pzskip.max_blocks(PZ_MAX_TOKENS * TOP_K, NUM_EXPERTS))
+        if _pz_self_check(layer):
+            layer.pzskip_ok = True
+            logger.info_once("pzskip: zero-row-skipping routed down projection enabled for prefill")
     if layer.zskip_prefill:
         logger.info_once(
             "zskip: prefill routed down projection enabled on layers %s",
             ",".join(map(str, sorted(PREFILL_LAYERS))),
         )
+
+
+def _pz_self_check(layer: torch.nn.Module) -> bool:
+    """Load-time guard: humming's w2 and pzskip on a deterministic 496-token call, bitwise."""
+    import json
+
+    from vllm import envs
+    from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
+        _humming_batch_invariant,
+    )
+    from vllm.model_executor.layers.fused_moe.experts.humming_tuned_moe import (
+        tuned_moe_configs,
+    )
+    from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+        moe_align_block_size,
+    )
+    from vllm.utils.humming import GemmType, HummingMethod
+
+    configs = tuned_moe_configs(layer)
+    if configs is None:
+        return False
+    dev = layer.w2_global_scale.device
+    compute_config = json.dumps(
+        {
+            "use_batch_invariant": _humming_batch_invariant(),
+            "use_f16_accum": envs.VLLM_HUMMING_USE_F16_ACCUM,
+            "gemm_type": GemmType.INDEXED.value,
+        }
+    )
+    m = 496
+    gen = torch.Generator(device=dev)
+    gen.manual_seed(4242)
+    topk_ids = torch.stack(
+        [torch.randperm(NUM_EXPERTS, generator=gen, device=dev)[:TOP_K] for _ in range(m)]
+    ).to(torch.int32)
+    u = torch.randn(m * TOP_K, INTER, generator=gen, device=dev)
+    keep = torch.rand(m * TOP_K, INTER, generator=gen, device=dev) < 0.15
+    act = (u.relu().square() * keep).to(torch.bfloat16).contiguous()
+    sorted_ids, expert_ids, ntp = moe_align_block_size(
+        topk_ids=topk_ids,
+        block_size=PZ_BLOCK_M,
+        num_experts=NUM_EXPERTS,
+        expert_map=None,
+        ignore_invalid_experts=True,
+    )
+    ref = torch.empty(m * TOP_K, HIDDEN, dtype=torch.bfloat16, device=dev)
+    HummingMethod.forward_layer(
+        layer=layer,
+        inputs=act,
+        input_scale=None,
+        outputs=ref,
+        sublayer_name="w2",
+        sorted_ids=sorted_ids,
+        expert_ids=expert_ids,
+        num_tokens_padded=ntp,
+        compute_config=compute_config,
+        valid_shape_m=m * TOP_K,
+        top_k=1,
+        tuning_config=json.dumps(configs[1]),
+    )
+    out = torch.empty_like(ref)
+    _pzskip.down(act, sorted_ids, expert_ids, ntp, layer.zskip_w2, out, wpc=PZ_CONFIG)
+    ok = torch.equal(out.view(torch.int16), ref.view(torch.int16))
+    if not ok:
+        logger.warning(
+            "pzskip: load-time check differs from humming on %s; humming keeps the prefill down",
+            getattr(layer, "layer_name", "?"),
+        )
+    return ok
 
 
 def _layer_index(layer: torch.nn.Module) -> int:
@@ -242,6 +328,14 @@ def maybe_down(
     if packed is None or not ENABLED:
         return False
     prefill = num_tokens > MAX_TOKENS
+    if (
+        prefill
+        and num_tokens <= PZ_MAX_TOKENS
+        and block_m == PZ_BLOCK_M
+        and getattr(layer, "pzskip_ok", False)
+        and _pz_down(layer, inputs, input_scale, outputs, num_tokens, top_k, moe_kwargs)
+    ):
+        return True
     if prefill:
         if (
             not getattr(layer, "zskip_prefill", False)
@@ -293,5 +387,46 @@ def maybe_down(
         mode=_zskip.SKIP,
         config=CONFIG,
         max_blocks=rows,
+    )
+    return True
+
+
+def _pz_down(
+    layer: torch.nn.Module,
+    inputs: torch.Tensor,
+    input_scale: torch.Tensor | None,
+    outputs: torch.Tensor,
+    num_tokens: int,
+    top_k: int,
+    moe_kwargs: dict[str, Any],
+) -> bool:
+    """Prefill-sized w2 with pzskip (humming's block_m 64 layout); False: caller runs humming."""
+    if top_k != TOP_K or input_scale is not None:
+        return False
+    if inputs.dtype != torch.bfloat16 or outputs.dtype != torch.bfloat16:
+        return False
+    if torch.compiler.is_compiling():
+        return False
+    rows = num_tokens * top_k
+    if (
+        inputs.dim() != 2
+        or tuple(inputs.shape) != (rows, INTER)
+        or inputs.stride(1) != 1
+        or inputs.stride(0) % 8
+        or inputs.data_ptr() % 16
+        or outputs.dim() != 2
+        or tuple(outputs.shape) != (rows, HIDDEN)
+        or outputs.stride(1) != 1
+        or outputs.stride(0) % 2
+    ):
+        return False
+    _pzskip.down(
+        inputs,
+        moe_kwargs["sorted_ids"],
+        moe_kwargs["expert_ids"],
+        moe_kwargs["num_tokens_padded"],
+        layer.zskip_w2,
+        outputs,
+        wpc=PZ_CONFIG,
     )
     return True

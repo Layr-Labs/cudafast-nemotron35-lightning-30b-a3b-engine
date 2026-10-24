@@ -46,6 +46,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
     sample_with_exponential_noise,
 )
 from vllm.v1.sample.sampler import _SAMPLING_EPS
+from vllm.v1.spec_decode.greedy_head_graph import GreedyHeadGraph
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
@@ -439,6 +440,22 @@ class SpecDecodeBaseProposer:
             logits = self.vocab_mapping.constrain_draft_logits(logits)
             draft_token_ids = logits.argmax(dim=-1)
             return self.vocab_mapping.map_draft_to_target_ids(draft_token_ids)
+        # The target FULL graph does not capture this draft-head call. Keep
+        # exactly the same projection and argmax, replaying only their launch
+        # sequence for the native single-device Nemotron MTP model.
+        if (
+            self.method == "mtp"
+            and self.draft_model_config.hf_config.model_type == "nemotron_h_mtp"
+            and self.vllm_config.parallel_config.tensor_parallel_size == 1
+            and self.vllm_config.parallel_config.pipeline_parallel_size == 1
+            and not self.speculative_config.enforce_eager
+            and not self.vllm_config.model_config.enforce_eager
+        ):
+            head_graph = getattr(self, "_greedy_head_graph", None)
+            if head_graph is None:
+                head_graph = GreedyHeadGraph(self.model.compute_logits)
+                self._greedy_head_graph = head_graph
+            return head_graph.sample(hidden_states)
         return self.model.compute_logits(hidden_states).argmax(dim=-1)
 
     def _sample_from_logits(

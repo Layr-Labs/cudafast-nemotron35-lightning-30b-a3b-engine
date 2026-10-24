@@ -358,7 +358,7 @@ TEST_LOCK_WAIT=1
 run_case "${PREFIX}" cleanup
 kill "${holder}" 2>/dev/null || true
 wait "${holder}" 2>/dev/null || true
-expect_rc "cleanup lock wait deadline" 0
+expect_rc "cleanup lock wait deadline" 3
 expect_actions "cleanup lock wait deadline" ""
 [[ "${OUT}" == "::warning::the GPU lock is still held (a cancelled step may still be tearing down); not stopping containers now; the next job's preflight stops any leftover" ]] \
   || fail "cleanup lock wait deadline: warning is not exact; ${OUT}"

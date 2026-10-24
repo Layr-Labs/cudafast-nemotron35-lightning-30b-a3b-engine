@@ -2,6 +2,7 @@
 #
 # stop-leaked-residents.sh -- remove exact resident containers that a cancelled
 # job could not stop, then wait until no compute process uses the GPU.
+# Exit 3 means that cleanup was deferred to the next job's preflight.
 set -euo pipefail
 
 usage() {
@@ -79,7 +80,7 @@ else
   lock_rc=$?
   if [[ "${mode}" == "cleanup" && "${lock_rc}" -eq 1 ]]; then
     echo "::warning::the GPU lock is still held (a cancelled step may still be tearing down); not stopping containers now; the next job's preflight stops any leftover" >&2
-    exit 0
+    exit 3
   fi
   error "another GPU window holds it: ${lock_path}"
   exit 1

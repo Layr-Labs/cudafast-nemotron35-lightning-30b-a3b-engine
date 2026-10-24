@@ -722,6 +722,7 @@ jobs:
         if: always()
         env:
           SANDBOX_JOB: ${{ github.run_id }}-${{ github.run_attempt }}
+          JOB_STATUS: ${{ job.status }}
         run: |
           set -uo pipefail
           if [[ -z "${SANDBOX_ROOT:-}" || -z "${SANDBOX_JOB:-}" ]]; then
@@ -729,9 +730,14 @@ jobs:
             exit 1
           fi
           rc=0
-          # A cancelled measurement step can still hold the GPU lock for a few
-          # seconds while its process tree exits; wait for it (live test 10-24).
-          ./tools/stop-leaked-residents.sh --mode cleanup --lock-wait 120 || rc=1
+          # Only a cancelled job may defer resident cleanup to the next preflight.
+          cleanup_rc=0
+          ./tools/stop-leaked-residents.sh --mode cleanup --lock-wait 120 || cleanup_rc=$?
+          if [[ "${cleanup_rc}" -eq 3 && "${JOB_STATUS}" == "cancelled" ]]; then
+            echo "::warning::resident cleanup was deferred to the next job preflight" >&2
+          elif [[ "${cleanup_rc}" -ne 0 ]]; then
+            rc=1
+          fi
           if command -v sudo >/dev/null 2>&1; then
             ./tools/sandbox-clear-job-dirs.sh "${SANDBOX_ROOT}" || rc=1
             ./tools/sandbox-wipe.sh || rc=1

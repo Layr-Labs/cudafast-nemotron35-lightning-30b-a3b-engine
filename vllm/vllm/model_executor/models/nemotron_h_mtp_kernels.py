@@ -280,6 +280,8 @@ def _mtp_moe_up_kernel(
     BN: tl.constexpr,
     BK: tl.constexpr,
     EVICT: tl.constexpr,
+    budget_ptr=None,
+    USE_BUDGET: tl.constexpr = False,
 ):
     # slot j < TOPK: routed expert ids[j]; slot j >= TOPK: shared slice j-TOPK
     pid_n = tl.program_id(0)
@@ -287,22 +289,30 @@ def _mtp_moe_up_kernel(
     offs_n = pid_n * BN + tl.arange(0, BN)
     offs_k = tl.arange(0, BK)
     nmask = offs_n < I
-    if j < TOPK:
-        e = tl.load(ids_ptr + j).to(tl.int64)
-        wbase = w13_ptr + e * stride_we + offs_n[:, None].to(tl.int64) * stride_wn
+    if USE_BUDGET:
+        active = (j >= TOPK) | (j < tl.load(budget_ptr))
     else:
-        rows = (j - TOPK) * I + offs_n
-        wbase = ws_ptr + rows[:, None].to(tl.int64) * stride_wsn
-    acc = tl.zeros((BN, BK), dtype=tl.float32)
-    for k0 in range(0, K, BK):
-        kk = k0 + offs_k
-        kmask = kk < K
-        w = _load_w(wbase + kk[None, :], nmask[:, None] & kmask[None, :], EVICT)
-        x = tl.load(x_ptr + kk, mask=kmask, other=0.0)
-        acc += w.to(tl.float32) * x[None, :].to(tl.float32)
-    h = tl.maximum(tl.sum(acc, axis=1), 0.0)
-    h = h * h
-    tl.store(h_ptr + j * I + offs_n, h.to(h_ptr.dtype.element_ty), mask=nmask)
+        active = True
+    if active:
+        if j < TOPK:
+            e = tl.load(ids_ptr + j).to(tl.int64)
+            wbase = w13_ptr + e * stride_we + offs_n[:, None].to(tl.int64) * stride_wn
+        else:
+            rows = (j - TOPK) * I + offs_n
+            wbase = ws_ptr + rows[:, None].to(tl.int64) * stride_wsn
+        acc = tl.zeros((BN, BK), dtype=tl.float32)
+        for k0 in range(0, K, BK):
+            kk = k0 + offs_k
+            kmask = kk < K
+            w = _load_w(wbase + kk[None, :], nmask[:, None] & kmask[None, :], EVICT)
+            x = tl.load(x_ptr + kk, mask=kmask, other=0.0)
+            acc += w.to(tl.float32) * x[None, :].to(tl.float32)
+        h = tl.maximum(tl.sum(acc, axis=1), 0.0)
+        h = h * h
+        tl.store(h_ptr + j * I + offs_n, h.to(h_ptr.dtype.element_ty), mask=nmask)
+    else:
+        # Rewritten each call; inactive routed slots compact to zero rows.
+        tl.store(h_ptr + j * I + offs_n, 0.0, mask=nmask)
 
 
 @triton.jit
@@ -563,6 +573,7 @@ def mtp_moe_row(
     n_shared: int,
     routed_scale: float,
     M: int,
+    budget: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """routed_scale * sum_j tw[j] * W2[ids[j]] relu2(W13[ids[j]] x)
     + SD relu2(SU x) for one row x [1, H], written to M output rows."""
@@ -586,6 +597,8 @@ def mtp_moe_row(
         BK=_MOE_UP_BK,
         num_warps=_MOE_UP_WARPS,
         num_stages=_MOE_UP_STAGES,
+        budget_ptr=budget,
+        USE_BUDGET=budget is not None,
     )
     y = torch.empty((M, H), dtype=x.dtype, device=x.device)
     if _RELU2_MODE:
@@ -617,6 +630,34 @@ def mtp_moe_row(
     return y
 
 
+# LOCAL PATCH (cudafast-nemotron35): routed experts the MTP draft evaluates per
+# token (the router's top 6 by weight, highest first); MTP_DRAFT_TOPK=0 keeps all.
+_DRAFT_TOPK = int(os.environ.get("MTP_DRAFT_TOPK", "3"))
+_DRAFT_ADAPTIVE = os.environ.get("MTP_DRAFT_ADAPTIVE", "1") != "0"
+_DRAFT_MASS = float(os.environ.get("MTP_DRAFT_ROUTER_MASS", "0.85"))
+
+
+@triton.jit
+def _draft_router_budget(
+    sorted_weights, masked_weights, count_out,
+    N: tl.constexpr, MIN_KEEP: tl.constexpr, MASS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    j = tl.arange(0, BLOCK)
+    w = tl.load(sorted_weights + j, mask=j < N, other=0.0)
+    prefix = tl.cumsum(w, axis=0)
+    total = tl.sum(w, axis=0)
+    finite_nonnegative = tl.sum(
+        ((j < N) & (w >= 0.0) & (w < float("inf")) & (w == w)).to(tl.int32), axis=0
+    ) == N
+    keep = 1 + tl.sum(((j < N) & (prefix < MASS * total)).to(tl.int32), axis=0)
+    keep = tl.minimum(N, tl.maximum(MIN_KEEP, keep))
+    keep = tl.where(finite_nonnegative & (total > 0.0)
+                    & (total < float("inf")) & (total == total), keep, N)
+    tl.store(masked_weights + j, tl.where(j < keep, w, 0.0), mask=j < N)
+    tl.store(count_out, keep)
+
+
 def mtp_moe_single_row_impl(
     hidden_states: torch.Tensor, row_src: torch.Tensor, layer_name: str
 ) -> torch.Tensor:
@@ -639,10 +680,29 @@ def mtp_moe_single_row_impl(
     topk_weights, topk_ids = mixer.experts.router.select_experts(
         hidden_states=x, router_logits=router_logits
     )
+    ids = topk_ids.reshape(-1)
+    tw = topk_weights.reshape(-1).to(torch.float32)
+    budget = None
+    if (_DRAFT_ADAPTIVE and _DRAFT_TOPK == 3 and ids.numel() == 6
+            and 0.0 < _DRAFT_MASS <= 1.0):
+        tw, order = torch.sort(tw, descending=True)
+        ids = ids.index_select(0, order).contiguous()
+        masked = torch.empty_like(tw)
+        budget = torch.empty(1, dtype=torch.int32, device=tw.device)
+        _draft_router_budget[(1,)](
+            tw, masked, budget, N=6, MIN_KEEP=3, MASS=_DRAFT_MASS, BLOCK=8,
+            num_warps=1,
+        )
+        tw = masked
+    elif 0 < _DRAFT_TOPK < ids.numel():
+        # Original pending-source fixed budget with compatible compact dispatch.
+        tw, order = torch.sort(tw, descending=True)
+        tw = tw[:_DRAFT_TOPK].contiguous()
+        ids = ids.index_select(0, order[:_DRAFT_TOPK]).contiguous()
     return mtp_moe_row(
         x,
-        topk_ids.reshape(-1),
-        topk_weights.reshape(-1).to(torch.float32),
+        ids,
+        tw,
         w13,
         w2,
         su,
@@ -650,6 +710,7 @@ def mtp_moe_single_row_impl(
         n_shared,
         float(mixer.routed_scaling_factor),
         M,
+        budget=budget,
     )
 
 

@@ -162,6 +162,22 @@
     {
       "file": "harness/kernels/marlinx/{csrc/marlinx.cu,py/__init__.py,README.md,tests/marlinx_zs_exact.py}",
       "why": "Shared expert down projection (3712->2688, ReLU^2 input): read only the k rows whose activation is nonzero in some row, from a byte-preserving k-row-major copy of the Marlin weight; the lane rebuilds Marlin's exact weight word, so dequant, MMA, segments and fp32 reductions are unchanged. Bit-exact vs stock Marlin on all 23 layers (4416 synthetic + 1380 real-activation cases, CUDA graph replay). MARLINX_ZS=0 disables."
+    },
+    {
+      "file": "vllm/model_executor/layers/fused_moe/experts/humming_zskip.py; vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py; harness/kernels/zskip",
+      "why": "zskip for prefill: on 15 sparse MoE layers (ZSKIP_PREFILL_LAYERS; 17-31 and the last layer keep humming), the routed w2 of calls over 8 tokens runs the zero-row-skipping kernel on the promoted swap repack, re-aligned to 32-row expert blocks (config 405: four 8-row MMAs share each dequantised weight fragment, block activations staged once per CTA in shared memory, -0 guard at the end with a dense redo). humming's indexed w2 is batch invariant, so the output equals humming's bit for bit (161 real prefill calls: 7 public prompts x 23 layers; load-time 40-token self-check). ZSKIP_PREFILL=0 disables."
+    },
+    {
+      "file": "models/nemotron_h_mtp_kernels.py;models/nemotron_h_mtp_compact.py",
+      "why": "IndependentnextcombinationonFULLverifiedf29. Usefulpendingb5616630-9603-44d1-a221-a7b2b4ec1d7d exactkernel767d84d4887d46e4de7b6fe5ae6b77f7f520ea4c selectsroutertop3of6 sortedweights, unchangedoriginalweightvalues/norenormalization, originalpinnedBF16head+shared/target/verifyremain. Owncompactdispatch nowadmitsTOPK1..6 plus2sharedslots insteadhardcoded6+2; h/ids/weight/countshapesand_compactgrid/_downTOPKderivedfromstaticnumel. Original_compact and_down bodies/numerics/sparseKorder untouched; top6originalshape/specializationunchanged. Thiskeepscurrenttranspose/sparsefastpathfor5slotsinsteaddecliningtocostlyfallback. Proposalquality/acceptance/runtimetradeoffunvalidated; noheadformat/requantization. Originalscreenrestored: whole4bebe05d-89f8-408a-ae6f-a8abd81e1f98later2.07691891640319 below1001by0.323percent; no isolatedpositiveevidence, notcarriedasnextbaseline/method. No9f7bnew605/705/mask/pruningcodeasbaseline. Alllocalworkstaticonly; officialremoteexecutiononly; preservebestf29."
+    },
+    {
+      "file": "models/nemotron_h_mtp_kernels.py",
+      "why": "Independentadaptiveextensionofb561native-draft expertbudget. Sortoriginal6routerweights/ids; oneinvocation-localGPUwarp computesminimumKEEP3..6 reaching0.85ofcurrent6weightmass, maskingomittedweightswithoutrescaling andemittingint32count. Defaultthresholdfixedalgorithmchoice,notderivedfromofficialscores; retainedroutermassdoesNOTboundMLPerror/acceptance. Originalupnumericalbodyunderuniformperexpertactivebranch;inactive routedslotsalwayswrittenBF16zero,currenth8slotscompactcount0soexistingdownskipsweightloads. Sharedslots6/7alwaysactive. NoCPUreadback,newweightpack,headformat/target/verify/phasechanges. Activeexpertmath/compact/downbodies retainedbutproposalapproximationandnewTritoncontrolflowunverified. MTP_DRAFT_ADAPTIVE0 fixed3withcompatiblecompact; TOPK0/6 all6noadaptive. Invalidrouterweights/nonpositive total keeps6. Freshmasked6weightscountbudget/h/output onsamestream; noresultcache; no localexecution. Onlyofficialremotevalidation."
+    },
+    {
+      "file": "layers/mamba/mamba_mixer2.py;layers/mamba/ops/layernorm_gated.py",
+      "why": "Usefulpending73fd220b-ae45-4678-927f-8c64b141e353 selectedONLYgroupedgatedRMSfusion two-source method, exactsource96cdb1e787b2da6a624deb07494c2cf8f02fd1b5 despitepublicnoteoldparent (actualparent1001). Initialblobsb0410d318840511582189bbc3f4566aa2c7e9782/5714a8bfd257a675cd850fc39f7b3c3d2855b926 exactthenownnarrowguardTP1/groups8/group512/BF16xandweightandgate. NormalizedBF16roundbeforeweightpreservedEAGER_ROUND; norm1defaultFalse originalroute. No73fdpycs/fusedprep160/newzskipbody selected. Reductiontree/SiLUexp/factoring/compilercontractioncanstilldifferfromATen; nountestedbitidentityclaim. Newtargetfusion+adaptive3..6draftcombination uncompiled/untestedlocally; officialoracleonly. Formats/pinnedweights/targetverify/state/phaseunchanged; gatefallbacknativeunsupported/flag0."
     }
   ]
 }

@@ -728,20 +728,41 @@ class HummingIndexedExperts(HummingExpertsBase):
             sublayer_name="w13",
         )
 
-        HummingMethod.forward_layer(
-            layer=self.layer,
-            inputs=inputs,
-            input_scale=input_scale,
-            outputs=buffers["gate_up_output"],
-            sublayer_name="w13",
-            **moe_kwargs1,
-        )
+        # The tuned NVFP4/BF16 path retains the original GEMM output rounding
+        # inside its epilogue, then writes relu(output)**2 directly to the
+        # activation buffer. Other shapes, formats and activations keep the
+        # ordinary projection and activation calls.
+        if (
+            activation == MoEActivation.RELU2_NO_MUL
+            and getattr(self, "_fused_relu2", False)
+            and inputs.dtype == torch.bfloat16
+            and input_scale is None
+        ):
+            from vllm.model_executor.layers.fused_moe.experts.humming_relu2_epilogue import (  # noqa: E501
+                forward_relu2,
+            )
 
-        self.apply_activation(
-            activation=activation,
-            input=buffers["gate_up_output"],
-            output=buffers["activation_output"],
-        )
+            forward_relu2(
+                layer=self.layer,
+                inputs=inputs,
+                outputs=buffers["activation_output"],
+                **moe_kwargs1,
+            )
+        else:
+            HummingMethod.forward_layer(
+                layer=self.layer,
+                inputs=inputs,
+                input_scale=input_scale,
+                outputs=buffers["gate_up_output"],
+                sublayer_name="w13",
+                **moe_kwargs1,
+            )
+
+            self.apply_activation(
+                activation=activation,
+                input=buffers["gate_up_output"],
+                output=buffers["activation_output"],
+            )
 
         inputs, input_scale = HummingMethod.may_quant_input(
             layer=self.layer,

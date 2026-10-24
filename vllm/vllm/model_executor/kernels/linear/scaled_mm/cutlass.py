@@ -157,6 +157,7 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
     def __init__(
         self, c: FP8ScaledMMLinearLayerConfig, layer_param_names: Sequence[str]
     ) -> None:
+        self._fp8small_weight: torch.Tensor | None = None
         self.logical_output_size: int | None = None
         super().__init__(c, layer_param_names)
 
@@ -211,6 +212,17 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         pad_k = (16 - weight.shape[0] % 16) % 16
         pad_n = (16 - weight.shape[1] % 16) % 16
         if pad_k == 0 and pad_n == 0:
+            if (
+                self.config.activation_quant_key == kFp8StaticTensorSym
+                and self.config.weight_quant_key == kFp8StaticTensorSym
+                and self.config.out_dtype == torch.bfloat16
+            ):
+                from .fp8small import prepare_weight
+
+                packed = prepare_weight(weight)
+                if packed is not None:
+                    layer.register_buffer("_fp8small_weight", packed, persistent=False)
+                    self._fp8small_weight = packed
             return
 
         # B is column-major [K, N]
@@ -262,9 +274,18 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         if pad_n > 0 and bias is not None:
             bias = self._pad_to_alignment(bias, dim=0, alignment=16)
 
-        output = ops.cutlass_scaled_mm(
-            A, B, out_dtype=out_dtype, scale_a=As, scale_b=Bs, bias=bias
-        )
+        if (
+            self._fp8small_weight is not None
+            and bias is None
+            and out_dtype == torch.bfloat16
+        ):
+            output = torch.ops.vllm.fp8small_scaled_mm(
+                A, B, self._fp8small_weight, As, Bs
+            )
+        else:
+            output = ops.cutlass_scaled_mm(
+                A, B, out_dtype=out_dtype, scale_a=As, scale_b=Bs, bias=bias
+            )
 
         if pad_n > 0:
             output = output[..., :output_size].contiguous()

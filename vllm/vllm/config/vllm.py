@@ -1880,6 +1880,12 @@ class VllmConfig:
                     and max_num_tokens not in cudagraph_capture_sizes
                 ):
                     cudagraph_capture_sizes.append(max_num_tokens)
+                decode_query_len = 1 + self.num_speculative_tokens
+                if (
+                    self.scheduler_config.max_num_seqs == 1
+                    and 1 < decode_query_len <= max_cudagraph_capture_size
+                ):
+                    cudagraph_capture_sizes.append(decode_query_len)
                 # de-duplicate and sort the sizes
                 cudagraph_capture_sizes = sorted(set(cudagraph_capture_sizes))
 

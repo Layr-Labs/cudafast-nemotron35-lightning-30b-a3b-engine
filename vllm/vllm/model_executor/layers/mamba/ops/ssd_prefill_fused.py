@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Two-stage GB10 prefill SSD: state+passing, then group-shared CB+scan.
 
-The existing cumsum and terminal-state gather remain outside this module.
+The existing cumsum remains outside this module. An optional single-sequence
+terminal cache sink stores the unchanged final FP32 recurrence in registers.
 Raw chunk states and CB never become global tensors. All chunk boundaries
 are still returned in FP32, including boundaries used by prefix-cache callers.
 """
+
+import os
 
 import torch
 
@@ -24,6 +27,8 @@ def _state_pass_kernel(
     LAST,
     INIT,
     OUT,
+    FINAL_CACHE,
+    FINAL_INDEX,
     H: tl.constexpr,
     N: tl.constexpr,
     RATIO: tl.constexpr,
@@ -35,6 +40,9 @@ def _state_pass_kernel(
     IS: tl.constexpr,
     OS: tl.constexpr,
     HAS_INIT: tl.constexpr,
+    WRITE_FINAL: tl.constexpr,
+    FS: tl.constexpr,
+    CACHE_SLOTS: tl.constexpr,
     BM: tl.constexpr,
     BN: tl.constexpr,
     BK: tl.constexpr,
@@ -95,6 +103,16 @@ def _state_pass_kernel(
         states = fast_exp(dA_cs) * states + new_states
         tl.store(
             OUT + chunk * OS[0] + head * OS[1] + state_offsets, states, mask=state_mask
+        )
+
+    if WRITE_FINAL:
+        cache_slot = tl.load(FINAL_INDEX).to(tl.int64)
+        cache_slot = tl.where(cache_slot < 0, cache_slot + CACHE_SLOTS, cache_slot)
+        tl.store(
+            FINAL_CACHE + cache_slot * FS[0] + head * FS[1]
+            + m[:, None] * FS[2] + n[None, :] * FS[3],
+            states,
+            mask=state_mask,
         )
 
 
@@ -298,8 +316,15 @@ def can_fuse_prefill(x, B, C, dt, dA, cu, last, seq, initial, state_dtype):
     )
 
 
-def fused_prefill(x, B, C, dt, dA, cu, last, seq, out, D=None, z=None, initial=None):
-    """Return every FP32 boundary; use the existing caller's final gather."""
+def fused_prefill(
+    x, B, C, dt, dA, cu, last, seq, out, D=None, z=None, initial=None,
+    final_cache=None, final_index=None,
+):
+    """Return all boundaries, or None when the terminal cache was already written.
+
+    Every boundary is still materialized for the unchanged scan stage. Only a
+    redundant final-state gather and cache scatter can be omitted.
+    """
     _, heads, hdim = x.shape
     _, groups, dstate = B.shape
     _, chunks, chunk = dt.shape
@@ -307,6 +332,27 @@ def fused_prefill(x, B, C, dt, dA, cu, last, seq, out, D=None, z=None, initial=N
         (chunks, heads, hdim, dstate), dtype=torch.float32, device=x.device
     )
     initial_strides = initial.stride() if initial is not None else (0, 0, 0, 0)
+    write_final = (
+        os.environ.get("VLLM_PREFILL_FINAL_CACHE", "1") != "0"
+        and final_cache is not None
+        and final_index is not None
+        and last.numel() == 1
+        and final_cache.ndim == 4
+        and final_cache.shape[0] > 0
+        and final_cache.shape[1:] == (heads, hdim, dstate)
+        and final_cache.dtype == torch.float32
+        and final_cache.device == x.device
+        and final_cache.stride(-1) == 1
+        and final_cache.stride(-2) == dstate
+        and final_cache.stride(-3) == hdim * dstate
+        and final_cache.stride(0) >= heads * hdim * dstate
+        and final_index.ndim == 1
+        and final_index.numel() == 1
+        and final_index.is_contiguous()
+        and final_index.dtype in (torch.int32, torch.int64)
+        and final_index.device == x.device
+    )
+    final_strides = final_cache.stride() if write_final else (0, 0, 0, 0)
     with torch.accelerator.device_index(x.device.index):
         _state_pass_kernel[(last.numel(), heads)](
             x,
@@ -317,6 +363,8 @@ def fused_prefill(x, B, C, dt, dA, cu, last, seq, out, D=None, z=None, initial=N
             last,
             initial,
             states,
+            final_cache if write_final else None,
+            final_index if write_final else None,
             H=hdim,
             N=dstate,
             RATIO=heads // groups,
@@ -328,6 +376,9 @@ def fused_prefill(x, B, C, dt, dA, cu, last, seq, out, D=None, z=None, initial=N
             IS=initial_strides,
             OS=states.stride(),
             HAS_INIT=initial is not None,
+            WRITE_FINAL=write_final,
+            FS=final_strides,
+            CACHE_SLOTS=final_cache.shape[0] if write_final else 0,
             BM=64,
             BN=128,
             BK=32,
@@ -373,4 +424,4 @@ def fused_prefill(x, B, C, dt, dA, cu, last, seq, out, D=None, z=None, initial=N
             num_warps=8,
             num_stages=1,
         )
-    return states
+    return None if write_final else states

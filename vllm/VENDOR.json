@@ -82,6 +82,10 @@
     {
       "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py",
       "why": "Cascade the accepted 4e916237-ea0f-48f5-8cd6-503252f54bc8 draft screen: 32 importance-ranked groups score the complete vocabulary, keep 256 per 2048-row chunk, recompute original 64-group scores for those candidates, then retain 32 per original chunk for the unchanged full-K rescore/BF16/min-ID chain. The wider intermediate set is informed by the negative smaller-screen evidence of b27645a4-0e5b-477b-9502-933cb2eb8a79, without an assumed recall guarantee. New buffers contain exact input-independent NVFP4 byte/scale subsets. No target/native-MTP weights, formats or verification changes. Additional proposal pruning and gathered partial-score lowering can change drafts; recall, exact-token result and speed require official remote validation. VLLM_MTP_SCREEN_CASCADE=0 retains the original single screen."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "Retain complete highestceb4274c-8eab-404c-a37e-99bd74c52a42, including42d5bbf8-efda-4b9a-9265-75687c0711f4 single boot-captured screen graph and its own existingfixed-divisor implementation; port ae98b095-4cfd-4d97-bfbf-4a3209f1e6ec nativeE2M1 paircvt with +0canonicalization, unchangedFP32dotlayout/stages2 and fusedBF16max/globalminID selector. Fresh scalarselectoroutput copied into existinggraphoutput; everygreedyreturn clones. Fuse liveBF16→existingownedFP32 _h.copy_ directly, eliminating temporaryfloat conversion, no candidate/group/pruning change. Existinggraph fixedserialscope remains; capture/exactbits/speedunverified locally, allruntime officialremote."
     }
   ]
 }

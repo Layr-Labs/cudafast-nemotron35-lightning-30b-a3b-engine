@@ -69,10 +69,6 @@ def _load():
         P, LL, I = ctypes.c_void_p, ctypes.c_longlong, ctypes.c_int
         lib.zskip_down.argtypes = [P, LL, I, P, P, P, I, P, P, P, P, LL, LL, LL, LL, LL, LL, LL, I, P, I, P, P, I, P, P]
         lib.zskip_down.restype = ctypes.c_int
-        prefix_down = getattr(lib, "zskip_down_prefix", None)
-        if prefix_down is not None:
-            prefix_down.argtypes = lib.zskip_down.argtypes + [P]
-            prefix_down.restype = ctypes.c_int
         lib.zskip_probe.argtypes = [ctypes.c_ulonglong, I, I, P, P, P]
         lib.zskip_probe.restype = ctypes.c_int
         lib.zskip_epi.argtypes = [P, I, ctypes.c_float, P, P, P]
@@ -81,11 +77,6 @@ def _load():
     except OSError as exc:
         _load_error = str(exc)
     return _lib
-
-
-def prefix_available() -> bool:
-    lib = _load()
-    return lib is not None and getattr(lib, "zskip_down_prefix", None) is not None
 
 
 def available() -> bool:
@@ -136,7 +127,7 @@ def config_info(config: int) -> dict:
     if rc != 0:
         raise ValueError(f"zskip config {config}: {rc}")
     return {"regs": info[0], "smem": info[1], "warps": info[2], "ctas_per_sm": info[3],
-            "shape": (1, 3, 1, 16) if config in (113, 118) else CONFIGS.get(config) or CONFIGS4.get(config)}
+            "shape": CONFIGS.get(config) or CONFIGS4.get(config)}
 
 
 BI_BYTES = 5120
@@ -224,25 +215,6 @@ def repack(w2_weight: torch.Tensor, w2_weight_scale: torch.Tensor, w2_global_sca
 
 
 @torch.no_grad()
-def to_swap2(pk: Packed, chunk: int = 16) -> Packed:
-    """dadon 12f98e36: interleave paired swap tiles, preserving every weight/scale byte.
-
-    Keep pk alive for pzskip and configs 108/100. This additional input-independent
-    buffer costs about 357 MB per layer. Chunk temporaries bound load-time peak use.
-    """
-    assert pk.layout == "swap"
-    E = pk.w.shape[0]
-    W, S = torch.empty_like(pk.w), torch.empty_like(pk.s)
-    for e0 in range(0, E, chunk):
-        e1 = min(E, e0 + chunk)
-        W[e0:e1] = pk.w[e0:e1].reshape(e1-e0, K, N//128, 2, 8, 4).permute(
-            0, 1, 2, 4, 3, 5).reshape(e1-e0, K, N//2)
-        S[e0:e1] = pk.s[e0:e1].reshape(e1-e0, G, N//128, 2, 8, 8).permute(
-            0, 1, 2, 4, 3, 5).reshape(e1-e0, G, N)
-    return Packed(W, S, pk.gs, "swap2", (K*(N//2), 64, N//2, G*N, 128, N))
-
-
-@torch.no_grad()
 def to_swapc(pk: Packed) -> Packed:
     """swap -> swapc: per expert, 64-column tile and k16 group, the 16 k rows (32 bytes each) and
     the 64 scale bytes contiguous. Same bytes, input-independent."""
@@ -256,8 +228,7 @@ def to_swapc(pk: Packed) -> Packed:
 def down(a: torch.Tensor, sorted_ids: torch.Tensor, expert_ids: torch.Tensor, num_tokens_padded: torch.Tensor,
          packed: Packed, out: torch.Tensor, mode: int = SKIP, config: int | None = None,
          max_blocks: int | None = None, stats: torch.Tensor | None = None, ctas_per_sm: int = 0,
-         trace: torch.Tensor | None = None,
-         verify_rows: torch.Tensor | None = None) -> torch.Tensor:
+         trace: torch.Tensor | None = None) -> torch.Tensor:
     """out[r] = humming w2 output row r for the moe_align layout (block 16) of a <= 4-token call.
     a: bf16 [shape_m, K] (relu^2 activations, rows = token * top_k + slot); out: bf16 [shape_m, N]."""
     global _pdl_on
@@ -265,8 +236,6 @@ def down(a: torch.Tensor, sorted_ids: torch.Tensor, expert_ids: torch.Tensor, nu
     assert lib is not None, _load_error
     if config is None:
         config = 100
-    if (config in (113, 118)) != (packed.layout == "swap2"):
-        raise ValueError("configs 113/118 require swap2; legacy configs require their original layout")
     shape_m = a.shape[0]
     assert a.dtype == torch.bfloat16 and a.shape[1] == K and a.stride(1) == 1
     assert out.dtype == torch.bfloat16 and out.shape[1] == N and out.stride(1) == 1 and out.shape[0] >= shape_m
@@ -283,22 +252,13 @@ def down(a: torch.Tensor, sorted_ids: torch.Tensor, expert_ids: torch.Tensor, nu
         ws.data_ptr(), queue.data_ptr(), ctas_per_sm, trace.data_ptr() if trace is not None else None,
         torch.cuda.current_stream(a.device).cuda_stream,
     )
-    launch = lib.zskip_down
-    if verify_rows is not None:
-        assert shape_m == 30 and config in (113, 118) and mode == SKIP
-        assert verify_rows.device == a.device and verify_rows.dtype == torch.int32
-        assert verify_rows.numel() == 1 and verify_rows.is_contiguous()
-        prefix_launch = getattr(lib, "zskip_down_prefix", None)
-        if prefix_launch is not None:
-            launch = prefix_launch
-            args += (verify_rows.data_ptr(),)
-    rc = launch(*args)
+    rc = lib.zskip_down(*args)
     if rc != 0 and _pdl_on and not torch.cuda.is_current_stream_capturing():
         # The PDL launch was rejected (the first calls run eagerly, before any capture):
         # use ordinary launches from now on and redo this call.
         lib.zskip_set_pdl(0)
         _pdl_on = False
-        rc = launch(*args)
+        rc = lib.zskip_down(*args)
     if rc != 0:
         raise RuntimeError(f"zskip_down failed: {rc} (config={config})")
     return out

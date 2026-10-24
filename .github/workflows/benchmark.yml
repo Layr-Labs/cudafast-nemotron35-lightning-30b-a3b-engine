@@ -729,7 +729,9 @@ jobs:
             exit 1
           fi
           rc=0
-          ./tools/stop-leaked-residents.sh --mode cleanup || rc=1
+          # A cancelled measurement step can still hold the GPU lock for a few
+          # seconds while its process tree exits; wait for it (live test 10-24).
+          ./tools/stop-leaked-residents.sh --mode cleanup --lock-wait 120 || rc=1
           if command -v sudo >/dev/null 2>&1; then
             ./tools/sandbox-clear-job-dirs.sh "${SANDBOX_ROOT}" || rc=1
             ./tools/sandbox-wipe.sh || rc=1

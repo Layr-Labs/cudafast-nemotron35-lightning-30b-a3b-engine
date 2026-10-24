@@ -736,11 +736,14 @@ class GPUModelRunner(
         # cuda event to synchronize use of reused CPU tensors between steps
         # when async scheduling is enabled.
         self.prepare_inputs_event: torch.Event | None = None
+        self._num_computed_tokens_h2d_event: torch.Event | None = None
         if self.use_async_scheduling:
             self.async_output_copy_stream = torch.cuda.Stream()
             # Blocking (sleep) event to avoid busy-polling the CUDA driver lock;
             # under TP contention that spin can balloon and make the rank a straggler.
             self.prepare_inputs_event = torch.cuda.Event(blocking=True)
+            if self.use_async_spec_decode:
+                self._num_computed_tokens_h2d_event = torch.cuda.Event()
 
         # self.cudagraph_batch_sizes sorts in ascending order.
         if (
@@ -1540,6 +1543,11 @@ class GPUModelRunner(
                 prev_req_id_to_index = self.input_batch.prev_req_id_to_index
                 if not prev_req_id_to_index:
                     return
+                # The previous cycle's valid-count event does not order this
+                # cycle's optimistic-count H2D. Finish that DMA before the
+                # deferred correction mutates its pinned CPU source in place.
+                if self._num_computed_tokens_h2d_event is not None:
+                    self._num_computed_tokens_h2d_event.synchronize()
                 for (
                     req_id,
                     optimistic_num_accepted,
@@ -2176,6 +2184,9 @@ class GPUModelRunner(
                 self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
                 non_blocking=True,
             )
+
+        if self._num_computed_tokens_h2d_event is not None:
+            self._num_computed_tokens_h2d_event.record()
 
         self.req_indices.np[:total_num_scheduled_tokens] = req_indices
         self.req_indices.copy_to_gpu(total_num_scheduled_tokens)

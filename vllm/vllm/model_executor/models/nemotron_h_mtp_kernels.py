@@ -455,6 +455,10 @@ def relu2_down(h, w2, sd, ids, tw, y, routed_scale, mode=None, bn=None, warps=No
             )
             return
         wp, sp = packed
+        from .nemotron_h_mtp_compact import maybe_down
+
+        if maybe_down(h, packed, ids, tw, y, routed_scale):
+            return
         strides = (wp.stride(0), 1, 1, H, H, inter * H)
     else:
         wp, sp = w2, sd

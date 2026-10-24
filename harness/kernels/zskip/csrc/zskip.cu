@@ -335,6 +335,46 @@ __global__ void __launch_bounds__(128) prep_kernel(const Params p) {
   const bool dense = p.mode == DENSE || p.mode == LOADONLY_DENSE;
   build_lists<128>(bi, s_nrows, p, s_rows, dense);
 }
+#ifndef ZSKIP_NO_FUSED
+
+template <int NT, int BM, int CAP>
+__device__ __forceinline__ void fused_prep(const Params& p, int mb, uint8_t* bi) {
+  static_assert(NT >= 32 && NT % 32 == 0, "fused prep needs whole warps");
+  const int tid = threadIdx.x, lane = tid & 31;
+  BlockHdr* h = reinterpret_cast<BlockHdr*>(bi);
+  __shared__ int s_rows[RMAX];
+  __shared__ int s_nrows;
+  if (tid < 32) {
+    int base = 0;
+#pragma unroll
+    for (int c = 0; c < (BM + 31) / 32; ++c) {
+      const int pos = 32 * c + lane;
+      const unsigned id = pos < BM ? static_cast<unsigned>(p.sorted_ids[mb * BM + pos]) : 0xFFFFFFFFu;
+      const bool valid = pos < BM && id < static_cast<unsigned>(p.shape_m);
+      const unsigned ball = __ballot_sync(0xFFFFFFFFu, valid);
+      const int rank = base + __popc(ball & ((1u << lane) - 1u));
+      const bool keep = valid && rank < CAP;
+      if (pos < 16) h->pos_row[pos] = static_cast<int8_t>(keep ? rank : RMAX);
+      if (keep) {
+        s_rows[rank] = static_cast<int>(id);
+        h->rows[rank] = static_cast<int>(id);
+      }
+      base += __popc(ball);
+    }
+    if (lane == 0) {
+      const int n = base;
+      s_nrows = n < CAP ? n : CAP;
+      h->nrows = s_nrows;
+      h->expert = p.expert_ids[mb];
+      if (n > CAP && p.stats && blockIdx.x == 0) atomicAdd(p.stats + 1, 1);
+    }
+  }
+  __syncthreads();
+  const bool dense = p.mode == DENSE || p.mode == LOADONLY_DENSE;
+  build_lists<NT>(bi, s_nrows, p, s_rows, dense);
+}
+
+#endif
 
 // CTA = W warps = 32W output columns (one column slice) of one expert block per work item.
 // Shared memory (dynamic): rows ring NR*RB row segments of 16W bytes (active row i of the block's
@@ -666,7 +706,7 @@ __device__ __forceinline__ uint32_t ldg_u32_l1(const void* p) {  // activations:
   return v;
 }
 
-template <int WPC, int R, int NH, int BM>
+template <int WPC, int R, int NH, int BM, bool Fused = false>
 __global__ void __launch_bounds__(WPC * 32) down4_kernel(const Params p) {
 #ifndef ZSKIP_NO_PDL
   pdl_wait();
@@ -678,6 +718,13 @@ __global__ void __launch_bounds__(WPC * 32) down4_kernel(const Params p) {
   const int T = blockIdx.x * WPC + warp;  // 64-column tile, 0..41
   if (mb * BM >= *p.num_tokens_padded) return;
   const uint8_t* bi = p.ws + (long long)mb * BI_BYTES;
+#ifndef ZSKIP_NO_FUSED
+  extern __shared__ __align__(16) uint8_t smem4[];
+  if constexpr (Fused) {
+    fused_prep<WPC * 32, BM, 8 * NH>(p, mb, smem4);
+    bi = smem4;
+  }
+#endif
   const BlockHdr* hdr = reinterpret_cast<const BlockHdr*>(bi);
   const int nrows = hdr->nrows;
   if (nrows == 0 || p.mode == SETUPONLY) return;
@@ -1624,11 +1671,12 @@ static int g_pdl = 0;  // zskip_set_pdl: launch the v4 pair with programmatic de
 
 #ifndef ZSKIP_NO_PDL
 template <typename Kern>
-static cudaError_t launch_pdl(Kern kernel, dim3 grid, dim3 block, cudaStream_t stream, const Params& p) {
+static cudaError_t launch_pdl(Kern kernel, dim3 grid, dim3 block, cudaStream_t stream, const Params& p,
+                              int dyn_smem = 0) {
   cudaLaunchConfig_t cfg = {};
   cfg.gridDim = grid;
   cfg.blockDim = block;
-  cfg.dynamicSmemBytes = 0;
+  cfg.dynamicSmemBytes = dyn_smem;
   cfg.stream = stream;
   cudaLaunchAttribute attr[1];
   attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
@@ -1658,6 +1706,26 @@ static int launch4(const Params& p, cudaStream_t stream) {
   down4_kernel<WPC, R, NH, BM><<<dim3(42 / WPC, p.max_blocks), WPC * 32, 0, stream>>>(p);
   return (int)cudaGetLastError();
 }
+
+#ifndef ZSKIP_NO_FUSED
+template <int WPC, int R, int NH, int BM>
+static int launch4f(const Params& p, cudaStream_t stream) {
+#ifndef ZSKIP_NO_PDL
+  if (g_pdl) {
+    cudaError_t e = launch_pdl(down4_kernel<WPC, R, NH, BM, true>, dim3(42 / WPC, p.max_blocks),
+                               dim3(WPC * 32), stream, p, BI_BYTES);
+    if (e != cudaSuccess) {
+      cudaGetLastError();
+      return (int)e;
+    }
+    return (int)cudaGetLastError();
+  }
+#endif
+  down4_kernel<WPC, R, NH, BM, true><<<dim3(42 / WPC, p.max_blocks), WPC * 32, BI_BYTES, stream>>>(p);
+  return (int)cudaGetLastError();
+}
+#define ZSKIP4F_CONFIGS(X) X(108, 2, 4, 1, 16)
+#endif
 
 // v4 config id, warps per CTA, ring depth (active groups in flight per warp), 8-row MMA halves per
 // block (rows per block cap = 8 NH), moe_align block size. 100..107: decode (<= 8 tokens, block 16);
@@ -1791,6 +1859,21 @@ int zskip_config(int id, int* info) {
   }
   ZSKIP4_CONFIGS(X4)
 #undef X4
+#ifndef ZSKIP_NO_FUSED
+#define X4F(ID, W_, R_, NH_, BM_) \
+  if (id == ID) { \
+    if (cudaFuncGetAttributes(&attr, down4_kernel<W_, R_, NH_, BM_, true>) != cudaSuccess) return -1; \
+    info[0] = attr.numRegs; \
+    info[1] = BI_BYTES; \
+    info[2] = W_; \
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&info[3], down4_kernel<W_, R_, NH_, BM_, true>, \
+                                                      W_ * 32, BI_BYTES) != cudaSuccess) \
+      return -1; \
+    return 0; \
+  }
+  ZSKIP4F_CONFIGS(X4F)
+#undef X4F
+#endif
   return -2;
 }
 
@@ -1834,6 +1917,12 @@ int zskip_down(const void* A, long long lda, int shape_m, const int* sorted_ids,
   if (config == ID) return launch4<W_, R_, NH_, BM_>(p, st);
   ZSKIP4_CONFIGS(X4)
 #undef X4
+#ifndef ZSKIP_NO_FUSED
+#define X4F(ID, W_, R_, NH_, BM_) \
+  if (config == ID) return launch4f<W_, R_, NH_, BM_>(p, st);
+  ZSKIP4F_CONFIGS(X4F)
+#undef X4F
+#endif
 #define X5(ID, W_, S_, NH_, BM_) \
   if (config == ID) return launch5<W_, S_, NH_, BM_>(p, st);
   ZSKIP5_CONFIGS(X5)

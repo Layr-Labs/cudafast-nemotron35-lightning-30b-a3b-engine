@@ -158,6 +158,32 @@ def _select_token(logits, ids, out, N: tl.constexpr, BLOCK: tl.constexpr):
     tl.store(out, tl.where(any_nan != 0, 1 << 30, chosen))
 
 
+@triton.jit
+def _screen_topk_kernel(scores, out, WIDTH: tl.constexpr, KEEP: tl.constexpr,
+                        OFFSET: tl.constexpr):
+    """Draft-only selection; ties prefer lowest local ID, unlike torch.topk."""
+    row = tl.program_id(0)
+    i = tl.arange(0, WIDTH)
+    score = tl.load(scores + row * WIDTH + i)
+    bits = score.to(tl.int32, bitcast=True)
+    ordered = tl.where(bits < 0, ~bits, bits ^ -2147483648).to(tl.uint32)
+    ordered = tl.where(score == 0.0, 2147483648, ordered).to(tl.uint32)
+    ordered = tl.where(score != score, 4294967295, ordered).to(tl.uint32)
+    key = (ordered.to(tl.uint64) << 32) | (~i.to(tl.uint32)).to(tl.uint64)
+    ranked = tl.sort(key, descending=True)
+    chosen = (~ranked.to(tl.uint32)).to(tl.int64)
+    tl.store(out + row * KEEP + i, chosen + row * OFFSET, mask=i < KEEP)
+
+
+def _screen_topk(scores: torch.Tensor, width: int, keep: int,
+                 offset: int = 0) -> torch.Tensor:
+    rows = scores.numel() // width
+    out = torch.empty((rows, keep), dtype=torch.int64, device=scores.device)
+    _screen_topk_kernel[(rows,)](scores, out, WIDTH=width, KEEP=keep,
+                                OFFSET=offset, num_warps=4)
+    return out
+
+
 class DraftHeadScreen:
     """Load-time buffers plus the greedy screen for one shared NVFP4 head."""
 
@@ -269,9 +295,8 @@ class DraftHeadScreen:
             # Every consumer below is order-independent (index-aligned gathers,
             # then the max with the lowest-id tie rule), so the candidate sets
             # need not be sorted: sorted=False skips a segmented sort per stage.
-            coarse_cand = (
-                self.scores.view(-1, SCREEN_CHUNK)
-                .topk(CASCADE_PER, dim=-1, sorted=False).indices + self.chunk_off
+            coarse_cand = _screen_topk(
+                self.scores, SCREEN_CHUNK, CASCADE_PER, SCREEN_CHUNK
             )
             hs = h.index_select(0, self.cols)
             _rows_dot(
@@ -280,17 +305,15 @@ class DraftHeadScreen:
             )
             # Scores retain the [original chunk, coarse candidate] layout.
             # Gather global IDs; adding chunk_off here would offset twice.
-            refined = self.refine_scores.view(-1, CASCADE_PER).topk(
-                SCREEN_PER, dim=-1, sorted=False
-            ).indices
+            refined = _screen_topk(
+                self.refine_scores, CASCADE_PER, SCREEN_PER
+            )
             cand = coarse_cand.gather(1, refined).reshape(-1)
         else:
             hs = h.index_select(0, self.cols)
             _rows_dot(hs, self.w_scr, self.s_scr, None, self.gscale, self.scores, False)
-            cand = (
-                self.scores.view(-1, SCREEN_CHUNK)
-                .topk(SCREEN_PER, dim=-1, sorted=False).indices
-                + self.chunk_off
+            cand = _screen_topk(
+                self.scores, SCREEN_CHUNK, SCREEN_PER, SCREEN_CHUNK
             ).reshape(-1)
         _rows_dot(h, self.w_full, self.s_full, cand, self.gscale, self.cand_logits, True)
         out = torch.empty((), dtype=torch.int64, device=h.device)

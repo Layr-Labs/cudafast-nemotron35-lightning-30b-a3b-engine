@@ -74,6 +74,10 @@
     {
       "file": "vllm/v1/worker/prefill_graph.py, vllm/v1/worker/gpu_model_runner.py, vllm/v1/attention/backends/flashinfer.py",
       "why": "Capture an input-independent whole-forward CUDA graph at boot for fresh single-request 496-token prefill, with native FlashInfer planning and fully refreshed request buffers; other lengths and target formats remain unchanged."
+    },
+    {
+      "file": "vllm/model_executor/layers/mamba/ops/ssd_prefill_fused.py (+ ssd_combined.py)",
+      "why": "Own GB10 prefill two-stage SSD: fuse chunk-state formation with unchanged FP32 state recurrence, and compute each CB row tile once per group in registers before all eight head scans. Removes raw chunk-state and FP32 CB global scratch while retaining every boundary state, cumsum, final gather, original numerical formats and target acceptance. Chunk sizes 128/256 and exact-shape guards; unsupported layouts retain the original path."
     }
   ]
 }

@@ -53,7 +53,7 @@ ENABLED = os.environ.get("ZSKIP", "1") != "0"
 LAYOUT = "swap"
 CONFIG = 100
 FUSED_PREP = os.environ.get("ZSKIP_FUSED_PREP", "1") != "0"
-FUSED_CONFIG = 108
+FUSED_CONFIG = 111
 MAX_TOKENS = 8
 # Prefill: MoE layers whose relu^2 activations are sparse enough for the skip to beat humming's
 # 64-row blocks on GB10 (measured per layer on prefill-length calls; the others lose). Layer 51,

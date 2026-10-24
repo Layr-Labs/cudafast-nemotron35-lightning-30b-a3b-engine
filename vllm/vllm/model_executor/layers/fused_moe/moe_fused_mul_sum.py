@@ -200,3 +200,56 @@ def moe_fused_mul_sum(
         )
 
     return outputs
+
+
+SCALE_ADD_ON = True
+
+
+@triton.jit
+def _scale_add_bf16_kernel(
+    shared_ptr,
+    fused_ptr,
+    out_ptr,
+    n,
+    scale,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    fused = tl.load(fused_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    shared = tl.load(shared_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    scaled = (fused * scale).to(tl.bfloat16)
+    out = (shared + scaled.to(tl.float32)).to(tl.bfloat16)
+    tl.store(out_ptr + offs, out, mask=mask)
+
+
+def scale_add_bf16(
+    shared: torch.Tensor,
+    fused: torch.Tensor,
+    scale: float,
+) -> torch.Tensor | None:
+    """shared + bf16(fp32(fused) * scale), one launch, for the small decode
+    and verify rows. Returns None (caller keeps the two stock ops) outside
+    that shape. The intermediate bf16 rounding matches those ops."""
+    if not SCALE_ADD_ON:
+        return None
+    if shared.dtype != torch.bfloat16 or fused.dtype != torch.bfloat16:
+        return None
+    if shared.shape != fused.shape or shared.ndim != 2:
+        return None
+    if not shared.is_contiguous() or not fused.is_contiguous():
+        return None
+    if shared.device.type != "cuda" or fused.device != shared.device:
+        return None
+    rows = shared.shape[0]
+    if not 1 <= rows <= 8:
+        return None
+    n = shared.numel()
+    if n == 0:
+        return None
+    out = torch.empty_like(shared)
+    block = 1024
+    _scale_add_bf16_kernel[(triton.cdiv(n, block),)](
+        shared, fused, out, n, float(scale), BLOCK=block, num_warps=4
+    )
+    return out

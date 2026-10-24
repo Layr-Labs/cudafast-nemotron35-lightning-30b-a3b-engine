@@ -142,6 +142,10 @@
     {
       "file": "mtp-head.manifest.json (depth 4), harness/kernels/smallk (M5 router), vllm/config/vllm.py (single-seq verify-width capture size), vllm/v1/worker/gpu_model_runner.py (fresh 496 prefill graph at depth 3 or 4)",
       "why": "Native MTP depth 4. The M5 router replica and the verify-width capture size are carried unchanged from jacklightChen 286548fd-f052-4777-828b-f5fa3019b614 (passed the exact-token gate at depth 4); the fresh-prefill-graph gate extension is carried unchanged from ivanfioravanti 90fd16ab-84b4-4503-9cea-32998faefcf8 (prefill graph active at depth 4). The last-layer prefill reroute of 286548fd is NOT carried: it changes the final hidden states the MTP drafter reads for prompt positions."
+    },
+    {
+      "file": "vllm/model_executor/layers/fused_moe/experts/humming_tuned_moe.py (+ hook in fused_humming_moe.py)",
+      "why": "Decode/verify MoE prologue and epilogue on the tuned humming path. (1) One-CTA expert alignment for 1-8 tokens, top-6, block 16, 128 experts (depth-4 verify is 5 tokens), replacing the stock two-kernel moe_align_block_size. Same sizes and the words the GEMMs read: ascending experts, stable routes, sentinel N, invalid ids dropped. MMA order unchanged. Prefill and other shapes keep the stock align. SMALL_ALIGN_ON is the switch. The align hook is jacklightChen 5ca90476 retargeted onto 6bb1900 (that submission's one-CTA align is not on HEAD; smallk's own align stays opt-in and off, it only covers numel<=32 and was measured as hidden by the shared-expert stream). (2) For the same 1-8 bf16 rows with no latent projection, one kernel applies the routed scale and adds the shared expert, with the stock intermediate bf16 rounding. SCALE_ADD_ON is the switch. Other shapes keep the two stock ops."
     }
   ]
 }

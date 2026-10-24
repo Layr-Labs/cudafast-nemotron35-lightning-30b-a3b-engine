@@ -254,6 +254,51 @@ try:
         bits = tl.where(y != y, nan_bits, bits)
         tl.store(y_ptr + offs, bits, mask=mask)
 
+    @triton.jit
+    def _small_moe_align_kernel(
+        topk_ptr,
+        sorted_ptr,
+        expert_ptr,
+        padded_ptr,
+        N: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        ROUTES: tl.constexpr,
+        SORTED: tl.constexpr,
+    ):
+        pad = tl.arange(0, SORTED)
+        tl.store(sorted_ptr + pad, N, mask=pad < N * BLOCK_M)
+        route = tl.arange(0, ROUTES)
+        valid = route < N
+        tl.store(expert_ptr + route, -1, mask=valid)
+
+        expert = tl.load(topk_ptr + route, mask=valid, other=1 << 20).to(tl.int32)
+        valid = valid & (expert >= 0) & (expert < 128)
+        same = expert[:, None] == expert[None, :]
+        rank = tl.sum(
+            (same & (route[None, :] < route[:, None]) & valid[None, :]).to(tl.int32),
+            axis=1,
+        )
+        count = tl.sum((same & valid[None, :]).to(tl.int32), axis=1)
+        first = valid & (rank == 0)
+        padded = tl.cdiv(count, BLOCK_M) * BLOCK_M
+        before = tl.sum(
+            tl.where(
+                first[None, :] & (expert[None, :] < expert[:, None]),
+                padded[None, :],
+                0,
+            ),
+            axis=1,
+        )
+        total = tl.sum(tl.where(first, padded, 0), axis=0)
+        tl.store(padded_ptr, total)
+        tl.debug_barrier()
+        tl.store(sorted_ptr + before + rank, route, mask=valid)
+        tl.store(
+            expert_ptr + (before + rank) // BLOCK_M,
+            expert,
+            mask=valid & (rank % BLOCK_M == 0),
+        )
+
     _HAVE_TRITON = True
 except Exception:  # noqa: BLE001
     _HAVE_TRITON = False
@@ -278,3 +323,52 @@ def relu2_bf16(input: torch.Tensor, output: torch.Tensor) -> bool:
         input, output.view(torch.int16), n, BLOCK=block, num_warps=4
     )
     return True
+
+
+SMALL_ALIGN_ON = True
+
+
+def small_humming_moe_align(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+    expert_map: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """One launch in place of the stock two-kernel moe_align_block_size for
+    the tuned single-stream decode/verify shapes (1-8 tokens, top-6, block 16,
+    128 experts). Outputs have the stock sizes and contents in every word the
+    GEMMs read: ascending expert order, routes stable inside an expert, the
+    stock sentinel N in padding. Only integer metadata is produced, so every
+    MMA chain is unchanged. Prefill, EP and untuned shapes return None and keep
+    the stock kernel."""
+    if not SMALL_ALIGN_ON or not _HAVE_TRITON:
+        return None
+    if (
+        expert_map is not None
+        or num_experts != TUNED_NUM_EXPERTS
+        or block_size != 16
+        or topk_ids.ndim != 2
+        or topk_ids.shape[1] != 6
+        or not 1 <= topk_ids.shape[0] <= 8
+        or not topk_ids.is_contiguous()
+        or topk_ids.dtype not in (torch.int32, torch.int64)
+        or topk_ids.device.type != "cuda"
+    ):
+        return None
+    n = topk_ids.numel()
+    dev = topk_ids.device
+    sorted_ids = torch.empty((n * block_size,), dtype=torch.int32, device=dev)
+    expert_ids = torch.empty((n,), dtype=torch.int32, device=dev)
+    num_tokens_padded = torch.empty((1,), dtype=torch.int32, device=dev)
+    _small_moe_align_kernel[(1,)](
+        topk_ids,
+        sorted_ids,
+        expert_ids,
+        num_tokens_padded,
+        N=n,
+        BLOCK_M=block_size,
+        ROUTES=triton.next_power_of_2(n),
+        SORTED=triton.next_power_of_2(n * block_size),
+        num_warps=4,
+    )
+    return sorted_ids, expert_ids, num_tokens_padded

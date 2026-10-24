@@ -1881,12 +1881,6 @@ class VllmConfig:
                 ):
                     cudagraph_capture_sizes.append(max_num_tokens)
                 # de-duplicate and sort the sizes
-                # Preserve tiny drafter graphs alongside the exact single-seq
-                # verify width. Existing single_seq_sizes_ok skips rounding.
-                if self.scheduler_config.max_num_seqs == 1:
-                    verify_width = 1 + self.num_speculative_tokens
-                    if verify_width <= max_cudagraph_capture_size:
-                        cudagraph_capture_sizes.append(verify_width)
                 cudagraph_capture_sizes = sorted(set(cudagraph_capture_sizes))
 
             if (

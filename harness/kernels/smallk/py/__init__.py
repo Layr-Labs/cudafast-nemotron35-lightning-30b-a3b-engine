@@ -5,8 +5,6 @@ reproduces and README.md the evidence:
 
 - router_gemm(x, w): the fp32 MoE gate y = x . w^T for M = 4 rows, with the summation tree of the
   cuBLAS gemmSN_TN kernel torch picks for (M = 4, N = 128, K = 2688).
-  M = 5 is a new unvalidated specialization of the same independent chains;
-  equality to the actual M5 cuBLAS selection is not established yet.
 - topk_sigmoid(logits, bias, ...): vLLM's fused grouped top-k for n_group = topk_group = 1,
   sigmoid scoring, fp32 logits and bias (128 experts).
 - align(topk_ids, ...): moe_align_block_size + count_and_sort_expert_tokens in one CTA.
@@ -43,7 +41,6 @@ def _flag(name: str, default: str = "1") -> bool:
 
 ENABLED = _flag("SMALLK")
 ROUTER_ON = ENABLED and _flag("SMALLK_ROUTER")
-ROUTER_M5_ON = _flag("SMALLK_ROUTER_M5")
 # Opt-in: exact, but no end-to-end gain at depth 3 (the routing chain overlaps the shared-expert
 # GEMMs on the side stream; a shorter chain only moves that overlap into the routed-expert GEMM).
 TOPK_ON = ENABLED and _flag("SMALLK_TOPK", "0")
@@ -55,8 +52,8 @@ PDL = int(os.environ.get("SMALLK_PDL", "1"))
 ROUTER_ROWS = int(os.environ.get("SMALLK_ROUTER_ROWS", "1"))
 TOPK_WARPS = int(os.environ.get("SMALLK_TOPK_WARPS", "4"))
 
-# M4 is verified in the carrier; M5 is the new remote-only experiment.
-ROUTER_SHAPES = frozenset({(4, 128, 2688), (5, 128, 2688)})  # M5 unverified extension
+# Shapes whose stock kernel was identified and whose arithmetic the kernel reproduces bit for bit.
+ROUTER_SHAPES = frozenset({(4, 128, 2688)})  # (M, N, K)
 NUM_EXPERTS = 128
 MAX_TOPK = 8
 # Stock count_and_sort fills an expert's slots in lane order when all ids sit in one warp; with
@@ -205,13 +202,11 @@ def _usable() -> bool:
 
 
 def maybe_router_gemm(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor | None:
-    """M4 router or follow-on M5 experiment; None for unsupported metadata."""
-    if not ROUTER_ON or x.dim() != 2 or x.shape[0] not in (4, 5) or w.dim() != 2:
+    """Exact router logits for a verified shape, or None (caller runs torch.mm)."""
+    if not ROUTER_ON or x.dim() != 2 or x.shape[0] != 4 or w.dim() != 2:
         return None
     m, k = x.shape
     n = w.shape[0]
-    if m == 5 and not ROUTER_M5_ON:
-        return None
     if (
         (m, n, k) not in ROUTER_SHAPES
         or x.dtype != torch.float32

@@ -1564,11 +1564,6 @@ class SpecDecodeBaseProposer:
         # once from the shared head's checkpoint tensors.
         prepare_screen = getattr(self.model, "prepare_draft_head_screen", None)
         self._draft_head_screen = prepare_screen() if prepare_screen else None
-        # Drafter-only projected-embedding table for the start projection
-        # (nemotron_h_mtp.py), built once the embeddings are shared.
-        prepare_eh_table = getattr(self.model, "prepare_eh_table", None)
-        if prepare_eh_table is not None:
-            prepare_eh_table()
 
         if (
             self.parallel_drafting

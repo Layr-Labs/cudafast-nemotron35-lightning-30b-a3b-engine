@@ -134,14 +134,6 @@
     {
       "file": "vllm/model_executor/models/nemotron_h_mtp_compact.py, nemotron_h_mtp_kernels.py",
       "why": "Carried from jacklightChen 73d42dd1-a764-48c2-b125-55a43407a3a7 onto 4d5563f. Drafter-only: compact the 8 BF16 post-ReLU2 slots (6 routed, 2 shared) to their nonzero values and ascending original K indices, then run the down projection over that compact domain against the existing finite-checked exact BF16 transpose. Target model, routing, up projections and strict greedy verification unchanged; drafter FP32 reduction tree differs, so proposals may differ while committed tokens stay the target's. Shape guard and unsupported shapes keep the dense zero-load kernel."
-    },
-    {
-      "file": "vllm/model_executor/models/nemotron_h_mtp.py, vllm/v1/spec_decode/llm_base_proposer.py",
-      "why": "Drafter-only start projection from a precomputed table: eh_proj(cat(enorm(E[t]), hnorm(h))) = W_e.enorm(E[t]) + W_h.hnorm(h). The embedding half depends only on the token id and checkpoint weights, so it is built once at load for every vocabulary row (fp32 [vocab, hidden], input-independent) after the proposer shares the embeddings; each draft pass gathers one row and streams only W_h (14.5 MB instead of 28.9 MB). Target untouched; drafter summation order differs, committed tokens stay the target's. VLLM_MTP_EH_TABLE=0 keeps the stock eh_proj."
-    },
-    {
-      "file": "mtp-head.manifest.json (depth 4), harness/kernels/smallk (M5 router), vllm/config/vllm.py (single-seq verify-width capture size), vllm/v1/worker/gpu_model_runner.py (fresh 496 prefill graph at depth 3 or 4)",
-      "why": "Native MTP depth 4. The M5 router replica and the verify-width capture size are carried unchanged from jacklightChen 286548fd-f052-4777-828b-f5fa3019b614 (passed the exact-token gate at depth 4); the fresh-prefill-graph gate extension is carried unchanged from ivanfioravanti 90fd16ab-84b4-4503-9cea-32998faefcf8 (prefill graph active at depth 4). The last-layer prefill reroute of 286548fd is NOT carried: it changes the final hidden states the MTP drafter reads for prompt positions."
     }
   ]
 }

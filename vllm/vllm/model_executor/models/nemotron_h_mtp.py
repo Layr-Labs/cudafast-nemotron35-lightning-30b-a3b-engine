@@ -54,32 +54,6 @@ from .nemotron_h_mtp_kernels import (
 logger = init_logger(__name__)
 
 
-def _start_projection(
-    layer: nn.Module,
-    inputs_embeds: torch.Tensor,
-    hidden_states: torch.Tensor,
-    embeds_projected: bool,
-) -> torch.Tensor:
-    """eh_proj(cat(enorm(e), hnorm(h))) for the MTP start projections.
-
-    With ``embeds_projected`` the caller passes the token's embedding half
-    already projected (``NemotronHMultiTokenPredictor.eh_table``, fp32), so
-    only the hidden-state half of eh_proj is read per draft pass. Drafter-only
-    numerics: the two halves are summed in fp32 instead of in one chain.
-    """
-    previous_hidden_states_normed = layer.hnorm(hidden_states)
-    if embeds_projected:
-        h_part = torch.ops.vllm.mtp_small_linear(
-            previous_hidden_states_normed, layer.eh_w_h
-        )
-        return (h_part.float() + inputs_embeds).to(h_part.dtype)
-    inputs_embeds_normed = layer.enorm(inputs_embeds)
-    # Fuse via concatenation and linear projection
-    fused = torch.cat([inputs_embeds_normed, previous_hidden_states_normed], dim=-1)
-    hidden_states, _ = layer.eh_proj(fused)
-    return hidden_states
-
-
 class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
     def __init__(
         self,
@@ -134,14 +108,19 @@ class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None = None,
-        embeds_projected: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # Start projections (Fusion)
         if self.has_start_projections:
+            # Normalize both inputs before fusion
             assert inputs_embeds is not None
-            hidden_states = _start_projection(
-                self, inputs_embeds, hidden_states, embeds_projected
+            inputs_embeds_normed = self.enorm(inputs_embeds)
+            previous_hidden_states_normed = self.hnorm(hidden_states)
+
+            # Fuse via concatenation and linear projection
+            fused = torch.cat(
+                [inputs_embeds_normed, previous_hidden_states_normed], dim=-1
             )
+            hidden_states, _ = self.eh_proj(fused)
 
         # Call parent forward (Attention)
         # Parent forward expects: hidden_states, residual
@@ -251,14 +230,19 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None = None,
-        embeds_projected: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # Start projections (Fusion)
         if self.has_start_projections:
+            # Normalize both inputs before fusion
             assert inputs_embeds is not None
-            hidden_states = _start_projection(
-                self, inputs_embeds, hidden_states, embeds_projected
+            inputs_embeds_normed = self.enorm(inputs_embeds)
+            previous_hidden_states_normed = self.hnorm(hidden_states)
+
+            # Fuse via concatenation and linear projection
+            fused = torch.cat(
+                [inputs_embeds_normed, previous_hidden_states_normed], dim=-1
             )
+            hidden_states, _ = self.eh_proj(fused)
 
         # MoE (parent forward inlined to gather the routed rows)
         if residual is None:
@@ -360,57 +344,11 @@ class NemotronHMultiTokenPredictor(nn.Module):
             )
         )
 
-        # Drafter-only: the embedding half of the start layer's eh_proj,
-        # projected once per vocabulary row (fp32, [vocab, hidden]); set by
-        # build_eh_table at load. None keeps the stock path.
-        self.register_buffer("eh_table", None, persistent=False)
-
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         assert self.embed_tokens is not None, (
             "embed_tokens not initialized - must be shared from target model"
         )
         return self.embed_tokens(input_ids)
-
-    @torch.no_grad()
-    def build_eh_table(self) -> bool:
-        """Precompute W_e @ enorm(E[t]) for every token t, where W_e is the
-        embedding half of eh_proj. The table depends only on checkpoint
-        weights (input-independent, built once at load); each draft pass then
-        reads one table row per input row and the hidden-state half of eh_proj
-        only, instead of the whole [hidden, 2 * hidden] matrix."""
-        layer = self.layers["0"]
-        emb = getattr(self.embed_tokens, "weight", None)
-        w = getattr(getattr(layer, "eh_proj", None), "weight", None)
-        if not getattr(layer, "has_start_projections", False) or emb is None or w is None:
-            return False
-        hidden = emb.shape[1]
-        if (
-            emb.dim() != 2
-            or w.dim() != 2
-            or tuple(w.shape) != (hidden, 2 * hidden)
-            or w.dtype != torch.bfloat16
-            or emb.dtype != torch.bfloat16
-            or not w.is_cuda
-            or emb.device != w.device
-        ):
-            return False
-        w_e = w[:, :hidden].float().t().contiguous()  # [hidden_in, hidden_out]
-        table = torch.empty(
-            (emb.shape[0], w.shape[0]), dtype=torch.float32, device=w.device
-        )
-        tf32 = torch.backends.cuda.matmul.allow_tf32
-        torch.backends.cuda.matmul.allow_tf32 = False
-        try:
-            chunk = 8192
-            for start in range(0, emb.shape[0], chunk):
-                rows = layer.enorm(emb[start : start + chunk])
-                torch.mm(rows.float(), w_e, out=table[start : start + chunk])
-        finally:
-            torch.backends.cuda.matmul.allow_tf32 = tf32
-        del w_e
-        layer.register_buffer("eh_w_h", w[:, hidden:].contiguous(), persistent=False)
-        self.register_buffer("eh_table", table, persistent=False)
-        return True
 
     def forward(
         self,
@@ -420,13 +358,8 @@ class NemotronHMultiTokenPredictor(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        embeds_projected = False
         if inputs_embeds is None:
-            if self.eh_table is not None:
-                inputs_embeds = self.eh_table[input_ids]
-                embeds_projected = True
-            else:
-                inputs_embeds = self.get_input_embeddings(input_ids)
+            inputs_embeds = self.get_input_embeddings(input_ids)
 
         residual = None
 
@@ -436,7 +369,6 @@ class NemotronHMultiTokenPredictor(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
-                embeds_projected=embeds_projected,
             )
         return hidden_states
 
@@ -522,25 +454,6 @@ class NemotronHMTP(nn.Module, SupportsPP):
         except Exception as e:  # noqa: BLE001 - any mismatch keeps the stock head
             logger.warning("MTP draft-head screen disabled: %r", e)
             return None
-
-    def prepare_eh_table(self) -> bool:
-        """Build the drafter's projected-embedding table once the embeddings
-        are shared (see NemotronHMultiTokenPredictor.build_eh_table).
-        VLLM_MTP_EH_TABLE=0 keeps the stock eh_proj."""
-        if os.environ.get("VLLM_MTP_EH_TABLE", "1") == "0":
-            return False
-        try:
-            built = self.model.build_eh_table()
-        except Exception as e:  # noqa: BLE001 - any failure keeps the stock eh_proj
-            logger.warning("MTP eh_proj table disabled: %r", e)
-            self.model.eh_table = None
-            return False
-        if built:
-            logger.info(
-                "MTP eh_proj: projected-embedding table %s built",
-                tuple(self.model.eh_table.shape),
-            )
-        return built
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)

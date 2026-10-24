@@ -82,6 +82,22 @@
     {
       "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py",
       "why": "Cascade the accepted 4e916237-ea0f-48f5-8cd6-503252f54bc8 draft screen: 32 importance-ranked groups score the complete vocabulary, keep 256 per 2048-row chunk, recompute original 64-group scores for those candidates, then retain 32 per original chunk for the unchanged full-K rescore/BF16/min-ID chain. The wider intermediate set is informed by the negative smaller-screen evidence of b27645a4-0e5b-477b-9502-933cb2eb8a79, without an assumed recall guarantee. New buffers contain exact input-independent NVFP4 byte/scale subsets. No target/native-MTP weights, formats or verification changes. Additional proposal pruning and gathered partial-score lowering can change drafts; recall, exact-token result and speed require official remote validation. VLLM_MTP_SCREEN_CASCADE=0 retains the original single screen."
+    },
+    {
+      "file": "vllm/v1/spec_decode/mtp_screen_stage_graph.py (+ llm_base_proposer.py)",
+      "why": "Per-stage CUDA graphs execute the existing native-MTP screen.greedy callback without bypassing its partial screen/full-K rescore. Stage0 stages its transient input into owned GPU storage; later stages bind the current producer view under exact address/layout/device/stream/inference signatures. Independent private pools/tokens survive until the original same-stream final stack; shared screen scratch stays serial on that stream. Model and screen identities are retained and rechecked. Fixed immutable serial resident only, no general hot-reload/concurrent-worker guarantee. Real first-use warm/capture costs remain included. Source/idea credit669da48f-6a15-4566-8833-04af4a3cb0f7 for head-only graph method and4e916237-ea0f-48f5-8cd6-503252f54bc8 for the exact screen callback. No local execution; runtime/capture/coverage/exact tokens/speed unvalidated."
+    },
+    {
+      "file": "vllm/v1/sample/rejection_sampler.py",
+      "why": "Reuse b936e1b9-f9ba-4e2f-bab7-32414bf90ae7 raw-logit top-k greedy row-argmax path: keep original exact-equality rejection, raw fp32 row gather/top-k/rank; remove redundant full-vocabulary intermediate copies/scatters only under no-op processor guards. Complete highest ff909 screen/SSD/prefill source stays intact. Pending method and new combination unverified; no cached-A or ring-index changes copied."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "Experimental16/32/64/fullK draft-screen pyramid on completeff909c58-c278-41fd-b5f5-4e27b102a268:16importance-ranked groups scan allvocab,512perchunk survive to32group gatheredrescore,256survive to unchanged64group refinement,32to unchangedfullK/BF16/minID. More approximate pruning and gathered32 reduction can alter drafts; no recall/correctness/speed guarantee. Wider25% firststage survival is informed by negative smaller-screen evidence b27645a4-0e5b-477b-9502-933cb2eb8a79. Exactrawsnapshot subsets only; target/nativeMTPweights/formats unchanged. Logicalpayload reduction is not measured DRAM or speed. All execution officialremote; VLLM_MTP_SCREEN_PYRAMID=0 restores verifiedcascade."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "Fuse native draft hidden-to-FP32 conversion and partial-column index_select into the consuming NVFP4 row dot. The kernel loads original hidden columns then explicitly converts to FP32 before the unchanged e2m1 products, group scale reductions, sequential accumulation and global scale. Same candidates/weights/scales/BR/BB/warp geometry; no target or nativeMTP format change. Removes source-level BF16-row float materialization and two index_select dispatches per cascade head; extra column-address loads can erase benefit. Wholecapture/tokens/speed unverified, all execution officialremote. Completeff909c58-c278-41fd-b5f5-4e27b102a268 is preparation base."
     }
   ]
 }

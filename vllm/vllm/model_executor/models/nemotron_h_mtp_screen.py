@@ -8,16 +8,17 @@ the drafter's lm_head is the target's shared NVFP4 head (131072 x 2688, about
 198 MB), and the drafter reads all of it three times per depth-3 cycle only to
 take one argmax per draft. This replaces that argmax:
 
-1. screen every vocabulary row on the 32 most important whole NVFP4
-   16-element groups, chosen once from weight-only importance, in fp32;
-2. keep the top CASCADE_PER rows of every SCREEN_CHUNK-row chunk;
+1. screen every vocabulary row on the16 most important whole NVFP4 groups;
+   retain512 per2048-row chunk, rescore those on32 groups, then keep256;
+2. without the optional pyramid, use the verified32-group all-vocabulary
+   screen and keep the top CASCADE_PER rows of every SCREEN_CHUNK-row chunk;
 3. rescore those candidates on the original 64 importance groups and keep
    the top SCREEN_PER candidates of each original chunk;
 4. rescore those rows on the full K in fp32, round to bf16 as the stock head
    does, and take the maximum with the lowest token id among equals (the rule
    torch.argmax applies to the stock bf16 logits).
 
-Importance is sum over k of final_norm_gamma[k]^2 * ||W[:, k]||^2. Both group
+Importance is sum over k of final_norm_gamma[k]^2 * ||W[:, k]||^2. All group
 sets are selected by importance rank before being sorted back into K order.
 The screen and the full copy are built once from the pinned checkpoint's own
 lm_head tensors (raw NVFP4 bytes, fp8 group scales, fp32 global scale): an
@@ -26,6 +27,7 @@ proposal can differ when either screen removes a candidate or the rescore's
 different fp32 accumulation changes rounded logits. The target's verification decides
 every committed token, and the timed window is still checked against its oracle.
 
+VLLM_MTP_SCREEN_PYRAMID=0 restores the verified32/64-group cascade.
 VLLM_MTP_SCREEN_CASCADE=0 restores the original 64-group single screen.
 VLLM_MTP_SCREEN=0 restores the stock head.
 """
@@ -45,6 +47,8 @@ SCREEN_CHUNK = 2048
 SCREEN_PER = 32
 CASCADE_FRAC_GROUPS = 32
 CASCADE_PER = 256
+PYRAMID_FRAC_GROUPS = 16
+PYRAMID_PER = 512
 
 
 def screen_enabled() -> bool:
@@ -63,14 +67,16 @@ def _e2m1(nib):
 
 @triton.jit
 def _nvfp4_rows_dot(
-    h_ptr,  # [2 * NBYTES] fp32
+    h_ptr,  # original full hidden row; convert selected elements to fp32
     w_ptr,  # [N, NBYTES] uint8, element 2j in the low nibble of byte j
     s_ptr,  # [N, NBYTES // 8] fp8 e4m3 group scales
     rows_ptr,  # [R] int64 row ids, or unused when GATHER is False
+    cols_ptr,  # [2 * NBYTES] original hidden indices, or unused
     out_ptr,  # [R] fp32
     R,
     gscale,
     NBYTES: tl.constexpr,
+    INDEX_H: tl.constexpr,
     GATHER: tl.constexpr,
     BR: tl.constexpr,
     BB: tl.constexpr,
@@ -97,21 +103,28 @@ def _nvfp4_rows_dot(
             mask=rmask[:, None],
             other=0.0,
         ).to(tl.float32)
-        hl = tl.load(h_ptr + 2 * ob)
-        hh = tl.load(h_ptr + 2 * ob + 1)
+        hidx_l = 2 * ob
+        hidx_h = 2 * ob + 1
+        if INDEX_H:
+            hidx_l = tl.load(cols_ptr + hidx_l)
+            hidx_h = tl.load(cols_ptr + hidx_h)
+        hl = tl.load(h_ptr + hidx_l).to(tl.float32)
+        hh = tl.load(h_ptr + hidx_h).to(tl.float32)
         part = _e2m1(wb & 15) * hl[None, :] + _e2m1(wb >> 4) * hh[None, :]
         part = tl.reshape(part, (BR, BB // 8, 8))
         acc += tl.sum(tl.sum(part, axis=2) * sc, axis=1)
     tl.store(out_ptr + r, acc * gscale, mask=rmask)
 
 
-def _rows_dot(h, w, s, rows, gscale, out, gather):
+def _rows_dot(h, w, s, rows, gscale, out, gather, cols=None):
     n_out = out.numel()
     nbytes = w.shape[1]
     br = 64 if not gather else 16
     _nvfp4_rows_dot[(triton.cdiv(n_out, br),)](
-        h, w, s, rows if gather else out, out, n_out, gscale,
-        NBYTES=nbytes, GATHER=gather, BR=br, BB=64, num_warps=4,
+        h, w, s, rows if gather else out, cols if cols is not None else out,
+        out, n_out, gscale,
+        NBYTES=nbytes, INDEX_H=cols is not None,
+        GATHER=gather, BR=br, BB=64, num_warps=4,
     )
 
 
@@ -141,9 +154,15 @@ class DraftHeadScreen:
         assert w.dtype == torch.uint8 and s.shape == (n, ng), (w.shape, s.shape)
         assert n % SCREEN_CHUNK == 0
         self.cascade = os.environ.get("VLLM_MTP_SCREEN_CASCADE", "1") != "0"
+        self.pyramid = self.cascade and (
+            os.environ.get("VLLM_MTP_SCREEN_PYRAMID", "1") != "0"
+        )
         if self.cascade:
             assert 0 < CASCADE_FRAC_GROUPS < SCREEN_FRAC_GROUPS <= ng
             assert SCREEN_PER <= CASCADE_PER <= SCREEN_CHUNK
+        if self.pyramid:
+            assert 0 < PYRAMID_FRAC_GROUPS < CASCADE_FRAC_GROUPS
+            assert CASCADE_PER <= PYRAMID_PER <= SCREEN_CHUNK
         # Weight-only importance of each 16-element group.
         lut = torch.tensor(
             [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6]
@@ -181,6 +200,22 @@ class DraftHeadScreen:
                 (n // SCREEN_CHUNK) * CASCADE_PER,
                 dtype=torch.float32, device=device,
             )
+            if self.pyramid:
+                # Importance-rank prefix, independently sorted back to K order.
+                wide_groups = ranked_groups[:PYRAMID_FRAC_GROUPS].sort().values
+                wide_cols = (
+                    wide_groups[:, None] * 16 + torch.arange(16)[None, :]
+                ).reshape(-1)
+                self.w_wide = (
+                    w.view(n, ng, 8)[:, wide_groups, :]
+                    .reshape(n, -1).to(device).contiguous()
+                )
+                self.s_wide = s[:, wide_groups].to(device).contiguous()
+                self.wide_cols = wide_cols.to(device)
+                self.mid_scores = torch.empty(
+                    (n // SCREEN_CHUNK) * PYRAMID_PER,
+                    dtype=torch.float32, device=device,
+                )
         self.chunk_off = (
             torch.arange(n // SCREEN_CHUNK, device=device) * SCREEN_CHUNK
         )[:, None]
@@ -198,21 +233,39 @@ class DraftHeadScreen:
         """Draft ids [B] for hidden [B, K] (B is small; one pass per row)."""
         out = []
         for i in range(hidden.shape[0]):
-            h = hidden[i].float().contiguous()
+            h = hidden[i].contiguous()
             if self.cascade:
-                hc = h.index_select(0, self.coarse_cols)
+                if self.pyramid:
+                    _rows_dot(
+                        h, self.w_wide, self.s_wide, None,
+                        self.gscale, self.scores, False, cols=self.wide_cols,
+                    )
+                    wide_cand = (
+                        self.scores.view(-1, SCREEN_CHUNK)
+                        .topk(PYRAMID_PER, dim=-1).indices + self.chunk_off
+                    )
+                    _rows_dot(
+                        h, self.w_coarse, self.s_coarse,
+                        wide_cand.reshape(-1),
+                        self.gscale, self.mid_scores, True, cols=self.coarse_cols,
+                    )
+                    mid = self.mid_scores.view(-1, PYRAMID_PER).topk(
+                        CASCADE_PER, dim=-1
+                    ).indices
+                    # IDs already include the original vocabulary chunk offset.
+                    coarse_cand = wide_cand.gather(1, mid)
+                else:
+                    _rows_dot(
+                        h, self.w_coarse, self.s_coarse, None,
+                        self.gscale, self.scores, False, cols=self.coarse_cols,
+                    )
+                    coarse_cand = (
+                        self.scores.view(-1, SCREEN_CHUNK)
+                        .topk(CASCADE_PER, dim=-1).indices + self.chunk_off
+                    )
                 _rows_dot(
-                    hc, self.w_coarse, self.s_coarse, None,
-                    self.gscale, self.scores, False,
-                )
-                coarse_cand = (
-                    self.scores.view(-1, SCREEN_CHUNK)
-                    .topk(CASCADE_PER, dim=-1).indices + self.chunk_off
-                )
-                hs = h.index_select(0, self.cols)
-                _rows_dot(
-                    hs, self.w_scr, self.s_scr, coarse_cand.reshape(-1),
-                    self.gscale, self.refine_scores, True,
+                    h, self.w_scr, self.s_scr, coarse_cand.reshape(-1),
+                    self.gscale, self.refine_scores, True, cols=self.cols,
                 )
                 # Scores retain the [original chunk, coarse candidate] layout.
                 # Gather global IDs; adding chunk_off here would offset twice.
@@ -221,8 +274,10 @@ class DraftHeadScreen:
                 ).indices
                 cand = coarse_cand.gather(1, refined).reshape(-1)
             else:
-                hs = h.index_select(0, self.cols)
-                _rows_dot(hs, self.w_scr, self.s_scr, None, self.gscale, self.scores, False)
+                _rows_dot(
+                    h, self.w_scr, self.s_scr, None,
+                    self.gscale, self.scores, False, cols=self.cols,
+                )
                 cand = (
                     self.scores.view(-1, SCREEN_CHUNK).topk(SCREEN_PER, dim=-1).indices
                     + self.chunk_off

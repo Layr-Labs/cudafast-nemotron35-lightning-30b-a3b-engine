@@ -134,6 +134,10 @@
     {
       "file": "vllm/model_executor/models/nemotron_h_mtp_compact.py, nemotron_h_mtp_kernels.py",
       "why": "Carried from jacklightChen 73d42dd1-a764-48c2-b125-55a43407a3a7 onto 4d5563f. Drafter-only: compact the 8 BF16 post-ReLU2 slots (6 routed, 2 shared) to their nonzero values and ascending original K indices, then run the down projection over that compact domain against the existing finite-checked exact BF16 transpose. Target model, routing, up projections and strict greedy verification unchanged; drafter FP32 reduction tree differs, so proposals may differ while committed tokens stay the target's. Shape guard and unsupported shapes keep the dense zero-load kernel."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_compact.py",
+      "why": "Retune native BF16 MTP compact-down launch from four to two warps at unchanged BN32/BK64. Maintains compaction, weights, full K support and source arithmetic. Triton reduction layout can differ at BF16 rounding boundaries; draft proposals are recomputed and target verification/acceptance are unchanged. Local exact-token and official scoring, not isolated timings, decide usefulness."
     }
   ]
 }

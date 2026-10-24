@@ -98,6 +98,6 @@ def maybe_down(h, packed, ids, weights, y, routed_scale):
     _down[(triton.cdiv(2688, 32),)](
         indices, values, counts, w2, sd, ids, weights, y,
         M=y.shape[0], H=2688, I=1856, ROUTED_SCALE=routed_scale,
-        TOPK=6, S=2, BN=32, BK=64, num_warps=4, num_stages=2,
+        TOPK=6, S=2, BN=32, BK=64, num_warps=2, num_stages=2,
     )
     return True

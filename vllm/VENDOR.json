@@ -82,6 +82,18 @@
     {
       "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py",
       "why": "Cascade the accepted 4e916237-ea0f-48f5-8cd6-503252f54bc8 draft screen: 32 importance-ranked groups score the complete vocabulary, keep 256 per 2048-row chunk, recompute original 64-group scores for those candidates, then retain 32 per original chunk for the unchanged full-K rescore/BF16/min-ID chain. The wider intermediate set is informed by the negative smaller-screen evidence of b27645a4-0e5b-477b-9502-933cb2eb8a79, without an assumed recall guarantee. New buffers contain exact input-independent NVFP4 byte/scale subsets. No target/native-MTP weights, formats or verification changes. Additional proposal pruning and gathered partial-score lowering can change drafts; recall, exact-token result and speed require official remote validation. VLLM_MTP_SCREEN_CASCADE=0 retains the original single screen."
+    },
+    {
+      "file": "vllm/model_executor/layers/fused_moe/router/gate_linear.py (+ harness/kernels/smallk)",
+      "why": "on GB10 the fp32 MoE router GEMM of the 4-row verify (M 4, N 128, K 2688) ran as cuBLAS gemmSN_TN on 16 CTAs (24 us per layer, 69 GB/s); the vllm::smallk_router_gemm op runs the same summation tree (fma chains over k = 256 j + r + 16 i, tiles then the 16 lanes added in ascending order, recovered by cancellation probes) on 128 CTAs (about 9 us). Bit-identical on the 23 real gate weights (0 of 2.8M outputs differ); any other shape runs torch.mm(x, weight.t()), the call inductor made before (SMALLK=0 or SMALLK_ROUTER=0 disables)"
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h.py, vllm/model_executor/layers/fused_moe/runner/moe_runner.py",
+      "why": "the MoE gate GEMM ran before the shared experts' side stream forked, alone on the GPU; the fp32 gate input (the same cast, still in the compiled graph) now enters the MoE custom op and the runner applies the gate after the fork, so the shared-expert GEMMs overlap it. Same kernels on the same inputs; only the stream schedule changes (SMALLK_EARLY_ROUTER=0 restores it)"
+    },
+    {
+      "file": "vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py, vllm/model_executor/layers/fused_moe/moe_align_block_size.py (opt-in)",
+      "why": "smallk's fused sigmoid top-k + moe_align kernel (bit-identical to ops.grouped_topk and the two align kernels for <= 32 ids) is off by default: the routing chain overlaps the shared-expert GEMMs, so shortening it gave no end-to-end gain (SMALLK_TOPK=1 SMALLK_ALIGN=1 enable it)"
     }
   ]
 }

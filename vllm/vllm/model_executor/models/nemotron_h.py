@@ -83,6 +83,16 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.nemotron_h import NemotronHConfig
 
 
+# smallk (harness/kernels/smallk): run the router GEMM inside the MoE custom op, after the shared
+# experts' side stream has forked, so the side stream's GEMMs overlap it. Same kernels on the same
+# fp32 input (the bf16 -> fp32 cast stays in the compiled graph); only the stream schedule changes.
+# SMALLK=0 or SMALLK_EARLY_ROUTER=0 keeps the gate in the compiled graph.
+try:
+    import smallk as _smallk
+except ImportError:
+    _smallk = None
+
+
 class NemotronHMLP(nn.Module):
     def __init__(
         self,
@@ -234,6 +244,19 @@ class NemotronHMoE(nn.Module):
             apply_routed_scale_to_output=True,
             router_logits_dtype=self.gate.out_dtype,
         )
+        self._smallk_early_router = (
+            _smallk is not None
+            and getattr(_smallk, "EARLY_ROUTER_ON", False)
+            and not self.is_sequence_parallel
+            and not self.use_latent_moe
+            and self.shared_experts is not None
+            and self.gate.weight.dtype == torch.float32
+            and self.gate.bias is None
+            and self.gate.out_dtype in (None, torch.float32)
+        )
+        if self._smallk_early_router:
+            # not a submodule: weight names and loading stay as they are
+            object.__setattr__(self.experts, "_smallk_gate", self.gate)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
@@ -241,6 +264,14 @@ class NemotronHMoE(nn.Module):
 
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
+
+        if self._smallk_early_router:
+            # the runner applies self.gate to this fp32 copy after the side-stream fork
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                router_logits=hidden_states.to(self.gate.weight.dtype),
+            )
+            return final_hidden_states.view(num_tokens, hidden_dim)
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)

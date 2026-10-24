@@ -868,6 +868,16 @@ class MoERunner(MoERunnerInterface):
                 router_logits = F.linear(hidden_states, self._combined_gate_weight)
             else:
                 router_logits, _ = self.gate(hidden_states)
+        else:
+            # smallk early router (models/nemotron_h.py): router_logits carries the gate input
+            # (fp32 gate without bias: GateLinear.forward is exactly this op body)
+            smallk_gate = self.__dict__.get("_smallk_gate")
+            if smallk_gate is not None:
+                from vllm.model_executor.layers.fused_moe.router.gate_linear import (
+                    smallk_router_gemm_impl,
+                )
+
+                router_logits = smallk_router_gemm_impl(router_logits, smallk_gate.weight)
 
         with self._sequence_parallel_context():
             # TODO(bnell): parts of the dispatch/combine steps will go away once

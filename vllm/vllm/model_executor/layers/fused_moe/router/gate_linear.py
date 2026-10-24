@@ -13,6 +13,15 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
+# smallk (harness/kernels/smallk): the fp32 router GEMM of the M = 4 verify with the exact
+# summation tree of the cuBLAS kernel F.linear picks for it, on 48 SMs instead of 16 CTAs.
+# SMALLK=0 or SMALLK_ROUTER=0 disables it; without the package, or for any call outside its
+# shape guard (M, N, K) = (4, 128, 2688), the op runs torch.mm(x, weight.t()) as before.
+try:
+    import smallk as _smallk
+except ImportError:
+    _smallk = None
+
 
 @PluggableLayer.register("gate_linear")
 class GateLinear(ReplicatedLinear):
@@ -215,6 +224,16 @@ class GateLinear(ReplicatedLinear):
         # Tier 6: F.linear (ReplicatedLinear)
         if self.out_dtype is not None and x.dtype != self.weight.dtype:
             x = x.to(self.weight.dtype)
+        if (
+            _smallk is not None
+            and _smallk.ROUTER_ON
+            and self.bias is None
+            and self.weight.dtype == torch.float32
+            and x.dtype == torch.float32
+            and self.out_dtype in (None, torch.float32)
+            and x.dim() == 2
+        ):
+            return torch.ops.vllm.smallk_router_gemm(x, self.weight), None
         output, output_bias = super().forward(x)
         if self.out_dtype is not None and output.dtype != self.out_dtype:
             output = output.to(self.out_dtype)
@@ -261,4 +280,24 @@ direct_register_custom_op(
     op_name="fp32_router_gemm_dispatch",
     op_func=fp32_router_gemm_dispatch_impl,
     fake_impl=fp32_router_gemm_dispatch_fake,
+)
+
+
+def smallk_router_gemm_impl(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Router logits x . weight^T in fp32: smallk for its verified shape, else torch.mm."""
+    if _smallk is not None:
+        out = _smallk.maybe_router_gemm(x, weight)
+        if out is not None:
+            return out
+    return torch.mm(x, weight.t())
+
+
+def smallk_router_gemm_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return x.new_empty((x.shape[0], weight.shape[0]), dtype=torch.float32)
+
+
+direct_register_custom_op(
+    op_name="smallk_router_gemm",
+    op_func=smallk_router_gemm_impl,
+    fake_impl=smallk_router_gemm_fake,
 )

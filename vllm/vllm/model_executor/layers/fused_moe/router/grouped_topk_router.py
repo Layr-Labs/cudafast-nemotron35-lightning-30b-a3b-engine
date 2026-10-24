@@ -24,6 +24,14 @@ from vllm.model_executor.layers.fused_moe.router.fused_topk_router import fused_
 from vllm.model_executor.utils import maybe_disable_graph_partition
 from vllm.platforms import current_platform
 
+# smallk (harness/kernels/smallk): the fused sigmoid grouped top-k for one group, bit-identical
+# to ops.grouped_topk; with the align block size known it also produces the align outputs in the
+# same kernel. SMALLK=0 or SMALLK_TOPK=0 disables it; outside its guard the stock path runs.
+try:
+    import smallk as _smallk
+except ImportError:
+    _smallk = None
+
 
 def fused_grouped_topk(
     hidden_states: torch.Tensor,
@@ -292,6 +300,33 @@ class GroupedTopKRouter(BaseRouter):
         input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute routing using grouped top-k."""
+        smallk_ok = self.__dict__.get("_smallk_ok")
+        if smallk_ok is None:
+            smallk_ok = self._smallk_ok = bool(
+                _smallk is not None
+                and _smallk.TOPK_ON
+                and self.scoring_func == "sigmoid"
+                and self.num_expert_group == 1
+                and self.topk_group == 1
+                and self.e_score_correction_bias is not None
+                and envs.VLLM_USE_FUSED_MOE_GROUPED_TOPK
+                and current_platform.is_cuda()
+                and not rocm_aiter_ops.is_fused_moe_enabled()
+            )
+        if (
+            smallk_ok
+            and indices_type in (None, torch.int32)
+            and not torch.compiler.is_compiling()
+        ):
+            out = _smallk.maybe_topk_sigmoid(
+                router_logits,
+                self.e_score_correction_bias,
+                self.top_k,
+                self.renormalize,
+                self.routed_scaling_factor,
+            )
+            if out is not None:
+                return out
 
         def valid_grouping() -> bool:
             # Check if num_experts is greater than num_expert_group

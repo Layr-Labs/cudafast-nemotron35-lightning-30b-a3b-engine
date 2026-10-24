@@ -14,6 +14,14 @@ from .base import NvFp4LinearKernel, NvFp4LinearLayerConfig
 
 logger = init_logger(__name__)
 
+# marlinx (harness/kernels/marlinx): a Marlin-exact NVFP4 GEMM for M <= 8 on the
+# shared-expert and lm_head shapes. MARLINX=0 disables it; when the package is
+# not built, or a call is outside its guard, stock Marlin runs.
+try:
+    import marlinx as _marlinx
+except ImportError:
+    _marlinx = None
+
 
 class MarlinNvFp4LinearKernel(NvFp4LinearKernel):
     """NVFP4 weight-only GEMM via Marlin (W4A16)."""
@@ -38,6 +46,8 @@ class MarlinNvFp4LinearKernel(NvFp4LinearKernel):
             "performance for compute-heavy workloads."
         )
         prepare_fp4_layer_for_marlin(layer)
+        if _marlinx is not None and _marlinx.prepare(layer):
+            logger.info_once("marlinx: Marlin-exact NVFP4 GEMM enabled for M <= 8")
 
     def apply_weights(
         self,
@@ -45,6 +55,10 @@ class MarlinNvFp4LinearKernel(NvFp4LinearKernel):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if bias is None and _marlinx is not None:
+            out = _marlinx.maybe_apply(layer, x)
+            if out is not None:
+                return out
         return apply_fp4_marlin_linear(
             input=x,
             weight=layer.weight,

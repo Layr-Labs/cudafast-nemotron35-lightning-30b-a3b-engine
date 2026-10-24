@@ -7,6 +7,14 @@ from vllm import _custom_ops as ops
 from vllm.triton_utils import triton
 from vllm.utils.math_utils import round_up
 
+# smallk (harness/kernels/smallk): both align kernels in one CTA (or the outputs the fused top-k
+# already produced), same integers. SMALLK=0 or SMALLK_ALIGN=0 disables it; outside its guard
+# (no expert map, no sorted-id padding, 128 experts, <= 32 ids, int32) the stock op runs.
+try:
+    import smallk as _smallk
+except ImportError:
+    _smallk = None
+
 
 def moe_align_block_size(
     topk_ids: torch.Tensor,
@@ -71,6 +79,11 @@ def moe_align_block_size(
     - The padding ensures that the total number of tokens is now divisible
         by block_size for proper block matrix operations.
     """
+    if _smallk is not None and not pad_sorted_ids and expert_map is None:
+        out = _smallk.maybe_align(topk_ids, num_experts, block_size, expert_map)
+        if out is not None:
+            return out
+
     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
     if pad_sorted_ids:
         max_num_tokens_padded = round_up(max_num_tokens_padded, block_size)

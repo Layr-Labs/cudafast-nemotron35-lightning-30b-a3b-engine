@@ -1,0 +1,284 @@
+"""smallk: bit-exact replacements for small latency-bound kernels of the Nemotron-3.5 MTP verify.
+
+libsmallk.so (ctypes, static cudart); csrc/smallk.cu documents the arithmetic each kernel
+reproduces and README.md the evidence:
+
+- router_gemm(x, w): the fp32 MoE gate y = x . w^T for M = 4 rows, with the summation tree of the
+  cuBLAS gemmSN_TN kernel torch picks for (M = 4, N = 128, K = 2688).
+- topk_sigmoid(logits, bias, ...): vLLM's fused grouped top-k for n_group = topk_group = 1,
+  sigmoid scoring, fp32 logits and bias (128 experts).
+- align(topk_ids, ...): moe_align_block_size + count_and_sort_expert_tokens in one CTA.
+- route(...): top-k and align in one CTA. The router hook (maybe_topk_sigmoid) launches it when
+  the align block size for this token count is known from an earlier align call, and parks the
+  align outputs; the align hook (maybe_align) hands them out for the same topk_ids storage.
+
+Switches (environment, read at import): SMALLK=0 disables everything; SMALLK_ROUTER=0 and
+SMALLK_EARLY_ROUTER=0 (both on by default) disable the router GEMM and its schedule change;
+SMALLK_TOPK=1 / SMALLK_ALIGN=1 opt into the top-k and align kernels (off by default: no
+end-to-end gain), SMALLK_FUSE=0 then keeps them separate.
+SMALLK_EARLY_ROUTER=0 keeps the router GEMM in the compiled graph (before the shared-expert stream
+forks) instead of inside the MoE custom op. A call outside a kernel's verified guard returns None
+and the caller runs the stock op.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import os
+
+import torch
+
+__all__ = ["LIB_PATH", "available", "load_error", "init", "router_gemm", "topk_sigmoid", "align", "route",
+           "ROUTER_ON", "TOPK_ON", "ALIGN_ON", "FUSE_ON", "EARLY_ROUTER_ON", "maybe_router_gemm", "maybe_topk_sigmoid",
+           "maybe_align"]
+
+LIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "libsmallk.so")
+
+
+def _flag(name: str, default: str = "1") -> bool:
+    return os.environ.get(name, default) != "0"
+
+
+ENABLED = _flag("SMALLK")
+ROUTER_ON = ENABLED and _flag("SMALLK_ROUTER")
+# Opt-in: exact, but no end-to-end gain at depth 3 (the routing chain overlaps the shared-expert
+# GEMMs on the side stream; a shorter chain only moves that overlap into the routed-expert GEMM).
+TOPK_ON = ENABLED and _flag("SMALLK_TOPK", "0")
+ALIGN_ON = ENABLED and _flag("SMALLK_ALIGN", "0")
+FUSE_ON = TOPK_ON and ALIGN_ON and _flag("SMALLK_FUSE")
+# models/nemotron_h.py: the gate runs inside the MoE custom op after the shared-expert stream fork
+EARLY_ROUTER_ON = ENABLED and _flag("SMALLK_EARLY_ROUTER")
+PDL = int(os.environ.get("SMALLK_PDL", "1"))
+ROUTER_ROWS = int(os.environ.get("SMALLK_ROUTER_ROWS", "1"))
+TOPK_WARPS = int(os.environ.get("SMALLK_TOPK_WARPS", "4"))
+
+# Shapes whose stock kernel was identified and whose arithmetic the kernel reproduces bit for bit.
+ROUTER_SHAPES = frozenset({(4, 128, 2688)})  # (M, N, K)
+NUM_EXPERTS = 128
+MAX_TOPK = 8
+# Stock count_and_sort fills an expert's slots in lane order when all ids sit in one warp; with
+# more ids the order across warps is a race, so only numel <= 32 is reproduced.
+ALIGN_MAX_NUMEL = 32
+
+_lib = None
+_load_error: str | None = None
+_ready = False
+_align_bs: dict[int, int] = {}  # numel -> block size the experts asked for
+_parked: tuple | None = None  # (ids_ptr, numel, block_size, sorted_ids, expert_ids, num_tokens_post_pad)
+
+
+def _load():
+    global _lib, _load_error
+    if _lib is not None or _load_error is not None:
+        return _lib
+    try:
+        lib = ctypes.CDLL(LIB_PATH)
+        vp, ci, cl, cf = ctypes.c_void_p, ctypes.c_int, ctypes.c_long, ctypes.c_float
+        lib.sk_version.restype = ci
+        lib.sk_init.restype = ci
+        lib.sk_router_gemm.argtypes = [vp, cl, ci, vp, ci, ci, vp, cl, ci, ci, ci, vp]
+        lib.sk_router_gemm.restype = ci
+        lib.sk_topk_sigmoid.argtypes = [vp, vp, ci, ci, ci, ci, cf, vp, vp, ci, ci, vp]
+        lib.sk_topk_sigmoid.restype = ci
+        lib.sk_align.argtypes = [vp, ci, ci, ci, vp, ci, vp, ci, vp, ci, vp]
+        lib.sk_align.restype = ci
+        lib.sk_route.argtypes = [vp, vp, ci, ci, ci, ci, cf, vp, vp, ci, vp, ci, vp, ci, vp, ci, vp]
+        lib.sk_route.restype = ci
+        _lib = lib
+    except OSError as exc:  # library missing or unloadable: callers fall back
+        _load_error = str(exc)
+    return _lib
+
+
+def available() -> bool:
+    return _load() is not None
+
+
+def load_error() -> str | None:
+    _load()
+    return _load_error
+
+
+def init() -> bool:
+    """Loads the kernels into the context. Must run outside CUDA graph capture."""
+    global _ready
+    if _ready:
+        return True
+    lib = _load()
+    if lib is None or torch.cuda.is_current_stream_capturing():
+        return False
+    rc = lib.sk_init()
+    if rc != 0:
+        raise RuntimeError(f"sk_init failed: {rc}")
+    _ready = True
+    return True
+
+
+def _stream(t: torch.Tensor) -> int:
+    return torch.cuda.current_stream(t.device).cuda_stream
+
+
+def _pdl(pdl: int | None) -> int:
+    return PDL if pdl is None else pdl
+
+
+def router_gemm(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor | None = None, rows: int | None = None,
+                mode: int = 0, pdl: int | None = None) -> torch.Tensor:
+    """y[M, N] = x[M, K] . w[N, K]^T in fp32 (x rows unit-stride, w contiguous). mode 1 (mul+add
+    chains) exists only to show the fma chain is the one cuBLAS uses."""
+    lib = _load()
+    assert lib is not None, _load_error
+    m, k = x.shape
+    n = w.shape[0]
+    if out is None:
+        out = torch.empty((m, n), dtype=torch.float32, device=x.device)
+    rc = lib.sk_router_gemm(x.data_ptr(), x.stride(0), m, w.data_ptr(), n, k, out.data_ptr(), out.stride(0),
+                            ROUTER_ROWS if rows is None else rows, mode, _pdl(pdl), _stream(x))
+    if rc != 0:
+        raise RuntimeError(f"sk_router_gemm failed: {rc} (M={m} N={n} K={k})")
+    return out
+
+
+def topk_sigmoid(logits: torch.Tensor, bias: torch.Tensor, topk: int, renormalize: bool, scale: float,
+                 warps: int | None = None, pdl: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    lib = _load()
+    assert lib is not None, _load_error
+    m, e = logits.shape
+    values = torch.empty((m, topk), dtype=torch.float32, device=logits.device)
+    indices = torch.empty((m, topk), dtype=torch.int32, device=logits.device)
+    rc = lib.sk_topk_sigmoid(logits.data_ptr(), bias.data_ptr(), m, e, topk, int(renormalize), float(scale),
+                             values.data_ptr(), indices.data_ptr(), TOPK_WARPS if warps is None else warps,
+                             _pdl(pdl), _stream(logits))
+    if rc != 0:
+        raise RuntimeError(f"sk_topk_sigmoid failed: {rc} (M={m} E={e} topk={topk})")
+    return values, indices
+
+
+def align_buffers(numel: int, num_experts: int, block_size: int, device) -> tuple[torch.Tensor, ...]:
+    """The three outputs, sized exactly as vLLM's moe_align_block_size allocates them."""
+    max_num_tokens_padded = numel + num_experts * (block_size - 1)
+    if numel < num_experts:
+        max_num_tokens_padded = min(numel * block_size, max_num_tokens_padded)
+    max_num_m_blocks = (max_num_tokens_padded + block_size - 1) // block_size
+    sorted_ids = torch.empty((max_num_tokens_padded,), dtype=torch.int32, device=device)
+    expert_ids = torch.empty((max_num_m_blocks,), dtype=torch.int32, device=device)
+    num_tokens_post_pad = torch.empty((1,), dtype=torch.int32, device=device)
+    return sorted_ids, expert_ids, num_tokens_post_pad
+
+
+def align(topk_ids: torch.Tensor, num_experts: int, block_size: int, sorted_ids: torch.Tensor,
+          expert_ids: torch.Tensor, num_tokens_post_pad: torch.Tensor, pdl: int | None = None) -> None:
+    lib = _load()
+    assert lib is not None, _load_error
+    rc = lib.sk_align(topk_ids.data_ptr(), topk_ids.numel(), num_experts, block_size, sorted_ids.data_ptr(),
+                      sorted_ids.numel(), expert_ids.data_ptr(), expert_ids.numel(), num_tokens_post_pad.data_ptr(),
+                      _pdl(pdl), _stream(topk_ids))
+    if rc != 0:
+        raise RuntimeError(f"sk_align failed: {rc} (numel={topk_ids.numel()} E={num_experts} bs={block_size})")
+
+
+def route(logits: torch.Tensor, bias: torch.Tensor, topk: int, renormalize: bool, scale: float, block_size: int,
+          pdl: int | None = None) -> tuple[torch.Tensor, ...]:
+    """(values, indices, sorted_ids, expert_ids, num_tokens_post_pad) from one kernel."""
+    lib = _load()
+    assert lib is not None, _load_error
+    m, e = logits.shape
+    values = torch.empty((m, topk), dtype=torch.float32, device=logits.device)
+    indices = torch.empty((m, topk), dtype=torch.int32, device=logits.device)
+    sorted_ids, expert_ids, ntpp = align_buffers(m * topk, e, block_size, logits.device)
+    rc = lib.sk_route(logits.data_ptr(), bias.data_ptr(), m, e, topk, int(renormalize), float(scale),
+                      values.data_ptr(), indices.data_ptr(), block_size, sorted_ids.data_ptr(), sorted_ids.numel(),
+                      expert_ids.data_ptr(), expert_ids.numel(), ntpp.data_ptr(), _pdl(pdl), _stream(logits))
+    if rc != 0:
+        raise RuntimeError(f"sk_route failed: {rc} (M={m} E={e} topk={topk} bs={block_size})")
+    return values, indices, sorted_ids, expert_ids, ntpp
+
+
+# ---------------------------------------------------------------- guarded entry points for vLLM
+def _usable() -> bool:
+    if _ready:
+        return True
+    return _load() is not None and init()
+
+
+def maybe_router_gemm(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor | None:
+    """Exact router logits for a verified shape, or None (caller runs torch.mm)."""
+    if not ROUTER_ON or x.dim() != 2 or x.shape[0] != 4 or w.dim() != 2:
+        return None
+    m, k = x.shape
+    n = w.shape[0]
+    if (
+        (m, n, k) not in ROUTER_SHAPES
+        or x.dtype != torch.float32
+        or w.dtype != torch.float32
+        or w.shape[1] != k
+        or x.stride(1) != 1
+        or not w.is_contiguous()
+        or not x.is_cuda
+    ):
+        return None
+    if not _usable():
+        return None
+    return router_gemm(x, w)
+
+
+def maybe_topk_sigmoid(logits: torch.Tensor, bias: torch.Tensor | None, topk: int, renormalize: bool,
+                       scale: float) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Exact grouped top-k (n_group = topk_group = 1, sigmoid, fp32) or None (caller runs vLLM's op).
+    With SMALLK_FUSE on and a known align block size, the align outputs are computed too and parked."""
+    global _parked
+    _parked = None
+    if not TOPK_ON or bias is None or logits.dim() != 2 or logits.shape[0] > 64:
+        return None
+    m = logits.shape[0]
+    if (
+        logits.shape[1] != NUM_EXPERTS
+        or logits.dtype != torch.float32
+        or bias.dtype != torch.float32
+        or bias.numel() != NUM_EXPERTS
+        or not logits.is_contiguous()
+        or not bias.is_contiguous()
+        or topk < 1
+        or topk > MAX_TOPK
+        or m < 1
+        or m > 64
+        or not logits.is_cuda
+    ):
+        return None
+    if not _usable():
+        return None
+    bs = _align_bs.get(m * topk) if FUSE_ON else None
+    if bs is None:
+        return topk_sigmoid(logits, bias, topk, renormalize, scale)
+    values, indices, sorted_ids, expert_ids, ntpp = route(logits, bias, topk, renormalize, scale, bs)
+    _parked = (indices.data_ptr(), indices.numel(), bs, sorted_ids, expert_ids, ntpp)
+    return values, indices
+
+
+def maybe_align(topk_ids: torch.Tensor, num_experts: int, block_size: int,
+                expert_map: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """(sorted_ids, expert_ids, num_tokens_post_pad) equal to vLLM's moe_align_block_size with
+    ignore_invalid_experts and no padding of sorted ids, or None (caller runs vLLM's op)."""
+    global _parked
+    parked, _parked = _parked, None
+    numel = topk_ids.numel()
+    if not ALIGN_ON or numel > ALIGN_MAX_NUMEL or expert_map is not None:
+        return None
+    if (
+        topk_ids.dtype != torch.int32
+        or not topk_ids.is_contiguous()
+        or numel < 1
+        or numel > ALIGN_MAX_NUMEL
+        or num_experts != NUM_EXPERTS
+        or block_size < 1
+        or not topk_ids.is_cuda
+    ):
+        return None
+    if not _usable():
+        return None
+    _align_bs[numel] = block_size
+    if parked is not None and parked[0] == topk_ids.data_ptr() and parked[1] == numel and parked[2] == block_size:
+        return parked[3], parked[4], parked[5]
+    sorted_ids, expert_ids, ntpp = align_buffers(numel, num_experts, block_size, topk_ids.device)
+    align(topk_ids, num_experts, block_size, sorted_ids, expert_ids, ntpp)
+    return sorted_ids, expert_ids, ntpp

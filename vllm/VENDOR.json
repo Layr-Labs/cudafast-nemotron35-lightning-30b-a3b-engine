@@ -58,6 +58,10 @@
     {
       "file": "vllm/model_executor/layers/fused_moe/experts/humming_tuned_moe.py (TUNED_PAD_K)",
       "why": "the tuned routed experts padded K to a multiple of 128, so the down projection's K 1856 became 1920 and every w2 tile streamed and multiplied two all-zero 32-wide K blocks; K now pads only to humming's BF16 pack granule (32), the smallest it accepts. Each element keeps the same K blocks in the same order; the dropped steps were mma(+0, +0, acc), which only turned an acc of -0 into +0, and a signed zero changes no later value's magnitude, logit or token"
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h.py (NemotronHMoE)",
+      "why": "strict single-device nonlatent NVFP4 W4A16 Humming target: pass the same original FP32 GateLinear through the existing MoERunner gate interface so its shared-stream fork precedes the gate in FULL graph dependencies; original gate/top-k/experts/format math and existing stream joins remain, unsupported modes and BF16 MTP keep the external gate; all runtime validation remote only"
     }
   ]
 }

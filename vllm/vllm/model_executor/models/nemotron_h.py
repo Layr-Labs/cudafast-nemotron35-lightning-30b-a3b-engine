@@ -79,6 +79,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
     sequence_parallel_chunk,
 )
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.nemotron_h import NemotronHConfig
 
@@ -209,8 +210,26 @@ class NemotronHMoE(nn.Module):
             self.fc1_latent_proj = None
             self.fc2_latent_proj = None
 
+        # Use the existing runner gate interface only where its input is the
+        # same original hidden Tensor: no latent transform, SP or distribution.
+        # Backend/dtype/padding qualification follows actual factory selection.
+        internal_gate_candidate = (
+            current_platform.is_cuda()
+            and not self.use_latent_moe
+            and self.shared_experts is not None
+            and not self.is_sequence_parallel
+            and not self.enable_eplb
+            and self.tp_size == 1
+            and self.ep_size == 1
+            and parallel_config.pipeline_parallel_size == 1
+            and parallel_config.data_parallel_size == 1
+            and parallel_config.prefill_context_parallel_size == 1
+            and parallel_config.decode_context_parallel_size == 1
+            and not parallel_config.use_ubatching
+        )
         self.experts = FusedMoEFactory(
             shared_experts=self.shared_experts,
+            gate=self.gate if internal_gate_candidate else None,
             num_experts=config.n_routed_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=self.moe_hidden_size,
@@ -235,6 +254,31 @@ class NemotronHMoE(nn.Module):
             router_logits_dtype=self.gate.out_dtype,
         )
 
+        if internal_gate_candidate:
+            from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+                NvFp4MoeBackend,
+            )
+            from vllm.model_executor.layers.quantization.modelopt import (
+                ModelOptNvFp4FusedMoE,
+            )
+
+            method = self.experts.routed_experts.quant_method
+            if not (
+                type(method) is ModelOptNvFp4FusedMoE
+                and method.use_a16
+                and method.nvfp4_backend == NvFp4MoeBackend.HUMMING
+                and self.experts.moe_config.moe_backend == "humming"
+                and self.experts.moe_config.hidden_dim == config.hidden_size
+                and not self.experts.moe_config.is_lora_enabled
+                and self.experts.routed_input_transform is None
+                and self.experts.routed_output_transform is None
+                and self.gate.weight.dtype == torch.float32
+                and self.gate.out_dtype == torch.float32
+            ):
+                # In particular, keep latent/padded/TRTLLM and BF16 MTP experts
+                # on the original external-gate path. No backend is replaced.
+                self.experts.gate = None
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -242,12 +286,19 @@ class NemotronHMoE(nn.Module):
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
-
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
-        )
+        if self.experts.is_internal_router:
+            # The runner calls this same GateLinear once, after its existing
+            # shared-stream fork. This follows its existing internal interface;
+            # router_logits is an unused placeholder until that original call.
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states, router_logits=hidden_states
+            )
+        else:
+            # router_logits: (num_tokens, n_experts)
+            router_logits, _ = self.gate(hidden_states)
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states, router_logits=router_logits
+            )
 
         if self.is_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(

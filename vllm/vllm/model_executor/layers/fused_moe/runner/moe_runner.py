@@ -287,6 +287,10 @@ class MoERunner(MoERunnerInterface):
         # Needed for string -> MoERunner layer lookup in custom ops.
         self.layer_name = layer_name
 
+        # A 1-element GPU index tensor while only that row of this layer's
+        # output is read; None (the default) routes every row on its own.
+        self.keep_m_row_src: torch.Tensor | None = None
+
         self._forward_entry = self._select_forward()
 
         # For smuggling this layer into the fused moe custom op
@@ -606,6 +610,16 @@ class MoERunner(MoERunnerInterface):
                 topk_indices_dtype=self._quant_method.topk_indices_dtype,
                 input_ids=input_ids,
             )
+            row_src = self.keep_m_row_src
+            if row_src is not None:
+                # Only row `row_src` of this layer's output is read (set by the
+                # model runner, see NemotronHForCausalLM.set_last_moe_row_src):
+                # every row takes that row's experts and weights. M, and so
+                # valid_shape_m = M * top_k and the kernel config, stay the
+                # same; that row's own ids, weights and inputs are unchanged.
+                rows = row_src.expand(topk_ids.size(0))
+                topk_ids = topk_ids.index_select(0, rows)
+                topk_weights = topk_weights.index_select(0, rows)
 
             fused_out = self.routed_experts.forward_modular(
                 x=hidden_states,

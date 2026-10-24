@@ -4455,13 +4455,20 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
+            keep_m = self._route_last_moe_through_logits_row(
+                logits_indices, spec_decode_metadata, cudagraph_mode, ubatch_slices
             )
+            try:
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
+            finally:
+                if keep_m:
+                    self.get_model().set_last_moe_row_src(None)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4556,6 +4563,49 @@ class GPUModelRunner(
             common_attn_metadata.max_seq_len + num_drafter_query_tokens
             <= self.effective_drafter_max_model_len
         ) and self._drafts_can_be_verified()
+
+    def _route_last_moe_through_logits_row(
+        self,
+        logits_indices: torch.Tensor,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+        cudagraph_mode: CUDAGraphMode,
+        ubatch_slices: Any,
+    ) -> bool:
+        """Route every row of the target's last MoE layer through the logits row.
+
+        Only for a step that reads one row of the final hidden states: one
+        request with max_tokens == 1 (the drafter is skipped, see
+        _drafts_can_be_verified), no prompt logprobs, no aux or pooled hidden
+        states, no routing capture or EPLB, no KV/EC connector, one PP rank,
+        run eagerly (no CUDA graph can freeze the switch). Then the last MoE
+        layer's other rows reach nothing but norm_f, a per-row norm, and are
+        never read. Every row keeps its own input and M is unchanged, so the
+        kernel config is the same and the logits row's experts, weights and
+        reduction order are its own: its output is bit-identical. The other
+        rows read 6 experts' weights instead of nearly all 128.
+        Returns True when the switch was set; the caller clears it.
+        """
+        if (
+            spec_decode_metadata is not None
+            or cudagraph_mode != CUDAGraphMode.NONE
+            or ubatch_slices is not None
+            or self.input_batch.num_reqs != 1
+            or logits_indices.shape[0] != 1
+            or self.num_prompt_logprobs
+            or self.use_aux_hidden_state_outputs
+            or self.is_pooling_model
+            or self.routed_experts_initialized
+            or self.eplb_state is not None
+            or has_kv_transfer_group()
+            or has_ec_transfer()
+            or get_pp_group().world_size != 1
+            or self._drafts_can_be_verified()
+        ):
+            return False
+        set_row_src = getattr(self.get_model(), "set_last_moe_row_src", None)
+        if set_row_src is None:
+            return False
+        return bool(set_row_src(logits_indices[:1]))
 
     def _drafts_can_be_verified(self) -> bool:
         """False when every request in the batch has max_tokens == 1.

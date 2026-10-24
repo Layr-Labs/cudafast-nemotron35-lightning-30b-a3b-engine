@@ -12,7 +12,7 @@ import os
 
 import torch
 
-__all__ = ["LIB_PATH", "available", "down", "BM"]
+__all__ = ["LIB_PATH", "available", "down", "BM", "block_rows"]
 
 LIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "libpzskip.so")
 ENABLED = os.environ.get("PZSKIP", "1") != "0"
@@ -45,8 +45,13 @@ def available() -> bool:
     return ENABLED and _load() is not None
 
 
-def max_blocks(shape_m: int, num_experts: int) -> int:
-    return (shape_m + num_experts * (BM - 1) + BM - 1) // BM
+def block_rows(wpc: int) -> int:
+    """Expert block rows a config expects in its moe_align layout (320-339: 32, 340-359: 16)."""
+    return 32 if 320 <= wpc < 340 else (16 if 340 <= wpc < 360 else BM)
+
+
+def max_blocks(shape_m: int, num_experts: int, bm: int = BM) -> int:
+    return (shape_m + num_experts * (bm - 1) + bm - 1) // bm
 
 
 def scratch(device: torch.device, blocks: int) -> torch.Tensor:
@@ -63,10 +68,12 @@ def scratch(device: torch.device, blocks: int) -> torch.Tensor:
 def down(a: torch.Tensor, sorted_ids: torch.Tensor, expert_ids: torch.Tensor,
          num_tokens_padded: torch.Tensor, packed, out: torch.Tensor, num_experts: int = 128,
          dense: bool = False, loadonly: bool = False, computeonly: bool = False, stats: torch.Tensor | None = None, wpc: int = WPC) -> torch.Tensor:
-    """out[r] = humming's w2 row r for the moe_align layout with block 64 (rows = token * top_k + slot)."""
+    """out[r] = humming's w2 row r for the moe_align layout with block block_rows(wpc)
+    (rows = token * top_k + slot)."""
     lib = _load()
     assert lib is not None, _load_error
-    blocks = min(max_blocks(a.shape[0], num_experts), sorted_ids.numel() // BM)
+    bm = block_rows(wpc)
+    blocks = min(max_blocks(a.shape[0], num_experts, bm), sorted_ids.numel() // bm)
     ws = scratch(a.device, blocks)
     rc = lib.pzskip_down(
         a.data_ptr(), a.stride(0), a.shape[0], sorted_ids.data_ptr(), expert_ids.data_ptr(),

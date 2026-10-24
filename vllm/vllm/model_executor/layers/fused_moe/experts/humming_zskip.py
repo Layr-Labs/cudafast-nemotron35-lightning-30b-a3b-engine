@@ -43,8 +43,9 @@ try:
 except ImportError:
     _pzskip = None
 PZ_ENABLED = os.environ.get("PZSKIP", "1") != "0"
-PZ_CONFIG = int(os.environ.get("PZSKIP_CONFIG", "300"))
-PZ_BLOCK_M = 64
+# config 322: 32-row expert blocks (sparser union masks than humming's 64-row blocks), 384 columns
+PZ_CONFIG = int(os.environ.get("PZSKIP_CONFIG", "322"))
+PZ_BLOCK_M = 64  # humming's prefill bucket that pzskip replaces
 PZ_MAX_TOKENS = 8192
 
 ENABLED = os.environ.get("ZSKIP", "1") != "0"
@@ -131,7 +132,10 @@ def finalize(layer: torch.nn.Module) -> None:
     logger.info_once("zskip: zero-row-skipping routed down projection enabled for <= 8 tokens")
     layer.pzskip_ok = False
     if PZ_ENABLED and _pzskip is not None and _pzskip.available():
-        _pzskip.scratch(gs.device, _pzskip.max_blocks(PZ_MAX_TOKENS * TOP_K, NUM_EXPERTS))
+        _pzskip.scratch(
+            gs.device,
+            _pzskip.max_blocks(PZ_MAX_TOKENS * TOP_K, NUM_EXPERTS, _pzskip.block_rows(PZ_CONFIG)),
+        )
         if _pz_self_check(layer):
             layer.pzskip_ok = True
             logger.info_once("pzskip: zero-row-skipping routed down projection enabled for prefill")
@@ -201,6 +205,8 @@ def _pz_self_check(layer: torch.nn.Module) -> bool:
         tuning_config=json.dumps(configs[1]),
     )
     out = torch.empty_like(ref)
+    if _pzskip.block_rows(PZ_CONFIG) != PZ_BLOCK_M:
+        sorted_ids, expert_ids, ntp = _align(topk_ids, _pzskip.block_rows(PZ_CONFIG))
     _pzskip.down(act, sorted_ids, expert_ids, ntp, layer.zskip_w2, out, wpc=PZ_CONFIG)
     ok = torch.equal(out.view(torch.int16), ref.view(torch.int16))
     if not ok:
@@ -357,7 +363,7 @@ def maybe_down(
         and num_tokens <= PZ_MAX_TOKENS
         and block_m == PZ_BLOCK_M
         and getattr(layer, "pzskip_ok", False)
-        and _pz_down(layer, inputs, input_scale, outputs, num_tokens, top_k, moe_kwargs)
+        and _pz_down(layer, inputs, input_scale, outputs, num_tokens, top_k, moe_kwargs, topk_ids)
     ):
         return True
     if prefill:
@@ -423,8 +429,9 @@ def _pz_down(
     num_tokens: int,
     top_k: int,
     moe_kwargs: dict[str, Any],
+    topk_ids: torch.Tensor | None = None,
 ) -> bool:
-    """Prefill-sized w2 with pzskip (humming's block_m 64 layout); False: caller runs humming."""
+    """Prefill-sized w2 with pzskip (humming's block_m 64 calls); False: caller runs humming."""
     if top_k != TOP_K or input_scale is not None:
         return False
     if inputs.dtype != torch.bfloat16 or outputs.dtype != torch.bfloat16:
@@ -444,13 +451,14 @@ def _pz_down(
         or outputs.stride(0) % 2
     ):
         return False
-    _pzskip.down(
-        inputs,
-        moe_kwargs["sorted_ids"],
-        moe_kwargs["expert_ids"],
-        moe_kwargs["num_tokens_padded"],
-        layer.zskip_w2,
-        outputs,
-        wpc=PZ_CONFIG,
-    )
+    bm = _pzskip.block_rows(PZ_CONFIG)
+    if bm == PZ_BLOCK_M:
+        sorted_ids = moe_kwargs["sorted_ids"]
+        expert_ids = moe_kwargs["expert_ids"]
+        ntp = moe_kwargs["num_tokens_padded"]
+    elif topk_ids is not None:
+        sorted_ids, expert_ids, ntp = _align(topk_ids, bm)
+    else:
+        return False
+    _pzskip.down(inputs, sorted_ids, expert_ids, ntp, layer.zskip_w2, outputs, wpc=PZ_CONFIG)
     return True

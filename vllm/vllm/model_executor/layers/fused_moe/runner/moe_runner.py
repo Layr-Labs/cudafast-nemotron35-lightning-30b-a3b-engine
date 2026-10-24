@@ -892,7 +892,11 @@ class MoERunner(MoERunnerInterface):
                     smallk_router_gemm_impl,
                 )
 
-                router_logits = smallk_router_gemm_impl(router_logits, smallk_gate.weight)
+                router_logits = smallk_router_gemm_impl(
+                    router_logits,
+                    smallk_gate.weight,
+                    row_mask=smallk_gate.__dict__.get("_smallk_row_mask", False),
+                )
 
         with self._sequence_parallel_context():
             # TODO(bnell): parts of the dispatch/combine steps will go away once

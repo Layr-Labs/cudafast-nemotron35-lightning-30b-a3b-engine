@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+import sys
 from importlib.util import find_spec
 from typing import TYPE_CHECKING, Any, cast
 
@@ -64,6 +65,12 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+
+def _mtp_kernels():
+    """nemotron_h_mtp_kernels when the model loaded it (never imported here)."""
+    return sys.modules.get("vllm.model_executor.models.nemotron_h_mtp_kernels")
+
 
 # Protect asynchronous H2D sources; switchable for in-process cost screening.
 PINNED_SOURCE_GUARDS = True
@@ -667,6 +674,10 @@ class SpecDecodeBaseProposer:
             # (which read via _get_positions) use the correct values.
             self.positions[:batch_size] = positions
 
+        # LOCAL PATCH (cudafast-nemotron35): confidence-gated draft depth (MTP
+        # drafter with the head screen, one greedy request): from here the screen
+        # counts kept drafts and may stop the loop; see nemotron_h_mtp_kernels.py.
+        depth_gate = self._mtp_depth_gate_begin(batch_size, sampling_metadata)
         draft_token_ids, draft_probs = self._sample_draft_tokens(
             sample_hidden_states, sampling_metadata
         )
@@ -820,11 +831,29 @@ class SpecDecodeBaseProposer:
         if set_moe_row_src is not None:
             set_moe_row_src(max(num_input_tokens, input_batch_size), None)
 
+        if depth_gate is not None:
+            _mtp_kernels().depth_gate_end(depth_gate)
+
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
         if draft_probs_list is not None:
             self._last_draft_probs = torch.stack(draft_probs_list, dim=1).contiguous()
         return draft_token_ids
+
+    def _mtp_depth_gate_begin(
+        self, batch_size: int, sampling_metadata: SamplingMetadata
+    ) -> torch.Tensor | None:
+        """The MTP depth gate's state when this draft loop is gated, else None:
+        only when every draft comes from the head screen's one-row graph."""
+        kernels = _mtp_kernels()
+        if kernels is None or getattr(self, "_draft_head_screen", None) is None:
+            return None
+        if getattr(self._draft_head_screen, "graph", None) is None:
+            return None
+        greedy = (
+            not self._enable_probabilistic_draft_probs or sampling_metadata.all_greedy
+        )
+        return kernels.depth_gate_begin(batch_size, greedy)
 
     def _copy_num_rejected_to_cpu(
         self, num_rejected_tokens_gpu: torch.Tensor | None

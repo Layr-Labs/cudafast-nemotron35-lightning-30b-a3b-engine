@@ -66,6 +66,80 @@ def mtp_pdl() -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Confidence-gated draft depth
+# --------------------------------------------------------------------------- #
+# Once a draft's top-1 probability (the screen's token select, over its candidate
+# logits) falls below DEPTH_THETA, the cycle's remaining draft passes stream no
+# weights: the kernels below mask their weight loads with the gate's stop flag and
+# produce zeros. The kept drafts are counted on device; the proposer hands the count
+# to the verify (smallk verify rows: rows past the last kept draft reuse a kept row's
+# experts) and the sampler rejects every draft past it, so the emitted tokens are those
+# of a verify at the kept depth, i.e. the target's. The stop flag is only ever set
+# inside the proposer's draft loop. MTP_DEPTH_GATE=0 disables.
+DEPTH_GATE = os.environ.get("MTP_DEPTH_GATE", "1") != "0"
+DEPTH_THETA = float(os.environ.get("MTP_DEPTH_THETA", "0.4"))
+_GATE: torch.Tensor | None = None  # int32 [stop, kept drafts, draft loop active]
+_GATE_START: torch.Tensor | None = None  # [0, 0, 1] on the gate's device (no H2D per cycle)
+
+
+def depth_gate_init(device: torch.device) -> torch.Tensor | None:
+    """Allocates the gate (at load, before any graph that reads it is captured)
+    and asks smallk for its verify-row buffer."""
+    global _GATE, _GATE_START
+    if DEPTH_GATE and _GATE is None and device.type == "cuda":
+        _GATE = torch.zeros(3, dtype=torch.int32, device=device)
+        _GATE_START = torch.tensor([0, 0, 1], dtype=torch.int32, device=device)
+        try:
+            import smallk
+
+            smallk.request_verify_rows()
+        except ImportError:
+            pass
+    return _GATE
+
+
+def _gate_args(t: torch.Tensor) -> tuple[torch.Tensor, bool]:
+    """(gate, GATED) for a drafter kernel launched on t's device."""
+    g = _GATE
+    if g is None or g.device != t.device:
+        return t, False
+    return g, True
+
+
+def depth_gate_begin(batch_size: int, all_greedy: bool) -> torch.Tensor | None:
+    """Start of a draft loop: clear the stop flag and the kept count, and mark the
+    loop active (the screen counts and stops only then). Only for one greedy
+    request, the case the screen's captured graph serves."""
+    g = _GATE
+    if (
+        g is None
+        or batch_size != 1
+        or not all_greedy
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return None
+    g.copy_(_GATE_START)
+    return g
+
+
+def depth_gate_end(gate: torch.Tensor) -> None:
+    """End of the draft loop: verify rows = kept drafts + 1 (every row when nothing
+    was counted), then the stop flag and the active mark cleared."""
+    try:
+        import smallk
+    except ImportError:
+        smallk = None
+    vrows = smallk.live_verify_rows(gate.device) if smallk is not None else None
+    if vrows is not None:
+        kept = gate[1:2]
+        vrows.copy_(
+            torch.where(kept > 0, kept + 1, torch.full_like(kept, smallk.VROWS_ALL))
+        )
+    gate[0:1].zero_()
+    gate[2:3].zero_()
+
+
+# --------------------------------------------------------------------------- #
 # Dense GEMV / small-M GEMM
 # --------------------------------------------------------------------------- #
 
@@ -99,6 +173,8 @@ def _mtp_gemv_kernel(
     BN: tl.constexpr,
     BK: tl.constexpr,
     EVICT: tl.constexpr,
+    gate_ptr=None,
+    GATED: tl.constexpr = False,
     launch_pdl: tl.constexpr = False,
 ):
     if launch_pdl:
@@ -109,13 +185,17 @@ def _mtp_gemv_kernel(
     offs_n = pid * BN + tl.arange(0, BN)
     offs_k = tl.arange(0, BK)
     nmask = offs_n < N
+    # weight-load mask: off once the depth gate stopped the draft loop (zeros out)
+    wn = nmask
+    if GATED:
+        wn = nmask & (tl.load(gate_ptr) == 0)
     acc = tl.zeros((BN, BK), dtype=tl.float32)
     for k0 in range(0, K, BK):
         kk = k0 + offs_k
         kmask = kk < K
         w = _load_w(
             w_ptr + offs_n[:, None] * stride_wn + kk[None, :],
-            nmask[:, None] & kmask[None, :],
+            wn[:, None] & kmask[None, :],
             EVICT,
         )
         x = tl.load(x_ptr + kk, mask=kmask, other=0.0)
@@ -139,6 +219,8 @@ def _mtp_small_gemm_kernel(
     BN: tl.constexpr,
     BK: tl.constexpr,
     EVICT: tl.constexpr,
+    gate_ptr=None,
+    GATED: tl.constexpr = False,
     launch_pdl: tl.constexpr = False,
 ):
     if launch_pdl:
@@ -150,6 +232,10 @@ def _mtp_small_gemm_kernel(
     offs_k = tl.arange(0, BK)
     offs_m = tl.arange(0, BM)
     nmask = offs_n < N
+    # weight-load mask: off once the depth gate stopped the draft loop (zeros out)
+    wn = nmask
+    if GATED:
+        wn = nmask & (tl.load(gate_ptr) == 0)
     mmask = offs_m < M
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k0 in range(0, K, BK):
@@ -157,7 +243,7 @@ def _mtp_small_gemm_kernel(
         kmask = kk < K
         w = _load_w(
             w_ptr + offs_n[:, None] * stride_wn + kk[None, :],
-            nmask[:, None] & kmask[None, :],
+            wn[:, None] & kmask[None, :],
             EVICT,
         )
         x = tl.load(
@@ -205,6 +291,7 @@ def _small_linear(x: torch.Tensor, w: torch.Tensor, evict: bool) -> torch.Tensor
         x = x.contiguous()
     N, K = w.shape
     y = torch.empty((M, N), dtype=x.dtype, device=x.device)
+    gate, gated = _gate_args(x)
     if M == 1:
         _mtp_gemv_kernel[(triton.cdiv(N, _GEMV_BN),)](
             x,
@@ -216,6 +303,8 @@ def _small_linear(x: torch.Tensor, w: torch.Tensor, evict: bool) -> torch.Tensor
             BN=_GEMV_BN,
             EVICT=evict,
             BK=_GEMV_BK,
+            gate_ptr=gate,
+            GATED=gated,
             num_warps=_GEMV_WARPS,
             num_stages=_GEMV_STAGES,
             launch_pdl=mtp_pdl(),
@@ -235,6 +324,8 @@ def _small_linear(x: torch.Tensor, w: torch.Tensor, evict: bool) -> torch.Tensor
             BN=_DOT_BN,
             EVICT=evict,
             BK=_DOT_BK,
+            gate_ptr=gate,
+            GATED=gated,
             num_warps=_DOT_WARPS,
             num_stages=_DOT_STAGES,
             launch_pdl=mtp_pdl(),
@@ -315,6 +406,8 @@ def _mtp_moe_up_kernel(
     BN: tl.constexpr,
     BK: tl.constexpr,
     EVICT: tl.constexpr,
+    gate_ptr=None,
+    GATED: tl.constexpr = False,
     launch_pdl: tl.constexpr = False,
 ):
     if launch_pdl:
@@ -326,6 +419,10 @@ def _mtp_moe_up_kernel(
     offs_n = pid_n * BN + tl.arange(0, BN)
     offs_k = tl.arange(0, BK)
     nmask = offs_n < I
+    # weight-load mask: off once the depth gate stopped the draft loop (zeros out)
+    wn = nmask
+    if GATED:
+        wn = nmask & (tl.load(gate_ptr) == 0)
     if j < TOPK:
         e = tl.load(ids_ptr + j).to(tl.int64)
         wbase = w13_ptr + e * stride_we + offs_n[:, None].to(tl.int64) * stride_wn
@@ -336,7 +433,7 @@ def _mtp_moe_up_kernel(
     for k0 in range(0, K, BK):
         kk = k0 + offs_k
         kmask = kk < K
-        w = _load_w(wbase + kk[None, :], nmask[:, None] & kmask[None, :], EVICT)
+        w = _load_w(wbase + kk[None, :], wn[:, None] & kmask[None, :], EVICT)
         x = tl.load(x_ptr + kk, mask=kmask, other=0.0)
         acc += w.to(tl.float32) * x[None, :].to(tl.float32)
     h = tl.maximum(tl.sum(acc, axis=1), 0.0)
@@ -365,6 +462,8 @@ def _mtp_moe_down_kernel(
     BN: tl.constexpr,
     BK: tl.constexpr,
     EVICT: tl.constexpr,
+    gate_ptr=None,
+    GATED: tl.constexpr = False,
     launch_pdl: tl.constexpr = False,
 ):
     if launch_pdl:
@@ -376,6 +475,10 @@ def _mtp_moe_down_kernel(
     offs_n = pid_n * BN + tl.arange(0, BN)
     offs_k = tl.arange(0, BK)
     nmask = offs_n < H
+    # weight-load mask: off once the depth gate stopped the draft loop (zeros out)
+    wn = nmask
+    if GATED:
+        wn = nmask & (tl.load(gate_ptr) == 0)
     routed = tl.zeros((BN,), dtype=tl.float32)
     for j in range(TOPK):
         e = tl.load(ids_ptr + j).to(tl.int64)
@@ -384,7 +487,7 @@ def _mtp_moe_down_kernel(
         for k0 in range(0, I, BK):
             kk = k0 + offs_k
             kmask = kk < I
-            w = _load_w(wbase + kk[None, :], nmask[:, None] & kmask[None, :], EVICT)
+            w = _load_w(wbase + kk[None, :], wn[:, None] & kmask[None, :], EVICT)
             h = tl.load(h_ptr + j * I + kk, mask=kmask, other=0.0)
             acc += w.to(tl.float32) * h[None, :].to(tl.float32)
         routed += tl.load(tw_ptr + j).to(tl.float32) * tl.sum(acc, axis=1)
@@ -397,7 +500,7 @@ def _mtp_moe_down_kernel(
             kmask = kk < I
             w = _load_w(
                 sbase + s * I + kk[None, :],
-                nmask[:, None] & kmask[None, :],
+                wn[:, None] & kmask[None, :],
                 EVICT,
             )
             h = tl.load(h_ptr + (TOPK + s) * I + kk, mask=kmask, other=0.0)
@@ -634,6 +737,7 @@ def mtp_moe_row(
     topk = ids.numel()
     E, inter, H = w13.shape
     h = torch.empty((topk + n_shared, inter), dtype=x.dtype, device=x.device)
+    gate, gated = _gate_args(x)
     _mtp_moe_up_kernel[(triton.cdiv(inter, _MOE_UP_BN), topk + n_shared)](
         x,
         w13,
@@ -649,6 +753,8 @@ def mtp_moe_row(
         BN=_MOE_UP_BN,
         EVICT=_EVICT_W,
         BK=_MOE_UP_BK,
+        gate_ptr=gate,
+        GATED=gated,
         num_warps=_MOE_UP_WARPS,
         num_stages=_MOE_UP_STAGES,
         launch_pdl=mtp_pdl(),
@@ -677,6 +783,8 @@ def mtp_moe_row(
         BN=_MOE_DN_BN,
         EVICT=_EVICT_W,
         BK=_MOE_DN_BK,
+        gate_ptr=gate,
+        GATED=gated,
         num_warps=_MOE_DN_WARPS,
         num_stages=_MOE_DN_STAGES,
         launch_pdl=mtp_pdl(),

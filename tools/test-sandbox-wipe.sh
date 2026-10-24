@@ -284,6 +284,8 @@ JOB_ROOT="${WORK}/jobs"
 JOB="${JOB_ROOT}/42-1"
 reset_job() {
   rm -rf -- "${JOB_ROOT}"
+  # only the deepest directory (the job dir) needs mode 2750; its parent is test scratch
+  # shellcheck disable=SC2174
   mkdir -p -m 2750 "${JOB}"
   mkdir -m 2770 "${JOB}/adapter-home" "${JOB}/sock"
 }

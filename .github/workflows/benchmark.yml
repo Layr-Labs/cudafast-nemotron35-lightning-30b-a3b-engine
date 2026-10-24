@@ -421,6 +421,10 @@ jobs:
             if [[ -d "${work}/${sib}" ]]; then setfacl -m "u:${SANDBOX_USER}:---" "${work}/${sib}"; fi
           done
 
+      # A cancelled job cannot run its own --stop.
+      - name: Stop resident containers left by an earlier job (GPU lock, exact name match)
+        run: ./tools/stop-leaked-residents.sh --mode preflight --lock-wait 900
+
       - name: Ranked box preflight (staged assets, contract pins, no credential)
         # Items 2-5 of the fail-closed inventory in this file's header. Runs
         # before ./setup.sh, so a mis-staged box is refused before it spends
@@ -725,6 +729,10 @@ jobs:
             exit 1
           fi
           rc=0
+          # Fail closed: any non-zero exit (including 3, the GPU lock is still held by a
+          # cancelled step's teardown) leaves no cleanup-ok, so nothing is revealed.
+          # The next job's preflight stops any leftover container.
+          ./tools/stop-leaked-residents.sh --mode cleanup --lock-wait 120 || rc=1
           if command -v sudo >/dev/null 2>&1; then
             ./tools/sandbox-clear-job-dirs.sh "${SANDBOX_ROOT}" || rc=1
             ./tools/sandbox-wipe.sh || rc=1

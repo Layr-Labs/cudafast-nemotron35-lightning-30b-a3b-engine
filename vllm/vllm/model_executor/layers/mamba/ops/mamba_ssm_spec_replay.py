@@ -173,6 +173,7 @@ def _selective_scan_update_spec_replay_kernel(
     num_replay = tl.maximum(num_accepted - 1, 0)
     # Absolute position of this verify's token 0.
     pos0 = tl.load(seq_lens_ptr + pid_b).to(tl.int64) - seq_len
+    ring_pow2 = (ring_len & (ring_len - 1)) == 0
 
     state_batch_indices_ptr += pid_b * stride_state_indices_batch
     state_batch_idx = tl.load(state_batch_indices_ptr).to(tl.int64)
@@ -226,7 +227,11 @@ def _selective_scan_update_spec_replay_kernel(
     for i_r in range(num_replay):
         # Non-negative even for garbage metadata (dummy runs), so the address
         # always stays inside slot 1's ring.
-        ring_pos = ((pos0 - num_replay + i_r) % ring_len + ring_len) % ring_len
+        ring_i = pos0 - num_replay + i_r
+        if ring_pow2:
+            ring_pos = ring_i & (ring_len - 1)
+        else:
+            ring_pos = ((ring_i % ring_len) + ring_len) % ring_len
         x = tl.load(
             ring_x_base + ring_pos * ring_stride_x + offs_m,
             mask=(offs_m < dim) & ring_ok,
@@ -297,7 +302,11 @@ def _selective_scan_update_spec_replay_kernel(
             # The new anchor: the state after token 0, as the reference's slot 0.
             tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=mask)
         else:
-            ring_pos = ((pos0 + i_t) % ring_len + ring_len) % ring_len
+            ring_i = pos0 + i_t
+            if ring_pow2:
+                ring_pos = ring_i & (ring_len - 1)
+            else:
+                ring_pos = ((ring_i % ring_len) + ring_len) % ring_len
             tl.store(
                 ring_x_base + ring_pos * ring_stride_x + offs_m,
                 x_raw,

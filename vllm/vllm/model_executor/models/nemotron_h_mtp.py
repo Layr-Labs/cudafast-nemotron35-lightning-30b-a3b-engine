@@ -34,7 +34,6 @@ from vllm.model_executor.models.utils import (
     make_empty_intermediate_tensors_factory,
     maybe_prefix,
 )
-from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.nemotron_h import NemotronHConfig
 
@@ -49,9 +48,6 @@ from .nemotron_h_mtp_kernels import (
     mtp_fast_enabled as _mtp_fast_enabled,
     register_mtp_moe_layer,
 )
-
-
-logger = init_logger(__name__)
 
 
 class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
@@ -439,21 +435,10 @@ class NemotronHMTP(nn.Module, SupportsPP):
 
     def process_weights_after_loading(self) -> None:
         prepare_mtp_relu2(self.model)
-
-    def prepare_draft_head_screen(self):
-        """The drafter's greedy head over the shared NVFP4 lm_head (see
-        nemotron_h_mtp_screen.py), or None when it does not apply."""
-        from .nemotron_h_mtp_screen import DraftHeadScreen, screen_enabled
-
-        if not screen_enabled():
-            return None
-        try:
-            return DraftHeadScreen(
-                self.vllm_config.model_config.model, self.lm_head.weight.device
-            )
-        except Exception as e:  # noqa: BLE001 - any mismatch keeps the stock head
-            logger.warning("MTP draft-head screen disabled: %r", e)
-            return None
+        for module in self.modules():
+            materialize = getattr(module, "materialize_decode_A", None)
+            if materialize is not None:
+                materialize()
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)

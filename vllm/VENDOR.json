@@ -68,12 +68,16 @@
       "why": "Pin the MTP predictor to ONE Inductor combo-kernel choice in its own compilation context: combined kernels, never benchmarked (combo_kernels=True, benchmark_combo_kernel=False; VLLM_MTP_COMBO=off pins separate kernels, =bench restores the timed pick). Drafter reduction order is fixed across boots, with target compilation settings and frozen formats unchanged."
     },
     {
-      "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py; vllm/model_executor/models/nemotron_h_mtp.py; vllm/v1/spec_decode/llm_base_proposer.py",
-      "why": "Drafter-only greedy head over the shared NVFP4 lm_head: partial-K screen on 64 of 168 fp4 groups (chosen at load from weights only), top-32 per 2048-row chunk, full-K fp32 rescore with bf16 rounding and lowest-id ties. Load-time copies of the checkpoint's own lm_head bytes and scales; the target's lm_head, logits and verification are untouched. VLLM_MTP_SCREEN=0 restores the stock draft head."
+      "file": "vllm/model_executor/layers/mamba/mamba_mixer2.py; vllm/model_executor/models/nemotron_h.py; vllm/model_executor/models/nemotron_h_mtp.py",
+      "why": "Decode expands A to fp32 on every Mamba layer. The SSM kernel reads one element per head, so the expanded tensor is built once after load and reused. Same values, same strides as the per-step cast."
     },
     {
-      "file": "vllm/v1/worker/prefill_graph.py, vllm/v1/worker/gpu_model_runner.py, vllm/v1/attention/backends/flashinfer.py",
-      "why": "Capture an input-independent whole-forward CUDA graph at boot for fresh single-request 496-token prefill, with native FlashInfer planning and fully refreshed request buffers; other lengths and target formats remain unchanged."
+      "file": "vllm/v1/sample/rejection_sampler.py",
+      "why": "Greedy raw_logits with a small top-k no longer builds a vocab-sized zero buffer or a second argmax. Tokens stay the row argmax (first-index ties). Logprobs are gathered from those same fp32 rows."
+    },
+    {
+      "file": "vllm/model_executor/layers/mamba/ops/mamba_ssm_spec_replay.py",
+      "why": "When the replay ring length is a power of two (depth 3 stores 8), the ring index is a mask. It matches the double modulo for negative positions. Other lengths keep the modulo."
     }
   ]
 }

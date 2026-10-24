@@ -572,6 +572,18 @@ class MambaMixer2(MambaBase, PluggableLayer):
         # Check if running on Blackwell (SM100+) for kernel tuning
         self.is_blackwell = current_platform.is_device_capability_family(100)
 
+    def materialize_decode_A(self) -> None:
+        """Expand A once. Decode used to materialize this on every verify."""
+        expanded = (
+            self.A[:, None, ...][:, :, None]
+            .expand(-1, self.head_dim, self.ssm_state_size)
+            .to(dtype=torch.float32)
+        )
+        if "_A_decode" in self._buffers:
+            self._A_decode = expanded
+        else:
+            self.register_buffer("_A_decode", expanded, persistent=False)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1057,11 +1069,13 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
             # 3. State Space Model sequence transformation
             n_groups = self.n_groups // self.tp_size
-            A_d = (
-                self.A[:, None, ...][:, :, None]
-                .expand(-1, self.head_dim, self.ssm_state_size)
-                .to(dtype=torch.float32)
-            )
+            A_d = getattr(self, "_A_decode", None)
+            if A_d is None:
+                A_d = (
+                    self.A[:, None, ...][:, :, None]
+                    .expand(-1, self.head_dim, self.ssm_state_size)
+                    .to(dtype=torch.float32)
+                )
             dt_d = dt_d[:, :, None].expand(-1, -1, self.head_dim)
             dt_bias = self.dt_bias[:, None, ...].expand(-1, self.head_dim)
             D_d = self.D[:, None, ...].expand(-1, self.head_dim)

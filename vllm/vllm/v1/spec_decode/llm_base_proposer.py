@@ -434,9 +434,6 @@ class SpecDecodeBaseProposer:
 
     def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Greedy-sample draft tokens from hidden states."""
-        screen = getattr(self, "_draft_head_screen", None)
-        if screen is not None:
-            return screen.greedy(hidden_states)
         if self.use_local_argmax_reduction:
             return self.model.get_top_tokens(hidden_states)
         if self.use_heterogeneous_vocab:
@@ -1560,10 +1557,6 @@ class SpecDecodeBaseProposer:
 
         self._maybe_share_embeddings(target_language_model)
         self._maybe_share_lm_head(target_language_model)
-        # Drafter-only greedy head (partial-K screen + full-K rescore), built
-        # once from the shared head's checkpoint tensors.
-        prepare_screen = getattr(self.model, "prepare_draft_head_screen", None)
-        self._draft_head_screen = prepare_screen() if prepare_screen else None
 
         if (
             self.parallel_drafting

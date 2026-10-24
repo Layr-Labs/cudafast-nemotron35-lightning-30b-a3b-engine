@@ -129,7 +129,7 @@ class RejectionSampler(nn.Module):
             logits.dtype in (torch.float16, torch.bfloat16, torch.float32)
             and self._can_use_greedy_argmax(sampling_metadata)
         ):
-            return self._greedy_argmax_sample(logits, metadata)
+            return self._greedy_argmax_sample(logits, metadata, sampling_metadata)
 
         bonus_logits_indices = metadata.bonus_logits_indices
         target_logits_indices = metadata.target_logits_indices
@@ -211,12 +211,18 @@ class RejectionSampler(nn.Module):
 
     def _can_use_greedy_argmax(self, sampling_metadata: SamplingMetadata) -> bool:
         """Only bypass processors when every greedy transformation is a no-op."""
+        logprobs_k = sampling_metadata.max_num_logprobs
+        raw_topk = (
+            type(logprobs_k) is int
+            and 0 < logprobs_k <= 20
+            and getattr(self.sampler, "logprobs_mode", None) == "raw_logits"
+        )
         if (
             self.synthetic_mode
             or type(self.sampler) is not Sampler
             or not sampling_metadata.all_greedy
             or sampling_metadata.all_random
-            or sampling_metadata.max_num_logprobs is not None
+            or (logprobs_k is not None and not raw_topk)
             or sampling_metadata.logprob_token_ids
             or not sampling_metadata.no_penalties
             or sampling_metadata.allowed_token_ids_mask is not None
@@ -240,7 +246,10 @@ class RejectionSampler(nn.Module):
         return True
 
     def _greedy_argmax_sample(
-        self, logits: torch.Tensor, metadata: SpecDecodeMetadata
+        self,
+        logits: torch.Tensor,
+        metadata: SpecDecodeMetadata,
+        sampling_metadata: SamplingMetadata | None = None,
     ) -> SamplerOutput:
         # BF16/FP16 values are exactly representable in FP32. Without active
         # processors, widening does not change their order or ties. Reduce
@@ -275,8 +284,35 @@ class RejectionSampler(nn.Module):
             None,
             SYNTHETIC_MODE=False,
         )
+        logprobs_tensors = None
+        logprobs_k = (
+            None
+            if sampling_metadata is None
+            else sampling_metadata.max_num_logprobs
+        )
+        if type(logprobs_k) is int and logprobs_k > 0:
+            cu = torch.zeros_like(metadata.cu_num_sampled_tokens)
+            cu[1:] = metadata.cu_num_sampled_tokens[:-1]
+            offsets = torch.arange(
+                output_token_ids.shape[-1],
+                device=cu.device,
+                dtype=cu.dtype,
+            )
+            accepted_logit_indices = (cu.unsqueeze(1) + offsets.unsqueeze(0)).flatten()
+            accepted_logit_indices.clamp_(max=logits.shape[0] - 1)
+            accepted_tokens = output_token_ids.clone().flatten()
+            accepted_tokens[accepted_tokens == PLACEHOLDER_TOKEN_ID] = 0
+            rows = logits[accepted_logit_indices]
+            if rows.dtype != torch.float32:
+                rows = rows.to(torch.float32)
+            logprobs_tensors = self.sampler.gather_logprobs(
+                rows,
+                logprobs_k,
+                accepted_tokens.to(torch.int64),
+            )
         return SamplerOutput(
-            sampled_token_ids=output_token_ids, logprobs_tensors=None
+            sampled_token_ids=output_token_ids,
+            logprobs_tensors=logprobs_tensors,
         )
 
     def _get_logprobs_tensors(

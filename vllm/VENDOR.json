@@ -74,6 +74,10 @@
     {
       "file": "vllm/v1/worker/prefill_graph.py, vllm/v1/worker/gpu_model_runner.py, vllm/v1/attention/backends/flashinfer.py",
       "why": "Capture an input-independent whole-forward CUDA graph at boot for fresh single-request 496-token prefill, with native FlashInfer planning and fully refreshed request buffers; other lengths and target formats remain unchanged."
+    },
+    {
+      "file": "v1/spec_decode/{fa2_plan_reuse,llm_base_proposer}.py; v1/attention/backends/flashinfer.py; model_executor/layers/{mamba/ops,fused_moe/experts}",
+      "why": "Compose published near-threshold components: 5ca90476 small integer route alignment; 540d9610 fixed-divisor replay specialization; a1004ac4 two-stage prefill and c7167ae0 same-proposal native FA2 planning reuse. Preserve latest fences and shapes. Exclude the new frontier hidden-prompt-selected combo policy; use the prior native predictor construction. Full citations and limitations in submission note."
     }
   ]
 }

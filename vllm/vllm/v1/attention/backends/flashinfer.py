@@ -5,8 +5,12 @@
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
+from math import isfinite
+from threading import get_ident
+from types import SimpleNamespace
 from typing import ClassVar
 
+import flashinfer
 import numpy as np
 import torch
 from flashinfer import (
@@ -80,6 +84,7 @@ from vllm.v1.kv_cache_interface import (
     KVQuantMode,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.spec_decode.fa2_plan_reuse import InstalledPlan, new_scope
 from vllm.v1.utils import CpuGpuBuffer
 
 FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT = 2048 * 1024 * 1024
@@ -663,6 +668,15 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             None  # Wrapper for non-causal prefill (DFlash)
         )
         self._decode_wrapper = None  # Wrapper for decode (general shape)
+        # The private-field proof applies only to this exact published source.
+        # Resolve package metadata once; an unknown/different wheel uses native plan.
+        self._proposal_plan_pin = (
+            getattr(flashinfer, "__version__", None) == "0.6.16.post3"
+            and getattr(flashinfer, "__git_version__", None)
+            == "9dc1b2495b40314dec8a8cde8cd7faf5c5206702"
+        )
+        self._proposal_plan_scope = None
+        self._proposal_plan_call = None
 
         if envs.VLLM_BATCH_INVARIANT:
             self.decode_fixed_split_size = 2048
@@ -1182,12 +1196,261 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         )
         return paged_kv_indices
 
+    def begin_proposal_plan_scope(self, epoch: object) -> bool:
+        scope = self._proposal_plan_scope
+        if scope is not None:
+            # Nested/concurrent entry disables the outer scope as well.
+            scope.invalidate()
+            return False
+        if not self._proposal_plan_pin:
+            return False
+        self._proposal_plan_scope = new_scope(epoch)
+        return True
+
+    def end_proposal_plan_scope(self, epoch: object) -> None:
+        scope = self._proposal_plan_scope
+        if scope is not None:
+            scope.invalidate()
+            if scope.epoch is epoch:
+                self._proposal_plan_call = None
+                self._proposal_plan_scope = None
+
+    def build_for_drafting(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        draft_index: int,
+    ) -> FlashInferMetadata:
+        scope = self._proposal_plan_scope
+        eligible = (
+            scope is not None
+            and scope.active
+            and scope.thread == get_ident()
+            and self._proposal_plan_call is None
+            and draft_index == scope.next_stage
+            and draft_index in (0, 1, 2)
+        )
+        if eligible:
+            scope.next_stage += 1
+            self._proposal_plan_call = (scope, common_attn_metadata, draft_index)
+        else:
+            if scope is not None:
+                scope.invalidate()
+            self._proposal_plan_call = None
+        try:
+            return self.build(
+                common_prefix_len=0,
+                common_attn_metadata=common_attn_metadata,
+                fast_build=True,
+            )
+        except BaseException:
+            if scope is not None:
+                scope.invalidate()
+            raise
+        finally:
+            self._proposal_plan_call = None
+
+    def _proposal_plan_key(self, common, wrapper, indices):
+        """Snapshot only at the two tail planning boundaries; no device readback."""
+        try:
+            scope = self._proposal_plan_scope
+            call = self._proposal_plan_call
+            if (
+                scope is None
+                or not scope.active
+                or call is None
+                or call[0] is not scope
+                or call[1] is not common
+                or call[2] not in (1, 2)
+                or scope.thread != get_ident()
+                or not self._proposal_plan_pin
+                or common.num_reqs != 1
+                or common.num_actual_tokens != 1
+                or common.max_query_len != 1
+                or not common.causal
+                or self.use_dcp
+                or self.dcp_world_size != 1
+                or self.is_kvcache_nvfp4
+                or self.use_trtllm_decode_attention
+                or self.has_sinks
+                or not self.enable_cuda_graph
+                or torch.cuda.is_current_stream_capturing()
+                or type(wrapper) is not BatchDecodeWithPagedKVCacheWrapper
+                or not wrapper.is_cuda_graph_enabled
+                or not wrapper.use_tensor_cores
+                or wrapper._fixed_batch_size != 1
+                or wrapper._q_len_per_req != 1
+                or wrapper._backend != "fa2"
+                or wrapper._jit_module is not None
+                or getattr(wrapper, "vllm_first_call", True)
+                or wrapper._cached_q_data_type != self.q_data_type_decode
+                or wrapper._cached_kv_data_type != self.kv_cache_dtype
+                or wrapper._cached_o_data_type != self.model_config.dtype
+                or self.q_data_type_decode != torch.bfloat16
+                or self.model_config.dtype != torch.bfloat16
+                or type(wrapper._cached_module) is not SimpleNamespace
+                or not callable(wrapper._cached_module.plan)
+                or not callable(wrapper._cached_module.paged_run)
+            ):
+                return None
+            for scalar in (self.sm_scale, self.logits_soft_cap):
+                if scalar is not None and (
+                    type(scalar) not in (float, int) or not isfinite(scalar)
+                ):
+                    return None
+            if (
+                wrapper._pos_encoding_mode != "NONE"
+                or wrapper._window_left != self.window_left
+                or wrapper._logits_soft_cap != (self.logits_soft_cap or 0.0)
+                or wrapper._sm_scale != self.sm_scale
+                or wrapper._rope_scale is not None
+                or wrapper._rope_theta is not None
+            ):
+                return None
+
+            indptr = self.paged_kv_indptr.cpu[:2]
+            last_len = self.paged_kv_last_page_len.cpu[:1]
+            if (
+                indptr.device.type != "cpu"
+                or last_len.device.type != "cpu"
+                or indptr.dtype != torch.int32
+                or last_len.dtype != torch.int32
+                or not indptr.is_contiguous()
+                or not last_len.is_contiguous()
+                or int(indptr[0]) != 0
+            ):
+                return None
+            pages = int(indptr[1])
+            if pages < 1 or not 1 <= int(last_len[0]) <= self.page_size:
+                return None
+            gpu_metadata = (
+                wrapper._qo_indptr_buf,
+                wrapper._paged_kv_indptr_buf,
+                wrapper._paged_kv_indices_buf,
+                wrapper._paged_kv_last_page_len_buf,
+            )
+            workspaces = (
+                wrapper._float_workspace_buffer,
+                wrapper._int_workspace_buffer,
+                wrapper._pin_memory_int_workspace_buffer,
+            )
+            for tensor in gpu_metadata + workspaces[:2]:
+                if tensor.device != self.device or not tensor.is_contiguous():
+                    return None
+            for tensor in gpu_metadata:
+                if tensor.dtype != torch.int32 or tensor.ndim != 1:
+                    return None
+            if (
+                gpu_metadata[0].numel() != 2
+                or gpu_metadata[1].numel() != 2
+                or gpu_metadata[2].numel() < pages
+                or gpu_metadata[3].numel() != 1
+                or indices.numel() != pages
+                or indices.dtype != torch.int32
+                or indices.device != self.device
+                or indices.data_ptr() != gpu_metadata[2].data_ptr()
+                or gpu_metadata[1].data_ptr() != self.paged_kv_indptr.gpu.data_ptr()
+                or gpu_metadata[2].data_ptr() != self.paged_kv_indices.gpu.data_ptr()
+                or gpu_metadata[3].data_ptr()
+                != self.paged_kv_last_page_len.gpu.data_ptr()
+            ):
+                return None
+            for tensor in workspaces:
+                if tensor.dtype != torch.uint8 or tensor.ndim != 1:
+                    return None
+            pinned = workspaces[2]
+            if (
+                pinned.device.type != "cpu"
+                or not pinned.is_contiguous()
+                or not pinned.is_pinned()
+                or pinned.numel() < workspaces[1].numel()
+                or wrapper.device != self.device
+            ):
+                return None
+            plan_values = tuple(wrapper._plan_info)
+            if len(plan_values) != 15 or any(type(x) is not int for x in plan_values):
+                return None
+
+            def tensor_key(tensor, identity=True):
+                return (
+                    id(tensor) if identity else None,
+                    tensor.data_ptr(),
+                    tensor.storage_offset(),
+                    tuple(tensor.shape),
+                    tuple(tensor.stride()),
+                    tensor.dtype,
+                    tensor.device,
+                )
+
+            stream = torch.cuda.current_stream(self.device)
+            key = (
+                scope.epoch,
+                int(stream.cuda_stream),
+                self.device,
+                id(wrapper),
+                id(wrapper._cached_module),
+                id(wrapper._cached_module.plan),
+                id(wrapper._cached_module.paged_run),
+                id(wrapper._plan_info),
+                plan_values,
+                wrapper._workspace_size,
+                wrapper._kv_layout,
+                wrapper._cached_q_data_type,
+                wrapper._cached_kv_data_type,
+                wrapper._cached_o_data_type,
+                (0, pages),
+                # Exact native FA2 plan geometry/flags, including fixed q_len1.
+                (
+                    1, 1, self.num_qo_heads, self.num_kv_heads,
+                    self.head_dim, self.head_dim, self.page_size, True, 2,
+                    self.window_left, self.decode_fixed_split_size,
+                    self.disable_split_kv, 0, 0,
+                ),
+                ("NONE", self.sm_scale, self.logits_soft_cap, None, None),
+                tuple(tensor_key(t) for t in gpu_metadata + workspaces),
+                tensor_key(common.block_table_tensor),
+                tensor_key(indptr, identity=False),
+                tensor_key(last_len, identity=False),
+            )
+            keepalive = (
+                wrapper,
+                wrapper._cached_module,
+                wrapper._plan_info,
+                common.block_table_tensor,
+                indptr,
+                last_len,
+                stream,
+            ) + gpu_metadata + workspaces
+            return key, keepalive
+        except (AttributeError, IndexError, RuntimeError, TypeError, ValueError):
+            # A private ABI mismatch disables this proposal, never the native path.
+            scope = self._proposal_plan_scope
+            if scope is not None:
+                scope.invalidate()
+            return None
+
     def build(
         self,
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> FlashInferMetadata:
+        # Consume once before any fallback/metadata mutation or possible exception.
+        proposal_call = self._proposal_plan_call
+        proposal_scope = self._proposal_plan_scope
+        installed_plan = None
+        if proposal_scope is not None:
+            installed_plan = proposal_scope.installed
+            proposal_scope.installed = None
+            if (
+                proposal_call is None
+                or proposal_call[0] is not proposal_scope
+                or proposal_call[1] is not common_attn_metadata
+                or proposal_scope.thread != get_ident()
+            ):
+                proposal_scope.invalidate()
+                installed_plan = None
+            elif proposal_call[2] != 2:
+                installed_plan = None
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         causal = common_attn_metadata.causal
@@ -1588,28 +1851,60 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 o_dtype = (
                     FP8_DTYPE if self.is_kvcache_nvfp4 else self.model_config.dtype
                 )
-                fast_plan_decode(
-                    decode_wrapper,
-                    indptr_cpu=self.paged_kv_indptr.cpu[: num_input_tokens + 1],
-                    indices=paged_kv_indices,
-                    last_page_len_cpu=self.paged_kv_last_page_len.cpu[
-                        :num_input_tokens
-                    ],
-                    num_qo_heads=self.num_qo_heads * self.dcp_world_size,
-                    num_kv_heads=self.num_kv_heads,
-                    head_dim=self.head_dim,
-                    page_size=self.page_size,
-                    # Disable flashinfer's pos encoding and use vllm's rope.
-                    pos_encoding_mode="NONE",
-                    sm_scale=self.sm_scale,
-                    window_left=self.window_left,
-                    logits_soft_cap=self.logits_soft_cap,
-                    q_data_type=self.q_data_type_decode,
-                    kv_data_type=self.kv_cache_dtype,
-                    o_data_type=o_dtype,
-                    fixed_split_size=self.decode_fixed_split_size,
-                    disable_split_kv=self.disable_split_kv,
+                plan_snapshot = None
+                if installed_plan is not None:
+                    plan_snapshot = self._proposal_plan_key(
+                        common_attn_metadata, decode_wrapper, paged_kv_indices
+                    )
+                reuse_plan = (
+                    installed_plan is not None
+                    and proposal_scope is not None
+                    and proposal_scope.active
+                    and self._proposal_plan_scope is proposal_scope
+                    and self._proposal_plan_call is proposal_call
+                    and installed_plan.owner is common_attn_metadata
+                    and plan_snapshot is not None
+                    and installed_plan.key == plan_snapshot[0]
                 )
+                if not reuse_plan:
+                    fast_plan_decode(
+                        decode_wrapper,
+                        indptr_cpu=self.paged_kv_indptr.cpu[: num_input_tokens + 1],
+                        indices=paged_kv_indices,
+                        last_page_len_cpu=self.paged_kv_last_page_len.cpu[
+                            :num_input_tokens
+                        ],
+                        num_qo_heads=self.num_qo_heads * self.dcp_world_size,
+                        num_kv_heads=self.num_kv_heads,
+                        head_dim=self.head_dim,
+                        page_size=self.page_size,
+                        # Disable flashinfer's pos encoding and use vllm's rope.
+                        pos_encoding_mode="NONE",
+                        sm_scale=self.sm_scale,
+                        window_left=self.window_left,
+                        logits_soft_cap=self.logits_soft_cap,
+                        q_data_type=self.q_data_type_decode,
+                        kv_data_type=self.kv_cache_dtype,
+                        o_data_type=o_dtype,
+                        fixed_split_size=self.decode_fixed_split_size,
+                        disable_split_kv=self.disable_split_kv,
+                    )
+                if (
+                    proposal_scope is not None
+                    and proposal_scope.active
+                    and proposal_call is not None
+                    and proposal_call[2] == 1
+                ):
+                    plan_snapshot = self._proposal_plan_key(
+                        common_attn_metadata, decode_wrapper, paged_kv_indices
+                    )
+                    if plan_snapshot is not None:
+                        proposal_scope.installed = InstalledPlan(
+                            common_attn_metadata, *plan_snapshot
+                        )
+                elif proposal_scope is not None and proposal_call is not None:
+                    if proposal_call[2] == 2:
+                        proposal_scope.invalidate()
                 attn_metadata.decode = FIDecode(wrapper=decode_wrapper)
         return attn_metadata
 

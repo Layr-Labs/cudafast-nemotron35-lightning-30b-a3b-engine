@@ -49,6 +49,7 @@ from vllm.model_executor.layers.mamba.ops.mamba_ssm import (
     try_get_optimal_ssm_config,
 )
 from vllm.model_executor.layers.mamba.ops.triton_helpers import fast_exp
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
@@ -68,6 +69,86 @@ def spec_replay_ring_elems(nheads: int, dim: int, ngroups: int, dstate: int) -> 
     """16-bit ring elements per ring entry: x (nheads*dim), B (ngroups*dstate),
     dt (nheads)."""
     return nheads * dim + ngroups * dstate + nheads
+
+
+def spec_replay_params_offset(
+    nheads: int, dim: int, ngroups: int, dstate: int, ring_len: int
+) -> int:
+    """FP32 offset of a 128-byte-aligned scratch tail after the raw BF16 ring."""
+    raw_bytes = 2 * ring_len * spec_replay_ring_elems(nheads, dim, ngroups, dstate)
+    return ((raw_bytes + 127) // 128) * 32
+
+
+def spec_replay_params_supported(
+    state: torch.Tensor,
+    x: torch.Tensor,
+    dt: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state_batch_indices: torch.Tensor,
+    ring_len: int,
+    conv_input: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_weight: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+) -> bool:
+    """Narrow shared gate for the conv producer and replay-SSM consumer.
+
+    Scratch contains current and replayed (processed dt, dA) in FP32. The
+    conv launch rewrites every active entry on every invocation, including
+    old entries recomputed from the raw BF16 ring. No persistent derived
+    cache needs initialization or mode tracking after a fallback/prefill.
+    """
+    if os.environ.get("VLLM_MAMBA_REPLAY_PARAMS_FAST", "1") == "0":
+        return False
+    if cu_seqlens is None or seq_lens is None or num_accepted_tokens is None:
+        return False
+    if not spec_replay_supported(
+        state, x, dt, A, B, dt_bias, state_batch_indices, ring_len
+    ):
+        return False
+    if (
+        state.device.type != "cuda"
+        or not current_platform.is_device_capability(121)
+        or state.shape[1:] != (64, 64, 128)
+        or state.stride(0) < 64 * 64 * 128
+        or x.dtype != torch.bfloat16
+        or A.dtype != torch.float32
+        or dt_bias.dtype not in (torch.bfloat16, torch.float32)
+        or B.shape[1:] != (8, 128)
+        or dt.shape != x.shape
+        or A.shape != (64, 64, 128)
+        or dt_bias.shape != (64, 64)
+        or conv_input.shape != (x.shape[0], 6144)
+        or conv_input.dtype != torch.bfloat16
+        or conv_state.dtype != torch.bfloat16
+        or conv_state.ndim != 3
+        or conv_state.shape[1] != 6144
+        or conv_weight.shape != (6144, 4)
+        or state_batch_indices.shape[0] != 1
+        or state_batch_indices.stride(1) != 1
+        or cu_seqlens.shape != (2,)
+        or cu_seqlens.stride(0) != 1
+        or seq_lens.ndim != 1
+        or seq_lens.numel() < 1
+        or num_accepted_tokens.shape != (1,)
+    ):
+        return False
+    max_query_len = state_batch_indices.shape[1]
+    if not (2 <= max_query_len <= 7 and 1 <= x.shape[0] <= max_query_len):
+        return False
+    if ring_len < 2 * (max_query_len - 1) + 1:
+        return False
+    # The convolution's effective history includes the speculative window.
+    if conv_state.shape[2] < 3 + max_query_len - 1:
+        return False
+    # Tail is within one slot, not merely within the whole state allocation.
+    offset = spec_replay_params_offset(64, 64, 8, 128, ring_len)
+    scratch_floats = (2 * max_query_len - 1) * 64 * 2
+    return offset + scratch_floats <= 64 * 64 * 128
 
 
 @triton.heuristics({"HAS_DT_BIAS": lambda args: args["dt_bias_ptr"] is not None})
@@ -149,6 +230,9 @@ def _selective_scan_update_spec_replay_kernel(
     HAS_Z: tl.constexpr,
     STORE_REPLAYED: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
+    PRECOMPUTED_PARAMS: tl.constexpr,
+    PARAM_OFFSET_F32: tl.constexpr,
+    PARAM_CURRENT_ROWS: tl.constexpr,
 ):
     # The dt/A of a head are scalars (stride-0 expansion over head_dim); that is
     # the only layout the Mamba2 decode path produces and the only one the
@@ -179,8 +263,15 @@ def _selective_scan_update_spec_replay_kernel(
     ring_batch_idx = tl.load(state_batch_indices_ptr + stride_state_indices_T).to(
         tl.int64
     )
+    if PRECOMPUTED_PARAMS:
+        # Slot 1 is scratch/ring memory; slot 0 remains the FP32 anchor.
+        params_base = (
+            state_ptr + ring_batch_idx * stride_state_batch + PARAM_OFFSET_F32
+        )
     state_ptr += state_batch_idx * stride_state_batch + pid_h * stride_state_head
     ring_ok = ring_batch_idx != null_block_id
+    if PRECOMPUTED_PARAMS:
+        params_ok = ring_ok & (state_batch_idx != null_block_id)
     ring_base = ring_ptr + ring_batch_idx * stride_ring_batch
     ring_x_base = ring_base + pid_h * dim
     ring_B_base = ring_base + ring_len * nheads * dim
@@ -232,15 +323,33 @@ def _selective_scan_update_spec_replay_kernel(
             mask=(offs_m < dim) & ring_ok,
             other=0.0,
         ).to(tl.float32)
-        dt = tl.load(
-            ring_dt_base + ring_pos * ring_stride_dt, mask=ring_ok, other=0.0
-        ).to(tl.float32)
-        if HAS_DT_BIAS:
-            dt += tl.load(dt_bias_ptr).to(tl.float32)
-        if DT_SOFTPLUS:
-            dt = softplus(dt)
-        A = tl.load(A_ptr).to(tl.float32)
-        dA = fast_exp(A * dt)  # scalar, not a matrix
+        if PRECOMPUTED_PARAMS:
+            if params_ok:
+                params = params_base + (
+                    (PARAM_CURRENT_ROWS + i_r) * nheads + pid_h
+                ) * 2
+                dt = tl.load(params)
+                dA = tl.load(params + 1)
+            else:
+                dt = tl.load(
+                    ring_dt_base + ring_pos * ring_stride_dt, mask=ring_ok, other=0.0
+                ).to(tl.float32)
+                if HAS_DT_BIAS:
+                    dt += tl.load(dt_bias_ptr).to(tl.float32)
+                if DT_SOFTPLUS:
+                    dt = softplus(dt)
+                A = tl.load(A_ptr).to(tl.float32)
+                dA = fast_exp(A * dt)
+        else:
+            dt = tl.load(
+                ring_dt_base + ring_pos * ring_stride_dt, mask=ring_ok, other=0.0
+            ).to(tl.float32)
+            if HAS_DT_BIAS:
+                dt += tl.load(dt_bias_ptr).to(tl.float32)
+            if DT_SOFTPLUS:
+                dt = softplus(dt)
+            A = tl.load(A_ptr).to(tl.float32)
+            dA = fast_exp(A * dt)  # scalar, not a matrix
 
         B = tl.load(
             ring_B_base + ring_pos * ring_stride_B + offs_n,
@@ -274,13 +383,30 @@ def _selective_scan_update_spec_replay_kernel(
         x_raw = tl.load(x_ptrs, mask=offs_m < dim, other=0.0)
         x = x_raw.to(tl.float32)
         dt_raw = tl.load(dt_ptr)
-        dt = dt_raw.to(tl.float32)
-        if HAS_DT_BIAS:
-            dt += tl.load(dt_bias_ptr).to(tl.float32)
-        if DT_SOFTPLUS:
-            dt = softplus(dt)
-        A = tl.load(A_ptr).to(tl.float32)
-        dA = fast_exp(A * dt)  # scalar, not a matrix
+        if PRECOMPUTED_PARAMS:
+            # NULL slots occur in padded/dummy requests. Preserve the
+            # old current-token computation instead of reading unwritten
+            # scratch in that case.
+            if params_ok:
+                params = params_base + (i_t * nheads + pid_h) * 2
+                dt = tl.load(params)
+                dA = tl.load(params + 1)
+            else:
+                dt = dt_raw.to(tl.float32)
+                if HAS_DT_BIAS:
+                    dt += tl.load(dt_bias_ptr).to(tl.float32)
+                if DT_SOFTPLUS:
+                    dt = softplus(dt)
+                A = tl.load(A_ptr).to(tl.float32)
+                dA = fast_exp(A * dt)
+        else:
+            dt = dt_raw.to(tl.float32)
+            if HAS_DT_BIAS:
+                dt += tl.load(dt_bias_ptr).to(tl.float32)
+            if DT_SOFTPLUS:
+                dt = softplus(dt)
+            A = tl.load(A_ptr).to(tl.float32)
+            dA = fast_exp(A * dt)  # scalar, not a matrix
 
         B_raw = tl.load(B_ptrs, mask=offs_n < dstate, other=0.0)
         B = B_raw.to(tl.float32)
@@ -417,6 +543,7 @@ def selective_state_update_spec_replay(
     ring_len=None,
     is_blackwell=False,
     replayed_out=None,
+    precomputed_params=False,
 ):
     """
     Spec-decode verify update with anchor + input-ring state handling.
@@ -431,6 +558,8 @@ def selective_state_update_spec_replay(
             tensor that receives the state each request starts the verify from.
 
     The caller must have checked `spec_replay_supported` for these layouts.
+    `precomputed_params` is only enabled by the shared producer/consumer gate
+    after the immediately preceding conv launch has filled the FP32 tail.
     """
     assert num_accepted_tokens is not None and cu_seqlens is not None
     assert seq_lens is not None and ring_len is not None
@@ -462,6 +591,12 @@ def selective_state_update_spec_replay(
     if replayed_out is not None:
         assert replayed_out.shape == (N, nheads, dim, dstate)
         assert replayed_out.dtype == torch.float32 and replayed_out.is_contiguous()
+    if precomputed_params:
+        assert dt_softplus and dt_bias is not None
+        assert (N, nheads, dim, dstate, ngroups) == (1, 64, 64, 128, 8)
+        assert x.dtype == torch.bfloat16 and A.dtype == torch.float32
+        offset = spec_replay_params_offset(nheads, dim, ngroups, dstate, ring_len)
+        assert offset + (2 * max_seqlen - 1) * nheads * 2 <= nheads * dim * dstate
 
     # The ring is slot memory reinterpreted as the inputs' 16-bit type.
     ring = state.view(x.dtype)
@@ -535,5 +670,8 @@ def selective_state_update_spec_replay(
             dt_softplus,
             True,
             BLOCK_SIZE_M,
+            precomputed_params,
+            spec_replay_params_offset(nheads, dim, ngroups, dstate, ring_len),
+            max_seqlen,
             num_warps=num_warps,
         )

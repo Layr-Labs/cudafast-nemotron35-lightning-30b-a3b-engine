@@ -36,6 +36,7 @@ from vllm.model_executor.layers.mamba.ops.layernorm_gated import rms_norm_gated
 from vllm.model_executor.layers.mamba.ops.mamba_ssm_spec_replay import (
     selective_state_update_spec_replay,
     spec_replay_enabled,
+    spec_replay_params_supported,
     spec_replay_ring_len,
     spec_replay_supported,
 )
@@ -1036,6 +1037,55 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 state_indices_tensor_d_input = state_indices_tensor_d
                 state_indices_tensor_d_output = state_indices_tensor_d
 
+            # Scalar head parameters are shared with the optional convolution
+            # producer. These are the same expanded views used by SSU below;
+            # in particular A is converted to FP32 before either kernel sees it.
+            n_groups = self.n_groups // self.tp_size
+            A_d = (
+                self.A[:, None, ...][:, :, None]
+                .expand(-1, self.head_dim, self.ssm_state_size)
+                .to(dtype=torch.float32)
+            )
+            dt_d = dt_d[:, :, None].expand(-1, -1, self.head_dim)
+            dt_bias = self.dt_bias[:, None, ...].expand(-1, self.head_dim)
+            D_d = self.D[:, None, ...].expand(-1, self.head_dim)
+            raw_x_d, raw_B_d, _ = self.split_hidden_states_B_C_fn(
+                hidden_states_B_C_d
+            )
+            # One host decision wires both producer and consumer. No values
+            # are read back from the GPU and no new staging/allocation is needed.
+            use_replay_params = (
+                self.use_spec_replay
+                and num_accepted_tokens is not None
+                and not is_mamba_cache_all
+                and spec_replay_params_supported(
+                    ssm_state,
+                    raw_x_d.view(-1, self.num_heads // self.tp_size, self.head_dim),
+                    dt_d,
+                    A_d,
+                    raw_B_d.view(-1, n_groups, self.ssm_state_size),
+                    dt_bias,
+                    state_indices_tensor_d,
+                    self.spec_replay_ring_len,
+                    hidden_states_B_C_d,
+                    conv_state,
+                    self.conv_weights,
+                    query_start_loc_d,
+                    attn_metadata.seq_lens,
+                    num_accepted_tokens,
+                )
+            )
+            if use_replay_params:
+                use_replay_params = self._spec_replay_ready(
+                    ssm_state,
+                    raw_x_d.view(-1, self.num_heads // self.tp_size, self.head_dim),
+                    dt_d,
+                    A_d,
+                    raw_B_d.view(-1, n_groups, self.ssm_state_size),
+                    dt_bias,
+                    state_indices_tensor_d,
+                )
+
             # 2. Convolution sequence transformation
             hidden_states_B_C_d = causal_conv1d_update(
                 hidden_states_B_C_d,
@@ -1049,6 +1099,14 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 num_accepted_tokens=num_accepted_tokens,
                 query_start_loc=query_start_loc_d,
                 max_query_len=state_indices_tensor_d.size(-1),
+                replay_params_state=ssm_state if use_replay_params else None,
+                replay_params_dt=dt_d if use_replay_params else None,
+                replay_params_A=A_d if use_replay_params else None,
+                replay_params_dt_bias=dt_bias if use_replay_params else None,
+                replay_params_seq_lens=(
+                    attn_metadata.seq_lens if use_replay_params else None
+                ),
+                replay_params_ring_len=self.spec_replay_ring_len,
             )
 
             hidden_states_d, B_d, C_d = self.split_hidden_states_B_C_fn(
@@ -1056,15 +1114,6 @@ class MambaMixer2(MambaBase, PluggableLayer):
             )
 
             # 3. State Space Model sequence transformation
-            n_groups = self.n_groups // self.tp_size
-            A_d = (
-                self.A[:, None, ...][:, :, None]
-                .expand(-1, self.head_dim, self.ssm_state_size)
-                .to(dtype=torch.float32)
-            )
-            dt_d = dt_d[:, :, None].expand(-1, -1, self.head_dim)
-            dt_bias = self.dt_bias[:, None, ...].expand(-1, self.head_dim)
-            D_d = self.D[:, None, ...].expand(-1, self.head_dim)
             B_d = B_d.view(-1, n_groups, B_d.shape[1] // n_groups)
             C_d = C_d.view(-1, n_groups, C_d.shape[1] // n_groups)
             hidden_states_d = hidden_states_d.view(
@@ -1141,6 +1190,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     seq_lens=attn_metadata.seq_lens,
                     ring_len=self.spec_replay_ring_len,
                     is_blackwell=self.is_blackwell,
+                    precomputed_params=use_replay_params,
                 )
             else:
                 selective_state_update(

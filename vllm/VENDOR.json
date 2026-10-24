@@ -58,6 +58,14 @@
     {
       "file": "vllm/model_executor/layers/fused_moe/experts/humming_tuned_moe.py (TUNED_PAD_K)",
       "why": "the tuned routed experts padded K to a multiple of 128, so the down projection's K 1856 became 1920 and every w2 tile streamed and multiplied two all-zero 32-wide K blocks; K now pads only to humming's BF16 pack granule (32), the smallest it accepts. Each element keeps the same K blocks in the same order; the dropped steps were mma(+0, +0, acc), which only turned an acc of -0 into +0, and a signed zero changes no later value's magnitude, logit or token"
+    },
+    {
+      "file": "vllm/model_executor/layers/mamba/ops/ssd_prefill_fused.py (+ ssd_combined.py)",
+      "why": "Own GB10 prefill two-stage SSD: fuse chunk-state formation with unchanged FP32 state recurrence, and compute each CB row tile once per group in registers before all eight head scans. Removes raw chunk-state and FP32 CB global scratch while retaining every boundary state, cumsum, final gather, original numerical formats and target acceptance. Chunk sizes 128/256 and exact-shape guards; unsupported layouts retain the original path."
+    },
+    {
+      "file": "vllm/v1/spec_decode/fa2_plan_reuse.py (+ llm_base_proposer.py and attention/backends/flashinfer.py)",
+      "why": "Same-proposal native Nemotron MTP depth3 FA2 installed-plan reuse. A fresh explicit proposal scope ends in finally; tail1 runs the original native planner and tail2 may reuse only that currently installed schedule when page counts and the complete configuration, module, plan, storage, owner and stream signature match. Every live metadata update/H2D/index copy and both original host fences remain. Exact FlashInfer0.6.16.post3 source9dc1b249 is required; unknown pins, other stages/builds, exceptions, capture/dummy paths and mismatches use native planning. No model output or floating scratch value is cached. Static source review only; official remote correctness and performance pending."
     }
   ]
 }

@@ -46,6 +46,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
     sample_with_exponential_noise,
 )
 from vllm.v1.sample.sampler import _SAMPLING_EPS
+from vllm.v1.spec_decode.fa2_plan_reuse import proposal_plan_scope
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
@@ -503,6 +504,7 @@ class SpecDecodeBaseProposer:
     def take_last_draft_probs(self) -> torch.Tensor | None:
         return self._last_draft_probs
 
+    @proposal_plan_scope
     def propose(
         self,
         num_speculative_tokens,

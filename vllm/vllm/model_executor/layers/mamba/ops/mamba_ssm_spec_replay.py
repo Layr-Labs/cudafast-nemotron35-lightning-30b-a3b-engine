@@ -41,7 +41,6 @@ kernel's next-verify load, which this kernel replaces.
 """
 
 import os
-import sys
 
 import torch
 
@@ -177,8 +176,6 @@ def _selective_scan_update_spec_replay_kernel(
     HG_RATIO: tl.constexpr = 0,
     CONST_DIV: tl.constexpr = False,
     launch_pdl: tl.constexpr = False,
-    verify_rows_ptr=None,
-    PREFIX_LIMIT: tl.constexpr = False,
 ):
     # The dt/A of a head are scalars (stride-0 expansion over head_dim); that is
     # the only layout the Mamba2 decode path produces and the only one the
@@ -207,14 +204,6 @@ def _selective_scan_update_spec_replay_kernel(
 
     if seq_len == 0:
         return
-
-    # Only the one-request depth-four verify may receive this device count.
-    # Keep seq_len unchanged: it determines the original absolute pos0 below.
-    # A sentinel count >= seq_len preserves the complete original recurrence.
-    compute_len = seq_len
-    if PREFIX_LIMIT:
-        valid_rows = tl.load(verify_rows_ptr).to(tl.int64)
-        compute_len = tl.minimum(seq_len, tl.maximum(valid_rows, 1))
 
     # The reference starts from slot init_token_idx = num_accepted - 1, i.e.
     # the state after token init_token_idx of the previous verify; the anchor
@@ -312,7 +301,7 @@ def _selective_scan_update_spec_replay_kernel(
         )
         tl.store(replayed_ptrs, state, mask=mask)
 
-    for i_t in range(compute_len):
+    for i_t in range(seq_len):
         x_ptrs = x_ptr + offs_m * stride_x_dim
         dt_ptrs = dt_ptr + offs_m * stride_dt_dim
         B_ptrs = B_ptr + offs_n * stride_B_dstate
@@ -378,16 +367,6 @@ def _selective_scan_update_spec_replay_kernel(
         out_ptr += stride_out_batch
         if HAS_Z:
             z_ptr += stride_z_batch
-
-    # Later target layers still receive a fully initialized tensor. Invalid
-    # suffix rows may be consumed, but are causal successors of every valid
-    # row and are forced rejected by the original confidence-depth sampler.
-    # Their ring entries are omitted: next num_accepted <= valid_rows, hence
-    # the next replay can read only the prefix entries written above.
-    if PREFIX_LIMIT:
-        for i_t in range(compute_len, seq_len):
-            tl.store(out_ptr + offs_m * stride_out_dim, 0.0, mask=offs_m < dim)
-            out_ptr += stride_out_batch
 
 
 def _normalize(state, x, dt, A, B, C, D, z, dt_bias, out, state_batch_indices):
@@ -534,18 +513,6 @@ def selective_state_update_spec_replay(
         dim, dstate, N, nheads, cache_dtype, is_blackwell
     )
 
-    verify_rows = None
-    if (
-        N == 1 and max_seqlen == 5 and batch == 5
-        and replayed_out is None
-        and os.environ.get("VLLM_MAMBA_SPEC_PREFIX", "1") != "0"
-    ):
-        smallk = sys.modules.get("smallk")
-        if smallk is not None and hasattr(smallk, "live_verify_rows"):
-            # Never import/allocate/rebind the buffer here; its address must
-            # already be the same one captured by every router and sampler.
-            verify_rows = smallk.live_verify_rows(x.device)
-
     with torch.accelerator.device_index(x.device.index):
         _selective_scan_update_spec_replay_kernel[grid](
             state,
@@ -612,6 +579,4 @@ def selective_state_update_spec_replay(
             CONST_DIV=_const_div_enabled(),
             num_warps=num_warps,
             launch_pdl=_pdl_enabled(),
-            verify_rows_ptr=verify_rows,
-            PREFIX_LIMIT=verify_rows is not None,
         )

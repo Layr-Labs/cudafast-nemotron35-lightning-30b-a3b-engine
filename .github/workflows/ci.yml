@@ -217,6 +217,9 @@ jobs:
       - name: Ranked preflight refusals (environment + paired baseline)
         run: tools/test-ranked-box-preflight-env.sh
 
+      - name: Leaked resident cleanup (GPU lock, exact name match)
+        run: tools/test-stop-leaked-residents.sh
+
       - name: Per-box baseline calibrator mechanics
         run: tools/test-calibrate-box.sh
 

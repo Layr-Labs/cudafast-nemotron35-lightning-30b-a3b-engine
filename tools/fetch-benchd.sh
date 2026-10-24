@@ -241,12 +241,20 @@ die() {
   exit 1
 }
 
-command -v shasum >/dev/null 2>&1 || die "shasum is required to verify benchd."
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d ' ' -f 1
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | cut -d ' ' -f 1
+  else
+    die "sha256sum or shasum is required to verify benchd."
+  fi
+}
 
 # -- manifest -----------------------------------------------------------------
 # benchd.manifest.json is values-only JSON, one key per line (build-dist.sh).
 # Parsed with sed rather than jq/python3 so the OFFLINE path on the ranked box
-# needs nothing but a shell and shasum.
+# needs nothing but a shell and a SHA-256 tool.
 manifest_field() {
   sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^\",]*\)\"\{0,1\}[[:space:]]*,\{0,1\}[[:space:]]*\$/\1/p" "$1"
 }
@@ -324,7 +332,7 @@ matches_recorder_entry() {
     echo "fetch-benchd.sh:   RECORDER MISMATCH: byte count manifest=${MF_RECORDER_BYTES} actual=${actual_bytes} (${path})" >&2
     return 1
   fi
-  actual_sha="$(shasum -a 256 "${path}" | awk '{print $1}')"
+  actual_sha="$(sha256_of "${path}")"
   if [[ "${actual_sha}" != "${MF_RECORDER_SHA256}" ]]; then
     echo "fetch-benchd.sh:   RECORDER MISMATCH: sha256 manifest=${MF_RECORDER_SHA256} actual=${actual_sha} (${path})" >&2
     return 1
@@ -343,7 +351,7 @@ matches_manifest() {
     echo "fetch-benchd.sh:   byte count mismatch: manifest=${MF_BYTES} actual=${actual_bytes} (${path})" >&2
     return 1
   fi
-  actual_sha="$(shasum -a 256 "${path}" | awk '{print $1}')"
+  actual_sha="$(sha256_of "${path}")"
   if [[ "${actual_sha}" != "${MF_SHA256}" ]]; then
     echo "fetch-benchd.sh:   sha256 mismatch: manifest=${MF_SHA256} actual=${actual_sha} (${path})" >&2
     return 1

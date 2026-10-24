@@ -686,7 +686,7 @@ def mtp_moe_row(
 
 # LOCAL PATCH (cudafast-nemotron35): routed experts the MTP draft evaluates per
 # token (the router's top 6 by weight, highest first); MTP_DRAFT_TOPK=0 keeps all.
-_DRAFT_TOPK = int(os.environ.get("MTP_DRAFT_TOPK", "3"))
+_DRAFT_TOPK = int(os.environ.get("MTP_DRAFT_TOPK", "2"))
 
 
 def mtp_moe_single_row_impl(

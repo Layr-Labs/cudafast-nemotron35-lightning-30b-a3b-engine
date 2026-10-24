@@ -5,6 +5,8 @@
 # Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
 
 
+import functools
+
 import numpy as np
 import torch
 
@@ -1093,6 +1095,11 @@ def _causal_conv1d_update_kernel(
         tl.store(o_ptrs, acc, mask=mask_1d)
 
 
+@functools.cache
+def _is_sm121() -> bool:
+    return current_platform.is_device_capability(121)
+
+
 def causal_conv1d_update(
     x: torch.Tensor,
     conv_state: torch.Tensor,
@@ -1223,6 +1230,13 @@ def causal_conv1d_update(
         state_len = width - 1
     np2_statelen = triton.next_power_of_2(state_len)
 
+    # One request over this model's 6144 conv channels is 24 CTAs of 256 on a
+    # 48-SM GB10; 128-channel tiles make 48, one per SM. Every channel is
+    # computed on its own, so the tile width changes no value.
+    block_n = 256
+    if batch == 1 and dim % 128 == 0 and _is_sm121():
+        block_n = 128
+
     def grid(META):
         return (
             batch,
@@ -1271,7 +1285,7 @@ def causal_conv1d_update(
         IS_SPEC_DECODING=num_accepted_tokens is not None,
         NP2_STATELEN=np2_statelen,
         HAS_NULL_BLOCK=null_block_id is not None,
-        BLOCK_N=256,
+        BLOCK_N=block_n,
         launch_pdl=current_platform.is_arch_support_pdl(),
     )
     if unsqueeze:

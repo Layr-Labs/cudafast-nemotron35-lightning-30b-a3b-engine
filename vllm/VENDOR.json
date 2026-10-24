@@ -154,6 +154,10 @@
     {
       "file": "harness/kernels/l2pf, layers/attention/attention.py, layers/mamba/mamba_mixer2.py, models/nemotron_h.py, v1/worker/gpu_model_runner.py",
       "why": "l2pf carried from e-man07 0a731363-6416-4fb9-aa94-b6f5f6e8155e (L2 prefetch of the next bandwidth-bound weight on a side stream during latency-bound windows; moves no value). Changed: the drafter hook prefetches the start projection's hidden half eh_w_h (what a draft pass reads first with the projected-embedding table) instead of eh_proj.weight. Added: a MoE-window hook (fused_humming_moe.py, nemotron_h.py, L2PF_MOE_MB default 6) that prefetches the head of the next Mamba layer's in_proj pack while the latency-bound small-call routed down projection runs, rejoining right after it."
+    },
+    {
+      "file": "vllm/v1/worker/prefill_graph.py, vllm/v1/worker/gpu_model_runner.py, vllm/model_executor/models/nemotron_h.py, vllm/model_executor/layers/fused_moe/runner/moe_runner.py",
+      "why": "In the one captured 496-token prefill forward that reads a single row of the final hidden states (logits row 495), every row of the last layer's MoE (the model's last layer) takes that row's six experts: the flag is set inside the whole-forward capture's forward helper and cleared in a finally, so it is baked into the recorded graph and no later or earlier forward sees it; the graph is replayed only for a request that reads that one row, with no prompt logprobs. M and valid_shape_m are unchanged, the last layer's other rows reach only the per-row final norm and are unread, and row 495 keeps its own input, experts, weights and K order, so its logits are bit-identical; six experts' weights are read instead of nearly all 128."
     }
   ]
 }

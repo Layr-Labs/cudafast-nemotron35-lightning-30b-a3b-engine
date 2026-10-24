@@ -73,7 +73,14 @@ if [[ "${lock_wait}" -eq 0 ]]; then
 else
   flock_args=(-w "${lock_wait}")
 fi
-if ! flock "${flock_args[@]}" "${lock_fd}"; then
+if flock "${flock_args[@]}" "${lock_fd}"; then
+  :
+else
+  lock_rc=$?
+  if [[ "${mode}" == "cleanup" && "${lock_rc}" -eq 1 ]]; then
+    echo "::warning::the GPU lock is still held (a cancelled step may still be tearing down); not stopping containers now; the next job's preflight stops any leftover" >&2
+    exit 0
+  fi
   error "another GPU window holds it: ${lock_path}"
   exit 1
 fi

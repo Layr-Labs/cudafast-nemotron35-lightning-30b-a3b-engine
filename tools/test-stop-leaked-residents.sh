@@ -15,6 +15,7 @@ STUB_BIN="${WORK}/bin"
 DOCKER_NAMES_FILE="${WORK}/docker-names"
 DOCKER_LOG="${WORK}/docker.log"
 GPU_FILE="${WORK}/gpu"
+GPU_LOG="${WORK}/gpu.log"
 LOCK="${WORK}/gpu.lock"
 STOP_MARK="${WORK}/stopped"
 PS_COUNT_FILE="${WORK}/ps-count"
@@ -62,6 +63,7 @@ esac
 EOF
 cat > "${STUB_BIN}/nvidia-smi" <<'EOF'
 #!/usr/bin/env bash
+printf '%s\n' "$*" >> "${GPU_LOG}"
 [[ "$*" == "--query-compute-apps=pid,process_name --format=csv,noheader" ]] || exit 1
 if [[ "${NVIDIA_SMI_HANG:-}" == "1" ]]; then
   while :; do :; done
@@ -83,6 +85,7 @@ reset_case() {
   : > "${DOCKER_NAMES_FILE}"
   : > "${DOCKER_LOG}"
   : > "${GPU_FILE}"
+  : > "${GPU_LOG}"
   : > "${PS_COUNT_FILE}"
   rm -f "${STOP_MARK}"
   AUTO_REMOVE_AFTER_PS=-1
@@ -99,6 +102,7 @@ run_case() {
     DOCKER_NAMES_FILE="${DOCKER_NAMES_FILE}" \
     DOCKER_LOG="${DOCKER_LOG}" \
     GPU_FILE="${GPU_FILE}" \
+    GPU_LOG="${GPU_LOG}" \
     STOP_MARK="${STOP_MARK}" \
     PS_COUNT_FILE="${PS_COUNT_FILE}" \
     AUTO_REMOVE_AFTER_PS="${AUTO_REMOVE_AFTER_PS}" \
@@ -131,6 +135,7 @@ run_hung_query() {
     DOCKER_NAMES_FILE="${DOCKER_NAMES_FILE}" \
     DOCKER_LOG="${DOCKER_LOG}" \
     GPU_FILE="${GPU_FILE}" \
+    GPU_LOG="${GPU_LOG}" \
     NVIDIA_SMI_HANG=1 \
     STOP_MARK="${STOP_MARK}" \
     PS_COUNT_FILE="${PS_COUNT_FILE}" \
@@ -333,6 +338,31 @@ expect_rc "lock wait deadline" 1
 expect_actions "lock wait deadline" ""
 [[ "${OUT}" == *"${LOCK}"* && "${OUT}" == *"another GPU window holds it"* ]] \
   || fail "lock wait deadline: lock error is missing; ${OUT}"
+
+# G. Cleanup defers to a lock holder without stopping containers or checking the GPU.
+reset_case
+printf '%s\n' "${MATCH}" > "${DOCKER_NAMES_FILE}"
+READY="${WORK}/lock-ready-cleanup-timeout"
+(
+  exec 8< "${LOCK}"
+  flock -n 8
+  : > "${READY}"
+  sleep 3
+) &
+holder=$!
+for _ in $(seq 1 100); do
+  [[ -e "${READY}" ]] && break
+  sleep 0.01
+done
+TEST_LOCK_WAIT=1
+run_case "${PREFIX}" cleanup
+kill "${holder}" 2>/dev/null || true
+wait "${holder}" 2>/dev/null || true
+expect_rc "cleanup lock wait deadline" 0
+expect_actions "cleanup lock wait deadline" ""
+[[ "${OUT}" == "::warning::the GPU lock is still held (a cancelled step may still be tearing down); not stopping containers now; the next job's preflight stops any leftover" ]] \
+  || fail "cleanup lock wait deadline: warning is not exact; ${OUT}"
+[[ ! -s "${GPU_LOG}" ]] || fail "cleanup lock wait deadline: nvidia-smi was called"
 
 if [[ "${failures}" -ne 0 ]]; then
   echo "test-stop-leaked-residents.sh: ${failures} case(s) failed" >&2

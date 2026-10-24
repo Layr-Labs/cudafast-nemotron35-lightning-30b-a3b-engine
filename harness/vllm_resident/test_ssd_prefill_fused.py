@@ -411,6 +411,13 @@ def fused_result(q, tl):
         LAST=q.last,
         INIT=q.initial,
         OUT=state,
+        # The promoted kernel added optional final-cache outputs. This host
+        # oracle exercises the original boundary-state path, not that cache.
+        FINAL_CACHE=state,
+        FINAL_INDEX=q.last,
+        WRITE_FINAL=False,
+        FS=state.stride(),
+        CACHE_SLOTS=q.last.numel(),
         H=q.h,
         N=q.n,
         RATIO=q.heads // q.groups,
@@ -624,7 +631,10 @@ class DispatchTests(unittest.TestCase):
         )
 
     def test_wrapper_launch_binding(self):
-        ns = {}
+        # Extracted function also reads the optional final-cache environment
+        # flag added by the promoted carrier. Supply its real module global.
+        import os
+        ns = {"os": os}
         calls = []
         for name in ("_state_pass_kernel", "_cb_scan_kernel"):
             f = function(FUSED, name, dict(tl=TL(), fast_exp=exp))

@@ -162,6 +162,14 @@
     {
       "file": "harness/kernels/marlinx/{csrc/marlinx.cu,py/__init__.py,README.md,tests/marlinx_zs_exact.py}",
       "why": "Shared expert down projection (3712->2688, ReLU^2 input): read only the k rows whose activation is nonzero in some row, from a byte-preserving k-row-major copy of the Marlin weight; the lane rebuilds Marlin's exact weight word, so dequant, MMA, segments and fp32 reductions are unchanged. Bit-exact vs stock Marlin on all 23 layers (4416 synthetic + 1380 real-activation cases, CUDA graph replay). MARLINX_ZS=0 disables."
+    },
+    {
+      "file": "vllm/model_executor/layers/fused_moe/experts/humming_zskip.py; vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py; harness/kernels/zskip",
+      "why": "zskip for prefill: on 15 sparse MoE layers (ZSKIP_PREFILL_LAYERS; 17-31 and the last layer keep humming), the routed w2 of calls over 8 tokens runs the zero-row-skipping kernel on the promoted swap repack, re-aligned to 32-row expert blocks (config 405: four 8-row MMAs share each dequantised weight fragment, block activations staged once per CTA in shared memory, -0 guard at the end with a dense redo). humming's indexed w2 is batch invariant, so the output equals humming's bit for bit (161 real prefill calls: 7 public prompts x 23 layers; load-time 40-token self-check). ZSKIP_PREFILL=0 disables."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "Draft-only fused top-k/index-offset selection; explicit low-ID tie break; target verifier unchanged."
     }
   ]
 }

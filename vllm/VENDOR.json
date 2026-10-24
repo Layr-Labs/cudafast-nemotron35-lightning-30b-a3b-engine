@@ -154,6 +154,10 @@
     {
       "file": "harness/kernels/l2pf, layers/attention/attention.py, layers/mamba/mamba_mixer2.py, models/nemotron_h.py, v1/worker/gpu_model_runner.py",
       "why": "l2pf carried from e-man07 0a731363-6416-4fb9-aa94-b6f5f6e8155e (L2 prefetch of the next bandwidth-bound weight on a side stream during latency-bound windows; moves no value). Changed: the drafter hook prefetches the start projection's hidden half eh_w_h (what a draft pass reads first with the projected-embedding table) instead of eh_proj.weight. Added: a MoE-window hook (fused_humming_moe.py, nemotron_h.py, L2PF_MOE_MB default 6) that prefetches the head of the next Mamba layer's in_proj pack while the latency-bound small-call routed down projection runs, rejoining right after it."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "Drafter-only coarse-screen work reduction: CASCADE_FRAC_GROUPS 32 to16. Existing BF16/NVFP4 tensor formats,64-group refinement,256 coarse candidates per chunk,32 final candidates,full-K final rescore and target verification are unchanged. Proposals are NOT bit-identical: earlier live-hidden diagnostic found31 disagreements of1512. Earlier complete-engine ABBA measured1.0095 to1.0148 composite across two GB10s on9f8a897; repeat1.0114. Current4693dd8 depth4 transfer is a deliberate official experiment, not a claimed measured gain."
     }
   ]
 }

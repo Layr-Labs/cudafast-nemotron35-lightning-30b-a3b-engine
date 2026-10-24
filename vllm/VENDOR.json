@@ -74,6 +74,14 @@
     {
       "file": "vllm/v1/worker/prefill_graph.py, vllm/v1/worker/gpu_model_runner.py, vllm/v1/attention/backends/flashinfer.py",
       "why": "Capture an input-independent whole-forward CUDA graph at boot for fresh single-request 496-token prefill, with native FlashInfer planning and fully refreshed request buffers; other lengths and target formats remain unchanged."
+    },
+    {
+      "file": "vllm/config/vllm.py (_set_cudagraph_sizes)",
+      "why": "For one request and tensor parallel size 1, include the exact depth+1 verify shape in automatic capture sizes, preserving one-token drafter graphs at non-power-of-two query lengths. Explicit user sizes remain unchanged; depth 4 selected in mtp-head.manifest.json."
+    },
+    {
+      "file": "vllm/v1/worker/gpu_model_runner.py (_capture_fresh_prefill_graph)",
+      "why": "The boot-time fresh 496-token prefill graph captures the target forward only (no drafter, used only when spec decode is off for that step), so its guard is relaxed from depth == 3 to depth >= 1; at depth 4 the prefill graph stays on instead of silently falling back to the eager prefill."
     }
   ]
 }

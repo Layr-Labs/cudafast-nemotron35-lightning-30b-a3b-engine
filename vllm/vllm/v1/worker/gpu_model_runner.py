@@ -7045,7 +7045,9 @@ class GPUModelRunner(
             and self.scheduler_config.max_num_seqs == 1
             and self.parallel_config.tensor_parallel_size == 1
             and self.parallel_config.pipeline_parallel_size == 1
-            and self.num_spec_tokens == 3
+            # The captured forward is the target's own prefill (the drafter
+            # is not in it), so it does not depend on the declared depth.
+            and self.num_spec_tokens >= 1
             and not self.use_aux_hidden_state_outputs
         ):
             return

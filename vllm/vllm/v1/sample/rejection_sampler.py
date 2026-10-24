@@ -14,7 +14,10 @@ from vllm.config.model import PROCESSED_LOGPROBS_MODES
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
-from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
+from vllm.v1.sample.logits_processor.builtin import (
+    LogitBiasLogitsProcessor,
+    MinTokensLogitsProcessor,
+)
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.bad_words import apply_bad_words_with_drafts
 from vllm.v1.sample.ops.penalties import apply_all_penalties
@@ -122,6 +125,9 @@ class RejectionSampler(nn.Module):
         """
         assert metadata.max_spec_len <= MAX_SPEC_LEN
 
+        if self._can_use_greedy_token_ids(sampling_metadata):
+            return self._greedy_token_ids(metadata, logits)
+
         bonus_logits_indices = metadata.bonus_logits_indices
         target_logits_indices = metadata.target_logits_indices
 
@@ -199,6 +205,60 @@ class RejectionSampler(nn.Module):
             sampled_token_ids=output_token_ids,
             logprobs_tensors=logprobs_tensors,
         )
+
+    def _can_use_greedy_token_ids(self, sm: SamplingMetadata) -> bool:
+        """Only bypass vocabulary intermediates when no processor can matter."""
+        if (
+            not sm.all_greedy
+            or self.synthetic_mode
+            or sm.max_num_logprobs is not None
+            or sm.logprob_token_ids
+            or not sm.no_penalties
+            or sm.allowed_token_ids_mask is not None
+            or sm.bad_words_token_ids
+            or sm.thinking_budget_state_holder is not None
+        ):
+            return False
+        for processor in sm.logitsprocs.non_argmax_invariant:
+            # These built-ins are installed even when inactive. Unknown
+            # processors (including subclasses) must retain the ordinary path.
+            if type(processor) is MinTokensLogitsProcessor and not processor.min_toks:
+                continue
+            if type(processor) is LogitBiasLogitsProcessor and not processor.biases:
+                continue
+            return False
+        return True
+
+    def _greedy_token_ids(
+        self, metadata: SpecDecodeMetadata, logits: torch.Tensor
+    ) -> SamplerOutput:
+        # Row selection commutes with the SAME fp32 torch argmax used by the
+        # ordinary sampler, including first-index tie breaking. Gather token IDs
+        # rather than [draft+bonus, vocab] logits and raw-logit preservation
+        # copies. No logits, processors, or acceptance arithmetic are changed.
+        token_ids = logits.to(torch.float32).argmax(dim=-1)
+        batch_size = len(metadata.num_draft_tokens)
+        output = torch.empty(
+            (batch_size, metadata.max_spec_len + 1),
+            dtype=torch.int32,
+            device=logits.device,
+        )
+        rejection_greedy_sample_kernel[(batch_size,)](
+            output,
+            metadata.cu_num_draft_tokens,
+            metadata.draft_token_ids,
+            token_ids,
+            token_ids,
+            None,
+            metadata.max_spec_len,
+            None,
+            None,
+            SYNTHETIC_MODE=False,
+            target_logits_indices_ptr=metadata.target_logits_indices,
+            bonus_logits_indices_ptr=metadata.bonus_logits_indices,
+            INIT_OUTPUT=True,
+        )
+        return SamplerOutput(sampled_token_ids=output, logprobs_tensors=None)
 
     def _get_logprobs_tensors(
         self,
@@ -723,6 +783,9 @@ def rejection_greedy_sample_kernel(
     uniform_probs_ptr,  # [num_tokens] or None (synthetic mode only)
     synthetic_conditional_rates_ptr,  # [num_speculative_tokens] or None
     SYNTHETIC_MODE: tl.constexpr,
+    target_logits_indices_ptr=None,
+    bonus_logits_indices_ptr=None,
+    INIT_OUTPUT: tl.constexpr = False,
 ):
     req_idx = tl.program_id(0)
     # FIXME(woosuk): Because is_greedy_ptr is not None at profiling run,
@@ -731,6 +794,13 @@ def rejection_greedy_sample_kernel(
     if not is_greedy:
         # Early exit for non-greedy sampling requests.
         return
+
+    if INIT_OUTPUT:
+        for pos in range(max_spec_len + 1):
+            tl.store(
+                output_token_ids_ptr + req_idx * (max_spec_len + 1) + pos,
+                -1,  # PLACEHOLDER_TOKEN_ID; Triton requires a literal here.
+            )
 
     start_idx = (
         tl.zeros([], dtype=cu_num_draft_tokens_ptr.dtype.element_ty)
@@ -744,7 +814,10 @@ def rejection_greedy_sample_kernel(
     for pos in range(num_draft_tokens):
         if not rejected:
             draft_token_id = tl.load(draft_token_ids_ptr + start_idx + pos)
-            target_argmax_id = tl.load(target_argmax_ptr + start_idx + pos).to(tl.int32)
+            target_idx = start_idx + pos
+            if target_logits_indices_ptr is not None:
+                target_idx = tl.load(target_logits_indices_ptr + target_idx)
+            target_argmax_id = tl.load(target_argmax_ptr + target_idx).to(tl.int32)
             if SYNTHETIC_MODE:
                 uniform_prob = tl.load(uniform_probs_ptr + start_idx + pos)
                 rate = tl.load(synthetic_conditional_rates_ptr + pos)
@@ -762,7 +835,10 @@ def rejection_greedy_sample_kernel(
 
     if not rejected:
         # If all tokens are accepted, append the bonus token.
-        bonus_token_id = tl.load(bonus_token_ids_ptr + req_idx)
+        bonus_idx = req_idx
+        if bonus_logits_indices_ptr is not None:
+            bonus_idx = tl.load(bonus_logits_indices_ptr + req_idx)
+        bonus_token_id = tl.load(bonus_token_ids_ptr + bonus_idx)
         tl.store(
             output_token_ids_ptr + req_idx * (max_spec_len + 1) + num_draft_tokens,
             bonus_token_id,

@@ -240,8 +240,10 @@ def identity_case(d, params, seed, n_req, cycles, var_len, report):
         checks = {
             "out": torch.equal(out_ref, out_rep),
             "init_state": torch.equal(expect_init, replayed),
-            "anchor": torch.equal(ssm_ref[tbl[:, 0].long()], ssm_rep[tbl[:, 0].long()]),
         }
+        if not rp.kanchor_t():
+            # With the lazy anchor, slot 0 keeps an older state between writes.
+            checks["anchor"] = torch.equal(ssm_ref[tbl[:, 0].long()], ssm_rep[tbl[:, 0].long()])
         for r in range(n_req):
             report["coverage"].setdefault(f"d{d}", {}).setdefault(str(int(na[r]) - 1), 0)
             report["coverage"][f"d{d}"][str(int(na[r]) - 1)] += 1
@@ -262,6 +264,8 @@ def identity_case(d, params, seed, n_req, cycles, var_len, report):
 
     # Footprint: nothing outside slot 0 and the ring part of slot 1 changed.
     ring_bytes = ring_len * rp.spec_replay_ring_elems(NHEADS, HEADDIM, NGROUPS, DSTATE) * 2
+    if rp.kanchor_t():
+        ring_bytes = SSM_BYTES  # the lazy anchor's headers follow the ring in slot 1
     cb = conv_bytes(d)
     touched = torch.zeros(pages_rep.shape, dtype=torch.bool, device=DEV)
     for r in range(n_req):

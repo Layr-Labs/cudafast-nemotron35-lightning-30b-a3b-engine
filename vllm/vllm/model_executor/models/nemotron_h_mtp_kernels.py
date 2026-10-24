@@ -795,6 +795,37 @@ def mtp_moe_row(
 # LOCAL PATCH (cudafast-nemotron35): routed experts the MTP draft evaluates per
 # token (the router's top 6 by weight, highest first); MTP_DRAFT_TOPK=0 keeps all.
 _DRAFT_TOPK = int(os.environ.get("MTP_DRAFT_TOPK", "3"))
+# MTP_TOPK_KEEP_KERNEL=0 keeps torch.sort + slice + index_select for the selection.
+_TOPK_KEEP_KERNEL = os.environ.get("MTP_TOPK_KEEP_KERNEL", "1") != "0"
+
+
+@triton.jit
+def _topk_keep_kernel(
+    tw_ptr, ids_ptr, otw_ptr, oids_ptr,
+    K: tl.constexpr, BK: tl.constexpr, KEEP: tl.constexpr,
+    launch_pdl: tl.constexpr = False,
+):
+    """The KEEP highest of K router weights, highest first, with their expert ids: each
+    element's rank is the number of weights above it plus the equal ones at a lower
+    slot (a stable descending sort), and ranks below KEEP are scattered to their place."""
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    i = tl.arange(0, BK)
+    valid = i < K
+    w = tl.load(tw_ptr + i, mask=valid, other=-float("inf"))
+    e = tl.load(ids_ptr + i, mask=valid, other=0)
+    # NaN ranks as +inf (torch.sort puts NaN first in descending order), so the
+    # ranks stay a permutation and every output slot is written.
+    key = tl.where(w != w, float("inf"), w)
+    wi = key[:, None]
+    wj = key[None, :]
+    jv = valid[None, :]
+    above = jv & ((wj > wi) | ((wj == wi) & (i[None, :] < i[:, None])))
+    rank = tl.sum(above.to(tl.int32), axis=1)
+    keep = valid & (rank < KEEP)
+    tl.store(otw_ptr + rank, w, mask=keep)
+    tl.store(oids_ptr + rank, e, mask=keep)
 
 
 def mtp_moe_single_row_impl(
@@ -814,7 +845,8 @@ def mtp_moe_single_row_impl(
         return mixer(hidden_states.index_select(0, row_src))
     w13, w2, su, sd, inter, n_shared = layer._fast_moe_weights
     M, H = hidden_states.shape
-    x = hidden_states.index_select(0, row_src[:1])  # [1, H]
+    # One row: row_src[0] can only be 0, so the row is the input itself (no gather).
+    x = hidden_states if M == 1 else hidden_states.index_select(0, row_src[:1])  # [1, H]
     router_logits, _ = mixer.gate(x)
     topk_weights, topk_ids = mixer.experts.router.select_experts(
         hidden_states=x, router_logits=router_logits
@@ -824,9 +856,19 @@ def mtp_moe_single_row_impl(
     if 0 < _DRAFT_TOPK < ids.numel():
         # LOCAL PATCH (cudafast-nemotron35): the draft keeps the _DRAFT_TOPK
         # highest-weight routed experts of the MTP layer (drafter-only).
-        tw, order = torch.sort(tw, descending=True)
-        tw = tw[:_DRAFT_TOPK].contiguous()
-        ids = ids.index_select(0, order[:_DRAFT_TOPK]).contiguous()
+        if _TOPK_KEEP_KERNEL and tw.is_cuda and ids.numel() <= 16:
+            tw_k = torch.empty(_DRAFT_TOPK, dtype=tw.dtype, device=tw.device)
+            ids_k = torch.empty(_DRAFT_TOPK, dtype=ids.dtype, device=ids.device)
+            _topk_keep_kernel[(1,)](
+                tw.contiguous(), ids.contiguous(), tw_k, ids_k,
+                K=ids.numel(), BK=triton.next_power_of_2(ids.numel()), KEEP=_DRAFT_TOPK,
+                num_warps=1, launch_pdl=mtp_pdl(),
+            )
+            tw, ids = tw_k, ids_k
+        else:
+            tw, order = torch.sort(tw, descending=True)
+            tw = tw[:_DRAFT_TOPK].contiguous()
+            ids = ids.index_select(0, order[:_DRAFT_TOPK]).contiguous()
     return mtp_moe_row(
         x,
         ids,

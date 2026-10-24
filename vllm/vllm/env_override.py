@@ -871,3 +871,120 @@ if os.environ.get("VLLM_TRITON_FORCE_FIRST_CONFIG", "0").strip().lower() in (
     )
 
     _install_force_first_config()
+
+# ============================================================
+# Inductor PDL, with the wait at every kernel's first access
+# ============================================================
+# LOCAL PATCH (cudafast-nemotron35): Inductor can launch its Triton kernels with
+# programmatic dependent launch (config.triton.enable_pdl, off by default), so a
+# kernel's launch overlaps the end of the one before it. As shipped, its codegen
+# emits griddepcontrol.wait only before an access that reads the immediately
+# previous scheduler node's writes, and triggers dependents right after the
+# kernel's loads. With an independent kernel in between, a kernel could then read
+# a buffer from two kernels back while it is still being written. Here the wait is
+# emitted before every access (_filter_pdl keeps the first), so every Inductor
+# kernel waits for its predecessor before it touches memory and triggers only after
+# that, the order every other PDL kernel in this tree follows. It moves no value.
+# Not applied if Inductor's internals differ from what this expects, or when
+# user-kernel epilogue fusion is on (those kernels' own loads carry no wait).
+# Decode-sized launches only: a kernel compiled with PDL is launched with the
+# programmatic-serialization attribute only when its problem size (the product of its
+# x/y/z numel and r*_numel arguments) is at most _INDUCTOR_PDL_MAX_ELEMS (8 rows of
+# 16384), i.e. the <= 8-token verify and drafter forwards; larger launches (every
+# prefill-sized one, seed and timed alike) use a copy of the launcher without the
+# attribute, so they start only after their predecessor completes and their wait is a
+# no-op (their early trigger can still let a following PDL kernel start, which waits
+# for them before touching memory, as every PDL kernel in this tree does). If that
+# launcher hook cannot be installed, PDL stays off.
+# VLLM_INDUCTOR_PDL=0 disables.
+_INDUCTOR_PDL_MAX_ELEMS = 8 * 16384
+
+
+def _install_inductor_pdl_launch_guard() -> bool:
+    try:
+        import copy
+
+        from torch._inductor.runtime.triton_heuristics import TritonCompileResult
+    except Exception:
+        return False
+    orig = getattr(TritonCompileResult, "_gen_launcher_code", None)
+    if orig is None:
+        return False
+    if getattr(orig, "_vllm_pdl_guard", False):
+        return True
+
+    def _gen_launcher_code(self, scope, def_args, runner_args):
+        run = scope.get("runner")
+        if getattr(run, "launch_pdl", False):
+            nopdl = copy.copy(run)
+            nopdl.launch_pdl = False
+            sizes = tuple(
+                i
+                for i, name in enumerate(runner_args)
+                if name in ("xnumel", "ynumel", "znumel")
+                or (name.startswith("r") and name.endswith("_numel") and name[1:-6].isdigit())
+            )
+            if "xnumel" not in runner_args:
+                scope["runner"] = nopdl
+            else:
+
+                def runner(*a, _p=run, _n=nopdl, _sizes=sizes):
+                    n = 1
+                    for i in _sizes:
+                        n *= a[i]
+                    return (_p if n <= _INDUCTOR_PDL_MAX_ELEMS else _n)(*a)
+
+                scope["runner"] = runner
+        return orig(self, scope, def_args, runner_args)
+
+    _gen_launcher_code._vllm_pdl_guard = True
+    TritonCompileResult._gen_launcher_code = _gen_launcher_code
+    return True
+
+
+def _patch_inductor_pdl_forced_wait() -> None:
+    if os.environ.get("VLLM_INDUCTOR_PDL", "1").strip().lower() in (
+        "0",
+        "false",
+        "off",
+        "no",
+    ):
+        return
+    try:
+        import torch._inductor.config as inductor_config
+        from torch._inductor.codegen.triton import TritonKernel
+    except Exception:
+        return
+    if not (
+        hasattr(inductor_config, "triton")
+        and hasattr(inductor_config.triton, "enable_pdl")
+        and hasattr(TritonKernel, "_handle_pdl_before_access")
+        and hasattr(TritonKernel, "_handle_pdl_after_load")
+        and hasattr(TritonKernel, "_filter_pdl")
+        and hasattr(TritonKernel, "_enable_pdl_codegen")
+        and hasattr(TritonKernel, "GDC_WAIT")
+    ):
+        return
+    if getattr(inductor_config, "epilogue_fusion_user_defined_triton_kernel", False):
+        return
+    if getattr(TritonKernel._handle_pdl_before_access, "_vllm_forced_wait", False):
+        return
+    if not _install_inductor_pdl_launch_guard():
+        return
+
+    def _handle_pdl_before_access(
+        self, wait_buffer, *dependencies, consider_reads=False
+    ):
+        if not self._enable_pdl_codegen():
+            return
+        # hoist before the loop (as upstream)
+        if self.inside_reduction and self.range_trees[-1].is_loop:
+            wait_buffer = self.body
+        wait_buffer.writeline(self.GDC_WAIT)
+
+    _handle_pdl_before_access._vllm_forced_wait = True
+    TritonKernel._handle_pdl_before_access = _handle_pdl_before_access
+    inductor_config.triton.enable_pdl = True
+
+
+_patch_inductor_pdl_forced_wait()

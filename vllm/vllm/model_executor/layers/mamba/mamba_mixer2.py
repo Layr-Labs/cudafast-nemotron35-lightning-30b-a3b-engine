@@ -33,6 +33,8 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_update,
 )
 from vllm.model_executor.layers.mamba.ops.layernorm_gated import rms_norm_gated
+from vllm.model_executor.layers.mamba.ops.gated_norm_fp8 import maybe_gated_norm_fp8
+from vllm.model_executor.layers.mamba.ops.mamba_ssm_macro import qualify_ssm_macro
 from vllm.model_executor.layers.mamba.ops.mamba_ssm_spec_replay import (
     selective_state_update_spec_replay,
     spec_replay_enabled,
@@ -562,6 +564,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
         )
         self.spec_replay_ring_len = spec_replay_ring_len(self.num_spec)
         self._spec_replay_ok: bool | None = None
+        self._spec_macro_ok = False
         if self.use_spec_replay:
             logger.info_once(
                 "Mamba2 spec decode: anchor-state replay (ring of %d tokens).",
@@ -620,7 +623,11 @@ class MambaMixer2(MambaBase, PluggableLayer):
         # SiLU is applied internally before normalization, unlike standard
         # norm usage
         gate = projected_states[..., : self.tped_intermediate_size]
-        hidden_states = self.norm(ssm_output, gate)
+        hidden_states = maybe_gated_norm_fp8(
+            self.norm, self.out_proj, ssm_output, gate
+        )
+        if hidden_states is None:
+            hidden_states = self.norm(ssm_output, gate)
 
         # 5. Final linear projection
         output, _ = self.out_proj(hidden_states)
@@ -722,6 +729,8 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     exc_info=True,
                 )
 
+        # Checkpoint-only remote admission, before cache allocation/capture.
+        self._spec_macro_ok = qualify_ssm_macro(self)
         logger.debug("Mamba2 SSD kernel warmup completed for layer %s", self.prefix)
         torch.accelerator.empty_cache()
 
@@ -1182,6 +1191,10 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     seq_lens=attn_metadata.seq_lens,
                     ring_len=self.spec_replay_ring_len,
                     is_blackwell=self.is_blackwell,
+                    geometry_override=(16, 4) if (
+                        self._spec_macro_ok and num_decodes == 1
+                        and num_decode_tokens == 5
+                    ) else None,
                 )
             else:
                 selective_state_update(

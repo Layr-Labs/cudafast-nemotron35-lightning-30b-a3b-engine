@@ -477,6 +477,8 @@ def selective_state_update_spec_replay(
     ring_len=None,
     is_blackwell=False,
     replayed_out=None,
+    geometry_override=None,
+    verify_rows_override=None,
 ):
     """
     Spec-decode verify update with anchor + input-ring state handling.
@@ -533,6 +535,8 @@ def selective_state_update_spec_replay(
     BLOCK_SIZE_M, num_warps = try_get_optimal_ssm_config(
         dim, dstate, N, nheads, cache_dtype, is_blackwell
     )
+    if geometry_override is not None:
+        BLOCK_SIZE_M, num_warps = geometry_override
 
     verify_rows = None
     if (
@@ -545,6 +549,9 @@ def selective_state_update_spec_replay(
             # Never import/allocate/rebind the buffer here; its address must
             # already be the same one captured by every router and sampler.
             verify_rows = smallk.live_verify_rows(x.device)
+
+    if verify_rows_override is not None:
+        verify_rows = verify_rows_override
 
     with torch.accelerator.device_index(x.device.index):
         _selective_scan_update_spec_replay_kernel[grid](

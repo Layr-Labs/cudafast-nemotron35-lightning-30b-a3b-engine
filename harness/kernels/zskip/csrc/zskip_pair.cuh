@@ -52,13 +52,11 @@ __global__ void __launch_bounds__(32) down_pair_kernel(const Params p) {
   const uint16_t* gact = reinterpret_cast<const uint16_t*>(bi + BI_ACTG);
   const bool math = p.mode == DENSE || p.mode == SKIP;
   bool dense = p.mode == DENSE || p.mode == LOADONLY_DENSE;
-  const int row_limit = prefix_row_limit(p);
   const __nv_bfloat16* xrow[NB];
 #pragma unroll
   for (int nb = 0; nb < NB; ++nb) {
     const int r = nb * 8 + g8;
-    xrow[nb] = r < nrows && hdr->rows[r] < row_limit
-        ? p.A + (long long)hdr->rows[r] * p.lda : nullptr;
+    xrow[nb] = r < nrows ? p.A + (long long)hdr->rows[r] * p.lda : nullptr;
   }
   const uint8_t* wbase = HALF ? p.W + e * p.w_expert + (P >> 1) * 64 + g8 * 8 + (P & 1) * 4
                               : p.W + e * p.w_expert + P * (32 * TPW) + g8 * (4 * TPW);
@@ -207,8 +205,7 @@ __global__ void __launch_bounds__(32) down_pair_kernel(const Params p) {
           const int cc = col + ((q >> 1) ? 8 : 0);
           if (tok < nrows) {
             const uint32_t v = to_bf16x2(mul_ftz(acc[tt * 4 + c][nb][q], gs4), 0.0f);  // humming's cvt.rn.bf16x2.f32
-            reinterpret_cast<uint16_t*>(p.C)[(long long)hdr->rows[tok] * p.ldc + cc] =
-                hdr->rows[tok] < row_limit ? static_cast<uint16_t>(v) : uint16_t(0);
+            reinterpret_cast<uint16_t*>(p.C)[(long long)hdr->rows[tok] * p.ldc + cc] = static_cast<uint16_t>(v);
           }
         }
       }

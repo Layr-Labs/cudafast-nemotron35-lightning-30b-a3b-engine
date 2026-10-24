@@ -197,19 +197,7 @@
     },
     {
       "file": "harness/kernels/zskip/csrc/zskip_pair.cuh, zskip.cu, py/__init__.py, build.sh; vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
-      "why": "Port dadon 12f98e36-35d1-41c0-ba8d-8fd101ffeee1 (31889a414e3f4b414b7aaca41f28daad6b4c0919) decode c113: swap2 paired 64-column tiles, one warp, ring 3. Compose fkiene bc524594 fused prep as c118, retaining c113, checked c108/c100 and all original load-time/prefill checks. Additional byte-preserving swap2 w2 copy leaves pzskip and c405 unchanged. Per-layer bitwise M4/M5/M8 guard, crowded routing and signed/empty zeros; ZSKIP_DADON=0 disables. Static CPU-only port: not CUDA-compiled, GPU-checked or timed locally."
-    },
-    {
-      "file": "vllm/model_executor/layers/mamba/ops/mamba_ssm_spec_replay.py",
-      "why": "Original confidence-prefix SSM recurrence pruning on fulla484. Only one-request depthfour five-row replay with the existing live smallk verify-row buffer is eligible. Preserve original seq_len/pos0, all previous accepted replay, valid-row arithmetic, first-row anchor and prefix input ring. Omit rejected suffix updates/ring writes and explicitlyzero suffixoutputs. Original sampler forces suffixrejection and acceptedcountbounds ringreaders. No local execution; official remote validation required."
-    },
-    {
-      "file": "harness/kernels/zskip/csrc/zskip.cu; zskip_pair.cuh; py/__init__.py; vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
-      "why": "Original confidence-prefix paired decode masks: optional separate C entry preserves old ABI. Only checkedM5pair113/118 may ignore invalid suffix rows when building zero union masks, use zero invalid activations and explicitlyzero invalid outputs. Existing valid operands/Korder/MMA/dequant/rounding unchanged. Remote per-layer finite admission checks allprefixcounts1..5 against humming validrows on spread/crowded/signedzero inputs; failurekeepsoriginalpair. No newcleargrid; all executionofficialremote."
-    },
-    {
-      "file": "harness/kernels/l2pf/py/__init__.py",
-      "why": "Carry useful04706ad7-c4e8-44b9-b8ba-77f14d8b8adf MoE-window immutable prefetch default6to12MB. Its complete official2.19195352041462 is within0.1% of fulla484, but only budget mechanism is combined here on higherfulla484. Prefix pair/SSM combination unverified."
+      "why": "Port dadon 12f98e36-35d1-41c0-ba8d-8fd101ffeee1 (31889a414e3f4b414b7aaca41f28daad6b4c0919) decode c113: swap2 paired 64-column tiles, one warp, ring 3. Compose fkiene bc524594 fused prep as c118, retaining c113, checked c108/c100 and all original load-time/prefill checks. Additional byte-preserving swap2 w2 copy leaves pzskip and c405 unchanged. Per-layer bitwise M4/M5/M8 guard, crowded routing and signed/empty zeros; ZSKIP_DADON=0 disables. Static CPU-only port: not CUDA-compiled, GPU-checked or timed locally. Resubmitted unchanged after submissions 06201161, ffc45457, 8ae878b2, 1d962d2d and 388e568c."
     }
   ]
 }

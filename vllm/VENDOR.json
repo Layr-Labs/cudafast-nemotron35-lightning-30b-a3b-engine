@@ -130,6 +130,14 @@
     {
       "file": "models/nemotron_shared_up.py, models/nemotron_h.py; harness/kernels/marlinx/{csrc/marlinx.cu,py/__init__.py}",
       "why": "New single-device prepared Marlin shared-expert up projection epilogue fuses ReLU squared for BF16 M1..8,N3712,K2688. Original GEMM BF16 rounding occurs first, then explicit RN FP32 square and RN BF16 output with canonical NaN; original Marlin accumulation, weights/scales/layout, dense/head/down ABI and unfused instantiations retained. Tensor-only opaque custom op has a full Marlin+activation fallback and fake schema; other sizes and unprepared/bias/TP paths retain original layer/activation. Source-only; no local execution."
+    },
+    {
+      "file": "harness/kernels/smallk/{csrc/smallk.cu,py/__init__.py,README.md}; vllm/config/vllm.py; mtp-head.manifest.json",
+      "why": "New experiment on complete C2 plus now-highest valid a1c083d7-215a-4b8e-abeb-ea12e7cad022 per-k sparse down (official1.92418420867247): native BF16 MTP depth4, exact5 single-sequence verify CUDA graph while preserving tiny draft graphs, and native M5 router extension. Reuse only those mechanisms from own5eb1514c-5de3-49fa-987d-614e7aa2f787, whose whole previous bundle scored1.8144433342994297 versus C2 1.8354630280356752 and is excluded as baseline. Previous B3slot graph is absent. M5 retains original independent FMA chains and fallback; isolated numerical identity/performance unproven despite prior whole token-oracle pass. New cheaper per-k backend changes the verify-cost regime; this full combination requires official remote validation. Graph idea63a1a1a2-411f-4d21-8234-25bd98d23b06, originalrouter100549d4-51c4-4f56-b3ca-2604731ab8a4."
+    },
+    {
+      "file": "vllm/model_executor/layers/fused_moe/runner/moe_runner.py; vllm/model_executor/models/nemotron_h.py; vllm/v1/worker/{prefill_graph.py,gpu_model_runner.py}",
+      "why": "Select only Bundle B of pending81f5f6b9-af28-4c98-b08d-cba5e0eeb588 exact commit77dfeb1108ca5946d32568f7c62767ee2d90c923: inside existing fresh single-row-logits prefill graph, last decoder MoE routes unread rows through the read row experts. Read row retains own input, IDs, weights, M-dependent tuning and K order. No stateful layer follows it; per-row final norm. Capture warmups use the same rule; setter cleared in finally, runtime graph replay refreshes every input. Guard excludes prompt-logprobs/aux hidden outputs. No cross-request work reuse, format change or expected-output cache. Other Bundle A changes not imported from81; three compatible fusions arrive through full a1 source. Source-only composition, no local execution. Uploadrefresh: entire81 completedcorrect1.80685685849703, >0.1percent belowC2; wholecarrierexcluded. OnlyprefillBundleBselected asnewexperiment onhighest a1, supportedonlyby non-isolatedprefillgain1.326014 versusC2 1.290244; noisolatedclaim."
     }
   ]
 }

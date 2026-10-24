@@ -365,6 +365,10 @@ int router_launch(const float* x, long ldx, int M, const float* w, int N, int K,
   switch (M) {
     case 4:
       return launch(router_gemm_kernel<R, 4, MODE>, grid, block, pdl, stream, x, ldx, w, K, y, ldy, N);
+    case 5:
+      // Follow-on M5 specialization: reuse each independent M4 arithmetic
+      // chain; equivalence to the M5 cuBLAS choice requires remote validation.
+      return launch(router_gemm_kernel<R, 5, MODE>, grid, block, pdl, stream, x, ldx, w, K, y, ldy, N);
     default:
       return 2;
   }
@@ -388,6 +392,14 @@ int sk_init() {
   rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<2, 4, 1>) != cudaSuccess;
   rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<4, 4, 1>) != cudaSuccess;
   rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<8, 4, 1>) != cudaSuccess;
+  rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<1, 5, 0>) != cudaSuccess;
+  rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<2, 5, 0>) != cudaSuccess;
+  rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<4, 5, 0>) != cudaSuccess;
+  rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<8, 5, 0>) != cudaSuccess;
+  rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<1, 5, 1>) != cudaSuccess;
+  rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<2, 5, 1>) != cudaSuccess;
+  rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<4, 5, 1>) != cudaSuccess;
+  rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<8, 5, 1>) != cudaSuccess;
   rc |= cudaFuncGetAttributes(&a, topk_sigmoid_kernel<128>) != cudaSuccess;
   rc |= cudaFuncGetAttributes(&a, align_kernel) != cudaSuccess;
   rc |= cudaFuncGetAttributes(&a, route_kernel) != cudaSuccess;

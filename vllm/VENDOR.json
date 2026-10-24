@@ -114,6 +114,30 @@
     {
       "file": "vllm/model_executor/layers/quantization/utils/humming_utils.py; vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py; harness/kernels/routed_sparse",
       "why": "Byte-exact NVFP4 down-weight packing at load and small-token sparse-sector kernel. Per-call masks skip weight reads only for exact-zero activation sectors, retaining ascending BF16 MMA, FP32 accumulation and original global-scale/RN epilogue. Existing Humming handles unsupported calls and prefill."
+    },
+    {
+      "file": "vllm/model_executor/layers/mamba/ops/ssd_prefill_fused.py, ssd_combined.py, mamba_mixer2.py",
+      "why": "On complete accepted31d30b53-14a9-44ec-bb99-bae7b70873a4, fuse the terminal FP32 state cache store into the existing prefill state recurrence. All chunk boundaries and CB scan arithmetic remain; eligible single nonempty sequence stores the same final registers to its cache row and omits the separate state-copy kernel. Full31 spin, metadata reuse, routerbig, native FP8 and activation fusion remain. Original single-copy fallback, cache-all and CPU paths remain. No local execution; first runtime validation is official remote."
+    },
+    {
+      "file": "vllm/model_executor/layers/mamba/ops/gated_norm_fp8.py, mamba_mixer2.py",
+      "why": "Guarded eight-group M1..8 BF16 gated RMSNorm plus checkpoint-static FP8 activation in one Triton producer. Preserve native-order gate/mean-square/rsqrt and both BF16 rounding boundaries around norm-weight multiplication; use existing QuantizedActivation static-key contract consumed by actual CutlassFP8 class, retaining native FP8 GEMM. Unsupported backend/dynamic scales/TP/bias/shape/padding retain original norm+quantization. Fixture declares n_groups8 and static Mamba W8A8; no local execution or bit-identity claim before official remote validation."
+    },
+    {
+      "file": "vllm/model_executor/layers/fused_moe/runner/shared_experts.py",
+      "why": "Retain complete highest valid5f31f929-693d-463d-b6ce-6bcb8e00884a early shared launch/join source exact91b9f547c89e4c53893bb6ab2d4288633b0d93b5. Same mechanism as creditedfd75aab7-ddbe-405f-8b78-4dc578d7539f, with only getenv killflag removal/docstring delta versus reviewedfdsource. Input wait/record_stream and join-before-output preserved, no duplicate launch; global shared-stream disable/NO_OVERLAP paths retain fallback. New terminalcache/gatednorm composition runtime unverified; no local execution."
+    },
+    {
+      "file": "models/nemotron_shared_up.py, models/nemotron_h.py; harness/kernels/marlinx/{csrc/marlinx.cu,py/__init__.py}",
+      "why": "New single-device prepared Marlin shared-expert up projection epilogue fuses ReLU squared for BF16 M1..8,N3712,K2688. Original GEMM BF16 rounding occurs first, then explicit RN FP32 square and RN BF16 output with canonical NaN; original Marlin accumulation, weights/scales/layout, dense/head/down ABI and unfused instantiations retained. Tensor-only opaque custom op has a full Marlin+activation fallback and fake schema; other sizes and unprepared/bias/TP paths retain original layer/activation. Source-only; no local execution."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_compact.py, nemotron_h_mtp_kernels.py",
+      "why": "New drafter-only BF16 post-ReLU2 exact-zero index/value compaction in ascending original K, followed by compact-domain down projections and original six-expert/shared weighted reduction. Reuse the existing finite-weight-checked exact BF16 transpose; no new weight representation, threshold pruning or host count read. Fresh compact buffers and counts are recomputed per call/replay. Preserve original up, routing, target and strict acceptance; FP32 down reduction tree changes, so proposal quality and speed are unverified. Shape guard and MTP_RELU2_COMPACT=0 retain original zero-down fallback. Source-only research, no local execution."
+    },
+    {
+      "file": "harness/kernels/routed_sparse/csrc/routed_sparse.cu and README.md",
+      "why": "Compose useful pending c2a77c1c-7c50-4cd9-9521-ca5cdd5ec009 exact two-file source a9be0c58f1c13872ac94098e29014926da569a20. Carry group masks in the register ring, bypass FP4 decode only for whole-zero K16 while retaining every MMA and original FTZ epilogue; sixteen mask partitions. Author local differential and matched timing reports are not our execution or an official gain. New combination unverified."
     }
   ]
 }

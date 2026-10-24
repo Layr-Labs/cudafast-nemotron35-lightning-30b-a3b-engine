@@ -30,7 +30,7 @@ execute their MMA steps. Routing weights and the final expert reduction use
 the existing implementation.
 
 The selected kernel uses four warps, a four-step register prefetch ring and
-four mask-generation CTAs per routed expert. The initial prototype, reusable
+sixteen mask-generation CTAs per routed expert. The initial prototype, reusable
 mask variant and 24 launch variants were tested separately. Timing reports
 are diagnostic kernel timings, not official model scores.
 
@@ -39,3 +39,7 @@ the guarded path, complete expert outputs and large-token fallback against
 the original Humming sequence using the pinned checkpoint. Full-model golden
 streams, repeated independent prompts and a fresh control/candidate benchmark
 are required before drawing an end-to-end performance conclusion.
+
+The follow-up skips FP4 decoding instructions when a complete K16 group is
+zero, substituting zero operands while still executing its original MMA step.
+It retains the same accumulator sequence and FTZ epilogue.

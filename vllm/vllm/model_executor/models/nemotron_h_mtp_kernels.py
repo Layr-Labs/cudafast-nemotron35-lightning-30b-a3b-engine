@@ -455,6 +455,12 @@ def relu2_down(h, w2, sd, ids, tw, y, routed_scale, mode=None, bn=None, warps=No
             )
             return
         wp, sp = packed
+        # Drafter only: keep all nonzero values but execute a compact K domain.
+        # The existing prepare above proves finite weights before zero omission.
+        from .nemotron_h_mtp_compact import maybe_down
+
+        if maybe_down(h, packed, ids, tw, y, routed_scale):
+            return
         strides = (wp.stride(0), 1, 1, H, H, inter * H)
     else:
         wp, sp = w2, sd

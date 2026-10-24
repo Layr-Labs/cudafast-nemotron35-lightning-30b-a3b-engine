@@ -80,6 +80,32 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(backend.logprob_starts, [False, True])
             self.assertEqual(len(s.top_logits(8)[0]), 8)
 
+    def test_resync_preserves_output_mode_for_eval_and_cycle(self):
+        for mode in (False, True):
+            for verb in ("eval", "cycle"):
+                for bounded in (False, True):
+                    with self.subTest(mode=mode, verb=verb, bounded=bounded):
+                        backend = FakeBackend(depth=3)
+                        s = Session(backend)
+                        frontier = s.sync(PROMPT, max_tokens=1 if bounded else None,
+                                          top_logits=mode)
+                        fed = frontier if bounded else (frontier + 1) % backend.vocab_size
+                        if verb == "eval":
+                            s.eval(fed)
+                        else:
+                            self.assertEqual(s.cycle(fed, 4), [fed])
+                        self.assertEqual(backend.logprob_starts, [mode, mode])
+                        ref = Session(FakeBackend(depth=0))
+                        self.assertEqual(s.frontier.token, ref.sync(PROMPT + [fed]))
+                        if mode:
+                            self.assertEqual(len(s.top_logits(8)[0]), 8)
+                        else:
+                            with self.assertRaises(RefusedError):
+                                s.top_logits(8)
+                        s.invalidate()
+                        s.sync(PROMPT)
+                        self.assertEqual(len(s.top_logits(8)[0]), 8)
+
     def test_the_skip_logprobs_switch_keeps_top_logits(self):
         import resident
 

@@ -154,7 +154,7 @@ class Session:
         if token != frontier.token or self._spent():
             # Teacher forcing, or a bounded sequence asked to go on: prefill
             # again from the context. Correct, and deliberately not fast.
-            self.sync(self.ctx + [token])
+            self.sync(self.ctx + [token], top_logits=not self.top_dropped)
             return
         self.ctx.append(token)
         if not self.ahead:
@@ -178,7 +178,7 @@ class Session:
         self._check_ids([fed])
         frontier = self._need_frontier()
         if fed != frontier.token or self._spent():
-            self.sync(self.ctx + [fed])
+            self.sync(self.ctx + [fed], top_logits=not self.top_dropped)
             return [fed]
         if not self.ahead:
             self.ahead.extend(self._engine_step())

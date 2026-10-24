@@ -1633,10 +1633,10 @@ mod session {
         );
     }
 
-    /// Only `free_decode_begin` syncs without top-k logits: a free run reads
-    /// tokens only, on either route. Every other opener still gets them.
+    /// Token-only free runs, including the correctness reference, omit top-k.
+    /// Teacher-forced openers retain their top-k logits.
     #[test]
-    fn only_a_free_run_syncs_without_top_logits() {
+    fn token_only_free_runs_sync_without_top_logits() {
         for route in [Route::Serial, Route::Mtp] {
             let session = Arc::new(Mutex::new(Scripted {
                 mtp_armed: true,
@@ -1653,7 +1653,7 @@ mod session {
         e.decode_begin(&[1, 2, 3]).unwrap();
         e.correctness_begin(&[1, 2, 3]).unwrap();
         e.correctness_freerun(&[1, 2, 3], 2).unwrap();
-        assert_eq!(session.lock().unwrap().free_run_syncs, 0);
+        assert_eq!(session.lock().unwrap().free_run_syncs, 1);
     }
 
     #[test]
@@ -2325,6 +2325,7 @@ mod resident {
         let seen = server.finish();
         assert_eq!(seen[1]["op"], "sync");
         assert_eq!(seen[1]["max_tokens"], 1);
+        assert_eq!(seen[1]["top_logits"], false);
         assert!(
             seen[2].get("max_tokens").is_none(),
             "a decode or correctness sync is unbounded"
@@ -2332,7 +2333,7 @@ mod resident {
     }
 
     /// A free run's sync tells the resident that no top-k logits will be read
-    /// on the sequence; every other sync leaves the field out.
+    /// on the sequence; timed prefill also omits them, teacher forcing keeps them.
     #[test]
     fn a_free_run_sync_drops_top_logits() {
         let server = Server::start(scripted);
@@ -2351,7 +2352,7 @@ mod resident {
             "a free run is unbounded"
         );
         assert!(seen[2].get("top_logits").is_none());
-        assert!(seen[3].get("top_logits").is_none());
+        assert_eq!(seen[3]["top_logits"], false);
     }
 
     /// A resident that offers `spec_run` in its hello takes the whole free run

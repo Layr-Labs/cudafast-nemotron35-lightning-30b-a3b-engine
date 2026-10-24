@@ -195,8 +195,9 @@ class VllmBackend:
 
     def _warm_up(self) -> None:
         prompt = [(i * 7919) % 30000 + 1000 for i in range(self.WARMUP_PROMPT_TOKENS)]
-        for _ in range(self.WARMUP_ROUNDS):
-            self.start(prompt)
+        for i in range(self.WARMUP_ROUNDS):
+            # Exercise both output paths using only synthetic input.
+            self.start(prompt, logprobs=(self.WARMUP_ROUNDS - i) % 2 == 0)
             for _ in range(self.WARMUP_DECODE_STEPS):
                 self.step()
             self.abort()

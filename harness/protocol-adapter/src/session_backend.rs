@@ -290,7 +290,7 @@ impl Engine for SessionEngine {
         // where the golden stopped (an EOS id), never forcing an exact length.
         let mut s = self.lock();
         let eos = eos_ids(s.eos_token());
-        Self::fault(s.sync(prompt))?;
+        Self::fault(s.sync_free_run(prompt))?;
         let mut out = Vec::with_capacity(steps.max(0) as usize);
         let mut next = s.argmax();
         for _ in 0..steps {

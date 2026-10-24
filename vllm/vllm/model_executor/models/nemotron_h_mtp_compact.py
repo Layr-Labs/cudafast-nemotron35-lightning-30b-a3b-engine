@@ -11,7 +11,7 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
-_ENABLED = os.environ.get("MTP_RELU2_COMPACT", "1") != "0"
+_ENABLED = os.environ.get("MTP_RELU2_COMPACT", "0") != "0"
 
 
 @triton.jit

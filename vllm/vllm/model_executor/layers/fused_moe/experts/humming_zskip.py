@@ -36,6 +36,8 @@ ENABLED = os.environ.get("ZSKIP", "1") != "0"
 # kernel v4 (warp per 64-column tile, weights as the MMA A operand) on the "swap" repack
 LAYOUT = "swap"
 CONFIG = 100
+FUSED_PREP = True
+FUSED_CONFIG = 200
 MAX_TOKENS = 8
 TOP_K = 6
 HIDDEN = 2688
@@ -89,13 +91,25 @@ def finalize(layer: torch.nn.Module) -> None:
         layer.zskip_w2 = None
         return
     _zskip.scratch(gs.device)
-    if not _self_check(layer):
+    if FUSED_PREP and _fused_check(layer):
+        layer.zskip_config = FUSED_CONFIG
+    elif not _self_check(layer):
         layer.zskip_w2 = None
         return
     logger.info_once("zskip: zero-row-skipping routed down projection enabled for <= 8 tokens")
 
 
-def _self_check(layer: torch.nn.Module) -> bool:
+def _fused_check(layer: torch.nn.Module) -> bool:
+    """The load-time check with FUSED_CONFIG; False (crown CONFIG next) on any failure."""
+    try:
+        _zskip.config_info(FUSED_CONFIG)
+        return _self_check(layer, FUSED_CONFIG, quiet=True)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning_once("zskip: fused prep unavailable (%r); config %d", exc, CONFIG)
+        return False
+
+
+def _self_check(layer: torch.nn.Module, config: int = CONFIG, quiet: bool = False) -> bool:
     """Load-time guard: humming's w2 and zskip on deterministic 4- and 8-token calls, bitwise."""
     import json
 
@@ -163,11 +177,13 @@ def _self_check(layer: torch.nn.Module) -> bool:
             layer.zskip_w2,
             out,
             mode=_zskip.SKIP,
-            config=CONFIG,
+            config=config,
             max_blocks=m * TOP_K,
         )
         ok = ok and torch.equal(out.view(torch.int16), ref.view(torch.int16))
-    if not ok:
+    if not ok and quiet:
+        logger.warning_once("zskip: fused prep differs from humming at load; config %d", CONFIG)
+    elif not ok:
         logger.warning(
             "zskip: load-time check differs from humming on %s; humming keeps the down projection",
             getattr(layer, "layer_name", "?"),
@@ -216,7 +232,7 @@ def maybe_down(
         packed,
         outputs,
         mode=_zskip.SKIP,
-        config=CONFIG,
+        config=getattr(layer, "zskip_config", CONFIG),
         max_blocks=rows,
     )
     return True

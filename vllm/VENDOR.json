@@ -162,6 +162,14 @@
     {
       "file": "harness/kernels/marlinx/{csrc/marlinx.cu,py/__init__.py,README.md,tests/marlinx_zs_exact.py}",
       "why": "Shared expert down projection (3712->2688, ReLU^2 input): read only the k rows whose activation is nonzero in some row, from a byte-preserving k-row-major copy of the Marlin weight; the lane rebuilds Marlin's exact weight word, so dequant, MMA, segments and fp32 reductions are unchanged. Bit-exact vs stock Marlin on all 23 layers (4416 synthetic + 1380 real-activation cases, CUDA graph replay). MARLINX_ZS=0 disables."
+    },
+    {
+      "file": "harness/kernels/zskip/{csrc/zskip.cu,build.sh,py/__init__.py}; layers/fused_moe/experts/humming_zskip.py",
+      "why": "Carried from znan2 6dac3667 onto fde0c2d, without that submission's marlinx K-row skip (already on HEAD). zskip config 200 is down4 config 100 with prep_kernel fused into each down CTA (same build_lists, block info in dynamic shared memory). One launch per small routed down instead of prep plus down. Load-time bitwise check against humming; any miss or a -DZSKIP_NO_FUSED build keeps config 100. CONFIGS4F mirrors ZSKIP4F_CONFIGS and is not part of the CONFIGS4 exact sweep."
+    },
+    {
+      "file": "models/nemotron_h_mtp_up_tc.py; nemotron_h_mtp_kernels.py; nemotron_h_mtp_compact.py",
+      "why": "Drafter only. The native-MTP single-row up projection uses the BF16 tensor-core kernel from jacklightChen 64784d4d (same weight bytes, column 0 of a replicated dot, ReLU^2 stored as the SIMT up kernel stores it); any shape or stride miss keeps _mtp_moe_up_kernel. The ReLU^2 compaction gather from 73d42dd1 stays available but defaults off (MTP_RELU2_COMPACT=1 restores), as in the 6dac3667 drafter, so the zero-load down runs without the extra gather launch. Target verification is unchanged; draft proposals may differ."
     }
   ]
 }

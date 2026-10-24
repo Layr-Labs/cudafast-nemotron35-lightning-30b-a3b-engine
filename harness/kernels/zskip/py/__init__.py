@@ -42,8 +42,8 @@ SETUPONLY = 4       # timing probe: masks and lists only
 CONFIGS = {0: (4, 32, 4, 8, 6), 1: (4, 32, 3, 8, 4), 2: (2, 32, 4, 8, 6), 3: (2, 32, 3, 8, 4),
            4: (6, 32, 4, 8, 6), 5: (6, 32, 3, 8, 4), 6: (12, 32, 3, 8, 4), 7: (4, 16, 6, 8, 6),
            8: (7, 32, 3, 8, 4), 9: (3, 32, 4, 8, 6)}
-# v4 (layout "swap" only): config id -> (warps per CTA, ring depth)
 CONFIGS4 = {100: (2, 4), 101: (2, 8), 102: (3, 8), 103: (6, 4), 104: (6, 8), 105: (7, 8), 106: (2, 12), 107: (1, 8)}
+CONFIGS4F = {200: (2, 4)}
 DEFAULT_CONFIG = int(os.environ.get("ZSKIP_CONFIG", "0"))
 
 _lib = None
@@ -107,7 +107,7 @@ def config_info(config: int) -> dict:
     if rc != 0:
         raise ValueError(f"zskip config {config}: {rc}")
     return {"regs": info[0], "smem": info[1], "warps": info[2], "ctas_per_sm": info[3],
-            "shape": CONFIGS.get(config) or CONFIGS4.get(config)}
+            "shape": CONFIGS.get(config) or CONFIGS4.get(config) or CONFIGS4F.get(config)}
 
 
 BI_BYTES = 4864

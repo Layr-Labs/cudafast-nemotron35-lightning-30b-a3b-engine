@@ -569,24 +569,27 @@ def mtp_moe_row(
     topk = ids.numel()
     E, inter, H = w13.shape
     h = torch.empty((topk + n_shared, inter), dtype=x.dtype, device=x.device)
-    _mtp_moe_up_kernel[(triton.cdiv(inter, _MOE_UP_BN), topk + n_shared)](
-        x,
-        w13,
-        su,
-        ids,
-        h,
-        inter,
-        H,
-        w13.stride(0),
-        w13.stride(1),
-        su.stride(0),
-        TOPK=topk,
-        BN=_MOE_UP_BN,
-        EVICT=_EVICT_W,
-        BK=_MOE_UP_BK,
-        num_warps=_MOE_UP_WARPS,
-        num_stages=_MOE_UP_STAGES,
-    )
+    from .nemotron_h_mtp_up_tc import maybe_up
+
+    if not maybe_up(x, w13, su, ids, h):
+        _mtp_moe_up_kernel[(triton.cdiv(inter, _MOE_UP_BN), topk + n_shared)](
+            x,
+            w13,
+            su,
+            ids,
+            h,
+            inter,
+            H,
+            w13.stride(0),
+            w13.stride(1),
+            su.stride(0),
+            TOPK=topk,
+            BN=_MOE_UP_BN,
+            EVICT=_EVICT_W,
+            BK=_MOE_UP_BK,
+            num_warps=_MOE_UP_WARPS,
+            num_stages=_MOE_UP_STAGES,
+        )
     y = torch.empty((M, H), dtype=x.dtype, device=x.device)
     if _RELU2_MODE:
         relu2_down(h, w2, sd, ids, tw, y, routed_scale)

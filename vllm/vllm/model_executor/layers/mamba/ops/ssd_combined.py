@@ -15,6 +15,7 @@ from vllm.triton_utils import triton
 from .ssd_bmm import _bmm_chunk_fwd
 from .ssd_chunk_scan import _chunk_scan_fwd
 from .ssd_chunk_state import _chunk_cumsum_fwd, _chunk_state_fwd
+from .ssd_prefill_fused import can_fuse_prefill, fused_prefill
 from .ssd_state_passing import _state_passing_fwd
 
 TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
@@ -98,6 +99,17 @@ def _mamba_chunk_scan_combined_fwd(
         dt_softplus=dt_softplus,
         dt_limit=dt_limit,
     )
+
+    # Own prefill path: keep cumsum unchanged, remove raw-state and CB scratch.
+    if can_fuse_prefill(
+        x, B, C, dt, dA_cumsum, cu_chunk_seqlens, last_chunk_indices,
+        seq_idx, initial_states, state_dtype,
+    ):
+        states = fused_prefill(
+            x, B, C, dt, dA_cumsum, cu_chunk_seqlens, last_chunk_indices,
+            seq_idx, out, D=D, z=z, initial=initial_states,
+        )
+        return states if return_intermediate_states else states[last_chunk_indices]
 
     # 2. Compute the state for each intra-chunk
     # (right term of low-rank factorization of off-diagonal blocks; B terms)

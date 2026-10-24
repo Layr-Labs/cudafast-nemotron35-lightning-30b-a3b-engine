@@ -640,6 +640,21 @@ class FlashInferMetadata:
     cascade_wrapper: MultiLevelCascadeAttentionWrapper | None
 
 
+@dataclass
+class _MTPSingleDecodeMetadataTicket:
+    """One immediate build may consume metadata produced on its own stream.
+
+    Tickets are caller-owned and never retained by a builder across a build,
+    request or exception. They authorize no reuse of a plan or model result.
+    """
+
+    builder: object
+    common_metadata: CommonAttentionMetadata
+    stream: int
+    signature: tuple
+    used: bool = False
+
+
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     kv_cache_spec: AttentionSpec
     reorder_batch_threshold: int = 1
@@ -1123,6 +1138,145 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             )
         return self._cascade_wrapper
 
+    @staticmethod
+    def _mtp_tensor_signature(tensor: torch.Tensor) -> tuple:
+        return (
+            id(tensor), tensor.data_ptr(), tuple(tensor.shape),
+            tuple(tensor.stride()), tensor.dtype, tensor.device,
+        )
+
+    def _mtp_single_decode_signature(
+        self, common: CommonAttentionMetadata
+    ) -> tuple:
+        tensors = (
+            common.seq_lens, common.block_table_tensor,
+            common.query_start_loc, common.slot_mapping,
+            self.paged_kv_indptr.gpu, self.paged_kv_indices.gpu,
+            self.paged_kv_last_page_len.gpu,
+        )
+        return (
+            tuple(self._mtp_tensor_signature(tensor) for tensor in tensors),
+            tuple(
+                None if tensor is None else self._mtp_tensor_signature(tensor)
+                for tensor in (
+                    common._seq_lens_cpu, common._num_computed_tokens_cpu,
+                    common.seq_lens_cpu_upper_bound,
+                )
+            ),
+            common.num_reqs, common.num_actual_tokens, common.max_query_len,
+            common.max_seq_len, common.causal, self.page_size,
+        )
+
+    def mtp_single_decode_step_buffers(
+        self, common: CommonAttentionMetadata
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Destinations for a normal native single-request tail step only.
+
+        The caller still runs the native CPU planner and both original host
+        staging fences. Initial wrapper planning, capture and dummy runs keep
+        the ordinary metadata route.
+        """
+        if (
+            type(self) is not FlashInferMetadataBuilder
+            or not self.enable_cuda_graph
+            or self.use_dcp
+            or self.use_trtllm_decode_attention
+            or self.is_kvcache_nvfp4
+            or self.has_sinks
+            or not common.causal
+            or common.num_reqs != 1
+            or common.num_actual_tokens != 1
+            or common.max_query_len != 1
+            or common.seq_lens.shape != (1,)
+            or common.seq_lens.dtype != torch.int32
+            or common.seq_lens.device != self.device
+            or common._seq_lens_cpu is None
+            or common._seq_lens_cpu.shape != (1,)
+            or common._seq_lens_cpu.dtype != torch.int32
+            or common._seq_lens_cpu.device.type != "cpu"
+            or common.block_table_tensor.ndim != 2
+            or common.block_table_tensor.shape[0] != 1
+            or common.block_table_tensor.dtype != torch.int32
+            or common.block_table_tensor.device != self.device
+            or common.block_table_tensor.stride(1) != 1
+            or common.max_seq_len + 1 > self.model_config.max_model_len
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        wrapper = self._decode_wrappers_cudagraph.get(1)
+        if (
+            wrapper is None
+            or not wrapper.is_cuda_graph_enabled
+            or getattr(wrapper, "vllm_first_call", True)
+        ):
+            return None
+        # The ordinary step increments each CPU shadow separately. If its
+        # exact sequence shadow overlaps either of the other two, the CPU
+        # planner can see multiple increments while the GPU sequence sees one.
+        # Preserve that existing path instead of substituting GPU-derived page
+        # metadata. Noncontiguous/foreign-device shadows conservatively fall
+        # back, so the contiguous byte ranges below are complete.
+        shadow = common._seq_lens_cpu
+        assert shadow is not None
+        shadow_begin = shadow.data_ptr()
+        shadow_end = shadow_begin + shadow.numel() * shadow.element_size()
+        for other in (
+            common._num_computed_tokens_cpu, common.seq_lens_cpu_upper_bound,
+        ):
+            if other is None:
+                continue
+            if other.device.type != "cpu" or not other.is_contiguous():
+                return None
+            other_begin = other.data_ptr()
+            other_end = other_begin + other.numel() * other.element_size()
+            if shadow_begin < other_end and other_begin < shadow_end:
+                return None
+        max_pages = cdiv(self.model_config.max_model_len, self.page_size)
+        buffers = (
+            self.paged_kv_indptr.gpu, self.paged_kv_indices.gpu,
+            self.paged_kv_last_page_len.gpu,
+        )
+        if (
+            common.block_table_tensor.shape[1] < max_pages
+            or buffers[0].numel() < 2
+            or buffers[1].numel() < max_pages
+            or buffers[2].numel() < 1
+            or any(tensor.dtype != torch.int32
+                   or tensor.device != self.device
+                   or not tensor.is_contiguous() for tensor in buffers)
+        ):
+            return None
+        return buffers
+
+    def mtp_single_decode_metadata_ticket(
+        self, common: CommonAttentionMetadata
+    ) -> _MTPSingleDecodeMetadataTicket:
+        """Publish after the fused step and its ordinary CPU shadow update."""
+        return _MTPSingleDecodeMetadataTicket(
+            builder=self, common_metadata=common,
+            stream=int(torch.cuda.current_stream(self.device).cuda_stream),
+            signature=self._mtp_single_decode_signature(common),
+        )
+
+    def _consume_mtp_single_decode_metadata(
+        self, common: CommonAttentionMetadata,
+        ticket: _MTPSingleDecodeMetadataTicket | None,
+    ) -> bool:
+        if ticket is None:
+            return False
+        was_used = ticket.used
+        ticket.used = True
+        return (
+            not was_used
+            and ticket.builder is self
+            and ticket.common_metadata is common
+            and not torch.cuda.is_current_stream_capturing()
+            and ticket.stream == int(
+                torch.cuda.current_stream(self.device).cuda_stream)
+            and ticket.signature == self._mtp_single_decode_signature(common)
+            and self.mtp_single_decode_step_buffers(common) is not None
+        )
+
     def _compute_flashinfer_kv_metadata(
         self,
         num_blocks_np: np.ndarray,
@@ -1130,6 +1284,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         block_table_tensor: torch.Tensor,
         num_reqs: int,
         page_size: int,
+        gpu_metadata_prepared: bool = False,
     ) -> torch.Tensor:
         """
         Compute paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len for FlashInfer
@@ -1153,20 +1308,22 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             : num_reqs + 1
         ]
         paged_kv_indptr = self.paged_kv_indptr.gpu[: num_reqs + 1]
-        paged_kv_indptr.copy_(
-            self.paged_kv_indptr_cpu_buffer[: num_reqs + 1], non_blocking=True
-        )
+        if not gpu_metadata_prepared:
+            paged_kv_indptr.copy_(
+                self.paged_kv_indptr_cpu_buffer[: num_reqs + 1], non_blocking=True
+            )
 
         # write self.paged_kv_indices inplace
         num_actual_pages = self.paged_kv_indptr.np[num_reqs]
         paged_kv_indices = self.paged_kv_indices.gpu[:num_actual_pages]
-        _copy_page_indices_kernel[(num_reqs,)](
-            paged_kv_indices,
-            block_table_tensor,
-            block_table_tensor.stride(0),
-            paged_kv_indptr,
-            BLOCK_SIZE=1024,
-        )
+        if not gpu_metadata_prepared:
+            _copy_page_indices_kernel[(num_reqs,)](
+                paged_kv_indices,
+                block_table_tensor,
+                block_table_tensor.stride(0),
+                paged_kv_indptr,
+                BLOCK_SIZE=1024,
+            )
 
         # write self.paged_kv_last_page_len_cpu inplace
         paged_kv_last_page_len_np = seq_lens_np % page_size
@@ -1175,9 +1332,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             page_size,
             paged_kv_last_page_len_np,
         )
-        self.paged_kv_last_page_len.gpu[:num_reqs].copy_(
-            self.paged_kv_last_page_len.cpu[:num_reqs], non_blocking=True
-        )
+        if not gpu_metadata_prepared:
+            self.paged_kv_last_page_len.gpu[:num_reqs].copy_(
+                self.paged_kv_last_page_len.cpu[:num_reqs], non_blocking=True
+            )
         return paged_kv_indices
 
     def build(
@@ -1185,7 +1343,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
+        mtp_single_decode_ticket: _MTPSingleDecodeMetadataTicket | None = None,
     ) -> FlashInferMetadata:
+        gpu_metadata_prepared = self._consume_mtp_single_decode_metadata(
+            common_attn_metadata, mtp_single_decode_ticket)
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         causal = common_attn_metadata.causal
@@ -1352,6 +1513,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 block_table_tensor,
                 num_reqs,
                 page_size,
+                gpu_metadata_prepared=(
+                    gpu_metadata_prepared and not use_cascade
+                    and num_decodes == 1 and num_decode_tokens == 1
+                    and num_prefills == 0 and needs_native_paged_decode
+                ),
             )
         else:
             paged_kv_indices = None

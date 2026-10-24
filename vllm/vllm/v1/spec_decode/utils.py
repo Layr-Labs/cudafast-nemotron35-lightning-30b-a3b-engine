@@ -134,6 +134,72 @@ def eagle_step_update_slot_mapping_and_metadata(
 
 
 @triton.jit
+def mtp_single_decode_inputs_metadata_kernel(
+    token_ptr,
+    hidden_ptr,
+    positions_ptr,
+    block_table_ptr,
+    seq_lens_ptr,
+    out_token_ptr,
+    out_hidden_ptr,
+    out_positions_ptr,
+    out_slot_mapping_ptr,
+    paged_indptr_ptr,
+    paged_indices_ptr,
+    paged_last_page_len_ptr,
+    block_size: tl.constexpr,
+    max_model_len: tl.constexpr,
+    n_blocks_per_req: tl.constexpr,
+    hidden_size: tl.constexpr,
+    COPY_BLOCK: tl.constexpr,
+    PAD_ID: tl.constexpr,
+):
+    """The ordinary one-request tail step, plus its exact copies/indices.
+
+    No floating-point arithmetic is performed on hidden states. The integer
+    position, slot and sequence formulas match the general step kernel above.
+    """
+    token = tl.load(token_ptr)
+    tl.store(out_token_ptr, token.to(tl.int32))
+    offsets = tl.arange(0, COPY_BLOCK)
+    for start in tl.range(0, hidden_size, COPY_BLOCK):
+        hidden = tl.load(
+            hidden_ptr + start + offsets,
+            mask=start + offsets < hidden_size, other=0)
+        tl.store(out_hidden_ptr + start + offsets, hidden,
+                 mask=start + offsets < hidden_size)
+
+    position = tl.load(positions_ptr)
+    new_position = position + 1
+    exceeds_max = new_position >= max_model_len
+    clamped_position = tl.where(exceeds_max, 0, new_position)
+    block_number = tl.minimum(
+        clamped_position // block_size, n_blocks_per_req - 1)
+    block_id = tl.load(block_table_ptr + block_number)
+    slot_id = block_id * block_size + clamped_position % block_size
+    slot_id = tl.where(exceeds_max, PAD_ID, slot_id)
+    seq_len = tl.load(seq_lens_ptr)
+    new_seq_len = tl.minimum(
+        tl.where(exceeds_max, 1, seq_len + 1), max_model_len)
+    tl.store(out_positions_ptr, clamped_position)
+    tl.store(out_slot_mapping_ptr, slot_id)
+    tl.store(seq_lens_ptr, new_seq_len)
+
+    num_pages = (new_seq_len + block_size - 1) // block_size
+    last_page_len = new_seq_len % block_size
+    last_page_len = tl.where(
+        (last_page_len == 0) & (new_seq_len != 0), block_size, last_page_len)
+    tl.store(paged_indptr_ptr, 0)
+    tl.store(paged_indptr_ptr + 1, num_pages)
+    tl.store(paged_last_page_len_ptr, last_page_len)
+    for start in tl.range(0, num_pages, COPY_BLOCK):
+        indices = tl.load(block_table_ptr + start + offsets,
+                          mask=start + offsets < num_pages, other=0)
+        tl.store(paged_indices_ptr + start + offsets, indices,
+                 mask=start + offsets < num_pages)
+
+
+@triton.jit
 def eagle_prepare_inputs_padded_kernel(
     cu_num_draft_tokens_ptr,  # [num_reqs]
     valid_sampled_tokens_count_ptr,  # [num_reqs]

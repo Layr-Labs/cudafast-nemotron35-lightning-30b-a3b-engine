@@ -55,6 +55,7 @@ from vllm.v1.spec_decode.utils import (
     eagle_prepare_next_token_padded_kernel,
     eagle_step_update_slot_mapping_and_metadata,
     extend_all_queries_by_N,
+    mtp_single_decode_inputs_metadata_kernel,
     next_power_of_2,
 )
 from vllm.v1.utils import CpuGpuBuffer
@@ -723,24 +724,32 @@ class SpecDecodeBaseProposer:
             # Padded rows of the single-token steps copy row 0.
             set_moe_row_src(input_batch_size, self._moe_row_zero)
         for token_index in range(self.num_speculative_tokens - 1):
-            # Update the inputs.
-            # cast to int32 is crucial when eagle model is compiled.
-            # tensor.argmax() returns int64 by default.
-            input_ids = draft_token_ids_list[-1].int()
+            fused_step = self._try_mtp_single_decode_inputs(
+                draft_token_ids_list[-1], hidden_states, positions,
+                common_attn_metadata, batch_size, input_batch_size, block_size,
+                cudagraph_runtime_mode, sampling_metadata,
+            )
+            prepared_single_decode = None
+            if fused_step is not None:
+                positions, prepared_single_decode = fused_step
+                input_ids = self.input_ids[:batch_size]
+            else:
+                # cast to int32 is crucial when eagle model is compiled.
+                # tensor.argmax() returns int64 by default.
+                input_ids = draft_token_ids_list[-1].int()
 
-            if self.use_heterogeneous_vocab:
-                # Map target token IDs to draft vocab space (TLI algorithm)
-                assert self.vocab_mapping is not None
-                input_ids = self.vocab_mapping.map_target_to_draft_ids(input_ids)
+                if self.use_heterogeneous_vocab:
+                    assert self.vocab_mapping is not None
+                    input_ids = self.vocab_mapping.map_target_to_draft_ids(input_ids)
 
-            if not self.constant_draft_positions:
-                positions = self._update_positions_dependent_metadata(
-                    positions,
-                    common_attn_metadata,
-                    batch_size,
-                    input_batch_size,
-                    block_size,
-                )
+                if not self.constant_draft_positions:
+                    positions = self._update_positions_dependent_metadata(
+                        positions,
+                        common_attn_metadata,
+                        batch_size,
+                        input_batch_size,
+                        block_size,
+                    )
 
             # Rebuild attention metadata. When draft positions are constant
             # (e.g. Gemma4 MTP), common_attn_metadata is invariant across
@@ -748,21 +757,34 @@ class SpecDecodeBaseProposer:
             if not self.constant_draft_positions or token_index == 0:
                 # A plan rewrites pinned host buffers that the previous plan's
                 # H2D copies read; wait until those copies have run.
-                if order_draft_plans and token_index > 0:
-                    assert self._draft_plan_event is not None
-                    self._draft_plan_event.synchronize()
-                _, per_layer_attn_metadata = (
-                    self.build_per_group_and_layer_attn_metadata(
-                        common_attn_metadata, draft_index=token_index + 1
-                    )
-                )
+                try:
+                    if order_draft_plans and token_index > 0:
+                        assert self._draft_plan_event is not None
+                        self._draft_plan_event.synchronize()
+                    if prepared_single_decode is None:
+                        _, per_layer_attn_metadata = (
+                            self.build_per_group_and_layer_attn_metadata(
+                                common_attn_metadata, draft_index=token_index + 1,
+                            )
+                        )
+                    else:
+                        _, per_layer_attn_metadata = (
+                            self.build_per_group_and_layer_attn_metadata(
+                                common_attn_metadata, draft_index=token_index + 1,
+                                prepared_single_decode=prepared_single_decode,
+                            )
+                        )
+                finally:
+                    if prepared_single_decode is not None:
+                        prepared_single_decode[1].used = True
                 if order_draft_plans:
                     assert self._draft_plan_event is not None
                     self._draft_plan_event.record()
 
             # copy inputs to buffer for cudagraph
-            self.input_ids[:batch_size] = input_ids
-            self.hidden_states[:batch_size] = hidden_states
+            if fused_step is None:
+                self.input_ids[:batch_size] = input_ids
+                self.hidden_states[:batch_size] = hidden_states
             if self.supports_mm_inputs:
                 self.inputs_embeds[:batch_size] = self.model.embed_input_ids(input_ids)
 
@@ -819,6 +841,108 @@ class SpecDecodeBaseProposer:
         if draft_probs_list is not None:
             self._last_draft_probs = torch.stack(draft_probs_list, dim=1).contiguous()
         return draft_token_ids
+
+    def _try_mtp_single_decode_inputs(
+        self,
+        token_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        common: CommonAttentionMetadata,
+        batch_size: int,
+        input_batch_size: int,
+        block_size: int,
+        cudagraph_runtime_mode: CUDAGraphMode,
+        sampling_metadata: SamplingMetadata,
+    ) -> tuple[torch.Tensor, tuple[Any, Any]] | None:
+        """Fuse only the ordinary native one-row tail's integer/copy work.
+
+        No model arithmetic, native planning or host fence is changed. Dummy
+        execution uses dummy_run(), which never calls this helper.
+        """
+        parallel = self.vllm_config.parallel_config
+        if (
+            self.method != "mtp"
+            or getattr(self.draft_model_config.hf_config, "model_type", None)
+            != "nemotron_h_mtp"
+            or self.parallel_drafting
+            or self.constant_draft_positions
+            or self.use_heterogeneous_vocab
+            or self.supports_mm_inputs
+            or self.uses_mrope
+            or self.uses_xdrope_dim > 0
+            or not self.pass_hidden_states_to_model
+            or self.eplb_state is not None
+            or self.speculative_config.enforce_eager
+            or self.vllm_config.model_config.enforce_eager
+            or parallel.tensor_parallel_size != 1
+            or parallel.pipeline_parallel_size != 1
+            or parallel.data_parallel_size != 1
+            or batch_size != 1
+            or input_batch_size != 1
+            or cudagraph_runtime_mode == CUDAGraphMode.NONE
+            or (self._enable_probabilistic_draft_probs
+                and not sampling_metadata.all_greedy)
+            or len(self.draft_attn_groups) != 1
+            or self.draft_attn_groups[0].backend.get_name() != "FLASHINFER"
+            or torch.cuda.is_current_stream_capturing()
+            or common._seq_lens_cpu is None
+            or common.max_seq_len + self.num_speculative_tokens > self.max_model_len
+        ):
+            return None
+        from vllm.v1.attention.backends.flashinfer import FlashInferMetadataBuilder
+
+        builder = self.draft_attn_groups[0].get_metadata_builder()
+        if type(builder) is not FlashInferMetadataBuilder or builder.page_size != block_size:
+            return None
+        metadata_buffers = builder.mtp_single_decode_step_buffers(common)
+        if metadata_buffers is None:
+            return None
+        if (
+            token_ids.shape != (1,)
+            or token_ids.dtype not in (torch.int32, torch.int64)
+            or hidden_states.shape != (1, self.hidden_size)
+            or hidden_states.dtype != torch.bfloat16
+            or self.hidden_states.dtype != hidden_states.dtype
+            or positions.shape != (1,)
+            or positions.dtype != torch.int64
+            or self.positions.dtype != torch.int64
+            or self.input_ids.dtype != torch.int32
+            or self._slot_mapping_buffer.dtype != torch.int64
+            or any(tensor.device != self.device or not tensor.is_contiguous()
+                   for tensor in (
+                       token_ids, hidden_states, positions, self.input_ids,
+                       self.hidden_states, self.positions, self._slot_mapping_buffer,
+                   ))
+        ):
+            return None
+        # Exact self-copy is safe; refuse overlapping offset copies. Ordinary
+        # model outputs and staged inputs have separate storage.
+        if (
+            hidden_states.untyped_storage().data_ptr()
+            == self.hidden_states.untyped_storage().data_ptr()
+            and hidden_states.data_ptr() != self.hidden_states.data_ptr()
+        ):
+            return None
+        mtp_single_decode_inputs_metadata_kernel[(1,)](
+            token_ids, hidden_states, positions, common.block_table_tensor,
+            common.seq_lens, self.input_ids, self.hidden_states, self.positions,
+            self._slot_mapping_buffer, *metadata_buffers,
+            block_size=block_size, max_model_len=self.max_model_len,
+            n_blocks_per_req=common.block_table_tensor.shape[1],
+            hidden_size=self.hidden_size, COPY_BLOCK=256,
+            PAD_ID=PADDING_SLOT_ID,
+        )
+        # These are the same CPU/view updates as the ordinary step method.
+        common.slot_mapping = self._slot_mapping_buffer[:batch_size]
+        common.max_seq_len = min(common.max_seq_len + 1, self.max_model_len)
+        if common._seq_lens_cpu is not None:
+            common._seq_lens_cpu += 1
+        if common._num_computed_tokens_cpu is not None:
+            common._num_computed_tokens_cpu += 1
+        if common.seq_lens_cpu_upper_bound is not None:
+            common.seq_lens_cpu_upper_bound += 1
+        ticket = builder.mtp_single_decode_metadata_ticket(common)
+        return self.positions[:batch_size], (builder, ticket)
 
     def _copy_num_rejected_to_cpu(
         self, num_rejected_tokens_gpu: torch.Tensor | None
@@ -1079,7 +1203,8 @@ class SpecDecodeBaseProposer:
         return model_kwargs, num_input_tokens
 
     def build_per_group_and_layer_attn_metadata(
-        self, common_attn_metadata: CommonAttentionMetadata, draft_index: int = 0
+        self, common_attn_metadata: CommonAttentionMetadata, draft_index: int = 0,
+        prepared_single_decode: tuple[Any, Any] | None = None,
     ) -> tuple[list[object], dict[str, object]]:
         # LOCAL PATCH (cudafast-nemotron35): hostfast staging guard.
         guard = self._hostfast_staging_guard()
@@ -1088,9 +1213,17 @@ class SpecDecodeBaseProposer:
         per_group_attn_metadata: list[object] = []
         per_layer_attn_metadata: dict[str, object] = {}
         for attn_group in self.draft_attn_groups:
-            attn_metadata = attn_group.get_metadata_builder().build_for_drafting(
-                common_attn_metadata=common_attn_metadata, draft_index=draft_index
-            )
+            builder = attn_group.get_metadata_builder()
+            if prepared_single_decode is not None and builder is prepared_single_decode[0]:
+                attn_metadata = builder.build(
+                    common_prefix_len=0, common_attn_metadata=common_attn_metadata,
+                    fast_build=True,
+                    mtp_single_decode_ticket=prepared_single_decode[1],
+                )
+            else:
+                attn_metadata = builder.build_for_drafting(
+                    common_attn_metadata=common_attn_metadata, draft_index=draft_index
+                )
             per_group_attn_metadata.append(attn_metadata)
             for layer_name in attn_group.layer_names:
                 per_layer_attn_metadata[layer_name] = attn_metadata

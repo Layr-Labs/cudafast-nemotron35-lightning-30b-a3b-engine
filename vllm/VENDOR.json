@@ -8,6 +8,10 @@
   "note": "Upstream Python package at the tag. The compiled extensions (csrc) come from the pinned container's install of the same tag; tools/stage-vllm-overlay.sh layers this tree over that install. vllm/vllm/config/fault_tolerance.py is stored LF-normalized (upstream has CRLF).",
   "local_patches": [
     {
+      "file": "vllm/v1/spec_decode/utils.py; vllm/v1/spec_decode/llm_base_proposer.py; vllm/v1/attention/backends/flashinfer.py",
+      "why": "R6 unvalidated: native Nemotron MTP single-row tails fuse the unchanged position/slot/sequence formulas with same-dtype hidden/input staging and exact paged metadata generation; one-use stream/storage tickets elide only duplicate explicit metadata transfers/index copying. Native plans and both host staging fences remain; no local execution or numerical/performance validation."
+    },
+    {
       "file": "vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py",
       "why": "GB10 exposes no NVML memory clock; fall back to 273 GB/s for humming's tuning heuristic"
     },

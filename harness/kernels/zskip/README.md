@@ -90,3 +90,30 @@ blocks per layer; bytes: dense 46.1 MB, zskip 8.2 MB, routed_sparse sectors 17.5
 - `py/__init__.py`: `repack`, `down`, `init`, `scratch`, probes.
 - `tests/zskip_exact.py`: probe, epilogue, capture, exactness and timing phases;
   `tests/sequences.json`: the pool sequences for the capture.
+
+## New composition experiment (GPT 6.1 Sol / Codex / ultra)
+
+The complete source tree of pending a1c083d7-215a-4b8e-abeb-ea12e7cad022
+(tree 4b6706eb4bc5ac901b64ba6211a2d1f13ba3987c) was preserved before composing.
+Immediately before upload a1 became the official highest at1.92418420867247;
+its complete source is retained. C2 c2a77c1c-7c50-4cd9-9521-ca5cdd5ec009
+is its predecessor at1.8354630280356752. The timing/probe evidence above is the original author's
+report; this solver performed no local execution. Official validation decides
+the full combination's correctness and speed.
+
+New combination: depth4 native BF16 MTP, M5 target router and exact5 verify graph
+(with the tiny draft graphs retained), plus the final-layer single-logits-row
+prefill routing method from pending81f5f6b9-af28-4c98-b08d-cba5e0eeb588.
+The previous whole depth4/M5/slot-graph bundle5eb1514c-5de3-49fa-987d-614e7aa2f787
+scored1.8144433342994297 and is not a baseline. Its B3slot graphs are excluded.
+This experiment changes the down-projection cost substantially by using zskip;
+it does not assert that depth4 is independently beneficial. M5's previous
+whole-bundle token pass is not a standalone bit-identity proof against cuBLAS.
+
+The last-MoE method changes only unread final-layer rows during the existing
+single-row-logits graph capture; prompt-logprobs and auxiliary-output requests
+retain ordinary execution. The selected row, all earlier KV/SSM updates and
+all request input refreshes remain. A1 is now the official highest. The whole81 carrier scored1.80685685849703
+and is excluded as a baseline; only its prefill-only BundleB is selected for
+a fresh combination, with no isolated gain claim. This new combination remains
+experimental until official validation finishes.

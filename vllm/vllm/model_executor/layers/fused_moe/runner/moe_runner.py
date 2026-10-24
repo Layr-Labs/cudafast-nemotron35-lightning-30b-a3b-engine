@@ -287,6 +287,8 @@ class MoERunner(MoERunnerInterface):
         # Needed for string -> MoERunner layer lookup in custom ops.
         self.layer_name = layer_name
 
+        self.keep_m_row_src: torch.Tensor | None = None
+
         self._forward_entry = self._select_forward()
 
         # For smuggling this layer into the fused moe custom op
@@ -606,6 +608,11 @@ class MoERunner(MoERunnerInterface):
                 topk_indices_dtype=self._quant_method.topk_indices_dtype,
                 input_ids=input_ids,
             )
+            row_src = self.keep_m_row_src
+            if row_src is not None:
+                rows = row_src.expand(topk_ids.size(0)).contiguous()
+                topk_ids = topk_ids.index_select(0, rows)
+                topk_weights = topk_weights.index_select(0, rows)
 
             fused_out = self.routed_experts.forward_modular(
                 x=hidden_states,

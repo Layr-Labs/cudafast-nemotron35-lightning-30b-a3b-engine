@@ -4508,6 +4508,7 @@ class GPUModelRunner(
                 and not use_spec_decode and not self.use_aux_hidden_state_outputs
                 and intermediate_tensors is None and inputs_embeds is None
                 and not model_kwargs and not has_encoder_input
+                and not self.num_prompt_logprobs
             )
             fresh_logits = None
             if use_fresh_graph:

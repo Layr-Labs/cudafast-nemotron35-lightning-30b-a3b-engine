@@ -104,15 +104,20 @@ class FreshPrefillGraph:
         torch.cuda.synchronize()
 
     def _forward(self):
-        with set_forward_context(
-            self.metadata, self.runner.vllm_config, num_tokens=496,
-            cudagraph_runtime_mode=CUDAGraphMode.NONE, slot_mapping=self.slots,
-        ):
-            hidden = self.runner._model_forward(
-                input_ids=self.input_ids, positions=self.positions,
-                intermediate_tensors=None, inputs_embeds=None,
-            )
-            logits = self.runner.model.compute_logits(hidden[self.logits_indices])
+        model = self.runner.get_model()
+        model.set_last_moe_row_src(self.logits_indices)
+        try:
+            with set_forward_context(
+                self.metadata, self.runner.vllm_config, num_tokens=496,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE, slot_mapping=self.slots,
+            ):
+                hidden = self.runner._model_forward(
+                    input_ids=self.input_ids, positions=self.positions,
+                    intermediate_tensors=None, inputs_embeds=None,
+                )
+                logits = self.runner.model.compute_logits(hidden[self.logits_indices])
+        finally:
+            model.set_last_moe_row_src(None)
         return hidden, logits
 
     def replay(self, metadata, slots, input_ids, positions):

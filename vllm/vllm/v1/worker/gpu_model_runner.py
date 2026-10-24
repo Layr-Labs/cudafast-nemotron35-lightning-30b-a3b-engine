@@ -4515,8 +4515,12 @@ class GPUModelRunner(
             )
             fresh_logits = None
             if use_fresh_graph:
+                # STOCK under the condition above, unchanged from this engine's
+                # record; LAST_ROW only when this prefill's other rows are
+                # never read (see _prefill_reads_one_row).
                 model_output, fresh_logits = fresh_graph.replay(
-                    attn_metadata, slot_mappings, input_ids, positions)
+                    attn_metadata, slot_mappings, input_ids, positions,
+                    last_row_only=self._prefill_reads_one_row())
             else:
                 model_output = self._model_forward(
                     input_ids=input_ids,
@@ -4620,6 +4624,20 @@ class GPUModelRunner(
             common_attn_metadata.max_seq_len + num_drafter_query_tokens
             <= self.effective_drafter_max_model_len
         ) and self._drafts_can_be_verified()
+
+    def _prefill_reads_one_row(self) -> bool:
+        """True when the 496-token prefill in flight yields only row 495.
+
+        The captured graph's last MoE layer may route every row through row
+        495's experts (prefill_graph.FreshPrefillGraph.LAST_ROW), which leaves
+        the other 495 rows of the final hidden state unread. Two things read
+        them: a request that asks for prompt logprobs, and the MTP drafter,
+        which takes every prompt row of that state as its target hidden states
+        when drafting is on. So the rerouted variant is replayed only for a
+        prefill the engine will not draft for, i.e. one whose only request has
+        max_tokens == 1 and finishes on the token this step samples.
+        """
+        return not self.num_prompt_logprobs and not self._drafts_can_be_verified()
 
     def _drafts_can_be_verified(self) -> bool:
         """False when every request in the batch has max_tokens == 1.
@@ -7159,8 +7177,8 @@ class GPUModelRunner(
         finally:
             self.input_batch.num_prompt_tokens[0] = old_prompt
             self.input_batch.num_computed_tokens_cpu[0] = old_computed
-        logger.info("Fresh 496 whole-forward graph captured in %.3f s; pool=%s",
-                    time.perf_counter() - started, self._fresh_prefill_graph.pool)
+        logger.info("Fresh 496 whole-forward graphs captured in %.3f s; pools=%s",
+                    time.perf_counter() - started, self._fresh_prefill_graph.pools)
 
     def _warmup_and_capture(
         self,

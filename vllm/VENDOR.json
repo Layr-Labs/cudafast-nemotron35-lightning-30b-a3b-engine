@@ -162,6 +162,14 @@
     {
       "file": "harness/kernels/marlinx/{csrc/marlinx.cu,py/__init__.py,README.md,tests/marlinx_zs_exact.py}",
       "why": "Shared expert down projection (3712->2688, ReLU^2 input): read only the k rows whose activation is nonzero in some row, from a byte-preserving k-row-major copy of the Marlin weight; the lane rebuilds Marlin's exact weight word, so dequant, MMA, segments and fp32 reductions are unchanged. Bit-exact vs stock Marlin on all 23 layers (4416 synthetic + 1380 real-activation cases, CUDA graph replay). MARLINX_ZS=0 disables."
+    },
+    {
+      "file": "harness/kernels/mtpstart; models/nemotron_h_mtp.py; models/nemotron_h_mtp_kernels.py",
+      "why": "Independent new nativeBF16 MTP hidden-half projection plusFP32tableadd fusedepilogue oncompletehighest1001d918-90a6-402c-8df5-859e2e9a799f. OriginalhnormBF16/eh_w_hBF16/tableFP32 retained. Weight-as-A m16n8k16, W4R8, ascendingK16, intermediateBF16RN h_part thenF32RNtableadd thenBF16RN output. Noextraweightcopy, M1..8fixedshape/alignment/deviceguard, oldmtp_small_linear_keep+add fallback, load-timekernelinitoutsidecapture, MTP_START_MMA=0 oldpath. NativeMTPFP32reductiontreechanges/acceptanceunknown; originaltargetunchanged relativetocomposedbaseline. Pattern/ideafrom31d30b53-14a9-44ec-bb99-bae7b70873a4, a1c083d7-215a-4b8e-abeb-ea12e7cad022 andown9f306515-7ee8-4d03-a726-edb27b925d37 prototype, notanewhead/format. No localcandidateexecution."
+    },
+    {
+      "file": "harness/kernels/zskip; layers/fused_moe/experts/humming_zskip.py; v1/worker/prefill_graph.py; gpu_model_runner.py",
+      "why": "Complete1001highest2.08364915102358 canonicalcc0a3d89260f72cb0cb6d5f442e1e92b2a428400 exactc697fe8 retainedincludingallsharedZSpackage/diagnosticsandnativecompactON. Addonly6dac3667-143e-45e4-9315-c508f6b7ad00 Z2config200fusedprep/100fallback, notitsZ1alternativeorR4off. Addpending37b94253-d70a-404d-9bd5-8595596f5acb exactdualgraph: STOCKforallMTP-readinggenerationprefills, LAST_ROWonlynodraft/noPromptLogprobs; separatepools/outputswithsharedrequestrefresh. Correctprior234no-readerclaim: MTPreadsallprompt hiddenrows. Kernel/graph/combinedproposalacceptance unvalidated. No localcandidateexecution."
     }
   ]
 }

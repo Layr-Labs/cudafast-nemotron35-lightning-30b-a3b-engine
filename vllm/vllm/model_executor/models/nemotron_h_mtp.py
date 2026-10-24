@@ -71,10 +71,9 @@ def _start_projection(
     if embeds_projected:
         # W_h (14.5 MB) is read by every draft pass of a cycle; ordinary loads
         # let it stay in L2 between passes while the rest stream evict-first.
-        h_part = torch.ops.vllm.mtp_small_linear_keep(
-            previous_hidden_states_normed, layer.eh_w_h
+        return torch.ops.vllm.mtp_start_projection(
+            previous_hidden_states_normed, layer.eh_w_h, inputs_embeds
         )
-        return (h_part.float() + inputs_embeds).to(h_part.dtype)
     inputs_embeds_normed = layer.enorm(inputs_embeds)
     # Fuse via concatenation and linear projection
     fused = torch.cat([inputs_embeds_normed, previous_hidden_states_normed], dim=-1)
@@ -538,6 +537,13 @@ class NemotronHMTP(nn.Module, SupportsPP):
             self.model.eh_table = None
             return False
         if built:
+            # Initialize native start kernels at load, outside graph capture.
+            try:
+                import mtpstart
+            except ImportError:
+                mtpstart = None
+            if mtpstart is not None:
+                mtpstart.prepare(self.model.eh_table.device)
             logger.info(
                 "MTP eh_proj: projected-embedding table %s built",
                 tuple(self.model.eh_table.shape),

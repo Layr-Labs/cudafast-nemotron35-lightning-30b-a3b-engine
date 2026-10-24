@@ -224,6 +224,34 @@ direct_register_custom_op(
 )
 
 
+def mtp_start_projection_impl(
+    x: torch.Tensor, w: torch.Tensor, embedding_part: torch.Tensor
+) -> torch.Tensor:
+    try:
+        import mtpstart
+    except ImportError:
+        mtpstart = None
+    if mtpstart is not None:
+        result = mtpstart.maybe_apply(x, w, embedding_part)
+        if result is not None:
+            return result
+    h_part = mtp_small_linear_keep_impl(x, w)
+    return (h_part.float() + embedding_part).to(h_part.dtype)
+
+
+def _mtp_start_projection_fake(
+    x: torch.Tensor, w: torch.Tensor, embedding_part: torch.Tensor
+) -> torch.Tensor:
+    return x.new_empty((x.shape[0], w.shape[0]))
+
+
+direct_register_custom_op(
+    op_name="mtp_start_projection",
+    op_func=mtp_start_projection_impl,
+    fake_impl=_mtp_start_projection_fake,
+)
+
+
 def install_mtp_small_linear(module: torch.nn.Module) -> int:
     """Route the BF16 unquantized linears under `module` through
     mtp_small_linear. Returns the number of layers switched."""

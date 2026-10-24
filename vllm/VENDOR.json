@@ -130,6 +130,14 @@
     {
       "file": "models/nemotron_shared_up.py, models/nemotron_h.py; harness/kernels/marlinx/{csrc/marlinx.cu,py/__init__.py}",
       "why": "New single-device prepared Marlin shared-expert up projection epilogue fuses ReLU squared for BF16 M1..8,N3712,K2688. Original GEMM BF16 rounding occurs first, then explicit RN FP32 square and RN BF16 output with canonical NaN; original Marlin accumulation, weights/scales/layout, dense/head/down ABI and unfused instantiations retained. Tensor-only opaque custom op has a full Marlin+activation fallback and fake schema; other sizes and unprepared/bias/TP paths retain original layer/activation. Source-only; no local execution."
+    },
+    {
+      "file": "vllm/model_executor/layers/mamba/ops/gated_norm_fp8.py, mamba_mixer2.py",
+      "why": "Guarded eight-group M1..8 BF16 gated RMSNorm plus checkpoint-static FP8 activation in one Triton producer. Preserve native-order gate/mean-square/rsqrt and both BF16 rounding boundaries around norm-weight multiplication; use existing QuantizedActivation static-key contract consumed by actual CutlassFP8 class, retaining native FP8 GEMM. Unsupported backend/dynamic scales/TP/bias/shape/padding retain original norm+quantization. Fixture declares n_groups8 and static Mamba W8A8; no local execution or bit-identity claim before official remote validation."
+    },
+    {
+      "file": "vllm/v1/worker/prefill_graph.py, vllm/v1/worker/gpu_model_runner.py, vllm/model_executor/models/nemotron_h.py, vllm/model_executor/layers/fused_moe/runner/moe_runner.py",
+      "why": "In the one captured 496-token prefill forward that reads a single row of the final hidden states (logits row 495), every row of the last layer's MoE (layer 51, the model's last layer) takes that row's six experts: the flag is set inside the whole-forward capture's forward helper and cleared in a finally, so it is baked into the recorded graph and no later or earlier forward sees it; the graph is replayed only for a request that reads that one row, with no prompt logprobs. M and valid_shape_m are unchanged, the last layer's other rows reach only the per-row final norm and are unread, and row 495 keeps its own input, experts, weights and K order, so its logits are bit-identical; six experts' weights are read instead of nearly all 128."
     }
   ]
 }

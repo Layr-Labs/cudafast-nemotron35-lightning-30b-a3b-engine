@@ -99,14 +99,17 @@ def _selective_scan_update_spec_replay_kernel(
     cu_seqlens_ptr,
     seq_lens_ptr,
     replayed_ptr,
-    # Matrix dimensions
+    # Matrix dimensions. The head/group ratio and ring length are fixed by
+    # the model and speculative depth, not by request data. Specialize them
+    # so head indexing and ring wrapping do not use runtime integer division
+    # (notably 64-bit remainder in each replay/verify iteration on sm_121).
     N,
     nheads,
     dim,
     dstate,
-    nheads_ngroups_ratio,
+    nheads_ngroups_ratio: tl.constexpr,
     ngroups,
-    ring_len,
+    ring_len: tl.constexpr,
     # Strides
     stride_state_batch,
     stride_state_head,

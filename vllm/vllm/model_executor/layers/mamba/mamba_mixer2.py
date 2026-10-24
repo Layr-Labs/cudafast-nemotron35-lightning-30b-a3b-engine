@@ -32,7 +32,10 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
-from vllm.model_executor.layers.mamba.ops.layernorm_gated import rms_norm_gated
+from vllm.model_executor.layers.mamba.ops.layernorm_gated import (
+    grouped_gated_rms,
+    rms_norm_gated,
+)
 from vllm.model_executor.layers.mamba.ops.mamba_ssm_spec_replay import (
     selective_state_update_spec_replay,
     spec_replay_enabled,
@@ -179,8 +182,20 @@ class Mixer2RMSNormGated(CustomOp):
             # Keep gate in float32 for numerical stability during silu
             return x * nn.functional.silu(gate.to(torch.float32)).to(input_dtype)
 
-        if ((self.n_groups % self.tp_size) != 0) or self.n_groups != 1:
+        if (self.n_groups % self.tp_size) != 0:
             return self.forward_native(x, gate)
+
+        if self.n_groups != 1:
+            fused = grouped_gated_rms(
+                x,
+                self.weight.data,
+                gate,
+                self.group_size,
+                self.variance_epsilon,
+            )
+            if fused is None:
+                return self.forward_native(x, gate)
+            return fused
 
         return rms_norm_gated(
             x,

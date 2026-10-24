@@ -47,6 +47,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
 )
 from vllm.v1.sample.sampler import _SAMPLING_EPS
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.mtp_tail_graph import MTPTailGraph, tail_graph_enabled
 from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
     compute_new_slot_mapping,
@@ -787,15 +788,32 @@ class SpecDecodeBaseProposer:
                     batch_size,
                 )
 
+            tail_slot_mapping = self._get_slot_mapping(input_batch_size)
+            tail_result = None
+            if (
+                batch_size == input_batch_size == 1
+                and cudagraph_runtime_mode != CUDAGraphMode.NONE
+                and tail_graph_enabled(self)
+            ):
+                if getattr(self, "_mtp_tail_graph", None) is None:
+                    self._mtp_tail_graph = MTPTailGraph()
+                tail_result = self._mtp_tail_graph.run(
+                    self.model, self.vllm_config, token_index + 1,
+                    model_kwargs, per_layer_attn_metadata, tail_slot_mapping,
+                )
+
             with set_forward_context(
                 per_layer_attn_metadata,
                 self.vllm_config,
                 num_tokens=input_batch_size,
                 num_tokens_across_dp=batch_size_across_dp,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
-                slot_mapping=self._get_slot_mapping(input_batch_size),
+                slot_mapping=tail_slot_mapping,
             ):
-                ret_hidden_states = self.model(**model_kwargs)
+                ret_hidden_states = (
+                    self.model(**model_kwargs)
+                    if tail_result is None else tail_result[0]
+                )
                 if not self.model_returns_tuple():
                     last_hidden_states = ret_hidden_states
                     hidden_states = ret_hidden_states
@@ -803,9 +821,12 @@ class SpecDecodeBaseProposer:
                     last_hidden_states, hidden_states = ret_hidden_states
 
             hidden_states = hidden_states[:batch_size]
-            draft_token_ids, draft_probs = self._sample_draft_tokens(
-                last_hidden_states[:batch_size], sampling_metadata
-            )
+            if tail_result is None:
+                draft_token_ids, draft_probs = self._sample_draft_tokens(
+                    last_hidden_states[:batch_size], sampling_metadata
+                )
+            else:
+                draft_token_ids, draft_probs = tail_result[1], None
             if draft_probs is not None:
                 assert draft_probs_list is not None
                 draft_probs_list.append(draft_probs)

@@ -40,7 +40,9 @@ struct Params {
   long long ldc;           // elements
   int N, K;
   int n_tiles, k_tiles;    // N/128, K/128
-  const uint32_t* Z;       // zero-row skip: k-row-major copy of B, [K/16][16][N/64][8] u32 (or null)
+  const uint32_t* Z;       // highest carrier's byte-preserving k-row weight copy
+  uint16_t* mask_out;       // optional fused shared-up metadata
+  const uint16_t* mask_in;  // optional same-call shared-down metadata
   int part1_cols;          // columns reduced by a single Marlin block
   int iters;               // Marlin stripe length (k-tiles per block) in part 2
 };
@@ -225,7 +227,7 @@ __device__ __forceinline__ __nv_bfloat16 round_output(float scaled) {
 }
 
 // Marlin write_result: bf16_rn(R * global_scale), rows < M only (warp 0).
-template <bool Relu2>
+template <bool Relu2, bool MaskOut = false>
 __device__ __forceinline__ void write_out(const Params& p, int col, int h, int lane,
                                           const float (&R)[4][4]) {
   const float g = __ldg(p.GS);
@@ -245,6 +247,18 @@ __device__ __forceinline__ void write_out(const Params& p, int col, int h, int l
       p.C[(t0 + 1) * p.ldc + f] = v1;
       p.C[(t0 + 1) * p.ldc + f + 8] = v3;
     }
+    if constexpr (MaskOut) {
+      // Each lane owns two tokens of feature g and g+8; OR all eight
+      // token columns of this warp's FINAL BF16 ReLU2 values. No atomics.
+      const bool lo = (t0 < p.M && (__bfloat16_as_ushort(v0) & 0x7fffu)) ||
+                      (t0 + 1 < p.M && (__bfloat16_as_ushort(v1) & 0x7fffu));
+      const bool hi = (t0 < p.M && (__bfloat16_as_ushort(v2) & 0x7fffu)) ||
+                      (t0 + 1 < p.M && (__bfloat16_as_ushort(v3) & 0x7fffu));
+      const unsigned bits = (lo ? 1u << (lane >> 2) : 0u) |
+                            (hi ? 1u << ((lane >> 2) + 8) : 0u);
+      const unsigned mask = __reduce_or_sync(0xffffffffu, bits);
+      if (lane == 0) p.mask_out[4 * (2 * col + h) + j] = (uint16_t)mask;
+    }
   }
 }
 
@@ -257,7 +271,7 @@ __device__ __forceinline__ int column_first_cut(const Params& p, int col) {
 
 // One 64-feature half column (`unit`) per CTA of 4 warps; warp w runs Marlin's
 // warp-row chain w through a register ring of P k16 blocks.
-template <int P, bool Relu2 = false, bool ZS = false>
+template <int P, bool Relu2 = false, bool ZS = false, bool MaskOut = false, bool MaskIn = false>
 __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
   __shared__ float red[2][3][16][32];
   __shared__ uint16_t zmask[ZS ? 512 : 1];
@@ -290,16 +304,20 @@ __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
   const uint32_t* Zp = ZS ? p.Z + (long long)(2 * col + h) * 8 + (lane >> 2) : nullptr;
   if constexpr (ZS) {
     for (int kb = threadIdx.x; kb < (p.K >> 4); kb += 128) {
-      uint32_t m = 0;
-      for (int r = 0; r < p.M; ++r) {
-        const uint4* ar = reinterpret_cast<const uint4*>(p.A + (long long)r * p.lda + 16 * kb);
-        const uint4 v0 = __ldg(ar), v1 = __ldg(ar + 1);
-        const uint32_t v[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+      if constexpr (MaskIn) {
+        zmask[kb] = __ldg(p.mask_in + kb);
+      } else {
+        uint32_t m = 0;
+        for (int r = 0; r < p.M; ++r) {
+          const uint4* ar = reinterpret_cast<const uint4*>(p.A + (long long)r * p.lda + 16 * kb);
+          const uint4 v0 = __ldg(ar), v1 = __ldg(ar + 1);
+          const uint32_t v[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
 #pragma unroll
-        for (int i = 0; i < 8; ++i)
-          m |= ((v[i] & 0x7fffu) ? 1u : 0u) << (2 * i) | ((v[i] & 0x7fff0000u) ? 1u : 0u) << (2 * i + 1);
+          for (int i = 0; i < 8; ++i)
+            m |= ((v[i] & 0x7fffu) ? 1u : 0u) << (2 * i) | ((v[i] & 0x7fff0000u) ? 1u : 0u) << (2 * i + 1);
+        }
+        zmask[kb] = (uint16_t)m;
       }
-      zmask[kb] = (uint16_t)m;
     }
     __syncthreads();
   }
@@ -370,7 +388,7 @@ __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
       }
     }
   }
-  if (!w) write_out<Relu2>(p, col, h, lane, R);
+  if (!w) write_out<Relu2, MaskOut>(p, col, h, lane, R);
 }
 
 // Streaming-read kernel used by the tests as a bandwidth probe and as a
@@ -395,9 +413,9 @@ __global__ void hog_kernel(const uint4* __restrict__ src, long long n16, unsigne
   if (x == 0x9e3779b9u) sink[0] = x + (unsigned)(uintptr_t)hog_smem;
 }
 
-template <int P, bool Relu2 = false, bool ZS = false>
+template <int P, bool Relu2 = false, bool ZS = false, bool MaskOut = false, bool MaskIn = false>
 static int launch(const Params& p, cudaStream_t stream) {
-  gemm_kernel<P, Relu2, ZS><<<2 * p.n_tiles, 128, 0, stream>>>(p);
+  gemm_kernel<P, Relu2, ZS, MaskOut, MaskIn><<<2 * p.n_tiles, 128, 0, stream>>>(p);
   return (int)cudaGetLastError();
 }
 
@@ -419,6 +437,17 @@ int marlinx_init(void) {
   return 0;
 }
 
+// Initialize additional mask producer/consumer instances outside capture.
+int marlinx_mask_init(void) {
+  cudaFuncAttributes attr;
+  cudaError_t e;
+  if ((e = cudaFuncGetAttributes(&attr, marlinx::gemm_kernel<4, true, false, true>)) != cudaSuccess) return (int)e;
+  if ((e = cudaFuncGetAttributes(&attr, marlinx::gemm_kernel<8, true, false, true>)) != cudaSuccess) return (int)e;
+  if ((e = cudaFuncGetAttributes(&attr, marlinx::gemm_kernel<4, false, true, false, true>)) != cudaSuccess) return (int)e;
+  if ((e = cudaFuncGetAttributes(&attr, marlinx::gemm_kernel<8, false, true, false, true>)) != cudaSuccess) return (int)e;
+  return 0;
+}
+
 // Registers per thread of gemm_kernel<depth> (depth 4 or 8), or -1.
 int marlinx_regs(int depth) {
   cudaFuncAttributes attr;
@@ -436,7 +465,7 @@ int marlinx_regs(int depth) {
 // a negative code for unsupported arguments.
 static int marlinx_gemm_impl(const void* A, long long lda, int M, const void* B, const void* S,
                  const void* GS, void* C, long long ldc, int N, int K, int sms, int depth,
-                 void* stream, bool relu2, const void* Z = nullptr) {
+                 void* stream, bool relu2, const void* Z = nullptr, void* mask_out = nullptr, const void* mask_in = nullptr) {
   if (M < 1 || M > 8) return -1;
   if (N <= 0 || K <= 0 || N % 128 || K % 128) return -2;
   if (sms <= 0) return -3;
@@ -455,6 +484,8 @@ static int marlinx_gemm_impl(const void* A, long long lda, int M, const void* B,
   p.n_tiles = N / 128;
   p.k_tiles = K / 128;
   p.Z = static_cast<const uint32_t*>(Z);
+  p.mask_out = static_cast<uint16_t*>(mask_out);
+  p.mask_in = static_cast<const uint16_t*>(mask_in);
   // Marlin's stripe partition with parallel = 1 and grid = sms.
   int part2 = p.n_tiles;
   if (p.n_tiles > sms) {
@@ -464,6 +495,22 @@ static int marlinx_gemm_impl(const void* A, long long lda, int M, const void* B,
   p.part1_cols = p.n_tiles - part2;
   p.iters = (p.k_tiles * part2 + sms - 1) / sms;
   cudaStream_t st = static_cast<cudaStream_t>(stream);
+  if (mask_out) {
+    if (!relu2 || Z || mask_in || N != 3712 || K != 2688) return -9;
+    switch (depth) {
+      case 4: return marlinx::launch<4, true, false, true>(p, st);
+      case 8: return marlinx::launch<8, true, false, true>(p, st);
+      default: return -5;
+    }
+  }
+  if (mask_in) {
+    if (relu2 || !Z || N != 2688 || K != 3712) return -9;
+    switch (depth) {
+      case 4: return marlinx::launch<4, false, true, false, true>(p, st);
+      case 8: return marlinx::launch<8, false, true, false, true>(p, st);
+      default: return -5;
+    }
+  }
   if (relu2) {
     if (N != 3712 || K != 2688) return -6;
     switch (depth) {
@@ -498,6 +545,20 @@ int marlinx_gemm_relu2(const void* A, long long lda, int M, const void* B, const
                  const void* GS, void* C, long long ldc, int N, int K, int sms, int depth,
                  void* stream) {
   return marlinx_gemm_impl(A, lda, M, B, S, GS, C, ldc, N, K, sms, depth, stream, true);
+}
+
+int marlinx_gemm_relu2_mask(const void* A, long long lda, int M, const void* B, const void* S,
+                 const void* GS, void* C, long long ldc, int N, int K, int sms, int depth,
+                 void* stream, void* mask) {
+  if (!mask) return -9;
+  return marlinx_gemm_impl(A, lda, M, B, S, GS, C, ldc, N, K, sms, depth, stream, true, nullptr, mask);
+}
+
+int marlinx_gemm_zs_mask(const void* A, long long lda, int M, const void* B, const void* S,
+                 const void* GS, void* C, long long ldc, int N, int K, int sms, int depth,
+                 void* stream, const void* Z, const void* mask) {
+  if (!Z || !mask) return -9;
+  return marlinx_gemm_impl(A, lda, M, B, S, GS, C, ldc, N, K, sms, depth, stream, false, Z, nullptr, mask);
 }
 
 // Shared expert down with zero-row skip: Z is the k-row-major copy of B made by

@@ -13,6 +13,7 @@ inside torch.compile tracing) returns None and the caller runs stock Marlin.
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 
 import torch
@@ -32,6 +33,8 @@ _lib = None
 _load_error: str | None = None
 _ready = False
 _sms: dict[int, int] = {}
+_mask_ready = False
+MASK_FUSION_ENABLED = os.environ.get("MARLINX_FUSED_MASK", "1") != "0"
 
 
 def _load():
@@ -58,6 +61,15 @@ def _load():
         if hasattr(lib, "marlinx_gemm_relu2"):
             lib.marlinx_gemm_relu2.argtypes = lib.marlinx_gemm.argtypes
             lib.marlinx_gemm_relu2.restype = ctypes.c_int
+        if all(hasattr(lib, name) for name in (
+            "marlinx_mask_init", "marlinx_gemm_relu2_mask", "marlinx_gemm_zs_mask"
+        )):
+            lib.marlinx_mask_init.argtypes = []
+            lib.marlinx_mask_init.restype = ctypes.c_int
+            lib.marlinx_gemm_relu2_mask.argtypes = lib.marlinx_gemm.argtypes + [ctypes.c_void_p]
+            lib.marlinx_gemm_relu2_mask.restype = ctypes.c_int
+            lib.marlinx_gemm_zs_mask.argtypes = lib.marlinx_gemm.argtypes + [ctypes.c_void_p] * 2
+            lib.marlinx_gemm_zs_mask.restype = ctypes.c_int
         lib.marlinx_hog.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
                                     ctypes.c_longlong, ctypes.c_void_p, ctypes.c_void_p]
         lib.marlinx_hog.restype = ctypes.c_int
@@ -104,6 +116,7 @@ def _sm_count(device: torch.device) -> int:
 def prepare(layer) -> bool:
     """Marks a Marlin NVFP4 linear layer (after prepare_fp4_layer_for_marlin) as eligible."""
     layer._marlinx_ok = False
+    layer._marlinx_mask_ok = False
     if not ENABLED or _load() is None:
         return False
     n = layer.output_size_per_partition
@@ -129,6 +142,8 @@ def prepare(layer) -> bool:
     layer._marlinx_zs = None
     if ok and ZS_ENABLED and (n, k) == ZS_SHAPE and hasattr(_lib, "marlinx_gemm_zs"):
         layer._marlinx_zs = zs_repack(w, n, k)
+    if ok and (n, k) in ((3712, 2688), (2688, 3712)):
+        layer._marlinx_mask_ok = _prepare_mask(layer, n, k)
     return ok
 
 
@@ -246,3 +261,88 @@ def maybe_apply_relu2(x, weight, weight_scale, global_scale, n, k):
         return None
     out = gemm(x2, weight, weight_scale, global_scale, n, k, relu2=True)
     return out.reshape(*x.shape[:-1], n)
+
+
+# Producer/consumer fusion: masks are current-call metadata, never cached.
+def _mask_args(x, w, s, gs, out, n, k):
+    return (x.data_ptr(), x.stride(0), x.shape[0], w.data_ptr(), s.data_ptr(),
+            gs.data_ptr(), out.data_ptr(), n, n, k, _sm_count(x.device), DEPTH,
+            torch.cuda.current_stream(x.device).cuda_stream)
+
+
+def gemm_relu2_mask(x, w, s, gs):
+    out = torch.empty((x.shape[0], 3712), dtype=torch.bfloat16, device=x.device)
+    mask = torch.empty(232, dtype=torch.int16, device=x.device)
+    rc = _lib.marlinx_gemm_relu2_mask(*_mask_args(x, w, s, gs, out, 3712, 2688), mask.data_ptr())
+    if rc:
+        raise RuntimeError(f"marlinx up/mask launch failed: {rc}")
+    return out, mask
+
+
+def gemm_zs_mask(x, w, z, s, gs, mask):
+    out = torch.empty((x.shape[0], 2688), dtype=torch.bfloat16, device=x.device)
+    rc = _lib.marlinx_gemm_zs_mask(*_mask_args(x, w, s, gs, out, 2688, 3712),
+                                   z.data_ptr(), mask.data_ptr())
+    if rc:
+        raise RuntimeError(f"marlinx down/mask launch failed: {rc}")
+    return out
+
+
+def _reference_mask(x):
+    live = ((x.view(torch.int16).to(torch.int32) & 0x7fff) != 0).any(dim=0)
+    bits = torch.arange(16, dtype=torch.int32, device=x.device)
+    return (live.view(-1, 16).to(torch.int32)
+            * torch.bitwise_left_shift(torch.ones_like(bits), bits)).sum(dim=1).to(torch.int16)
+
+
+@torch.no_grad()
+def _prepare_mask(layer, n, k):
+    """Official-remote load-time eligibility; samples do not prove equivalence.
+
+    Per-layer M1/4/5/8, deterministic finite and zero inputs; compare BF16
+    output bits and the final-output mask. No request results are kept.
+    """
+    global _mask_ready
+    if (not MASK_FUSION_ENABLED or not all(hasattr(_lib, name) for name in (
+            "marlinx_mask_init", "marlinx_gemm_relu2_mask", "marlinx_gemm_zs_mask"))
+            or torch.cuda.is_current_stream_capturing()
+            or ((n, k) == (2688, 3712) and layer._marlinx_zs is None)):
+        return False
+    try:
+        if not _mask_ready:
+            rc = _lib.marlinx_mask_init()
+            if rc:
+                raise RuntimeError(f"marlinx mask initialization failed: {rc}")
+            _mask_ready = True
+        device = layer.weight.device
+        for m in (1, 4, 5, 8):
+            index = torch.arange(m * k, dtype=torch.int32, device=device).view(m, k)
+            values = (((index * 17 + 11) % 31).float() - 15.0) * 0.125
+            for all_zero in (False, True):
+                x = (torch.zeros_like(values) if all_zero else values).to(torch.bfloat16)
+                if (n, k) == (3712, 2688):
+                    ref = gemm(x, layer.weight, layer.weight_scale,
+                               layer.weight_global_scale, n, k, relu2=True)
+                    got, mask = gemm_relu2_mask(x, layer.weight, layer.weight_scale,
+                                               layer.weight_global_scale)
+                    ok = (torch.equal(got.view(torch.int16), ref.view(torch.int16))
+                          and torch.equal(mask, _reference_mask(ref)))
+                else:
+                    columns = torch.arange(k, device=device)
+                    dead = (columns % 4) != 0
+                    zero = torch.where((columns % 2) == 0,
+                                       torch.full_like(x, -0.0), torch.zeros_like(x))
+                    x = torch.where(dead, zero, x.relu().square())
+                    mask = _reference_mask(x)
+                    ref = gemm(x, layer.weight, layer.weight_scale,
+                               layer.weight_global_scale, n, k, zs=layer._marlinx_zs)
+                    got = gemm_zs_mask(x, layer.weight, layer._marlinx_zs,
+                                       layer.weight_scale, layer.weight_global_scale, mask)
+                    ok = torch.equal(got.view(torch.int16), ref.view(torch.int16))
+                if not ok:
+                    logging.getLogger(__name__).warning("shared mask eligibility mismatch at N=%d M=%d", n, m)
+                    return False
+        return True
+    except Exception as exc:
+        logging.getLogger(__name__).warning("shared mask eligibility failed: %r", exc)
+        return False

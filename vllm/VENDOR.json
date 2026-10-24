@@ -162,6 +162,14 @@
     {
       "file": "harness/kernels/marlinx/{csrc/marlinx.cu,py/__init__.py,README.md,tests/marlinx_zs_exact.py}",
       "why": "Shared expert down projection (3712->2688, ReLU^2 input): read only the k rows whose activation is nonzero in some row, from a byte-preserving k-row-major copy of the Marlin weight; the lane rebuilds Marlin's exact weight word, so dequant, MMA, segments and fp32 reductions are unchanged. Bit-exact vs stock Marlin on all 23 layers (4416 synthetic + 1380 real-activation cases, CUDA graph replay). MARLINX_ZS=0 disables."
+    },
+    {
+      "file": "harness/kernels/marlinx/{csrc/marlinx.cu,py/__init__.py}; models/nemotron_shared_mask.py; models/nemotron_h.py",
+      "why": "Independent new shared-expert producer/consumer metadata fusion oncomplete1001d918-90a6-402c-8df5-859e2e9a799f: originalshared-up BF16-RN/ReLU2 epilogue computes eachK16mask fromtheFINALstoredBF16values, acrossallMrows viawarpreduceOR, oneuint16per16features. Oneinvocation-local232-entryint16storage carriesidenticalrawbits intoexistingsharedZSdown, replacingits42CTA repeatedactivation-mask scanswithmaskloads. OriginalFP4weightnibbles/scales/layout, allMMAs/chains/segments/reductions/BF16epilogues unchanged; onlymaskproducer/source differs. NoextraGPUlaunch/weightcopy, nopersistentactivation/resultcache. PureopaquecompleteMLP opusesread-onlyweight/scaleargs andfreshhidden/mask/output oncurrentstream; unsupportedshape/TP/bias/unprepared paths keeporiginalMLP. Separate remote load-timeper-layerM1/4/5/8finite/zero/negativezero bitcomparisons validateproduceroutput+mask andconsumer, retainingoriginalpathonmismatch. MARLINX_FUSED_MASK=0 oldpath. Sources1001ZS, a9086396-4cfc-4e67-ad9c-63c44f08289a/shared-up823carrier, andpriorfullnativeMarlin lineage. Newcodeuncompiled/untestedlocally; officialremoteonly. Runtime/profitunknown andsamplesnotuniversalproof. Independentofpendingde04MTPkernel/Z2/dualgraph; refreshwholehighestbeforeupload."
+    },
+    {
+      "file": "vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py;layers/fused_moe/moe_fused_mul_sum.py;models/nemotron_h.py;v1/worker/prefill_graph.py",
+      "why": "Usefulpending a8894a68-c1bd-4929-8ed5-bc2959bc08a6 selectedfourruntimefilemethod only, officialdd5a2a2c42ff780f02443f30d84e6995ac75186e: keepactualM64blockcontainingrow495foreachof6unifiedexpertsatfreshM496lastMoE; deviceargmax/gatherretainsactualintrablocklane, num_tokens_padded384, uncomputedearlier routedcontributions explicitlyzero withoutscratchloads. ExistingfullM496tuning/Kchains/selectedrowmath retainedbystructure, finaltargetstatesupstreamunchanged. EarlierfinalhiddenrowsAREconsumedbyMTPsoacceptancerisk/wholeexacttokensrequired, noisolatedlosslessclaim. Complete1001sharedZSnative/py/README/diagnosticretained, sourcea889wholerollbackofthose4filesNOTimported. NativecompactON/depth4/allnonselectedruntime unchanged. Newmask+selectedpruningcomposition unverified; officialremoteonly."
     }
   ]
 }

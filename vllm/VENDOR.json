@@ -69,7 +69,7 @@
     },
     {
       "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py; vllm/model_executor/models/nemotron_h_mtp.py; vllm/v1/spec_decode/llm_base_proposer.py",
-      "why": "Drafter-only greedy head over the shared NVFP4 lm_head: partial-K screen on 64 of 168 fp4 groups (chosen at load from weights only), top-32 per 2048-row chunk, full-K fp32 rescore with bf16 rounding and lowest-id ties. Load-time copies of the checkpoint's own lm_head bytes and scales; the target's lm_head, logits and verification are untouched. VLLM_MTP_SCREEN=0 restores the stock draft head."
+      "why": "Drafter-only greedy head over the shared NVFP4 lm_head: partial-K screen on 64 of 168 fp4 groups (chosen at load from weights only), top-64 per 2048-row chunk, full-K fp32 rescore with bf16 rounding and lowest-id ties. Load-time copies of the checkpoint's own lm_head bytes and scales; the target's lm_head, logits and verification are untouched. VLLM_MTP_SCREEN=0 restores the stock draft head."
     },
     {
       "file": "vllm/v1/worker/prefill_graph.py, vllm/v1/worker/gpu_model_runner.py, vllm/v1/attention/backends/flashinfer.py",
@@ -81,7 +81,7 @@
     },
     {
       "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py",
-      "why": "Cascade the accepted 4e916237-ea0f-48f5-8cd6-503252f54bc8 draft screen: 32 importance-ranked groups score the complete vocabulary, keep 256 per 2048-row chunk, recompute original 64-group scores for those candidates, then retain 32 per original chunk for the unchanged full-K rescore/BF16/min-ID chain. The wider intermediate set is informed by the negative smaller-screen evidence of b27645a4-0e5b-477b-9502-933cb2eb8a79, without an assumed recall guarantee. New buffers contain exact input-independent NVFP4 byte/scale subsets. No target/native-MTP weights, formats or verification changes. Additional proposal pruning and gathered partial-score lowering can change drafts; recall, exact-token result and speed require official remote validation. VLLM_MTP_SCREEN_CASCADE=0 retains the original single screen."
+      "why": "Cascade the accepted 4e916237-ea0f-48f5-8cd6-503252f54bc8 draft screen: 32 importance-ranked groups score the complete vocabulary, keep 256 per 2048-row chunk, recompute original 64-group scores for those candidates, then retain 64 per original chunk for the unchanged full-K rescore/BF16/min-ID chain. The wider intermediate set is informed by the negative smaller-screen evidence of b27645a4-0e5b-477b-9502-933cb2eb8a79, without an assumed recall guarantee. New buffers contain exact input-independent NVFP4 byte/scale subsets. No target/native-MTP weights, formats or verification changes. Additional proposal pruning and gathered partial-score lowering can change drafts; recall, exact-token result and speed require official remote validation. VLLM_MTP_SCREEN_CASCADE=0 retains the original single screen."
     },
     {
       "file": "vllm/model_executor/layers/fused_moe/router/gate_linear.py (+ harness/kernels/smallk)",
@@ -94,6 +94,10 @@
     {
       "file": "vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py, vllm/model_executor/layers/fused_moe/moe_align_block_size.py (opt-in)",
       "why": "smallk's fused sigmoid top-k + moe_align kernel (bit-identical to ops.grouped_topk and the two align kernels for <= 32 ids) is off by default: the routing chain overlaps the shared-expert GEMMs, so shortening it gave no end-to-end gain (SMALLK_TOPK=1 SMALLK_ALIGN=1 enable it)"
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "Widen the drafter's exact full-K rescore from 32 to 64 survivors per 2048-row chunk (2048 to 4096 rows per draft step, +2.95 MiB per step at unchanged partial-K screen bytes). The rescore set is a superset of the previous one for the same 256-per-chunk refine pool, so the draft argmax is taken over at least the same candidates with the same fp32 full-K accumulation, bf16 rounding and lowest-id tie rule; only the proposal can change, and the target's verification still decides every committed token. No target weights, formats, screens or verification change."
     }
   ]
 }

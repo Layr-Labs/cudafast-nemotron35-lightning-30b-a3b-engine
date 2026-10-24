@@ -77,6 +77,21 @@ class GateLinear(ReplicatedLinear):
         )
         self.out_dtype = out_dtype
 
+        # Nemotron-H target router: the GB10 2688x128 FP32 shape otherwise
+        # falls through to general GEMM. Keep the existing weight format.
+        self.allow_gb10_small_fp32_router = (
+            force_fp32_compute
+            and not bias
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability(121)
+            and (input_size, output_size) == (2688, 128)
+            and self.weight.dtype == torch.float32
+            and out_dtype == torch.float32
+        )
+        if self.allow_gb10_small_fp32_router:
+            # Register only when this device/shape can use the custom op.
+            from . import gb10_fp32_router  # noqa: F401
+
         # DSV3 specialized kernel eligibility (SM90+, exact dims)
         self.allow_specialized_router_gemm = can_use_specialized_kernels
         self.allow_dsv3_router_gemm = (
@@ -168,6 +183,13 @@ class GateLinear(ReplicatedLinear):
     def forward(
         self, x: torch.Tensor
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        if (
+            self.allow_gb10_small_fp32_router
+            and 1 <= x.shape[0] <= 4
+            and x.dtype in (torch.bfloat16, torch.float32)
+        ):
+            return torch.ops.vllm.gb10_small_fp32_router(x, self.weight), None
+
         # Tier 1: cuteDSL ll_bf16_gemm (SM90+, any dims)
         if self.allow_ll_bf16_gemm and x.shape[0] <= 16 and x.dtype == torch.bfloat16:
             from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (

@@ -82,6 +82,10 @@
     {
       "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py",
       "why": "Cascade the accepted 4e916237-ea0f-48f5-8cd6-503252f54bc8 draft screen: 32 importance-ranked groups score the complete vocabulary, keep 256 per 2048-row chunk, recompute original 64-group scores for those candidates, then retain 32 per original chunk for the unchanged full-K rescore/BF16/min-ID chain. The wider intermediate set is informed by the negative smaller-screen evidence of b27645a4-0e5b-477b-9502-933cb2eb8a79, without an assumed recall guarantee. New buffers contain exact input-independent NVFP4 byte/scale subsets. No target/native-MTP weights, formats or verification changes. Additional proposal pruning and gathered partial-score lowering can change drafts; recall, exact-token result and speed require official remote validation. VLLM_MTP_SCREEN_CASCADE=0 retains the original single screen."
+    },
+    {
+      "file": "vllm/model_executor/layers/fused_moe/router/gb10_fp32_router.py (+ gate_linear.py)",
+      "why": "Own GB10 FP32 router for the 2688x128 target shape at M=1..4: each CTA streams two expert rows and reuses weights across four token lanes, using FP32 FMA and a fixed reduction without tf32/tensor-core approximation or weight conversion. Larger/unsupported cases keep the existing dispatcher. Summation order differs from cuBLAS; exact timed-token and real routing checks remain mandatory. Added on promoted ceb4274c (which already carries our SSD prefill fusion); no state sink."
     }
   ]
 }

@@ -45,6 +45,7 @@ SCREEN_CHUNK = 2048
 SCREEN_PER = 32
 CASCADE_FRAC_GROUPS = 32
 CASCADE_PER = 256
+_SCREEN_STAGES = 2
 
 
 def screen_enabled() -> bool:
@@ -64,6 +65,28 @@ def _e2m1(nib):
     p2 = tl.where(e == 1, 1.0, tl.where(e == 2, 2.0, 4.0))
     mag = tl.where(e == 0, m * 0.5, (1.0 + m * 0.5) * p2)
     return tl.where((nib & 8) != 0, -mag, mag)
+
+
+@triton.jit
+def _e2m1_pair(byte):
+    # Exact hardware decode of both nibbles; FP4 values all fit in FP16/FP32.
+    lo, hi = tl.inline_asm_elementwise(
+        """{
+        .reg .b8 a, b, c, d;
+        .reg .b32 pair;
+        .reg .b16 lo, hi;
+        mov.b32 {a, b, c, d}, $2;
+        cvt.rn.f16x2.e2m1x2 pair, a;
+        mov.b32 {lo, hi}, pair;
+        cvt.f32.f16 $0, lo;
+        cvt.f32.f16 $1, hi;
+        }""",
+        constraints="=f,=f,r", args=[byte],
+        dtype=(tl.float32, tl.float32), is_pure=True, pack=1,
+    )
+    # The software decoder canonicalizes E2M1 -0 to +0 in FP32. Hardware
+    # preserves -0; match the reference even for the two zero encodings.
+    return tl.where(lo == 0.0, 0.0, lo), tl.where(hi == 0.0, 0.0, hi)
 
 
 @triton.jit
@@ -104,7 +127,8 @@ def _nvfp4_rows_dot(
         ).to(tl.float32)
         hl = tl.load(h_ptr + 2 * ob)
         hh = tl.load(h_ptr + 2 * ob + 1)
-        part = _e2m1(wb & 15) * hl[None, :] + _e2m1(wb >> 4) * hh[None, :]
+        lo, hi = _e2m1_pair(wb)
+        part = lo * hl[None, :] + hi * hh[None, :]
         part = tl.reshape(part, (BR, BB // 8, 8))
         acc += tl.sum(tl.sum(part, axis=2) * sc, axis=1)
     tl.store(out_ptr + r, acc * gscale, mask=rmask)
@@ -116,8 +140,23 @@ def _rows_dot(h, w, s, rows, gscale, out, gather):
     br = 64 if not gather else 16
     _nvfp4_rows_dot[(triton.cdiv(n_out, br),)](
         h, w, s, rows if gather else out, out, n_out, gscale,
-        NBYTES=nbytes, GATHER=gather, BR=br, BB=64, num_warps=4,
+        NBYTES=nbytes, GATHER=gather, BR=br, BB=64, num_warps=4, num_stages=_SCREEN_STAGES,
     )
+
+
+@triton.jit
+def _select_token(logits, ids, out, N: tl.constexpr, BLOCK: tl.constexpr):
+    """Stock BF16 maximum, then minimum token id among ties, in one launch."""
+    i = tl.arange(0, BLOCK)
+    # Round before reduction: FP32 logit differences can disappear in BF16.
+    v = tl.load(logits + i, mask=i < N, other=-float("inf"))
+    v = v.to(tl.bfloat16).to(tl.float32)
+    token = tl.load(ids + i, mask=i < N, other=1 << 30)
+    best = tl.max(v, axis=0)
+    # torch.max propagates NaNs; its subsequent equality tests all fail.
+    any_nan = tl.max(((i < N) & (v != v)).to(tl.int32), axis=0)
+    chosen = tl.min(tl.where((i < N) & (v == best), token, 1 << 30), axis=0)
+    tl.store(out, tl.where(any_nan != 0, 1 << 30, chosen))
 
 
 class DraftHeadScreen:
@@ -251,14 +290,17 @@ class DraftHeadScreen:
                 + self.chunk_off
             ).reshape(-1)
         _rows_dot(h, self.w_full, self.s_full, cand, self.gscale, self.cand_logits, True)
-        v = self.cand_logits.to(torch.bfloat16)
-        best = v.max()
-        return torch.where(v == best, cand, self.big).min()
+        out = torch.empty((), dtype=torch.int64, device=h.device)
+        _select_token[(1,)](
+            self.cand_logits, cand, out, N=self.cand_logits.numel(),
+            BLOCK=triton.next_power_of_2(self.cand_logits.numel()),
+        )
+        return out
 
     def greedy(self, hidden: torch.Tensor) -> torch.Tensor:
         """Draft ids [B] for hidden [B, K] (B is small; one pass per row)."""
         if self.graph is not None and hidden.shape[0] == 1:
-            self._h.copy_(hidden[0].float())
+            self._h.copy_(hidden[0])
             self.graph.replay()
             return self._out.clone()
         out = []

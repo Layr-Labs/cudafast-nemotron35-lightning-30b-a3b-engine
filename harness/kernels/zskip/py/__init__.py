@@ -67,12 +67,8 @@ def _load():
         lib.zskip_config.argtypes = [ctypes.c_int, ctypes.c_void_p]
         lib.zskip_config.restype = ctypes.c_int
         P, LL, I = ctypes.c_void_p, ctypes.c_longlong, ctypes.c_int
-        lib.zskip_down.argtypes = [P, LL, I, P, P, P, I, P, P, P, P, LL, LL, LL, LL, LL, LL, LL, I, P, I, P, P, I, P, P]
+        lib.zskip_down.argtypes = [P, LL, I, P, P, P, I, P, P, P, P, LL, LL, LL, LL, LL, LL, LL, I, P, I, P, P, I, P, P, I, P]
         lib.zskip_down.restype = ctypes.c_int
-        prefix_down = getattr(lib, "zskip_down_prefix", None)
-        if prefix_down is not None:
-            prefix_down.argtypes = lib.zskip_down.argtypes + [P]
-            prefix_down.restype = ctypes.c_int
         lib.zskip_probe.argtypes = [ctypes.c_ulonglong, I, I, P, P, P]
         lib.zskip_probe.restype = ctypes.c_int
         lib.zskip_epi.argtypes = [P, I, ctypes.c_float, P, P, P]
@@ -81,11 +77,6 @@ def _load():
     except OSError as exc:
         _load_error = str(exc)
     return _lib
-
-
-def prefix_available() -> bool:
-    lib = _load()
-    return lib is not None and getattr(lib, "zskip_down_prefix", None) is not None
 
 
 def available() -> bool:
@@ -256,8 +247,7 @@ def to_swapc(pk: Packed) -> Packed:
 def down(a: torch.Tensor, sorted_ids: torch.Tensor, expert_ids: torch.Tensor, num_tokens_padded: torch.Tensor,
          packed: Packed, out: torch.Tensor, mode: int = SKIP, config: int | None = None,
          max_blocks: int | None = None, stats: torch.Tensor | None = None, ctas_per_sm: int = 0,
-         trace: torch.Tensor | None = None,
-         verify_rows: torch.Tensor | None = None) -> torch.Tensor:
+         trace: torch.Tensor | None = None, vrows: torch.Tensor | None = None, top_k: int = 0) -> torch.Tensor:
     """out[r] = humming w2 output row r for the moe_align layout (block 16) of a <= 4-token call.
     a: bf16 [shape_m, K] (relu^2 activations, rows = token * top_k + slot); out: bf16 [shape_m, N]."""
     global _pdl_on
@@ -274,6 +264,10 @@ def down(a: torch.Tensor, sorted_ids: torch.Tensor, expert_ids: torch.Tensor, nu
         max_blocks = shape_m  # every block holds >= 1 valid row
     max_blocks = min(max_blocks, expert_ids.numel())
     assert max_blocks <= MAX_BLOCKS
+    if vrows is not None and (
+        top_k <= 0 or vrows.dtype != torch.int32 or vrows.numel() != 1 or vrows.device != a.device
+    ):
+        raise ValueError("zskip vrows must be a same-device int32 scalar and top_k > 0")
     ws, queue = scratch(a.device)
     args = (
         a.data_ptr(), a.stride(0), shape_m, sorted_ids.data_ptr(), expert_ids.data_ptr(),
@@ -281,24 +275,16 @@ def down(a: torch.Tensor, sorted_ids: torch.Tensor, expert_ids: torch.Tensor, nu
         out.data_ptr(), out.stride(0), packed.w_expert, packed.w_tile, packed.w_k, packed.s_expert,
         packed.s_tile, packed.s_g, mode, stats.data_ptr() if stats is not None else None, config,
         ws.data_ptr(), queue.data_ptr(), ctas_per_sm, trace.data_ptr() if trace is not None else None,
+        None if vrows is None else vrows.data_ptr(), int(top_k),
         torch.cuda.current_stream(a.device).cuda_stream,
     )
-    launch = lib.zskip_down
-    if verify_rows is not None:
-        assert shape_m == 30 and config in (113, 118) and mode == SKIP
-        assert verify_rows.device == a.device and verify_rows.dtype == torch.int32
-        assert verify_rows.numel() == 1 and verify_rows.is_contiguous()
-        prefix_launch = getattr(lib, "zskip_down_prefix", None)
-        if prefix_launch is not None:
-            launch = prefix_launch
-            args += (verify_rows.data_ptr(),)
-    rc = launch(*args)
+    rc = lib.zskip_down(*args)
     if rc != 0 and _pdl_on and not torch.cuda.is_current_stream_capturing():
         # The PDL launch was rejected (the first calls run eagerly, before any capture):
         # use ordinary launches from now on and redo this call.
         lib.zskip_set_pdl(0)
         _pdl_on = False
-        rc = launch(*args)
+        rc = lib.zskip_down(*args)
     if rc != 0:
         raise RuntimeError(f"zskip_down failed: {rc} (config={config})")
     return out

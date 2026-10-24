@@ -1,5 +1,3 @@
-// Port of dadon 12f98e36 (31889a4), decode config 113 only. Main's BI layout and
-// prep are deliberately retained. Fused=true composes fkiene bc524594's prep.
 #ifndef ZSKIP_NO_PAIR
 __device__ __forceinline__ uint4 ldg_u128(const void* p) {
   uint4 v;
@@ -9,13 +7,6 @@ __device__ __forceinline__ uint4 ldg_u128(const void* p) {
   return v;
 }
 
-// TPW = 64-column tiles per warp. TPW = 1 reads layout "swap"; TPW = 2 reads layout "swap2", where
-// the two tiles of a 128-column pair are interleaved so a lane's words of both tiles are adjacent
-// (one 8-byte load per k row: 64-byte segments per row, 16-byte scale loads).
-// NB = token n-blocks of 8 per warp: an expert block of up to 8 * NB rows; the dequantised
-// weight fragments of a group serve all NB n-blocks.
-// HALF (TPW = 1): the warp's 64-column tile is one half of a "swap2" pair (4-byte words, 8-byte
-// scales at the tile's offset in the pair) instead of a "swap" tile.
 template <bool Fused>
 __global__ void __launch_bounds__(32) down_pair_kernel(const Params p) {
   constexpr int TPW = 2, WPC = 1, R = 3, NB = 1;
@@ -26,7 +17,7 @@ __global__ void __launch_bounds__(32) down_pair_kernel(const Params p) {
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   const int g8 = lane >> 2, t = lane & 3;
   const int mb = blockIdx.y;
-  const int P = blockIdx.x * WPC + warp;  // tile (TPW = 1) or tile pair (TPW = 2)
+  const int P = blockIdx.x * WPC + warp;
 #ifndef ZSKIP_NO_PDL
   pdl_wait();
   pdl_launch_dependents();
@@ -43,7 +34,7 @@ __global__ void __launch_bounds__(32) down_pair_kernel(const Params p) {
   const BlockHdr* hdr = reinterpret_cast<const BlockHdr*>(bi);
   const int nrows = hdr->nrows;
   if (nrows == 0 || p.mode == SETUPONLY) return;
-  if (nrows > 8 * NB) {  // the launcher's config covers every block it is given; never taken
+  if (nrows > 8 * NB) {
     if (lane == 0 && p.stats) atomicAdd(p.stats + 1, 1);
     return;
   }
@@ -52,19 +43,16 @@ __global__ void __launch_bounds__(32) down_pair_kernel(const Params p) {
   const uint16_t* gact = reinterpret_cast<const uint16_t*>(bi + BI_ACTG);
   const bool math = p.mode == DENSE || p.mode == SKIP;
   bool dense = p.mode == DENSE || p.mode == LOADONLY_DENSE;
-  const int row_limit = prefix_row_limit(p);
   const __nv_bfloat16* xrow[NB];
 #pragma unroll
   for (int nb = 0; nb < NB; ++nb) {
     const int r = nb * 8 + g8;
-    xrow[nb] = r < nrows && hdr->rows[r] < row_limit
-        ? p.A + (long long)hdr->rows[r] * p.lda : nullptr;
+    xrow[nb] = r < nrows ? p.A + (long long)hdr->rows[r] * p.lda : nullptr;
   }
   const uint8_t* wbase = HALF ? p.W + e * p.w_expert + (P >> 1) * 64 + g8 * 8 + (P & 1) * 4
                               : p.W + e * p.w_expert + P * (32 * TPW) + g8 * (4 * TPW);
   const uint8_t* sbase = HALF ? p.S + e * p.s_expert + (P >> 1) * 128 + g8 * 16 + (P & 1) * 8
                               : p.S + e * p.s_expert + P * (64 * TPW) + g8 * (8 * TPW);
-  // the k-slot pair of this lane in a group: rows 2t, 2t+1 (low k) and 2t+8, 2t+9 (high k)
   const int kr[4] = {2 * t, 2 * t + 1, 2 * t + 8, 2 * t + 9};
 
   float acc[4 * TPW][NB][4];
@@ -146,8 +134,6 @@ __global__ void __launch_bounds__(32) down_pair_kernel(const Params p) {
             const uint32_t keep23 = ((m23 & 1u) ? 0x0000FFFFu : 0u) | ((m23 & 2u) ? 0xFFFF0000u : 0u);
 #pragma unroll
             for (int tt = 0; tt < TPW; ++tt) {
-              // scales: byte 2c + h of (s[2tt], s[2tt+1]) -> column 16c + g8 + 8h of tile tt;
-              // humming's fp8 bit placement, x 2^120
               const uint32_t sx = s[2 * tt], sy = s[2 * tt + 1];
               const uint32_t s01 = hmul2_u32(fp8_to_bf16x2(((sx << 8) & 0x0000FF00u) | ((sx << 16) & 0xFF000000u)), kExp120);
               const uint32_t s23 = hmul2_u32(fp8_to_bf16x2(((sx >> 8) & 0x0000FF00u) | (sx & 0xFF000000u)), kExp120);
@@ -156,10 +142,10 @@ __global__ void __launch_bounds__(32) down_pair_kernel(const Params p) {
 #pragma unroll
               for (int c = 0; c < 4; ++c) {
                 const uint32_t sp = c == 0 ? s01 : (c == 1 ? s23 : (c == 2 ? s45 : s67));
-                const uint32_t slo = __byte_perm(sp, 0, 0x1010);  // column g8 (h = 0)
-                const uint32_t shi = __byte_perm(sp, 0, 0x3232);  // column g8 + 8 (h = 1)
+                const uint32_t slo = __byte_perm(sp, 0, 0x1010);
+                const uint32_t shi = __byte_perm(sp, 0, 0x3232);
                 const uint32_t sel = c | (c << 4) | ((c + 4) << 8) | ((c + 4) << 12);
-                const uint32_t x01 = __byte_perm(w[0][tt], w[1][tt], sel);  // bytes: w0[c], w0[c], w1[c], w1[c]
+                const uint32_t x01 = __byte_perm(w[0][tt], w[1][tt], sel);
                 const uint32_t x23 = __byte_perm(w[2][tt], w[3][tt], sel);
                 const uint32_t a0 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x01 << 12), kExp124), slo) & keep01;
                 const uint32_t a1 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x01 << 8), kExp124), shi) & keep01;
@@ -167,7 +153,6 @@ __global__ void __launch_bounds__(32) down_pair_kernel(const Params p) {
                 const uint32_t a3 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x23 << 8), kExp124), shi) & keep23;
 #pragma unroll
                 for (int nb = 0; nb < NB; ++nb) {
-                  // n-blocks without valid rows (warp-uniform) issue no MMA
                   if (nb == 0 || nrows > nb * 8) mma_bf16(acc[tt * 4 + c][nb], a0, a1, a2, a3, bb[nb][0], bb[nb][1]);
                 }
               }
@@ -187,7 +172,6 @@ __global__ void __launch_bounds__(32) down_pair_kernel(const Params p) {
       }
     }
     if (!__any_sync(0xFFFFFFFFu, neg0) || dense || !math) break;
-    // a -0 accumulator appeared: recompute this warp's tiles with every row loaded
     if (lane == 0 && p.stats) atomicAdd(p.stats + 0, 1);
     dense = true;
   }
@@ -206,9 +190,8 @@ __global__ void __launch_bounds__(32) down_pair_kernel(const Params p) {
           const int tok = nb * 8 + 2 * t + (q & 1);
           const int cc = col + ((q >> 1) ? 8 : 0);
           if (tok < nrows) {
-            const uint32_t v = to_bf16x2(mul_ftz(acc[tt * 4 + c][nb][q], gs4), 0.0f);  // humming's cvt.rn.bf16x2.f32
-            reinterpret_cast<uint16_t*>(p.C)[(long long)hdr->rows[tok] * p.ldc + cc] =
-                hdr->rows[tok] < row_limit ? static_cast<uint16_t>(v) : uint16_t(0);
+            const uint32_t v = to_bf16x2(mul_ftz(acc[tt * 4 + c][nb][q], gs4), 0.0f);
+            reinterpret_cast<uint16_t*>(p.C)[(long long)hdr->rows[tok] * p.ldc + cc] = static_cast<uint16_t>(v);
           }
         }
       }
@@ -217,4 +200,4 @@ __global__ void __launch_bounds__(32) down_pair_kernel(const Params p) {
 }
 
 
-#endif  // ZSKIP_NO_PAIR
+#endif

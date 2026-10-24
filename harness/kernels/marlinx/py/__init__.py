@@ -32,8 +32,6 @@ _lib = None
 _load_error: str | None = None
 _ready = False
 _sms: dict[int, int] = {}
-# Optional ABI: old/no-PDL libraries keep the ordinary launch. A rejected
-# eager PDL launch disables all PDL entry points; capture errors never retry.
 _PDL_ENABLED = os.environ.get("MARLINX_PDL", "1") != "0"
 _pdl_active = False
 _init_pdl = None
@@ -81,7 +79,7 @@ def _load():
                     "relu2": lib.marlinx_gemm_relu2_pdl,
                     "zs": lib.marlinx_gemm_zs_pdl,
                 }
-            except AttributeError:  # old library or MARLINX_NO_PDL build
+            except AttributeError:
                 init_pdl = None
             if init_pdl is not None:
                 init_pdl.argtypes = []
@@ -211,7 +209,6 @@ def gemm(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
         args += (zs.data_ptr(),)
     rc = op(*args)
     if rc and use_pdl and not torch.cuda.is_current_stream_capturing():
-        # Match fp8small: only rejected eager launches retry, never capture.
         _pdl_active = False
         rc = _ops[mode](*args)
     if rc != 0:

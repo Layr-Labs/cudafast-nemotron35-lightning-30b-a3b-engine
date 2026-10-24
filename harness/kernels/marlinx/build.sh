@@ -15,15 +15,12 @@ arch=${arch// /}
 arch=${arch%+PTX}
 sm=${arch/./}
 "$nvcc" --version | tail -n 2
-rm -f "$out/libmarlinx.so"  # the fallback below tests for this build's output, not a stale one
+rm -f "$out/libmarlinx.so"
 # No --use_fast_math: the reductions must stay plain IEEE fp32 adds and multiplies.
 "$nvcc" -O3 -std=c++17 -shared -Xcompiler -fPIC -lineinfo \
   -gencode "arch=compute_${sm},code=sm_${sm}" \
   -Xptxas -v \
   -o "$out/libmarlinx.so" "$here/csrc/marlinx.cu" 2>&1 || true
-# If the PDL variant does not build, build once more without it (-DMARLINX_NO_PDL
-# removes every PDL line: the previous source; the Python side then keeps the
-# ordinary launch).
 if ! test -f "$out/libmarlinx.so"; then
   echo "marlinx: PDL build failed; rebuilding with -DMARLINX_NO_PDL" >&2
   "$nvcc" -O3 -std=c++17 -shared -Xcompiler -fPIC -lineinfo \

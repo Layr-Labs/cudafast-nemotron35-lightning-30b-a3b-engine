@@ -81,15 +81,9 @@ struct Params {
   int* queue;               // work-item counter (reset by prep_kernel)
   int max_blocks;           // expert blocks covered (grid of prep_kernel)
   unsigned long long* trace;  // optional timing trace: 8 words per item (see down3_kernel)
-  const int* verify_rows;  // optional confidence prefix, paired M5 only
+  const int* vrows;
+  int top_k;
 };
-
-__device__ __forceinline__ int prefix_row_limit(const Params& p) {
-  if (p.verify_rows == nullptr) return p.shape_m;
-  const int rows = *p.verify_rows;
-  // Avoid multiplying the ALL_ROWS sentinel. Eligible calls have 5 tokens x6.
-  return rows >= 5 ? p.shape_m : (rows < 1 ? 1 : rows) * 6;
-}
 
 __device__ __forceinline__ unsigned long long gtimer() {
   unsigned long long t;
@@ -225,7 +219,6 @@ __device__ __forceinline__ void build_lists(uint8_t* dst, int nrows_valid, const
   uint16_t* act_g = reinterpret_cast<uint16_t*>(dst + BI_ACTG);
   uint16_t* act_k = reinterpret_cast<uint16_t*>(dst + BI_ACTK);
   __shared__ int s_tot[2];
-  const int row_limit = prefix_row_limit(p);
   for (int g = tid; g < 128; g += NT) {
     uint32_t m = 0;
     if (g < G) {
@@ -233,7 +226,6 @@ __device__ __forceinline__ void build_lists(uint8_t* dst, int nrows_valid, const
         m = 0xFFFFu;
       } else {
         for (int r = 0; r < nrows_valid; ++r) {
-          if (rows[r] >= row_limit) continue;
           const uint4* q = reinterpret_cast<const uint4*>(p.A + (long long)rows[r] * p.lda + 16 * g);
           m |= nz_mask8(__ldg(q)) | (nz_mask8(__ldg(q + 1)) << 8);
         }
@@ -295,6 +287,32 @@ __device__ __forceinline__ void build_lists(uint8_t* dst, int nrows_valid, const
 
 // one CTA per expert block (grid = max_blocks): rows, masks and lists into p.ws; block 0 also
 // resets the work queue of the main kernel (launched next on the same stream)
+__device__ __forceinline__ int vrow_limit(const Params& p) {
+  if (p.vrows == nullptr || p.top_k <= 0) return 0x7fffffff;
+  const int v = *p.vrows;
+  return v > 0 ? v : 0x7fffffff;
+}
+
+__device__ __forceinline__ bool slot_kept(unsigned id, int shape_m, int top_k, int limit) {
+  if (id >= static_cast<unsigned>(shape_m)) return false;
+  if (top_k <= 0 || limit >= 0x7fffffff) return true;
+  return static_cast<int>(id / static_cast<unsigned>(top_k)) < limit;
+}
+
+template <int BM>
+__device__ void zero_masked_slots(const Params& p, int mb, int limit) {
+  if (limit >= 0x7fffffff || p.top_k <= 0) return;
+  const int tid = threadIdx.x;
+  const int nt = blockDim.x;
+  for (int pos = 0; pos < BM; ++pos) {
+    const unsigned id = static_cast<unsigned>(p.sorted_ids[mb * BM + pos]);
+    if (slot_kept(id, p.shape_m, p.top_k, limit)) continue;
+    if (id >= static_cast<unsigned>(p.shape_m)) continue;
+    __nv_bfloat16* row = p.C + static_cast<long long>(id) * p.ldc;
+    for (int col = tid; col < N; col += nt) row[col] = __nv_bfloat16{};
+  }
+}
+
 template <int BM, int CAP>
 __global__ void __launch_bounds__(128) prep_kernel(const Params p) {
 #ifndef ZSKIP_NO_PDL
@@ -303,6 +321,7 @@ __global__ void __launch_bounds__(128) prep_kernel(const Params p) {
 #endif
   const int tid = threadIdx.x, lane = tid & 31;
   const int mb = blockIdx.x;
+  const int limit = vrow_limit(p);
   uint8_t* bi = p.ws + (long long)mb * BI_BYTES;
   BlockHdr* h = reinterpret_cast<BlockHdr*>(bi);
   __shared__ int s_rows[RMAX];
@@ -322,7 +341,7 @@ __global__ void __launch_bounds__(128) prep_kernel(const Params p) {
     for (int c = 0; c < (BM + 31) / 32; ++c) {
       const int pos = 32 * c + lane;
       const unsigned id = pos < BM ? static_cast<unsigned>(p.sorted_ids[mb * BM + pos]) : 0xFFFFFFFFu;
-      const bool valid = pos < BM && id < static_cast<unsigned>(p.shape_m);
+      const bool valid = pos < BM && slot_kept(id, p.shape_m, p.top_k, limit);
       const unsigned ball = __ballot_sync(0xFFFFFFFFu, valid);
       const int rank = base + __popc(ball & ((1u << lane) - 1u));
       const bool keep = valid && rank < CAP;
@@ -344,6 +363,7 @@ __global__ void __launch_bounds__(128) prep_kernel(const Params p) {
   __syncthreads();
   const bool dense = p.mode == DENSE || p.mode == LOADONLY_DENSE;
   build_lists<128>(bi, s_nrows, p, s_rows, dense);
+  zero_masked_slots<BM>(p, mb, limit);
 }
 #ifndef ZSKIP_NO_FUSED
 
@@ -351,6 +371,7 @@ template <int NT, int BM, int CAP>
 __device__ __forceinline__ void fused_prep(const Params& p, int mb, uint8_t* bi) {
   static_assert(NT >= 32 && NT % 32 == 0, "fused prep needs whole warps");
   const int tid = threadIdx.x, lane = tid & 31;
+  const int limit = vrow_limit(p);
   BlockHdr* h = reinterpret_cast<BlockHdr*>(bi);
   __shared__ int s_rows[RMAX];
   __shared__ int s_nrows;
@@ -360,7 +381,7 @@ __device__ __forceinline__ void fused_prep(const Params& p, int mb, uint8_t* bi)
     for (int c = 0; c < (BM + 31) / 32; ++c) {
       const int pos = 32 * c + lane;
       const unsigned id = pos < BM ? static_cast<unsigned>(p.sorted_ids[mb * BM + pos]) : 0xFFFFFFFFu;
-      const bool valid = pos < BM && id < static_cast<unsigned>(p.shape_m);
+      const bool valid = pos < BM && slot_kept(id, p.shape_m, p.top_k, limit);
       const unsigned ball = __ballot_sync(0xFFFFFFFFu, valid);
       const int rank = base + __popc(ball & ((1u << lane) - 1u));
       const bool keep = valid && rank < CAP;
@@ -382,6 +403,7 @@ __device__ __forceinline__ void fused_prep(const Params& p, int mb, uint8_t* bi)
   __syncthreads();
   const bool dense = p.mode == DENSE || p.mode == LOADONLY_DENSE;
   build_lists<NT>(bi, s_nrows, p, s_rows, dense);
+  if (blockIdx.x == 0) zero_masked_slots<BM>(p, mb, limit);
 }
 
 #endif
@@ -1929,15 +1951,12 @@ int zskip_config(int id, int* info) {
   return -2;
 }
 
-static int zskip_down_impl(const void* A, long long lda, int shape_m, const int* sorted_ids, const int* expert_ids,
+int zskip_down(const void* A, long long lda, int shape_m, const int* sorted_ids, const int* expert_ids,
                const int* num_tokens_padded, int max_blocks, const void* W, const void* S, const float* GS,
                void* C, long long ldc, long long w_expert, long long w_tile, long long w_k, long long s_expert,
                long long s_tile, long long s_g, int mode, int* stats, int config, void* ws, int* queue,
-               int ctas_per_sm, void* trace, void* stream, const int* verify_rows) {
-  if (verify_rows != nullptr && (shape_m != 30 || mode != SKIP ||
-      (config != 113 && config != 118))) return -5;
+               int ctas_per_sm, void* trace, const int* vrows, int top_k, void* stream) {
   Params p;
-  p.verify_rows = verify_rows;
   p.A = reinterpret_cast<const __nv_bfloat16*>(A);
   p.lda = lda;
   p.shape_m = shape_m;
@@ -1961,6 +1980,8 @@ static int zskip_down_impl(const void* A, long long lda, int shape_m, const int*
   p.queue = queue;
   p.max_blocks = max_blocks;
   p.trace = reinterpret_cast<unsigned long long*>(trace);
+  p.vrows = vrows;
+  p.top_k = top_k;
   if (max_blocks <= 0) return 0;
   if ((lda % 8) || (ldc % 2)) return -3;
   cudaStream_t st = reinterpret_cast<cudaStream_t>(stream);
@@ -2001,22 +2022,6 @@ static int zskip_down_impl(const void* A, long long lda, int shape_m, const int*
 #endif
 #endif
   return -2;
-}
-
-int zskip_down(const void* A, long long lda, int shape_m, const int* sorted_ids, const int* expert_ids,
-               const int* num_tokens_padded, int max_blocks, const void* W, const void* S, const float* GS,
-               void* C, long long ldc, long long w_expert, long long w_tile, long long w_k, long long s_expert,
-               long long s_tile, long long s_g, int mode, int* stats, int config, void* ws, int* queue,
-               int ctas_per_sm, void* trace, void* stream) {
-  return zskip_down_impl(A, lda, shape_m, sorted_ids, expert_ids, num_tokens_padded, max_blocks, W, S, GS, C, ldc, w_expert, w_tile, w_k, s_expert, s_tile, s_g, mode, stats, config, ws, queue, ctas_per_sm, trace, stream, nullptr);
-}
-
-int zskip_down_prefix(const void* A, long long lda, int shape_m, const int* sorted_ids, const int* expert_ids,
-               const int* num_tokens_padded, int max_blocks, const void* W, const void* S, const float* GS,
-               void* C, long long ldc, long long w_expert, long long w_tile, long long w_k, long long s_expert,
-               long long s_tile, long long s_g, int mode, int* stats, int config, void* ws, int* queue,
-               int ctas_per_sm, void* trace, void* stream, const int* verify_rows) {
-  return zskip_down_impl(A, lda, shape_m, sorted_ids, expert_ids, num_tokens_padded, max_blocks, W, S, GS, C, ldc, w_expert, w_tile, w_k, s_expert, s_tile, s_g, mode, stats, config, ws, queue, ctas_per_sm, trace, stream, verify_rows);
 }
 
 int zskip_probe(unsigned long long seed, int blocks, int iters, unsigned long long* counts, uint32_t* samples,

@@ -21,9 +21,6 @@ def bits_equal(a, b):
 
 
 def launch(layer, x, out, pdl, depth, mode="gemm"):
-    # Direct ABI deliberately bypasses fallback, and reuses caller-owned output
-    # storage. marlinx has NO workspace/lock argument or global scratch; the
-    # layers' same stock-Marlin workspace objects remain untouched throughout.
     name = "marlinx_gemm" + ("_" + mode if mode != "gemm" else "")
     op = getattr(marlinx._load(), name + ("_pdl" if pdl else ""))
     n, k = layer.output_size_per_partition, layer.input_size_per_partition
@@ -41,7 +38,7 @@ def launch(layer, x, out, pdl, depth, mode="gemm"):
 
 
 def graph_ms(fn, batch=1, reps=7):
-    fn()  # eager first: load/launch errors cannot hide in capture
+    fn()
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -97,8 +94,6 @@ def main():
     for depth in (4, 8):
         for m in range(1, 9):
             for idx, (up, down) in enumerate(shared):
-                # All shape classes: dense shared up/down, fused up+ReLU2,
-                # activation-derived ZS down, and the separate large head.
                 for kind in (0, 1, 2):
                     x = gen_x(m, 2688, kind, gen)
                     activation = relu2(stock(up, x))
@@ -126,12 +121,8 @@ def main():
                 check(f"head/d{depth}/M{m}/kind{kind}/on-off", on, off)
                 check(f"head/d{depth}/M{m}/kind{kind}/stock", off, stock(head, x))
 
-            # Same h/y/output buffers, same prepared layers and same unused
-            # stock workspaces across every launch and replay. No copies or
-            # kernels between fused up and ZS down. Also stresses dense reads
-            # after the preceding grid overwrote y at the previous pair.
             storage = gen_x(m, 2688 + 64, 0, gen)
-            x = storage[:, :2688]  # aligned strided input
+            x = storage[:, :2688]
             h = torch.empty((m, 3712), device="cuda", dtype=x.dtype)
             y = torch.empty((m, 2688), device="cuda", dtype=x.dtype)
             logits = torch.empty((m, 131072), device="cuda", dtype=x.dtype)

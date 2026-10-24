@@ -84,8 +84,6 @@ __device__ __forceinline__ void pdl_launch_dependents() {
 }
 #endif
 
-// Activations can be the preceding grid's output. PDL uses coherent loads
-// after its memory-clobbering wait, including the activation-derived ZS mask.
 template <bool PDL>
 __device__ __forceinline__ uint32_t ld_activation_u32(const uint32_t* p) {
   if constexpr (!PDL) return ld_nc_u32(p);
@@ -320,9 +318,6 @@ __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
   const int total = 2 * p.k_tiles;
 #ifndef MARLINX_NO_PDL
   if constexpr (PDL) {
-    // B/S are immutable checkpoint tensors. Z is also a weight-only repack,
-    // but which Z rows are read depends on A: defer ALL Z/mask reads to wait.
-    // Preload only scales for ZS, weights and scales for dense/fused-up/head.
     Cursor pre = ld;
 #pragma unroll
     for (int s = 0; s < P; ++s) {
@@ -420,8 +415,6 @@ __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
     }
   }
 #ifndef MARLINX_NO_PDL
-  // Every thread has waited, and every CTA triggers. Only this grid's C
-  // epilogue remains; a dependent must wait before reading any of C.
   if constexpr (PDL) pdl_launch_dependents();
 #endif
   if (!w) write_out<Relu2>(p, col, h, lane, R);
@@ -491,7 +484,6 @@ int marlinx_init(void) {
 }
 
 #ifndef MARLINX_NO_PDL
-// Optional ABI; initialize every PDL specialization before graph capture.
 int marlinx_init_pdl(void) {
   cudaFuncAttributes attr;
   cudaError_t e;

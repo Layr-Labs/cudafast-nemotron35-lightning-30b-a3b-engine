@@ -1883,6 +1883,21 @@ class VllmConfig:
                 # de-duplicate and sort the sizes
                 cudagraph_capture_sizes = sorted(set(cudagraph_capture_sizes))
 
+                # A single-request speculative verify has exactly depth + 1
+                # rows. Keep that size alongside the small drafter graphs;
+                # otherwise non-power-of-two verify lengths round every capture
+                # size up in resolve_cudagraph_mode_and_sizes, padding even
+                # a one-token draft. Explicit user sizes remain authoritative.
+                decode_query_len = 1 + self.num_speculative_tokens
+                if (
+                    self.scheduler_config.max_num_seqs == 1
+                    and self.parallel_config.tensor_parallel_size == 1
+                    and decode_query_len <= max_cudagraph_capture_size
+                ):
+                    cudagraph_capture_sizes = sorted(
+                        set(cudagraph_capture_sizes) | {decode_query_len}
+                    )
+
             if (
                 self.parallel_config.tensor_parallel_size > 1
                 and self.compilation_config.pass_config.enable_sp

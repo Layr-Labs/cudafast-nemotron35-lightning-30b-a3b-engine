@@ -94,6 +94,14 @@
     {
       "file": "vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py, vllm/model_executor/layers/fused_moe/moe_align_block_size.py (opt-in)",
       "why": "smallk's fused sigmoid top-k + moe_align kernel (bit-identical to ops.grouped_topk and the two align kernels for <= 32 ids) is off by default: the routing chain overlaps the shared-expert GEMMs, so shortening it gave no end-to-end gain (SMALLK_TOPK=1 SMALLK_ALIGN=1 enable it)"
+    },
+    {
+      "file": "vllm/v1/worker/prefill_fast.py (new; + vllm/v1/worker/gpu_model_runner.py, vllm/model_executor/layers/mamba/mamba_mixer2.py, vllm/model_executor/layers/mamba/ops/prefill_state_copy.py)",
+      "why": "host-side trims of the prefill step: the engine core waits for a step's sampled-token copy on a spinning instead of a blocking (sleeping) CUDA event, which on GB10 woke 1.0-1.6 ms after the copy finished; and a prefill-only batch builds the Mamba-2 attention metadata once and derives the other KV-cache groups' with update_block_table (the metadata differs between groups only in the state indices). and each prefill's final SSM states go from the chunk states to the cache in one copy kernel instead of a gather plus an index_put (same bytes, no arithmetic). No computed value changes (VLLM_PREFILL_SPIN_OUTPUT_WAIT=0 / VLLM_PREFILL_MAMBA_META_REUSE=0 / VLLM_PREFILL_STATE_COPY=0 disable; VLLM_PREFILL_FAST_CHECK=1 also builds and compares every field)"
+    },
+    {
+      "file": "vllm/model_executor/layers/fused_moe/router/gate_linear.py (+ harness/kernels/routerbig)",
+      "why": "the fp32 MoE router GEMM at prefill M (480/496/512 rows, 128 experts, K 2688) runs routerbig instead of cuBLAS's split-K SIMT sgemm: the same twelve fma chains over 224 consecutive k (ascending, from 0) added left to right, the summation tree recovered from the cuBLAS kernel by cancellation probes, on 96 CTAs of 256 threads plus an ordered reduction (60.3 -> 42.9 us per layer in the prefill); outputs are bit-identical (ROUTERBIG=0 restores torch.mm)"
     }
   ]
 }

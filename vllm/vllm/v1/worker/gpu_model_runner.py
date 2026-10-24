@@ -210,7 +210,7 @@ from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
-from vllm.v1.worker import hostfast, mamba_utils
+from vllm.v1.worker import hostfast, mamba_utils, prefill_fast
 from vllm.v1.worker.block_table import SlotMappingMode
 from vllm.v1.worker.cp_utils import (
     check_attention_cp_compatibility,
@@ -276,7 +276,9 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
 
         # Event on the copy stream so we can synchronize the non-blocking copy.
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
-        self.async_copy_ready_event = torch.cuda.Event(blocking=True)
+        # LOCAL PATCH (cudafast-nemotron35): a spinning event unless
+        # VLLM_PREFILL_SPIN_OUTPUT_WAIT=0 (v1/worker/prefill_fast.py).
+        self.async_copy_ready_event = prefill_fast.output_event()
 
         # Keep a reference to the device tensor to avoid it being
         # deallocated until we finish copying it to the host.
@@ -2554,13 +2556,40 @@ class GPUModelRunner(
                     common_attn_metadata.block_table_tensor,
                     common_attn_metadata.slot_mapping,
                 )
+            elif (
+                # LOCAL PATCH (cudafast-nemotron35): reuse the Mamba-2 metadata
+                # of a prefill-only batch across KV-cache groups
+                # (v1/worker/prefill_fast.py, VLLM_PREFILL_MAMBA_META_REUSE=0
+                # disables).
+                isinstance(builder, Mamba2AttentionMetadataBuilder)
+                and cache_key in cached_attn_metadata
+                and prefill_fast.mamba_reusable(cached_attn_metadata[cache_key])
+            ):
+                attn_metadata_i = builder.update_block_table(
+                    cached_attn_metadata[cache_key],
+                    common_attn_metadata.block_table_tensor,
+                    common_attn_metadata.slot_mapping,
+                )
+                if prefill_fast.CHECK:
+                    prefill_fast.check_same(
+                        attn_metadata_i,
+                        builder.build(
+                            common_prefix_len=cascade_attn_prefix_len,
+                            common_attn_metadata=common_attn_metadata,
+                            **extra_attn_metadata_args,
+                        ),
+                        f"mamba2[{kv_cache_gid}]",
+                    )
             else:
                 attn_metadata_i = builder.build(
                     common_prefix_len=cascade_attn_prefix_len,
                     common_attn_metadata=common_attn_metadata,
                     **extra_attn_metadata_args,
                 )
-                if builder.supports_update_block_table:
+                if builder.supports_update_block_table or (
+                    isinstance(builder, Mamba2AttentionMetadataBuilder)
+                    and prefill_fast.mamba_reusable(attn_metadata_i)
+                ):
                     cached_attn_metadata[cache_key] = attn_metadata_i
 
             if ubid is None:

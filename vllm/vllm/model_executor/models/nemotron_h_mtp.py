@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """NemotronH-MTP model with attention layers."""
 
+import copy
 import typing
 from collections.abc import Callable, Iterable
 
@@ -9,7 +10,12 @@ import torch
 import torch.nn as nn
 
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, ModelConfig, VllmConfig
+from vllm.config import (
+    CacheConfig,
+    ModelConfig,
+    VllmConfig,
+    set_current_vllm_config,
+)
 from vllm.config.parallel import ParallelConfig
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
@@ -37,6 +43,7 @@ from .nemotron_h import (
 )
 from .nemotron_h_mtp_kernels import (
     install_mtp_small_linear,
+    prepare_mtp_relu2,
     mtp_fast_enabled as _mtp_fast_enabled,
     register_mtp_moe_layer,
 )
@@ -389,10 +396,20 @@ class NemotronHMTP(nn.Module, SupportsPP):
                 vllm_config.parallel_config.eplb_config.num_redundant_experts
             )
 
-        # MTP predictor
-        self.model = NemotronHMultiTokenPredictor(
-            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "mtp")
-        )
+        # MTP-only: timing-based combo-kernel selection changes RMSNorm's
+        # reduction order between boots. Keep the target compilation settings
+        # intact and compile the drafter with separate fixed norm kernels.
+        predictor_config = copy.copy(vllm_config)
+        predictor_config.compilation_config = copy.copy(vllm_config.compilation_config)
+        predictor_config.compilation_config.inductor_compile_config = {
+            **vllm_config.compilation_config.inductor_compile_config,
+            "combo_kernels": False,
+        }
+        # The compile wrapper takes its config from the current context.
+        with set_current_vllm_config(predictor_config):
+            self.model = NemotronHMultiTokenPredictor(
+                vllm_config=predictor_config, prefix=maybe_prefix(prefix, "mtp")
+            )
         # Small-M BF16 GEMMs for the head's dense layers (drafter only).
         if _mtp_fast_enabled("DENSE"):
             install_mtp_small_linear(self.model)
@@ -409,6 +426,9 @@ class NemotronHMTP(nn.Module, SupportsPP):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+
+    def process_weights_after_loading(self) -> None:
+        prepare_mtp_relu2(self.model)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)

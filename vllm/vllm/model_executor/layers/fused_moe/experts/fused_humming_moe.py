@@ -21,6 +21,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.experts.humming_tuned_moe import (
     relu2_bf16,
+    small_humming_moe_align,
     tuned_moe_configs,
 )
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
@@ -653,13 +654,23 @@ class HummingIndexedExperts(HummingExpertsBase):
             )
             moe_block_size = 64
 
-        sorted_ids, expert_ids, num_tokens_padded = moe_align_block_size(
-            topk_ids=topk_ids,
-            block_size=moe_block_size,
-            num_experts=self.global_num_experts,
-            expert_map=expert_map,
-            ignore_invalid_experts=True,
-        )
+        aligned = None
+        if self._fused_relu2:
+            aligned = small_humming_moe_align(
+                topk_ids,
+                moe_block_size,
+                self.global_num_experts,
+                expert_map,
+            )
+        if aligned is None:
+            aligned = moe_align_block_size(
+                topk_ids=topk_ids,
+                block_size=moe_block_size,
+                num_experts=self.global_num_experts,
+                expert_map=expert_map,
+                ignore_invalid_experts=True,
+            )
+        sorted_ids, expert_ids, num_tokens_padded = aligned
 
         moe_common_kwargs = {
             "sorted_ids": sorted_ids,

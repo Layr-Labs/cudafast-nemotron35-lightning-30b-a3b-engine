@@ -236,6 +236,14 @@ def _selective_scan_update_spec_replay_kernel(
         D_ptr += pid_h * stride_D_head
         D_ptrs = D_ptr + offs_m * stride_D_dim
 
+    # A, D and dt_bias are immutable model weights, disjoint from the
+    # mutable state/input ring. Share their loads across replay and verify.
+    A = tl.load(A_ptr).to(tl.float32)
+    if HAS_DT_BIAS:
+        dt_bias_value = tl.load(dt_bias_ptr).to(tl.float32)
+    if HAS_D:
+        D = tl.load(D_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
+
     # Replay the accepted tokens 1..num_replay of the previous verify: the
     # reference's state update on the reference's inputs, no outputs.
     for i_r in range(num_replay):
@@ -251,10 +259,9 @@ def _selective_scan_update_spec_replay_kernel(
             ring_dt_base + ring_pos * ring_stride_dt, mask=ring_ok, other=0.0
         ).to(tl.float32)
         if HAS_DT_BIAS:
-            dt += tl.load(dt_bias_ptr).to(tl.float32)
+            dt += dt_bias_value
         if DT_SOFTPLUS:
             dt = softplus(dt)
-        A = tl.load(A_ptr).to(tl.float32)
         dA = fast_exp(A * dt)  # scalar, not a matrix
 
         B = tl.load(
@@ -291,17 +298,14 @@ def _selective_scan_update_spec_replay_kernel(
         dt_raw = tl.load(dt_ptr)
         dt = dt_raw.to(tl.float32)
         if HAS_DT_BIAS:
-            dt += tl.load(dt_bias_ptr).to(tl.float32)
+            dt += dt_bias_value
         if DT_SOFTPLUS:
             dt = softplus(dt)
-        A = tl.load(A_ptr).to(tl.float32)
         dA = fast_exp(A * dt)  # scalar, not a matrix
 
         B_raw = tl.load(B_ptrs, mask=offs_n < dstate, other=0.0)
         B = B_raw.to(tl.float32)
         C = tl.load(C_ptrs, mask=offs_n < dstate, other=0.0).to(tl.float32)
-        if HAS_D:
-            D = tl.load(D_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
         if HAS_Z:
             z = tl.load(z_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
 

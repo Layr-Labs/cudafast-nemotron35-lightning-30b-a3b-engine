@@ -46,7 +46,9 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
     sample_with_exponential_noise,
 )
 from vllm.v1.sample.sampler import _SAMPLING_EPS
+from vllm.v1.spec_decode.draft_plan_banks import DraftPlanBanks
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.mtp_tail_graph import MTPTailGraph, tail_graph_enabled
 from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
     compute_new_slot_mapping,
@@ -67,6 +69,9 @@ logger = init_logger(__name__)
 
 
 class SpecDecodeBaseProposer:
+    # Subclasses may override attention-backend initialization.
+    _draft_plan_banks: DraftPlanBanks | None = None
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -748,7 +753,10 @@ class SpecDecodeBaseProposer:
             if not self.constant_draft_positions or token_index == 0:
                 # A plan rewrites pinned host buffers that the previous plan's
                 # H2D copies read; wait until those copies have run.
-                if order_draft_plans and token_index > 0:
+                if (
+                    order_draft_plans and token_index > 0
+                    and self._draft_plan_banks is None
+                ):
                     assert self._draft_plan_event is not None
                     self._draft_plan_event.synchronize()
                 _, per_layer_attn_metadata = (
@@ -756,7 +764,7 @@ class SpecDecodeBaseProposer:
                         common_attn_metadata, draft_index=token_index + 1
                     )
                 )
-                if order_draft_plans:
+                if order_draft_plans and self._draft_plan_banks is None:
                     assert self._draft_plan_event is not None
                     self._draft_plan_event.record()
 
@@ -787,15 +795,32 @@ class SpecDecodeBaseProposer:
                     batch_size,
                 )
 
+            tail_slot_mapping = self._get_slot_mapping(input_batch_size)
+            tail_result = None
+            if (
+                batch_size == input_batch_size == 1
+                and cudagraph_runtime_mode != CUDAGraphMode.NONE
+                and tail_graph_enabled(self)
+            ):
+                if getattr(self, "_mtp_tail_graph", None) is None:
+                    self._mtp_tail_graph = MTPTailGraph()
+                tail_result = self._mtp_tail_graph.run(
+                    self.model, self.vllm_config, token_index + 1,
+                    model_kwargs, per_layer_attn_metadata, tail_slot_mapping,
+                )
+
             with set_forward_context(
                 per_layer_attn_metadata,
                 self.vllm_config,
                 num_tokens=input_batch_size,
                 num_tokens_across_dp=batch_size_across_dp,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
-                slot_mapping=self._get_slot_mapping(input_batch_size),
+                slot_mapping=tail_slot_mapping,
             ):
-                ret_hidden_states = self.model(**model_kwargs)
+                ret_hidden_states = (
+                    self.model(**model_kwargs)
+                    if tail_result is None else tail_result[0]
+                )
                 if not self.model_returns_tuple():
                     last_hidden_states = ret_hidden_states
                     hidden_states = ret_hidden_states
@@ -803,9 +828,12 @@ class SpecDecodeBaseProposer:
                     last_hidden_states, hidden_states = ret_hidden_states
 
             hidden_states = hidden_states[:batch_size]
-            draft_token_ids, draft_probs = self._sample_draft_tokens(
-                last_hidden_states[:batch_size], sampling_metadata
-            )
+            if tail_result is None:
+                draft_token_ids, draft_probs = self._sample_draft_tokens(
+                    last_hidden_states[:batch_size], sampling_metadata
+                )
+            else:
+                draft_token_ids, draft_probs = tail_result[1], None
             if draft_probs is not None:
                 assert draft_probs_list is not None
                 draft_probs_list.append(draft_probs)
@@ -1081,6 +1109,8 @@ class SpecDecodeBaseProposer:
     def build_per_group_and_layer_attn_metadata(
         self, common_attn_metadata: CommonAttentionMetadata, draft_index: int = 0
     ) -> tuple[list[object], dict[str, object]]:
+        if self._draft_plan_banks is not None:
+            return self._draft_plan_banks.build(common_attn_metadata, draft_index)
         # LOCAL PATCH (cudafast-nemotron35): hostfast staging guard.
         guard = self._hostfast_staging_guard()
         if guard is not None:
@@ -1915,6 +1945,12 @@ class SpecDecodeBaseProposer:
                     attention_groups[backend_key].layer_names.append(layer_name)
 
         self.draft_attn_groups = list(attention_groups.values())
+        self._draft_plan_banks = None
+        if PIN_MEMORY and self.max_batch_size == 1 and tail_graph_enabled(self):
+            self._draft_plan_banks = DraftPlanBanks.create(
+                self.draft_attn_groups, self.vllm_config, self.device,
+                self.speculative_config.num_speculative_tokens,
+            )
         if kernel_block_sizes is not None and 0 <= self.kv_cache_gid < len(
             kernel_block_sizes
         ):

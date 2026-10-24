@@ -44,6 +44,7 @@ from vllm.model_executor.layers.mamba.ops.selective_state_update_replayssm_outpu
 )
 from vllm.model_executor.layers.mamba.ops.ssd_combined import (
     mamba_chunk_scan_combined_varlen,
+    prefill_state_sink_supported,
 )
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import selective_state_update
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -894,6 +895,15 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
             # NOTE: final output is an in-place update of out tensor
             assert preallocated_ssm_out_p is not None
+            direct_state_sink = (
+                not is_mamba_cache_all
+                and prefill_state_sink_supported(
+                    ssm_state,
+                    state_indices_tensor_p,
+                    num_prefills,
+                    (self.num_heads // self.tp_size, self.head_dim, self.ssm_state_size),
+                )
+            )
             varlen_states = mamba_chunk_scan_combined_varlen(
                 hidden_states_p.view(
                     num_prefill_tokens, self.num_heads // self.tp_size, self.head_dim
@@ -916,6 +926,10 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 dt_limit=(0.0, float("inf")),
                 out=preallocated_ssm_out_p.view(num_prefill_tokens, -1, self.head_dim),
                 state_dtype=ssm_state.dtype,
+                final_states_out=ssm_state if direct_state_sink else None,
+                final_states_indices=(
+                    state_indices_tensor_p if direct_state_sink else None
+                ),
             )
 
             if is_mamba_cache_all:
@@ -997,7 +1011,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     ).squeeze(1)
                 ] = varlen_states[last_chunk_indices_p]
 
-            else:
+            elif not direct_state_sink:
                 # update ssm states
                 # - varlen state is a (num_prefills, nheads, headdim, dstate)
                 #   tensor

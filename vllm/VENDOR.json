@@ -8,6 +8,10 @@
   "note": "Upstream Python package at the tag. The compiled extensions (csrc) come from the pinned container's install of the same tag; tools/stage-vllm-overlay.sh layers this tree over that install. vllm/vllm/config/fault_tolerance.py is stored LF-normalized (upstream has CRLF).",
   "local_patches": [
     {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_packed.py (+ nemotron_h_mtp.py, nemotron_h_mtp_kernels.py)",
+      "why": "MTP-only lossless load-time 12-bit BF16 encoding of original pinned routed/shared expert-up, QKV and eh_proj. Original GEMV/up reduction layouts and QKV MMA v2 products/accumulation retained. eh_proj uses packed GEMV only at M=1, retains original BF16 (28,901,376 bytes) for every other shape; QKV uses packed M=1/2..16, temporary exact decode only for unsupported nonempty shapes, empty input returns empty. Zero temporary reconstructions in decode rounds required by gate. Packed compute launches disable PDL and require ordinary stream/graph serialization; the unpacked PDL path is retained. Expert-up consumes the base-selected ids in the same slot order (default three routed plus two shared slices, six routed when MTP_DRAFT_TOPK=0); routing weights and down kernels are unchanged. No decoded cache, target or drafter numeric change; exhaustive boot bit assertions, MTP_PACK12=0 original path."
+    },
+    {
       "file": "vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py",
       "why": "GB10 exposes no NVML memory clock; fall back to 273 GB/s for humming's tuning heuristic"
     },
@@ -161,7 +165,7 @@
     },
     {
       "file": "harness/kernels/marlinx/{csrc/marlinx.cu,py/__init__.py,README.md,tests/marlinx_zs_exact.py}",
-      "why": "Shared expert down projection (3712->2688, ReLU^2 input): read only the k rows whose activation is nonzero in some row, from a byte-preserving k-row-major copy of the Marlin weight; the lane rebuilds Marlin's exact weight word, so dequant, MMA, segments and fp32 reductions are unchanged. Bit-exact vs stock Marlin on all 23 layers (4416 synthetic + 1380 real-activation cases, CUDA graph replay). MARLINX_ZS=0 disables."
+      "why": "Shared expert down projection (3712->2688, ReLU^2 input): read only the k rows whose activation is nonzero in some row, from a byte-preserving k-row-major copy of the Marlin weight; the lane rebuilds Marlin's exact weight word, so dequant, MMA, segments and fp32 reductions are unchanged. Bit-exact vs stock Marlin on all 23 layers (4416 synthetic + 1380 real-activation cases, CUDA graph replay). MARLINX_ZS=0 disables. Optional programmatic dependent launch adds weight/scale-only ring preloads before griddepcontrol.wait (ZS preloads scales only; activation-derived masks and selected Z reads follow the wait), coherent activation reads after it, and launch_dependents before the unchanged final BF16 epilogue. No global workspace or reduction locks; the same CTA-local segment reductions, K order and fused ReLU2 rounding remain. MARLINX_PDL=0 disables; optional ABI, eager rejected-launch fallback, no retry in capture, and MARLINX_NO_PDL build fallback follow fp8small. CPU-reviewed port; CUDA compilation, byte-exact M1-8 graph/chain tests and emitted-token gates still required on Spark."
     },
     {
       "file": "vllm/model_executor/layers/fused_moe/experts/humming_zskip.py; vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py; harness/kernels/zskip",
@@ -187,5 +191,24 @@
       "file": "harness/kernels/zskip/{csrc/zskip.cu,py/__init__.py,build.sh}, vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
       "why": "Decode routed down only (<=8 tokens): config 108 is config 100's down4 with prep_kernel's row list and build_lists run in that CTA's dynamic shared memory (5120 bytes), so the prep launch is not issued. Same block info, same MMA and epilogue. Load-time bitwise check against humming on the 4- and 8-token cases; any mismatch, or a library built with -DZSKIP_NO_FUSED, keeps config 100. Prefill stays config 405. ZSKIP_FUSED_PREP=0 keeps config 100. Budget, not measured on this host: README times config 100 at 70.7 us per MoE layer at M=4; 23 MoE layers. The prep launch plus the global block-info round trip is taken as 5 us/layer, about 0.12 ms per forward. The brief's +1% line is about 0.6 ms/round, so this is under that if a round is one forward; it removes the prep kernel from the decode w2 pair."
     }
-  ]
+  ],
+  "cuda_mma_head_on_35bf": {
+    "model": "GPT 6.1 Sol",
+    "harness": "Codex",
+    "effort": "ultra",
+    "base": "35bf37b3-78f3-4b8b-bbfb-1f3e43380c5f",
+    "canonicalBaseTree": "d1f5d44cb9b71ba2c422f0dc6dc567b570739e8f",
+    "changes": [
+      "Tensor Core BF16/F32 draft partial-head plus fused CUB shard/merge/refine; original fullK final remains",
+      "Selected732 lossless C2 andMarlinPDL oncomplete35bf"
+    ],
+    "priorNativeCarrier": "dcd65e2a-28e1-4584-86da-ee8c1452a174",
+    "localExecutionPerformed": false,
+    "combinedValidation": "unverified; official remote only",
+    "excluded": [
+      "whole negative dcd confidence-prefix/top2 and older12f swap2 kernels"
+    ],
+    "selectedAdditional732": "732c3711-b4f8-4d68-8d5f-158639bffb62 lossless C2 plusMarlinPDL; full35bf all5materialfiles unchanged",
+    "depthPolicy": "Preserve full35bf depth4; pending453 now official2.02458103738517 andexcluded"
+  }
 }

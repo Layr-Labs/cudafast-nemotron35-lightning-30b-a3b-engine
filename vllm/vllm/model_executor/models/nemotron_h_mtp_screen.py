@@ -270,8 +270,31 @@ class DraftHeadScreen:
         if _l2pf is not None and self.cascade:
             _l2pf.DRAFT_SCREEN[:] = [self.w_coarse]
         self.graph = None
+        self.native_selector = None
         self._h = torch.empty(k, dtype=torch.float32, device=device)
         self._out = torch.empty(1, dtype=torch.int32, device=device)
+        # Official remote boot only. Real checkpoint weights, synthetic current
+        # hidden vectors and the original full732 proposal path are compared.
+        # This finite admission is not a universal arithmetic equivalence proof.
+        if (device.type == "cuda" and self.cascade
+                and os.environ.get("MTP_HEAD_FUSED", "1") != "0"):
+            try:
+                from head_fused import Selector
+                native = Selector(self, device)
+                i = torch.arange(k, device=device, dtype=torch.float32)
+                ok = True
+                for seed in (3, 17, 41):
+                    h = (((i * seed + 11).remainder(257) - 128) / 64).contiguous()
+                    original = self._greedy_row(h)
+                    proposed = self._finish_row(h, native.candidates(h))
+                    if not torch.equal(original, proposed):
+                        ok = False
+                        break
+                if ok:
+                    self.native_selector = native
+                logger.info("MTP fused head finite admission: %s", ok)
+            except (ImportError, OSError, RuntimeError, AssertionError) as exc:
+                logger.warning("MTP fused head declined: %r", exc)
         if device.type == "cuda" and screen_graph_enabled():
             try:
                 self._h.zero_()
@@ -293,10 +316,12 @@ class DraftHeadScreen:
             self.graph is not None,
         )
 
-    def _greedy_row(self, h: torch.Tensor) -> torch.Tensor:
+    def _greedy_row(self, h: torch.Tensor, allow_native: bool = True) -> torch.Tensor:
         """One row h [K] float32: the cascade (or the single screen) and the
         argmax tie rule. Every buffer it touches is fixed-address, so the body
         is capturable as-is."""
+        if allow_native and self.native_selector is not None:
+            return self._finish_row(h, self.native_selector.candidates(h))
         if self.cascade:
             hc = h.index_select(0, self.coarse_cols)
             _rows_dot(
@@ -329,6 +354,10 @@ class DraftHeadScreen:
                 .topk(SCREEN_PER, dim=-1, sorted=False).indices
                 + self.chunk_off
             ).reshape(-1)
+        return self._finish_row(h, cand)
+
+    def _finish_row(self, h, cand):
+        # Original full-K rescore and BF16/minimum-ID final selection.
         _rows_dot(h, self.w_full, self.s_full, cand, self.gscale, self.cand_logits, True)
         out = torch.empty((), dtype=torch.int32, device=h.device)
         _select_token[(1,)](
@@ -340,11 +369,14 @@ class DraftHeadScreen:
 
     def greedy(self, hidden: torch.Tensor) -> torch.Tensor:
         """Draft ids [B] for hidden [B, K] (B is small; one pass per row)."""
-        if self.graph is not None and hidden.shape[0] == 1:
+        if (self.graph is not None and hidden.shape[0] == 1
+                and hidden.dtype == torch.bfloat16):
             self._h.copy_(hidden[0])
             self.graph.replay()
             return self._out.clone()
         out = []
         for i in range(hidden.shape[0]):
-            out.append(self._greedy_row(hidden[i].float().contiguous()))
+            out.append(self._greedy_row(
+                hidden[i].float().contiguous(), allow_native=hidden.dtype == torch.bfloat16
+            ))
         return torch.stack(out)

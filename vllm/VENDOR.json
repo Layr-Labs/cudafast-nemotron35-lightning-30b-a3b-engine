@@ -210,6 +210,10 @@
     {
       "file": "harness/kernels/l2pf/py/__init__.py",
       "why": "Carry useful04706ad7-c4e8-44b9-b8ba-77f14d8b8adf MoE-window immutable prefetch default6to12MB. Its complete official2.19195352041462 is within0.1% of fulla484, but only budget mechanism is combined here on higherfulla484. Prefix pair/SSM combination unverified."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "Stopped finite draft-screen fast exit: after the existing device depth gate stops proposing, check hidden finiteness and write fresh +0 score accumulators instead of executing zero-masked NVFP4 decoder and reductions. Active drafts and exceptional hidden values retain original arithmetic. No prior score is reused, candidate sets and final token selection are unchanged. Bitwise parent diagnostic covers all cascade stages and changed-input/gate graph replays."
     }
   ]
 }

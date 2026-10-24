@@ -124,37 +124,48 @@ def _nvfp4_rows_dot(
     wr = rmask
     if GATED:
         wr = rmask & (tl.load(gate_ptr) == 0)
-    if GATHER:
-        if INDEX32:
-            rows = tl.load(rows_ptr + r, mask=rmask, other=0).to(tl.int32)
-        else:
-            rows = tl.load(rows_ptr + r, mask=rmask, other=0).to(tl.int64)
-    else:
-        if INDEX32:
-            rows = r.to(tl.int32)
-        else:
-            rows = r.to(tl.int64)
+    # A stopped draft loads zero weights and scales. For finite hidden values its
+    # score is exactly +0, so avoid the decoder and reductions as well as loads.
+    # Preserve the original exceptional-value behavior (0 * Inf/NaN is NaN).
+    zero_fast = False
+    if GATED:
+        if tl.load(gate_ptr) != 0:
+            hk = tl.arange(0, triton.next_power_of_2(2 * NBYTES))
+            hv = tl.load(h_ptr + hk, mask=hk < 2 * NBYTES, other=0.0)
+            exceptional = (hv != hv) | (tl.abs(hv) == float("inf"))
+            zero_fast = tl.sum(exceptional.to(tl.int32), axis=0) == 0
     acc = tl.zeros((BR,), dtype=tl.float32)
-    for b0 in range(0, NBYTES, BB):
-        ob = b0 + tl.arange(0, BB)
-        wb = tl.load(
-            w_ptr + rows[:, None] * NBYTES + ob[None, :],
-            mask=wr[:, None],
-            other=0,
-            eviction_policy="evict_first",
-        ).to(tl.int32)
-        og = (b0 // 8) + tl.arange(0, BB // 8)
-        sc = tl.load(
-            s_ptr + rows[:, None] * (NBYTES // 8) + og[None, :],
-            mask=wr[:, None],
-            other=0.0,
-        ).to(tl.float32)
-        hl = tl.load(h_ptr + 2 * ob)
-        hh = tl.load(h_ptr + 2 * ob + 1)
-        lo, hi = _e2m1_pair(wb)
-        part = lo * hl[None, :] + hi * hh[None, :]
-        part = tl.reshape(part, (BR, BB // 8, 8))
-        acc += tl.sum(tl.sum(part, axis=2) * sc, axis=1)
+    if not zero_fast:
+        if GATHER:
+            if INDEX32:
+                rows = tl.load(rows_ptr + r, mask=rmask, other=0).to(tl.int32)
+            else:
+                rows = tl.load(rows_ptr + r, mask=rmask, other=0).to(tl.int64)
+        else:
+            if INDEX32:
+                rows = r.to(tl.int32)
+            else:
+                rows = r.to(tl.int64)
+        for b0 in range(0, NBYTES, BB):
+            ob = b0 + tl.arange(0, BB)
+            wb = tl.load(
+                w_ptr + rows[:, None] * NBYTES + ob[None, :],
+                mask=wr[:, None],
+                other=0,
+                eviction_policy="evict_first",
+            ).to(tl.int32)
+            og = (b0 // 8) + tl.arange(0, BB // 8)
+            sc = tl.load(
+                s_ptr + rows[:, None] * (NBYTES // 8) + og[None, :],
+                mask=wr[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            hl = tl.load(h_ptr + 2 * ob)
+            hh = tl.load(h_ptr + 2 * ob + 1)
+            lo, hi = _e2m1_pair(wb)
+            part = lo * hl[None, :] + hi * hh[None, :]
+            part = tl.reshape(part, (BR, BB // 8, 8))
+            acc += tl.sum(tl.sum(part, axis=2) * sc, axis=1)
     tl.store(out_ptr + r, acc * gscale, mask=rmask)
 
 

@@ -16,6 +16,10 @@ device's streaming rate:
   when every MoE input row is the same row, which the single-request proposer
   guarantees (``NemotronHMTP.set_moe_row_src``).
 
+* ``draft_nvfp4_logits``: the shared NVFP4 lm_head at one row. The target
+  still runs CUTLASS W4A4. The drafter reads a plain (unswizzled) copy of
+  the same packed weights and does a bf16×NVFP4 GEMV.
+
 These change the drafter's floating-point summation order only. The target
 model never calls them. The target decides every emitted token, so the
 emitted stream is unchanged; only the draft acceptance can move.
@@ -498,3 +502,140 @@ direct_register_custom_op(
     op_func=mtp_moe_single_row_impl,
     fake_impl=_mtp_moe_single_row_fake,
 )
+
+
+# --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+
+_NVFP4_BN, _NVFP4_BK, _NVFP4_WARPS = 8, 128, 4
+
+
+@triton.jit
+def _nvfp4_e2m1(nibble):
+    """E2M1 nibble to fp32. Same bit pattern as nvfp4_emulation_utils."""
+    magnitude = nibble & 0x07
+    sign = (nibble >> 3) & 1
+    fp32_bits = 0x3F000000 + (magnitude.to(tl.int32) << 22)
+    val = fp32_bits.to(tl.float32, bitcast=True)
+    val = tl.where(magnitude == 0, 0.0, val)
+    val = tl.where(magnitude == 1, 0.5, val)
+    return tl.where(sign == 1, -val, val)
+
+
+@triton.jit
+def _mtp_nvfp4_gemv_kernel(
+    x_ptr,
+    w_ptr,
+    s_ptr,
+    g_ptr,
+    y_ptr,
+    N,
+    K,
+    stride_w,
+    stride_s,
+    stride_x,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+):
+    """y[n] = sum_k x[k] * dequant(w[n, k]).
+
+    w is packed uint8, low nibble first, two values per byte, group 16.
+    s is the raw e4m3 group scale (uint8 view). g is the ModelOpt forward
+    global scale (amax/2688), applied once, not inverted.
+    """
+    pid = tl.program_id(0)
+    offs_n = pid * BN + tl.arange(0, BN)
+    nmask = offs_n < N
+    offs_b = tl.arange(0, BK // 2)
+    offs_k = tl.arange(0, BK)
+    offs_g = tl.arange(0, BK // 16)
+    gscale = tl.load(g_ptr).to(tl.float32)
+    acc = tl.zeros((BN,), dtype=tl.float32)
+    for k0 in range(0, K, BK):
+        raw = tl.load(
+            w_ptr + offs_n[:, None] * stride_w + (k0 // 2) + offs_b[None, :],
+            mask=nmask[:, None],
+            other=0,
+            eviction_policy="evict_first",
+        )
+        decoded = tl.interleave(
+            _nvfp4_e2m1(raw & 0x0F), _nvfp4_e2m1((raw >> 4) & 0x0F)
+        )
+        sf_raw = tl.load(
+            s_ptr + offs_n[:, None] * stride_s + (k0 // 16) + offs_g[None, :],
+            mask=nmask[:, None],
+            other=0,
+            eviction_policy="evict_first",
+        )
+        sf = tl.cast(sf_raw, tl.float8e4nv, bitcast=True).to(tl.float32) * gscale
+        decoded = tl.reshape(decoded, (BN, BK // 16, 16)) * sf[:, :, None]
+        decoded = tl.reshape(decoded, (BN, BK))
+        x = tl.load(x_ptr + (k0 + offs_k) * stride_x, other=0.0)
+        acc += tl.sum(decoded * x[None, :].to(tl.float32), axis=1)
+    tl.store(y_ptr + offs_n, acc.to(y_ptr.dtype.element_ty), mask=nmask)
+
+
+def draft_nvfp4_logits(
+    lm_head: torch.nn.Module, hidden_states: torch.Tensor
+) -> torch.Tensor | None:
+    """Draft logits for one row, or None to keep the CUTLASS lm_head.
+
+    Activations stay bf16. The target's W4A4 quant of this same head is not
+    used here, so draft ids can differ; committed ids are still the target's.
+    """
+    if os.environ.get("MTP_DRAFT_NVFP4_GEMV", "1") == "0":
+        return None
+    if getattr(lm_head, "tp_size", 1) != 1:
+        return None
+    if getattr(lm_head, "bias", None) is not None:
+        return None
+    weight = getattr(lm_head, "draft_fp4_weight", None)
+    scale = getattr(lm_head, "draft_fp4_scale", None)
+    global_scale = getattr(lm_head, "draft_fp4_global_scale", None)
+    if weight is None or scale is None or global_scale is None:
+        logger.info_once("MTP draft NVFP4 GEMV off (no plain lm_head snapshot)")
+        return None
+    if (
+        hidden_states.dim() != 2
+        or hidden_states.shape[0] != 1
+        or not hidden_states.is_cuda
+        or hidden_states.dtype not in (torch.bfloat16, torch.float16)
+    ):
+        return None
+    if (
+        weight.dtype != torch.uint8
+        or weight.dim() != 2
+        or not weight.is_cuda
+        or not weight.is_contiguous()
+    ):
+        return None
+    n_rows, packed_k = weight.shape
+    k = packed_k * 2
+    if hidden_states.shape[1] != k or k % _NVFP4_BK != 0:
+        return None
+    if scale.shape != (n_rows, k // 16) or not scale.is_contiguous():
+        return None
+    scale_u8 = scale.view(torch.uint8)
+    y = torch.empty(
+        (1, n_rows), dtype=hidden_states.dtype, device=hidden_states.device
+    )
+    _mtp_nvfp4_gemv_kernel[(triton.cdiv(n_rows, _NVFP4_BN),)](
+        hidden_states,
+        weight,
+        scale_u8,
+        global_scale,
+        y,
+        n_rows,
+        k,
+        weight.stride(0),
+        scale_u8.stride(0),
+        hidden_states.stride(1),
+        BN=_NVFP4_BN,
+        BK=_NVFP4_BK,
+        num_warps=_NVFP4_WARPS,
+        num_stages=2,
+    )
+    logger.info_once(
+        "MTP draft NVFP4 GEMV on (N=%d, K=%d, plain packed lm_head)", n_rows, k
+    )
+    return y

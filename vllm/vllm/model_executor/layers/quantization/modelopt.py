@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from fnmatch import fnmatch
 from typing import TYPE_CHECKING, Any, cast
 
@@ -1220,6 +1221,32 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         layer.input_global_scale_inv = Parameter(
             (1.0 / layer.input_global_scale).to(torch.float32), requires_grad=False
         )
+
+        prefix = getattr(layer, "prefix", "")
+        if (
+            isinstance(prefix, str)
+            and prefix.endswith("lm_head")
+            and self.quant_config.group_size == 16
+            and os.environ.get("MTP_DRAFT_NVFP4_GEMV", "1") != "0"
+        ):
+            layer.register_buffer(
+                "draft_fp4_weight",
+                layer.weight.detach().contiguous().clone(),
+                persistent=False,
+            )
+            layer.register_buffer(
+                "draft_fp4_scale",
+                layer.weight_scale.detach().contiguous().clone(),
+                persistent=False,
+            )
+            layer.register_buffer(
+                "draft_fp4_global_scale",
+                layer.weight_global_scale.detach()
+                .to(torch.float32)
+                .reshape(())
+                .contiguous(),
+                persistent=False,
+            )
 
         # Convert layer to NVFP4 linear kernel format
         self.kernel.process_weights_after_loading(layer)

@@ -36,6 +36,7 @@ from .nemotron_h import (
     NemotronHMoEDecoderLayer,
 )
 from .nemotron_h_mtp_kernels import (
+    draft_nvfp4_logits,
     install_mtp_small_linear,
     mtp_fast_enabled as _mtp_fast_enabled,
     register_mtp_moe_layer,
@@ -467,7 +468,19 @@ class NemotronHMTP(nn.Module, SupportsPP):
         assert self.lm_head is not None, (
             "lm_head not initialized - must be shared from target model"
         )
-        return self.logits_processor(self.lm_head, hidden_states)
+        logits = draft_nvfp4_logits(self.lm_head, hidden_states)
+        if logits is None:
+            return self.logits_processor(self.lm_head, hidden_states)
+        org = self.logits_processor.org_vocab_size
+        if logits.shape[-1] != org:
+            logits = logits[..., :org]
+        soft_cap = self.logits_processor.soft_cap
+        if soft_cap is not None:
+            logits = torch.tanh(logits / soft_cap) * soft_cap
+        scale = self.logits_processor.scale
+        if scale != 1.0:
+            logits = logits * scale
+        return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load MTP weights with proper name remapping."""

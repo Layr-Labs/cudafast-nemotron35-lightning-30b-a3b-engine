@@ -14,7 +14,10 @@ from vllm.config.model import PROCESSED_LOGPROBS_MODES
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
-from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
+from vllm.v1.sample.logits_processor.builtin import (
+    LogitBiasLogitsProcessor,
+    MinTokensLogitsProcessor,
+)
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.bad_words import apply_bad_words_with_drafts
 from vllm.v1.sample.ops.penalties import apply_all_penalties
@@ -122,6 +125,12 @@ class RejectionSampler(nn.Module):
         """
         assert metadata.max_spec_len <= MAX_SPEC_LEN
 
+        if (
+            logits.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and self._can_use_greedy_argmax(sampling_metadata)
+        ):
+            return self._greedy_argmax_sample(logits, metadata)
+
         bonus_logits_indices = metadata.bonus_logits_indices
         target_logits_indices = metadata.target_logits_indices
 
@@ -198,6 +207,68 @@ class RejectionSampler(nn.Module):
         return SamplerOutput(
             sampled_token_ids=output_token_ids,
             logprobs_tensors=logprobs_tensors,
+        )
+
+    def _can_use_greedy_argmax(self, sampling_metadata: SamplingMetadata) -> bool:
+        """Only bypass processors when every greedy transformation is a no-op."""
+        if (
+            self.synthetic_mode
+            or type(self.sampler) is not Sampler
+            or not sampling_metadata.all_greedy
+            or sampling_metadata.all_random
+            or sampling_metadata.max_num_logprobs is not None
+            or sampling_metadata.logprob_token_ids
+            or not sampling_metadata.no_penalties
+            or sampling_metadata.allowed_token_ids_mask is not None
+            or sampling_metadata.bad_words_token_ids
+        ):
+            return False
+        holder = sampling_metadata.thinking_budget_state_holder
+        if holder is not None and holder.has_tracked_requests():
+            return False
+        for processor in sampling_metadata.logitsprocs.non_argmax_invariant:
+            if type(processor) is MinTokensLogitsProcessor:
+                if processor.min_toks:
+                    return False
+            elif type(processor) is LogitBiasLogitsProcessor:
+                if processor.biases:
+                    return False
+            else:
+                return False
+        return True
+
+    def _greedy_argmax_sample(
+        self, logits: torch.Tensor, metadata: SpecDecodeMetadata
+    ) -> SamplerOutput:
+        row_argmax = logits.argmax(dim=-1)
+        target_argmax = row_argmax[metadata.target_logits_indices].contiguous()
+        bonus_token_ids = (
+            row_argmax[metadata.bonus_logits_indices]
+            .to(torch.int32)
+            .unsqueeze(-1)
+            .contiguous()
+        )
+        batch_size = len(metadata.num_draft_tokens)
+        output_token_ids = torch.full(
+            (batch_size, metadata.max_spec_len + 1),
+            PLACEHOLDER_TOKEN_ID,
+            dtype=torch.int32,
+            device=logits.device,
+        )
+        rejection_greedy_sample_kernel[(batch_size,)](
+            output_token_ids,
+            metadata.cu_num_draft_tokens,
+            metadata.draft_token_ids,
+            target_argmax,
+            bonus_token_ids,
+            None,
+            metadata.max_spec_len,
+            None,
+            None,
+            SYNTHETIC_MODE=False,
+        )
+        return SamplerOutput(
+            sampled_token_ids=output_token_ids, logprobs_tensors=None
         )
 
     def _get_logprobs_tensors(

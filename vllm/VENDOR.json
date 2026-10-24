@@ -66,6 +66,10 @@
     {
       "file": "vllm/model_executor/models/nemotron_h_mtp.py",
       "why": "Pin the MTP predictor to ONE Inductor combo-kernel choice in its own compilation context: combined kernels, never benchmarked (combo_kernels=True, benchmark_combo_kernel=False; VLLM_MTP_COMBO=off pins separate kernels, =bench restores the timed pick). Drafter reduction order is fixed across boots, with target compilation settings and frozen formats unchanged."
+    },
+    {
+      "file": "vllm/v1/worker/prefill_graph.py, vllm/v1/worker/gpu_model_runner.py, vllm/v1/attention/backends/flashinfer.py",
+      "why": "Capture an input-independent whole-forward CUDA graph at boot for fresh single-request 496-token prefill, with native FlashInfer planning and fully refreshed request buffers; other lengths and target formats remain unchanged."
     }
   ]
 }

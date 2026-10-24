@@ -250,6 +250,9 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Protect asynchronous H2D sources; switchable for in-process cost screening.
+PINNED_SOURCE_GUARDS = True
+
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
@@ -736,11 +739,14 @@ class GPUModelRunner(
         # cuda event to synchronize use of reused CPU tensors between steps
         # when async scheduling is enabled.
         self.prepare_inputs_event: torch.Event | None = None
+        self._num_computed_tokens_h2d_event: torch.Event | None = None
         if self.use_async_scheduling:
             self.async_output_copy_stream = torch.cuda.Stream()
             # Blocking (sleep) event to avoid busy-polling the CUDA driver lock;
             # under TP contention that spin can balloon and make the rank a straggler.
             self.prepare_inputs_event = torch.cuda.Event(blocking=True)
+            if self.use_async_spec_decode:
+                self._num_computed_tokens_h2d_event = torch.cuda.Event()
 
         # self.cudagraph_batch_sizes sorts in ascending order.
         if (
@@ -1540,6 +1546,11 @@ class GPUModelRunner(
                 prev_req_id_to_index = self.input_batch.prev_req_id_to_index
                 if not prev_req_id_to_index:
                     return
+                # hostfast S1 waits for an older count event, which does
+                # not cover this step's upload of the pinned optimistic count.
+                # Finish that DMA before correcting its CPU source in place.
+                if PINNED_SOURCE_GUARDS and self._num_computed_tokens_h2d_event is not None:
+                    self._num_computed_tokens_h2d_event.synchronize()
                 for (
                     req_id,
                     optimistic_num_accepted,
@@ -2176,6 +2187,9 @@ class GPUModelRunner(
                 self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
                 non_blocking=True,
             )
+
+        if PINNED_SOURCE_GUARDS and self._num_computed_tokens_h2d_event is not None:
+            self._num_computed_tokens_h2d_event.record()
 
         self.req_indices.np[:total_num_scheduled_tokens] = req_indices
         self.req_indices.copy_to_gpu(total_num_scheduled_tokens)

@@ -1880,6 +1880,22 @@ class VllmConfig:
                     and max_num_tokens not in cudagraph_capture_sizes
                 ):
                     cudagraph_capture_sizes.append(max_num_tokens)
+                # Native single-request MTP needs the exact verify width as
+                # well as the small PIECEWISE drafter sizes. At depth 2 the
+                # default [1, 2, 4] omits width 3; later spec-decode rounding
+                # would replace the entire list with [3], padding the
+                # drafter's one-row pass. Keep both kinds of graph instead.
+                # Explicit capture lists and TP/SP policies retain control.
+                if (
+                    self.scheduler_config.max_num_seqs == 1
+                    and self.parallel_config.tensor_parallel_size == 1
+                    and self.model_config.hf_config.model_type == "nemotron_h"
+                    and self.speculative_config is not None
+                    and self.speculative_config.method == "mtp"
+                    and self.num_speculative_tokens > 0
+                    and 1 + self.num_speculative_tokens <= max_cudagraph_capture_size
+                ):
+                    cudagraph_capture_sizes.append(1 + self.num_speculative_tokens)
                 # de-duplicate and sort the sizes
                 cudagraph_capture_sizes = sorted(set(cudagraph_capture_sizes))
 

@@ -104,20 +104,16 @@ class FreshPrefillGraph:
         torch.cuda.synchronize()
 
     def _forward(self):
-        # Only row 495 of the final hidden state is read (:94, :115, and the
-        # same index in replay). While this call runs, the last MoE layer
-        # routes every row through that row's experts, so it reads 6 experts'
-        # weights instead of nearly all 128 and the other rows' MoE outputs,
-        # which reach only norm_f's per-row norm and are never read, come from
-        # the same experts. M, valid_shape_m and the kernel config do not
-        # change, and row 495's own input, experts, weights and K order do
-        # not change, so its logits stay bit-identical. The two warm-ups above
-        # and the capture below all run this way, so the captured graph holds
-        # the switch; replay (:118-128) runs only the recorded kernels and
-        # never re-decides it, and the clear keeps every later forward (the
-        # decode graphs are captured earlier, :7036 against :7024) untouched.
+        # Target logits read only row 495. The drafter can read other
+        # final hidden rows; changing them can affect proposal acceptance.
+        # The last MoE has no target-state side effects. Keep its original
+        # M496 shapes and K chains, but execute only each selected expert's
+        # M64 tile containing row 495, with its original lane and padding.
+        # Two complete warm-ups above include every new copy and reduction
+        # specialization before capture. Every replay recomputes routing
+        # and metadata; no request result survives into the next request.
         model = self.runner.get_model()
-        model.set_last_moe_row_src(self.logits_indices)
+        model.set_last_moe_row_src(self.logits_indices, last_tile_only=True)
         try:
             with set_forward_context(
                 self.metadata, self.runner.vllm_config, num_tokens=496,

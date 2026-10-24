@@ -186,7 +186,21 @@ __device__ __forceinline__ void close_segment(float (&red)[2][3][16][32], int pa
     for (int e = 0; e < 4; ++e) acc[j][e] = 0.0f;
 }
 
+template <bool Relu2>
+__device__ __forceinline__ __nv_bfloat16 round_output(float scaled) {
+  const __nv_bfloat16 rounded = __float2bfloat16_rn(scaled);
+  if constexpr (Relu2) {
+    float value = __bfloat162float(rounded);
+    value = value < 0.0f ? 0.0f : value;
+    const float squared = __fmul_rn(value, value);
+    return squared != squared ? __ushort_as_bfloat16(0x7fff)
+                              : __float2bfloat16_rn(squared);
+  }
+  return rounded;
+}
+
 // Marlin write_result: bf16_rn(R * global_scale), rows < M only (warp 0).
+template <bool Relu2>
 __device__ __forceinline__ void write_out(const Params& p, int col, int h, int lane,
                                           const float (&R)[4][4]) {
   const float g = __ldg(p.GS);
@@ -194,10 +208,10 @@ __device__ __forceinline__ void write_out(const Params& p, int col, int h, int l
 #pragma unroll
   for (int j = 0; j < 4; ++j) {
     const long long f = 128LL * col + 64 * h + 16 * j + (lane >> 2);
-    const __nv_bfloat16 v0 = __float2bfloat16_rn(R[j][0] * g);
-    const __nv_bfloat16 v1 = __float2bfloat16_rn(R[j][1] * g);
-    const __nv_bfloat16 v2 = __float2bfloat16_rn(R[j][2] * g);
-    const __nv_bfloat16 v3 = __float2bfloat16_rn(R[j][3] * g);
+    const __nv_bfloat16 v0 = round_output<Relu2>(R[j][0] * g);
+    const __nv_bfloat16 v1 = round_output<Relu2>(R[j][1] * g);
+    const __nv_bfloat16 v2 = round_output<Relu2>(R[j][2] * g);
+    const __nv_bfloat16 v3 = round_output<Relu2>(R[j][3] * g);
     if (t0 < p.M) {
       p.C[t0 * p.ldc + f] = v0;
       p.C[t0 * p.ldc + f + 8] = v2;
@@ -218,7 +232,7 @@ __device__ __forceinline__ int column_first_cut(const Params& p, int col) {
 
 // One 64-feature half column (`unit`) per CTA of 4 warps; warp w runs Marlin's
 // warp-row chain w through a register ring of P k16 blocks.
-template <int P>
+template <int P, bool Relu2 = false>
 __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
   __shared__ float red[2][3][16][32];
   const int unit = blockIdx.x;
@@ -295,7 +309,7 @@ __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
       }
     }
   }
-  if (!w) write_out(p, col, h, lane, R);
+  if (!w) write_out<Relu2>(p, col, h, lane, R);
 }
 
 // Streaming-read kernel used by the tests as a bandwidth probe and as a
@@ -320,9 +334,9 @@ __global__ void hog_kernel(const uint4* __restrict__ src, long long n16, unsigne
   if (x == 0x9e3779b9u) sink[0] = x + (unsigned)(uintptr_t)hog_smem;
 }
 
-template <int P>
+template <int P, bool Relu2 = false>
 static int launch(const Params& p, cudaStream_t stream) {
-  gemm_kernel<P><<<2 * p.n_tiles, 128, 0, stream>>>(p);
+  gemm_kernel<P, Relu2><<<2 * p.n_tiles, 128, 0, stream>>>(p);
   return (int)cudaGetLastError();
 }
 
@@ -337,6 +351,8 @@ int marlinx_init(void) {
   cudaError_t e;
   if ((e = cudaFuncGetAttributes(&attr, marlinx::gemm_kernel<4>)) != cudaSuccess) return (int)e;
   if ((e = cudaFuncGetAttributes(&attr, marlinx::gemm_kernel<8>)) != cudaSuccess) return (int)e;
+  if ((e = cudaFuncGetAttributes(&attr, marlinx::gemm_kernel<4, true>)) != cudaSuccess) return (int)e;
+  if ((e = cudaFuncGetAttributes(&attr, marlinx::gemm_kernel<8, true>)) != cudaSuccess) return (int)e;
   if ((e = cudaFuncGetAttributes(&attr, marlinx::hog_kernel<8>)) != cudaSuccess) return (int)e;
   return 0;
 }
@@ -356,9 +372,9 @@ int marlinx_regs(int depth) {
 // out[M, N] = Marlin NVFP4 GEMM of A[M, K]. sms is the SM count Marlin uses as
 // its grid (cudaDevAttrMultiProcessorCount). Returns 0, a cudaError_t value, or
 // a negative code for unsupported arguments.
-int marlinx_gemm(const void* A, long long lda, int M, const void* B, const void* S,
+static int marlinx_gemm_impl(const void* A, long long lda, int M, const void* B, const void* S,
                  const void* GS, void* C, long long ldc, int N, int K, int sms, int depth,
-                 void* stream) {
+                 void* stream, bool relu2) {
   if (M < 1 || M > 8) return -1;
   if (N <= 0 || K <= 0 || N % 128 || K % 128) return -2;
   if (sms <= 0) return -3;
@@ -385,11 +401,31 @@ int marlinx_gemm(const void* A, long long lda, int M, const void* B, const void*
   p.part1_cols = p.n_tiles - part2;
   p.iters = (p.k_tiles * part2 + sms - 1) / sms;
   cudaStream_t st = static_cast<cudaStream_t>(stream);
+  if (relu2) {
+    if (N != 3712 || K != 2688) return -6;
+    switch (depth) {
+      case 4: return marlinx::launch<4, true>(p, st);
+      case 8: return marlinx::launch<8, true>(p, st);
+      default: return -5;
+    }
+  }
   switch (depth) {
     case 4: return marlinx::launch<4>(p, st);
     case 8: return marlinx::launch<8>(p, st);
     default: return -5;
   }
+}
+
+int marlinx_gemm(const void* A, long long lda, int M, const void* B, const void* S,
+                 const void* GS, void* C, long long ldc, int N, int K, int sms, int depth,
+                 void* stream) {
+  return marlinx_gemm_impl(A, lda, M, B, S, GS, C, ldc, N, K, sms, depth, stream, false);
+}
+
+int marlinx_gemm_relu2(const void* A, long long lda, int M, const void* B, const void* S,
+                 const void* GS, void* C, long long ldc, int N, int K, int sms, int depth,
+                 void* stream) {
+  return marlinx_gemm_impl(A, lda, M, B, S, GS, C, ldc, N, K, sms, depth, stream, true);
 }
 
 // Streams nbytes from src with blocks x threads, reserving smem bytes of

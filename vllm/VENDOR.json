@@ -56,8 +56,12 @@
       "why": "one request over the model's 6144 conv channels launched 24 CTAs of 256 channels on a 48-SM GB10; on sm_121 with one request the update kernel now uses 128-channel tiles (48 CTAs). Every channel is computed independently, so no value changes (other devices and batches keep 256)."
     },
     {
+      "file": "vllm/v1/spec_decode/metadata.py; vllm/v1/worker/gpu_model_runner.py",
+      "why": "For native single-device Nemotron MTP's one-request full configured-depth D+1 decode window, prebuild five shape-derived read-only index/count tables with original dtypes and clone the current resident input-token slice once per step as an independent draft snapshot. Unsupported host shapes/dtypes/counts, prefills and capture keep the original metadata builder. Original hidden gathering, head and sampling/acceptance arithmetic remain unchanged; only static indexing programs are cached. Runtime validation is remote only."
+    },
+    {
       "file": "vllm/model_executor/layers/fused_moe/experts/humming_tuned_moe.py (TUNED_PAD_K)",
-      "why": "the tuned routed experts padded K to a multiple of 128, so the down projection's K 1856 became 1920 and every w2 tile streamed and multiplied two all-zero 32-wide K blocks; K now pads only to humming's BF16 pack granule (32), the smallest it accepts. Each element keeps the same K blocks in the same order; the dropped steps were mma(+0, +0, acc), which only turned an acc of -0 into +0, and a signed zero changes no later value's magnitude, logit or token"
+      "why": "Port the officially accepted K32 padding delta from submission 86e31da6-589c-42a9-9fc0-a2074658a3be, source a0e1caeb418cc43b63d1ab6d155058344bf419b4: tuned BF16 NVFP4 routed w2 K1856 stays 1856 instead of 1920. Logical weights, scales, tuning tables and the retained K-group order are unchanged. Static audit of pinned humming 0.1.10 supports the packing, activation/expert strides and K-loop tail guards. Standalone official correctness does not prove universal bit identity for exceptional values; the host/metadata combination requires separate official validation."
     }
   ]
 }

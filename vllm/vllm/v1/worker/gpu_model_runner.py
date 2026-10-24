@@ -198,7 +198,7 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
-from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.metadata import SpecDecodeMetadata, UniformSpecDecodeTables
 from vllm.v1.spec_decode.ngram_proposer_gpu import (
     NgramProposerGPU,
     copy_num_valid_draft_tokens,
@@ -671,6 +671,36 @@ class GPUModelRunner(
         self.use_async_spec_decode = (
             self.use_async_scheduling and self.num_spec_tokens > 0
         )
+
+        # Immutable shape-only programs, not request results. Native single-
+        # device MTP with a full D+1 decode window has constant sampling rows.
+        self._uniform_spec_decode_tables: UniformSpecDecodeTables | None = None
+        if (
+            self.device.type == "cuda"
+            and self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+            and self.speculative_config.draft_model_config is not None
+            and self.speculative_config.draft_model_config.hf_config.model_type
+            == "nemotron_h_mtp"
+            and self.model_config.hf_config.model_type == "nemotron_h"
+            and 1 <= self.num_spec_tokens <= 6
+            and not self.speculative_config.parallel_drafting
+            and not self.speculative_config.use_heterogeneous_vocab
+            and not self.speculative_config.disable_padded_drafter_batch
+            and self.parallel_config.tensor_parallel_size == 1
+            and self.parallel_config.pipeline_parallel_size == 1
+            and self.parallel_config.data_parallel_size == 1
+            and self.parallel_config.prefill_context_parallel_size == 1
+            and self.parallel_config.decode_context_parallel_size == 1
+            and not self.parallel_config.use_ubatching
+            and not self.parallel_config.enable_eplb
+            and self.lora_config is None
+            and not self.model_config.is_encoder_decoder
+            and not self.cache_config.kv_sharing_fast_prefill
+        ):
+            self._uniform_spec_decode_tables = UniformSpecDecodeTables.create(
+                self.num_spec_tokens, self.device
+            )
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
@@ -2857,6 +2887,28 @@ class GPUModelRunner(
         num_draft_tokens: np.ndarray,
         cu_num_scheduled_tokens: np.ndarray,
     ) -> SpecDecodeMetadata:
+        tables = self._uniform_spec_decode_tables
+        if (
+            tables is not None
+            and self.num_spec_tokens == tables.depth
+            and self.input_batch.num_reqs == 1
+            and num_draft_tokens.shape == (1,)
+            and num_draft_tokens.dtype == np.dtype(np.int32)
+            and int(num_draft_tokens[0]) == tables.depth
+            and cu_num_scheduled_tokens.shape == (1,)
+            and cu_num_scheduled_tokens.dtype == np.dtype(np.int64)
+            and int(cu_num_scheduled_tokens[0]) == tables.depth + 1
+            and self.input_batch.num_computed_tokens_cpu[0]
+            >= self.input_batch.num_prompt_tokens[0]
+            and self.input_ids.gpu.ndim == 1
+            and self.input_ids.gpu.dtype == torch.int32
+            and self.input_ids.gpu.device == tables.logits_indices.device
+            and self.input_ids.gpu.is_contiguous()
+            and self.input_ids.gpu.numel() >= tables.depth + 1
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            return tables.make_metadata(self.input_ids.gpu)
+
         # Inputs:
         # cu_num_scheduled_tokens:  [  4, 104, 107, 207, 209]
         # num_draft_tokens:         [  3,   0,   2,   0,   1]

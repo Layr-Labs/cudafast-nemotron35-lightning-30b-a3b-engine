@@ -16,19 +16,20 @@ those freely and keeps everything that is part of the chain.
 It also stops vLLM from zero-padding the expert weights' N dimension to a
 multiple of 256 (w13 1856 -> 2048, w2 2688 -> 2816); humming only needs
 N % 64 == 0. Output columns are independent, and the padded columns were never
-stored, so this changes no bit. K is padded only to humming's BF16 pack granule
-(prepare_humming_weight asserts padded_k % (512 / a_bits) == 0, 32 here), so
-w2's K stays 1856 instead of 1920 and its tiles no longer stream and multiply
-two all-zero 32-wide K blocks. Those blocks were four mma(+0, +0, acc) steps at
-the end of each chain: the identity for every non-NaN fp32 acc except -0, which
-they turned into +0 (harness/tests/humming_moe_exact.py, phase mma, checks all
-2^32 values). So the only possible difference is a w2 element that ends at -0
-where stock ends at +0. Downstream ops only add, scale, square or take the
-magnitude of it (bf16 rounding, the top-k combine, the residual add, RMSNorm,
-FP8 amax scaling, the next matmuls); none divides by an activation or reads its
-sign, so every later value has the same magnitude and compares equal, and the
-logits and tokens are unchanged. w13's K (2688) needs no padding. The repack is
-input-independent and value-exact.
+stored, so this changes no bit. The tuned BF16 path pads K to humming's
+32-element packing granule: w13's K (2688) is unchanged, and w2's K (1856)
+no longer pads to 1920. The retained logical K groups keep their original
+order, BF16 group scaling and fp32 accumulator chain; four terminal zero
+K16 MMA groups are omitted. The pinned humming 0.1.10 source supports this
+shape, the unchanged logical activation stride, packed expert/scale strides
+and the 58-block K loop with its existing stage-tail guards.
+
+The standalone K32 delta passed official correctness in submission
+86e31da6-589c-42a9-9fc0-a2074658a3be. That result is workload evidence, not a
+universal bit-identity claim for signed zero, NaNs or subnormal accumulators.
+The combination with the host and metadata optimizations requires its own
+official correctness and performance validation. The repack remains
+input-independent and retains the logical FP4 values and group scales.
 
 The configs are keyed by the layer's shapes and only apply when the layer
 matches them exactly (NVFP4 W4A16 group-16 experts with a per-expert global
@@ -50,9 +51,8 @@ logger = init_logger(__name__)
 # Stock padding vLLM applies to humming MoE weights.
 STOCK_PAD_N = 256
 STOCK_PAD_K = 128
-# Smallest paddings humming accepts with BF16 activations
-# (prepare_humming_weight asserts padded_n % 64 == 0 and
-# padded_k % (512 / a_bits) == 0): see the module docstring.
+# Smallest BF16 paddings humming accepts: prepare_humming_weight asserts
+# padded_n % 64 == 0 and padded_k % (512 / a_bits) == 0, or K32 for BF16.
 TUNED_PAD_N = 64
 TUNED_PAD_K = 32
 

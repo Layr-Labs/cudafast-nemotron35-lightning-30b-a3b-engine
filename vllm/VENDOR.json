@@ -142,6 +142,10 @@
     {
       "file": "mtp-head.manifest.json (depth 4), harness/kernels/smallk (M5 router), vllm/config/vllm.py (single-seq verify-width capture size), vllm/v1/worker/gpu_model_runner.py (fresh 496 prefill graph at depth 3 or 4)",
       "why": "Native MTP depth 4. The M5 router replica and the verify-width capture size are carried unchanged from jacklightChen 286548fd-f052-4777-828b-f5fa3019b614 (passed the exact-token gate at depth 4); the fresh-prefill-graph gate extension is carried unchanged from ivanfioravanti 90fd16ab-84b4-4503-9cea-32998faefcf8 (prefill graph active at depth 4). The last-layer prefill reroute of 286548fd is NOT carried: it changes the final hidden states the MTP drafter reads for prompt positions."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_compact.py",
+      "why": "Parallelize native BF16 MTP compact down projection over six routed and two shared expert slots, then combine FP32 per-slot sums in original expert order. Stable nonzero compaction, checkpoint tensors, BN32/BK64/four-warp per-slot reduction, target verification and inherited native depth4 are unchanged. Live-weight operation screen: 14 cases,94080 BF16 elements,56 graph replays; no initial BF16 differences. Full-engine and official score determine utility, not synthetic speedups."
     }
   ]
 }

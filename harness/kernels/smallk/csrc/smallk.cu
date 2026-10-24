@@ -9,6 +9,10 @@
 //      y       = ((L(0) + L(1)) + L(2)) + ... + L(15)   (lanes ascending).
 //    cuBLAS runs 8 outputs per CTA (16 CTAs for 128 experts); here one CTA owns R rows and gives
 //    every (tile, lane) chain its own thread, so all weight loads are in flight at once.
+//    W16 variant: the gate weight is read from a bf16 shadow that the caller built only if every fp32
+//    value is exactly a bf16 value (the checkpoint stores the gate in bf16; vLLM upcasts it on GB10).
+//    Each element is widened back with (bits << 16), so the fma chains see the same fp32 operands
+//    and the result is bit-identical; the weight read halves (1.38 -> 0.69 MB per gate call).
 // 2. grouped top-k (n_group = topk_group = 1, sigmoid scoring, fp32 bias, renormalize) with the
 //    arithmetic of vLLM v0.27.1 single_group_topk_warp_kernel: same sigmoid expression, same
 //    selection key (score bits, then lower expert index), same unbias/sum/scale rounding steps.
@@ -22,7 +26,7 @@
 #include <cmath>
 #include <cstdint>
 
-#define SK_VERSION 2
+#define SK_VERSION 4
 
 namespace {
 
@@ -45,10 +49,23 @@ constexpr int kLanes = 16;      // k mod 16
 constexpr int kTile = 256;      // k elements per tile (16 per lane)
 constexpr int kMaxTiles = 16;   // K <= 4096
 
+// Gate weight element i: fp32 as stored, or (W16) the bf16 shadow widened exactly to fp32.
+template <bool W16>
+__device__ __forceinline__ float ldw(const void* __restrict__ w, long i) {
+#ifndef SMALLK_NO_W16
+  if constexpr (W16) {
+    return __uint_as_float(static_cast<unsigned int>(__ldg(static_cast<const unsigned short*>(w) + i)) << 16);
+  } else
+#endif
+  {
+    return __ldg(static_cast<const float*>(w) + i);
+  }
+}
+
 // MODE 0: chain = fmaf(w, x, acc) from acc = 0. MODE 1: chain = acc + (w * x) (separate rounding).
-template <int R, int M, int MODE>
+template <int R, int M, int MODE, bool W16 = false>
 __global__ void __launch_bounds__(kLanes * kMaxTiles)
-    router_gemm_kernel(const float* __restrict__ x, long ldx, const float* __restrict__ w, int K,
+    router_gemm_kernel(const float* __restrict__ x, long ldx, const void* __restrict__ w, int K,
                        float* __restrict__ y, long ldy, int N) {
   const int t = threadIdx.x;
   const int r = t & (kLanes - 1);
@@ -67,18 +84,18 @@ __global__ void __launch_bounds__(kLanes * kMaxTiles)
     for (int a = 0; a < R; ++a)
 #pragma unroll
       for (int m = 0; m < M; ++m) acc[a][m] = 0.0f;
-    const float* wrow[R];
+    long wrow[R];
 #pragma unroll
     for (int a = 0; a < R; ++a) {
       const int n = min(n0 + a, N - 1);
-      wrow[a] = w + static_cast<long>(n) * K + base;
+      wrow[a] = static_cast<long>(n) * K + base;
     }
     if (len == kLanes) {
       float wv[kLanes][R];
 #pragma unroll
       for (int i = 0; i < kLanes; ++i)
 #pragma unroll
-        for (int a = 0; a < R; ++a) wv[i][a] = __ldg(wrow[a] + i * kLanes);
+        for (int a = 0; a < R; ++a) wv[i][a] = ldw<W16>(w, wrow[a] + i * kLanes);
 #pragma unroll
       for (int i = 0; i < kLanes; ++i) {
         float xv[M];
@@ -102,7 +119,7 @@ __global__ void __launch_bounds__(kLanes * kMaxTiles)
         for (int m = 0; m < M; ++m) xv[m] = __ldg(x + m * ldx + base + i * kLanes);
 #pragma unroll
         for (int a = 0; a < R; ++a) {
-          const float wa = __ldg(wrow[a] + i * kLanes);
+          const float wa = ldw<W16>(w, wrow[a] + i * kLanes);
 #pragma unroll
           for (int m = 0; m < M; ++m) {
             if (MODE == 0) {
@@ -357,18 +374,18 @@ int launch(Kern kernel, dim3 grid, dim3 block, int pdl, cudaStream_t stream, Arg
   return err == cudaSuccess ? 0 : 1000 + static_cast<int>(err);
 }
 
-template <int R, int MODE>
-int router_launch(const float* x, long ldx, int M, const float* w, int N, int K, float* y, long ldy, int pdl,
+template <int R, int MODE, bool W16 = false>
+int router_launch(const float* x, long ldx, int M, const void* w, int N, int K, float* y, long ldy, int pdl,
                   cudaStream_t stream) {
   dim3 grid((N + R - 1) / R);
   dim3 block(kLanes * ((K + kTile - 1) / kTile));
   switch (M) {
     case 4:
-      return launch(router_gemm_kernel<R, 4, MODE>, grid, block, pdl, stream, x, ldx, w, K, y, ldy, N);
+      return launch(router_gemm_kernel<R, 4, MODE, W16>, grid, block, pdl, stream, x, ldx, w, K, y, ldy, N);
     case 5:
       // Follow-on M5 specialization: reuse each independent M4 arithmetic
       // chain; equivalence to the M5 cuBLAS choice requires remote validation.
-      return launch(router_gemm_kernel<R, 5, MODE>, grid, block, pdl, stream, x, ldx, w, K, y, ldy, N);
+      return launch(router_gemm_kernel<R, 5, MODE, W16>, grid, block, pdl, stream, x, ldx, w, K, y, ldy, N);
     default:
       return 2;
   }
@@ -400,6 +417,16 @@ int sk_init() {
   rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<2, 5, 1>) != cudaSuccess;
   rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<4, 5, 1>) != cudaSuccess;
   rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<8, 5, 1>) != cudaSuccess;
+#ifndef SMALLK_NO_W16
+  rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<1, 4, 0, true>) != cudaSuccess;
+  rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<2, 4, 0, true>) != cudaSuccess;
+  rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<4, 4, 0, true>) != cudaSuccess;
+  rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<8, 4, 0, true>) != cudaSuccess;
+  rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<1, 5, 0, true>) != cudaSuccess;
+  rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<2, 5, 0, true>) != cudaSuccess;
+  rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<4, 5, 0, true>) != cudaSuccess;
+  rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<8, 5, 0, true>) != cudaSuccess;
+#endif
   rc |= cudaFuncGetAttributes(&a, topk_sigmoid_kernel<128>) != cudaSuccess;
   rc |= cudaFuncGetAttributes(&a, align_kernel) != cudaSuccess;
   rc |= cudaFuncGetAttributes(&a, route_kernel) != cudaSuccess;
@@ -428,6 +455,23 @@ int sk_router_gemm(const float* x, long ldx, int M, const float* w, int N, int K
   }
   return 3;
 }
+
+#ifndef SMALLK_NO_W16
+// sk_router_gemm with the gate weight read from w16 = bf16(w), which the caller built only when every
+// value of w is exactly a bf16 value (bit-identical result; fma chains only, mode 0).
+int sk_router_gemm_w16(const float* x, long ldx, int M, const void* w16, int N, int K, float* y, long ldy, int rows,
+                       int pdl, void* stream) {
+  if (K % kLanes != 0 || K > kTile * kMaxTiles || K <= 0 || N <= 0) return 1;
+  cudaStream_t s = static_cast<cudaStream_t>(stream);
+  switch (rows) {
+    case 1: return router_launch<1, 0, true>(x, ldx, M, w16, N, K, y, ldy, pdl, s);
+    case 2: return router_launch<2, 0, true>(x, ldx, M, w16, N, K, y, ldy, pdl, s);
+    case 4: return router_launch<4, 0, true>(x, ldx, M, w16, N, K, y, ldy, pdl, s);
+    case 8: return router_launch<8, 0, true>(x, ldx, M, w16, N, K, y, ldy, pdl, s);
+  }
+  return 3;
+}
+#endif  // SMALLK_NO_W16: without it the Python side keeps the fp32 read (no sk_router_gemm_w16 symbol)
 
 // logits [M][E] fp32 contiguous, bias [E] fp32; values [M][topk] fp32, indices [M][topk] int32.
 int sk_topk_sigmoid(const float* logits, const float* bias, int M, int E, int topk, int renormalize, float scale,

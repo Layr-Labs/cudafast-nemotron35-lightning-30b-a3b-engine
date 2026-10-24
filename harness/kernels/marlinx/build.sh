@@ -14,6 +14,7 @@ arch=${arch%%;*}
 arch=${arch// /}
 arch=${arch%+PTX}
 sm=${arch/./}
+rm -f "$out/libmarlinx.so"
 "$nvcc" --version | tail -n 2
 # No --use_fast_math: the reductions must stay plain IEEE fp32 adds and multiplies.
 "$nvcc" -O3 -std=c++17 -shared -Xcompiler -fPIC -lineinfo \

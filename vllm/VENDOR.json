@@ -162,6 +162,14 @@
     {
       "file": "harness/kernels/marlinx/{csrc/marlinx.cu,py/__init__.py,README.md,tests/marlinx_zs_exact.py}",
       "why": "Shared expert down projection (3712->2688, ReLU^2 input): read only the k rows whose activation is nonzero in some row, from a byte-preserving k-row-major copy of the Marlin weight; the lane rebuilds Marlin's exact weight word, so dequant, MMA, segments and fp32 reductions are unchanged. Bit-exact vs stock Marlin on all 23 layers (4416 synthetic + 1380 real-activation cases, CUDA graph replay). MARLINX_ZS=0 disables."
-    }
+    },
+    {
+      "file": "vllm/model_executor/layers/fused_moe/experts/humming_zskip.py; vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py; harness/kernels/zskip",
+      "why": "zskip for prefill: on 15 sparse MoE layers (ZSKIP_PREFILL_LAYERS; 17-31 and the last layer keep humming), the routed w2 of calls over 8 tokens runs the zero-row-skipping kernel on the promoted swap repack, re-aligned to 32-row expert blocks (config 405: four 8-row MMAs share each dequantised weight fragment, block activations staged once per CTA in shared memory, -0 guard at the end with a dense redo). humming's indexed w2 is batch invariant, so the output equals humming's bit for bit (161 real prefill calls: 7 public prompts x 23 layers; load-time 40-token self-check). ZSKIP_PREFILL=0 disables."
+    },
+    "New source-only screen_radix native CUB block radix selection plus chunk-index construction. Ordered FP32/low-ID key method from 3e519ff4-4664-434d-b412-fc3c96227f25; new CUB implementation replaces full Triton sort, retains original score/rescore/select math and fallback. No local execution; official remote only.",
+    "New original-segment parallel shared Marlin ZS down: retain each four-warp MMA chain and segment cut, compute current-call FP32 partials in independent CTAs, then merge in original bottom-to-top order. Per-layer official remote bitwise admission M1/4/5/8, ordinary fallback, no local execution. Native source origin1001, shared-down research direction noted by3e519ff4-4664-434d-b412-fc3c96227f25.",
+    "Selected pending0852152c-9025-499d-83bd-684cf825232e smallk BF16 router weight shadow/read: source native/build exact, own finite-only admission inpy in addition tobitwise widen-back. OriginalF32FMA chains/M4/M5/layout/targetformats retained; no other085 methods selected.",
+    "Selected pendinge8dfb912-3b05-489e-a7d7-e5e7b2984e4c pzskip v2 native/package with config300, using own50a5620b-435d-412a-beb9-a25e1c0feff1 complementary nonf29/nonlast51 dispatch. Preserve fullf29 M32layers/native andallancestors. NoFP8PDL fromnegative50carried. Officialremoteonly."
   ]
 }

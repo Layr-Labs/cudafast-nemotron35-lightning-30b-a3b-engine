@@ -7,6 +7,9 @@ reproduces and README.md the evidence:
   cuBLAS gemmSN_TN kernel torch picks for (M = 4, N = 128, K = 2688).
   M = 5 is a new unvalidated specialization of the same independent chains;
   equality to the actual M5 cuBLAS selection is not established yet.
+  maybe_router_gemm reads the gate weight from a bf16 shadow when every fp32 value of it is exactly
+  a bf16 value (checked once per gate outside capture; the checkpoint stores the gate in bf16 and
+  vLLM upcasts it on GB10): same fp32 operands, half the bytes. SMALLK_ROUTER_W16=0 turns it off.
 - topk_sigmoid(logits, bias, ...): vLLM's fused grouped top-k for n_group = topk_group = 1,
   sigmoid scoring, fp32 logits and bias (128 experts).
 - align(topk_ids, ...): moe_align_block_size + count_and_sort_expert_tokens in one CTA.
@@ -31,8 +34,8 @@ import os
 import torch
 
 __all__ = ["LIB_PATH", "available", "load_error", "init", "router_gemm", "topk_sigmoid", "align", "route",
-           "ROUTER_ON", "TOPK_ON", "ALIGN_ON", "FUSE_ON", "EARLY_ROUTER_ON", "maybe_router_gemm", "maybe_topk_sigmoid",
-           "maybe_align"]
+           "ROUTER_ON", "ROUTER_W16_ON", "TOPK_ON", "ALIGN_ON", "FUSE_ON", "EARLY_ROUTER_ON", "maybe_router_gemm",
+           "maybe_topk_sigmoid", "maybe_align", "gate_w16"]
 
 LIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "libsmallk.so")
 
@@ -44,6 +47,7 @@ def _flag(name: str, default: str = "1") -> bool:
 ENABLED = _flag("SMALLK")
 ROUTER_ON = ENABLED and _flag("SMALLK_ROUTER")
 ROUTER_M5_ON = _flag("SMALLK_ROUTER_M5")
+ROUTER_W16_ON = ROUTER_ON and _flag("SMALLK_ROUTER_W16")
 # Opt-in: exact, but no end-to-end gain at depth 3 (the routing chain overlaps the shared-expert
 # GEMMs on the side stream; a shorter chain only moves that overlap into the routed-expert GEMM).
 TOPK_ON = ENABLED and _flag("SMALLK_TOPK", "0")
@@ -68,10 +72,12 @@ _load_error: str | None = None
 _ready = False
 _align_bs: dict[int, int] = {}  # numel -> block size the experts asked for
 _parked: tuple | None = None  # (ids_ptr, numel, block_size, sorted_ids, expert_ids, num_tokens_post_pad)
+_w16: dict = {}  # gate weight data_ptr -> (weight, bf16 shadow or None when not bf16-exact)
+_has_w16_entry = False
 
 
 def _load():
-    global _lib, _load_error
+    global _lib, _load_error, _has_w16_entry
     if _lib is not None or _load_error is not None:
         return _lib
     try:
@@ -81,6 +87,12 @@ def _load():
         lib.sk_init.restype = ci
         lib.sk_router_gemm.argtypes = [vp, cl, ci, vp, ci, ci, vp, cl, ci, ci, ci, vp]
         lib.sk_router_gemm.restype = ci
+        try:
+            lib.sk_router_gemm_w16.argtypes = [vp, cl, ci, vp, ci, ci, vp, cl, ci, ci, vp]
+            lib.sk_router_gemm_w16.restype = ci
+            _has_w16_entry = True
+        except AttributeError:  # older library: fp32 reads only
+            _has_w16_entry = False
         lib.sk_topk_sigmoid.argtypes = [vp, vp, ci, ci, ci, ci, cf, vp, vp, ci, ci, vp]
         lib.sk_topk_sigmoid.restype = ci
         lib.sk_align.argtypes = [vp, ci, ci, ci, vp, ci, vp, ci, vp, ci, vp]
@@ -126,17 +138,24 @@ def _pdl(pdl: int | None) -> int:
 
 
 def router_gemm(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor | None = None, rows: int | None = None,
-                mode: int = 0, pdl: int | None = None) -> torch.Tensor:
+                mode: int = 0, pdl: int | None = None, w16: torch.Tensor | None = None) -> torch.Tensor:
     """y[M, N] = x[M, K] . w[N, K]^T in fp32 (x rows unit-stride, w contiguous). mode 1 (mul+add
-    chains) exists only to show the fma chain is the one cuBLAS uses."""
+    chains) exists only to show the fma chain is the one cuBLAS uses. w16: bf16 copy of w that
+    holds the same values (gate_w16), read instead of w (mode 0 only)."""
     lib = _load()
     assert lib is not None, _load_error
     m, k = x.shape
     n = w.shape[0]
     if out is None:
         out = torch.empty((m, n), dtype=torch.float32, device=x.device)
-    rc = lib.sk_router_gemm(x.data_ptr(), x.stride(0), m, w.data_ptr(), n, k, out.data_ptr(), out.stride(0),
-                            ROUTER_ROWS if rows is None else rows, mode, _pdl(pdl), _stream(x))
+    if w16 is not None:
+        assert _has_w16_entry and mode == 0 and w16.dtype == torch.bfloat16 and w16.shape == w.shape
+        assert w16.is_contiguous() and w16.device == w.device
+        rc = lib.sk_router_gemm_w16(x.data_ptr(), x.stride(0), m, w16.data_ptr(), n, k, out.data_ptr(),
+                                    out.stride(0), ROUTER_ROWS if rows is None else rows, _pdl(pdl), _stream(x))
+    else:
+        rc = lib.sk_router_gemm(x.data_ptr(), x.stride(0), m, w.data_ptr(), n, k, out.data_ptr(), out.stride(0),
+                                ROUTER_ROWS if rows is None else rows, mode, _pdl(pdl), _stream(x))
     if rc != 0:
         raise RuntimeError(f"sk_router_gemm failed: {rc} (M={m} N={n} K={k})")
     return out
@@ -224,7 +243,28 @@ def maybe_router_gemm(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor | None:
         return None
     if not _usable():
         return None
-    return router_gemm(x, w)
+    return router_gemm(x, w, w16=gate_w16(w))
+
+
+def gate_w16(w: torch.Tensor) -> torch.Tensor | None:
+    """bf16 copy of the fp32 gate weight w if bf16(w) widens back to w bit for bit (signed zeros,
+    subnormals, infinities and NaN payloads included), else None. Built once per weight, outside
+    CUDA graph capture; a call during capture before the first build reads w itself."""
+    if not ROUTER_W16_ON or not _has_w16_entry:
+        return None
+    ptr = w.data_ptr()
+    hit = _w16.get(ptr)
+    if hit is not None and hit[0].data_ptr() == ptr and hit[0].shape == w.shape:
+        return hit[1]
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    w16 = w.detach().to(torch.bfloat16).contiguous()
+    back = w16.to(torch.float32)
+    # bitwise: equal() treats -0.0 == +0.0, the widening is exact so compare the int32 views
+    exact = bool(torch.isfinite(w).all()) and bool(torch.equal(
+        back.view(torch.int32), w.detach().contiguous().view(torch.int32)))
+    _w16[ptr] = (w, w16 if exact else None)  # keeps w alive, so ptr cannot be reused by another tensor
+    return w16 if exact else None
 
 
 def maybe_topk_sigmoid(logits: torch.Tensor, bias: torch.Tensor | None, topk: int, renormalize: bool,

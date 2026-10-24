@@ -142,6 +142,10 @@
     {
       "file": "mtp-head.manifest.json (depth 4), harness/kernels/smallk (M5 router), vllm/config/vllm.py (single-seq verify-width capture size), vllm/v1/worker/gpu_model_runner.py (fresh 496 prefill graph at depth 3 or 4)",
       "why": "Native MTP depth 4. The M5 router replica and the verify-width capture size are carried unchanged from jacklightChen 286548fd-f052-4777-828b-f5fa3019b614 (passed the exact-token gate at depth 4); the fresh-prefill-graph gate extension is carried unchanged from ivanfioravanti 90fd16ab-84b4-4503-9cea-32998faefcf8 (prefill graph active at depth 4). The last-layer prefill reroute of 286548fd is NOT carried: it changes the final hidden states the MTP drafter reads for prompt positions."
+    },
+    {
+      "file": "vllm/v1/worker/prefill_graph.py, vllm/v1/worker/gpu_model_runner.py, vllm/model_executor/models/nemotron_h.py, vllm/model_executor/layers/fused_moe/runner/moe_runner.py",
+      "why": "In the one captured 496-token prefill forward that reads a single row of the final hidden states (logits row 495), every row of the last layer's MoE (the model's last layer) takes that row's six experts: the flag is set inside the whole-forward capture's forward helper and cleared in a finally, so it is baked into the recorded graph and no later or earlier forward sees it; the graph is replayed only for a request that reads that one row, with no prompt logprobs. M and valid_shape_m are unchanged, the last layer's other rows reach only the per-row final norm and are unread, and row 495 keeps its own input, experts, weights and K order, so its logits are bit-identical; six experts' weights are read instead of nearly all 128."
     }
   ]
 }

@@ -104,15 +104,32 @@ class FreshPrefillGraph:
         torch.cuda.synchronize()
 
     def _forward(self):
-        with set_forward_context(
-            self.metadata, self.runner.vllm_config, num_tokens=496,
-            cudagraph_runtime_mode=CUDAGraphMode.NONE, slot_mapping=self.slots,
-        ):
-            hidden = self.runner._model_forward(
-                input_ids=self.input_ids, positions=self.positions,
-                intermediate_tensors=None, inputs_embeds=None,
-            )
-            logits = self.runner.model.compute_logits(hidden[self.logits_indices])
+        # Only row 495 of the final hidden state is read (:94, :115, and the
+        # same index in replay). While this call runs, the last MoE layer
+        # routes every row through that row's experts, so it reads 6 experts'
+        # weights instead of nearly all 128 and the other rows' MoE outputs,
+        # which reach only norm_f's per-row norm and are never read, come from
+        # the same experts. M, valid_shape_m and the kernel config do not
+        # change, and row 495's own input, experts, weights and K order do
+        # not change, so its logits stay bit-identical. The two warm-ups above
+        # and the capture below all run this way, so the captured graph holds
+        # the switch; replay (:118-128) runs only the recorded kernels and
+        # never re-decides it, and the clear keeps every later forward (the
+        # decode graphs are captured earlier, :7036 against :7024) untouched.
+        model = self.runner.get_model()
+        model.set_last_moe_row_src(self.logits_indices)
+        try:
+            with set_forward_context(
+                self.metadata, self.runner.vllm_config, num_tokens=496,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE, slot_mapping=self.slots,
+            ):
+                hidden = self.runner._model_forward(
+                    input_ids=self.input_ids, positions=self.positions,
+                    intermediate_tensors=None, inputs_embeds=None,
+                )
+                logits = self.runner.model.compute_logits(hidden[self.logits_indices])
+        finally:
+            model.set_last_moe_row_src(None)
         return hidden, logits
 
     def replay(self, metadata, slots, input_ids, positions):

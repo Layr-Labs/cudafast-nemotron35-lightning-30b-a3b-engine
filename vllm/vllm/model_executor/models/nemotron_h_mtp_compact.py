@@ -2,6 +2,7 @@
 
 Keep every nonzero ReLU2 activation, including NaNs, in original K order.
 The compact reduction has a different FP32 tree from the existing drafter.
+Expert slots run independently, then combine in original expert order.
 Proposal quality, exact-token acceptance and throughput need remote validation.
 """
 
@@ -73,6 +74,53 @@ def _down(
         tl.store(y + row * H + n, out, mask=n < H)
 
 
+@triton.jit
+def _down_partial(
+    indices, values, counts, w2, sd, ids, partial,
+    H: tl.constexpr, I: tl.constexpr, TOPK: tl.constexpr,
+    BN: tl.constexpr, BK: tl.constexpr,
+):
+    # Independent expert slots; full stable compact K sequence in every slot.
+    slot = tl.program_id(1)
+    n = tl.program_id(0) * BN + tl.arange(0, BN)
+    lane = tl.arange(0, BK)
+    count = tl.load(counts + slot)
+    if slot < TOPK:
+        expert = tl.load(ids + slot).to(tl.int64)
+        base = w2 + expert * I * H
+    else:
+        base = sd + (slot - TOPK).to(tl.int64) * I * H
+    acc = tl.zeros((BK, BN), tl.float32)
+    for start in range(0, count, BK):
+        pos = start + lane
+        k = tl.load(indices + slot * I + pos, mask=pos < count, other=0)
+        value = tl.load(values + slot * I + pos, mask=pos < count, other=0.0)
+        weight = tl.load(
+            base + k[:, None].to(tl.int64) * H + n[None, :],
+            mask=(pos[:, None] < count) & (n[None, :] < H),
+            other=0.0, eviction_policy="evict_first",
+        )
+        acc += weight.to(tl.float32) * value[:, None].to(tl.float32)
+    tl.store(partial + slot * H + n, tl.sum(acc, axis=0), mask=n < H)
+
+
+@triton.jit
+def _down_combine(partial, weights, y, H: tl.constexpr, M: tl.constexpr,
+                  TOPK: tl.constexpr, S: tl.constexpr,
+                  ROUTED_SCALE: tl.constexpr, BN: tl.constexpr):
+    n = tl.program_id(0) * BN + tl.arange(0, BN)
+    routed = tl.zeros((BN,), tl.float32)
+    for j in range(TOPK):
+        part = tl.load(partial + j * H + n, mask=n < H, other=0.0)
+        routed += tl.load(weights + j).to(tl.float32) * part
+    shared = tl.zeros((BN,), tl.float32)
+    for s in range(S):
+        shared += tl.load(partial + (TOPK + s) * H + n, mask=n < H, other=0.0)
+    out = (routed * ROUTED_SCALE + shared).to(y.dtype.element_ty)
+    for row in range(M):
+        tl.store(y + row * H + n, out, mask=n < H)
+
+
 def maybe_down(h, packed, ids, weights, y, routed_scale):
     """Reuse the existing finite, exact BF16 transpose prepared before capture."""
     if not _ENABLED:
@@ -95,9 +143,14 @@ def maybe_down(h, packed, ids, weights, y, routed_scale):
     values = torch.empty_like(h)
     counts = torch.empty(8, dtype=torch.int32, device=h.device)
     _compact[(8,)](h, indices, values, counts, I=1856, BLOCK=2048, num_warps=4)
-    _down[(triton.cdiv(2688, 32),)](
-        indices, values, counts, w2, sd, ids, weights, y,
-        M=y.shape[0], H=2688, I=1856, ROUTED_SCALE=routed_scale,
-        TOPK=6, S=2, BN=32, BK=64, num_warps=4, num_stages=2,
+    partial = torch.empty((8, 2688), dtype=torch.float32, device=h.device)
+    _down_partial[(triton.cdiv(2688, 32), 8)](
+        indices, values, counts, w2, sd, ids, partial,
+        H=2688, I=1856, TOPK=6, BN=32, BK=64,
+        num_warps=4, num_stages=2,
+    )
+    _down_combine[(triton.cdiv(2688, 128),)](
+        partial, weights, y, H=2688, M=y.shape[0], TOPK=6, S=2,
+        ROUTED_SCALE=routed_scale, BN=128, num_warps=4,
     )
     return True

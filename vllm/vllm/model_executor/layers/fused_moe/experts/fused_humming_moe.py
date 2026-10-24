@@ -30,6 +30,28 @@ from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size,
 )
 from vllm.model_executor.layers.fused_moe.moe_fused_mul_sum import moe_fused_mul_sum
+
+# l2pf (harness/kernels/l2pf); absent, nothing changes.
+try:
+    import l2pf as _l2pf
+except ImportError:
+    _l2pf = None
+
+
+def _l2pf_next_layer(layer, num_tokens: int) -> bool:
+    """LOCAL PATCH (cudafast-nemotron35): small calls only: queue an L2 prefetch
+    of the head of the next Mamba layer's in_proj weight (its fp8small pack when
+    present) on a side stream while the latency-bound routed down projection
+    runs. Moves no value; the caller rejoins after the down projection."""
+    if _l2pf is None or num_tokens > 8 or _l2pf.MOE_BYTES <= 0:
+        return False
+    nxt = _l2pf.AHEAD_MOE.get(str(getattr(layer, "layer_name", "")))
+    if nxt is None:
+        return False
+    w = getattr(nxt, "_fp8small_weight", None)
+    if w is None:
+        w = getattr(nxt, "weight", None)
+    return _l2pf.prefetch(w, max_bytes=_l2pf.MOE_BYTES)
 from vllm.model_executor.layers.fused_moe.moe_permute_unpermute import (
     MoEPermuteScratch,
     moe_permute,
@@ -776,6 +798,9 @@ class HummingIndexedExperts(HummingExpertsBase):
         )
 
         down_output = buffers["down_output"].view(-1, hidden_states.size(-1))
+        l2pf_pending = expert_map is None and _l2pf_next_layer(
+            self.layer, topk_ids.size(0)
+        )
         # LOCAL PATCH (cudafast-nemotron35): zskip computes humming's w2 output
         # for <= 4 tokens without loading the weight rows whose activations
         # are zero (humming_zskip.py); otherwise routed_sparse or humming runs.
@@ -809,6 +834,8 @@ class HummingIndexedExperts(HummingExpertsBase):
                 sublayer_name="w2",
                 **moe_kwargs2,
             )
+        if l2pf_pending:
+            _l2pf.join(down_output.device)
 
         moe_fused_mul_sum(
             inputs=buffers["down_output"].view(*topk_ids.shape, -1),

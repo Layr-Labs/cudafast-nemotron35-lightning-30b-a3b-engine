@@ -142,6 +142,26 @@
     {
       "file": "mtp-head.manifest.json (depth 4), harness/kernels/smallk (M5 router), vllm/config/vllm.py (single-seq verify-width capture size), vllm/v1/worker/gpu_model_runner.py (fresh 496 prefill graph at depth 3 or 4)",
       "why": "Native MTP depth 4. The M5 router replica and the verify-width capture size are carried unchanged from jacklightChen 286548fd-f052-4777-828b-f5fa3019b614 (passed the exact-token gate at depth 4); the fresh-prefill-graph gate extension is carried unchanged from ivanfioravanti 90fd16ab-84b4-4503-9cea-32998faefcf8 (prefill graph active at depth 4). The last-layer prefill reroute of 286548fd is NOT carried: it changes the final hidden states the MTP drafter reads for prompt positions."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "Draft-head screen: topk(sorted=False) for the coarse, refine and single-screen candidate sets. Every consumer is order-independent (index-aligned gathers, then the BF16 max with the lowest-id tie rule), so the drafted token is unchanged; skips a segmented sort per stage per draft pass."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_kernels.py, nemotron_h_mtp.py",
+      "why": "mtp_small_linear_keep: the drafter GEMV/small GEMM with ordinary (not evict-first) weight loads, used only for the start projection's hidden half W_h (14.5 MB), which every draft pass of a cycle reads; the drafter's other weight streams stay evict-first, so W_h can remain in the 24 MB L2 between passes. Same arithmetic."
+    },
+    {
+      "file": "harness/kernels/l2pf, layers/attention/attention.py, layers/mamba/mamba_mixer2.py, models/nemotron_h.py, v1/worker/gpu_model_runner.py",
+      "why": "l2pf carried from e-man07 0a731363-6416-4fb9-aa94-b6f5f6e8155e (L2 prefetch of the next bandwidth-bound weight on a side stream during latency-bound windows; moves no value). Changed: the drafter hook prefetches the start projection's hidden half eh_w_h (what a draft pass reads first with the projected-embedding table) instead of eh_proj.weight. Added: a MoE-window hook (fused_humming_moe.py, nemotron_h.py, L2PF_MOE_MB default 6) that prefetches the head of the next Mamba layer's in_proj pack while the latency-bound small-call routed down projection runs, rejoining right after it."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_up_tc.py; nemotron_h_mtp_kernels.py",
+      "why": "Independent new draft-only BF16 tensorcore up experiment on complete highest f38ce1ad-87fa-4cfb-8a0c-ac46587810f7 source, retaining its projected-embedding table. Replace original8x1024 SIMTaccumulator tile withBF16 dot32x128 by128x16 replicatedcurrentvector, FP32accumulator, column0 selection, originalFP32ReLU2 thenBF16store. ExactnativeBF16 originalrouted/sharedweight pointers, noweightcopies/layoutconversion and no targetcalls. Fulltargetverification/oracle unchanged; draftFP32tree/proposals/acceptance canchange. MTP_MOE_TENSORCORE_UP=0 originalfallback; strictfixedshape/dtype/device/strideguards. Original stable compaction retained; parallel-expert down and ordered combine separately credited to071fdb75-2498-44dc-ab53-844a62d02071. No local syntax/import/compile/test/benchmark/model execution. Kernelthroughput andwholeacceptance trade unvalidated, originalup mayalreadybandwidthbound so noassumedgain."
+    },
+    {
+      "file": "models/nemotron_h_mtp_compact.py; v1/worker/gpu_model_runner.py",
+      "why": "Compose useful pending071fdb75-2498-44dc-ab53-844a62d02071 exactcompactmodulebbfab2deaef37834462d804c3f813e9b005e9b08 (8expertparallelFP32partials and orderedcombine, originalfourwarps) withpending8174c25a-097e-495c-843e-81e9e768aec9 fullruntimecache/prefetch/topk source, plusownnativeBF16MTPupTC oncompletevalidf38ce1ad-87fa-4cfb-8a0c-ac46587810f7. No7f two-warpproductionchange. No81lastMoE rowreroute; onlyits prompt-logprobs graphguard retained. FullMTPprefillhiddenstates remain. Cachehints do not changeintendedmath; unsortedtopk boundaryties/NaNs andcombineddraftproposalacceptance notprovedequivalent. No localexecution; officialremotevalidation required."
     }
   ]
 }

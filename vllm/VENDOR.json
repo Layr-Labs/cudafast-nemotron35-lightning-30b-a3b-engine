@@ -8,6 +8,10 @@
   "note": "Upstream Python package at the tag. The compiled extensions (csrc) come from the pinned container's install of the same tag; tools/stage-vllm-overlay.sh layers this tree over that install. vllm/vllm/config/fault_tolerance.py is stored LF-normalized (upstream has CRLF).",
   "local_patches": [
     {
+      "file": "vllm/v1/worker/hostfast.py",
+      "why": "Correct host CPU int32 sequence lengths through a NumPy view of the fresh output clone, avoiding per-row PyTorch scalar select/subtract/copy dispatch. Preserve input, padding, dtype and the non-CPU/non-int32 fallback. VLLM_HOSTFAST_CPU_INTS=0 restores the original arithmetic. CPU-only correctness and helper timings are recorded separately; no GPU or official score improvement is claimed."
+    },
+    {
       "file": "vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py",
       "why": "GB10 exposes no NVML memory clock; fall back to 273 GB/s for humming's tuning heuristic"
     },

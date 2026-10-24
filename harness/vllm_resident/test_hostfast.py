@@ -169,6 +169,23 @@ class ExactVerifySeqLens(unittest.TestCase):
         )
         self.assertIsNone(out)
 
+    def test_cpu_corrections_preserve_strided_inputs_and_padding(self):
+        old = hostfast.CPU_INTS
+        try:
+            for enabled in (False, True):
+                hostfast.CPU_INTS = enabled
+                for dtype in (torch.int32, torch.int64):
+                    storage = torch.tensor([500, 999, 0, 888], dtype=dtype)
+                    out = hostfast.exact_verify_seq_lens(
+                        storage[::2], 1, np.array([0]), np.array([3]), [2]
+                    )
+                    self.assertEqual(out.tolist(), [498, 0])
+                    self.assertEqual(out.dtype, dtype)
+                    out[0] += 1
+                    self.assertEqual(storage.tolist(), [500, 999, 0, 888])
+        finally:
+            hostfast.CPU_INTS = old
+
 
 @unittest.skipIf(hostfast is None, "torch is not importable here")
 class DraftSeqLens(unittest.TestCase):

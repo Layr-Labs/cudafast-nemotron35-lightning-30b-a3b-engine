@@ -32,6 +32,7 @@ Switches, read once at import in every process (all default on):
   VLLM_HOSTFAST_S2=0     the first draft step reads seq_lens back again
   VLLM_HOSTFAST_GC=0     automatic GC stays on in the engine core
   VLLM_HOSTFAST_PIN=0    no CPU affinity change
+  VLLM_HOSTFAST_CPU_INTS=0  use PyTorch scalar arithmetic for CPU int32 metadata
   VLLM_HOSTFAST_CHECK=1  debug, default off: also read seq_lens back from the
                          GPU at every replaced site and raise on a mismatch
 """
@@ -56,6 +57,7 @@ S2 = _flag("VLLM_HOSTFAST_S2", "1")
 GC = _flag("VLLM_HOSTFAST_GC", "1")
 PIN = _flag("VLLM_HOSTFAST_PIN", "1")
 CHECK = _flag("VLLM_HOSTFAST_CHECK", "0")
+CPU_INTS = _flag("VLLM_HOSTFAST_CPU_INTS", "1")
 
 # Counters for the debug check: builds compared, and builds that kept the GPU
 # readback because the CPU value was not available. Logged to stderr.
@@ -112,6 +114,16 @@ def exact_verify_seq_lens(
     count (the caller then keeps the GPU readback).
     """
     out = optimistic_seq_lens.clone()
+    # These are host-side integer lengths, not model tensors. Avoid a
+    # Tensor select/subtract/copy dispatch for each scalar correction. The
+    # NumPy view aliases only this fresh clone; padding and the input stay
+    # untouched. Keep the original path for any other device/dtype/layout.
+    values = (
+        out.numpy()
+        if CPU_INTS and out.device.type == "cpu"
+        and out.dtype == torch.int32 and out.ndim == 1
+        else out
+    )
     for i in range(num_reqs):
         p = int(prev_positions[i])
         if p < 0:
@@ -121,7 +133,7 @@ def exact_verify_seq_lens(
             continue
         if p >= len(valid_sampled_token_count):
             return None
-        out[i] -= drafts + 1 - int(valid_sampled_token_count[p])
+        values[i] -= drafts + 1 - int(valid_sampled_token_count[p])
     return out
 
 

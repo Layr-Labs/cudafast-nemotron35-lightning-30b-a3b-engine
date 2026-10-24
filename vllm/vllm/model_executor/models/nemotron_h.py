@@ -884,6 +884,15 @@ class NemotronHForCausalLM(
             quant_config=self.quant_config,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
+        # LOCAL PATCH (cudafast-nemotron35): the last decoder layer is an MoE
+        # layer with no Mamba layer after it; its small-call routed down
+        # projection prefetches the head of the lm_head instead (l2pf).
+        if _l2pf is not None and self.model.end_layer > self.model.start_layer:
+            last = self.model.layers[self.model.end_layer - 1]
+            if isinstance(last, NemotronHMoEDecoderLayer):
+                name = getattr(getattr(last.mixer, "experts", None), "layer_name", None)
+                if name is not None and str(name) not in _l2pf.AHEAD_MOE:
+                    _l2pf.AHEAD_MOE[str(name)] = self.lm_head
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
 

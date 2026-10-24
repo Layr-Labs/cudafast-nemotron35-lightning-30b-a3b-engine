@@ -161,7 +161,7 @@
     },
     {
       "file": "harness/kernels/marlinx/{csrc/marlinx.cu,py/__init__.py,README.md,tests/marlinx_zs_exact.py}",
-      "why": "Shared expert down projection (3712->2688, ReLU^2 input): read only the k rows whose activation is nonzero in some row, from a byte-preserving k-row-major copy of the Marlin weight; the lane rebuilds Marlin's exact weight word, so dequant, MMA, segments and fp32 reductions are unchanged. Bit-exact vs stock Marlin on all 23 layers (4416 synthetic + 1380 real-activation cases, CUDA graph replay). MARLINX_ZS=0 disables."
+      "why": "Shared expert down projection (3712->2688, ReLU^2 input): read only the k rows whose activation is nonzero in some row, from a byte-preserving k-row-major copy of the Marlin weight; the lane rebuilds Marlin's exact weight word, so dequant, MMA, segments and fp32 reductions are unchanged. Bit-exact vs stock Marlin on all 23 layers (4416 synthetic + 1380 real-activation cases, CUDA graph replay). MARLINX_ZS=0 disables. Optional programmatic dependent launch adds weight/scale-only ring preloads before griddepcontrol.wait (ZS preloads scales only; activation-derived masks and selected Z reads follow the wait), coherent activation reads after it, and launch_dependents before the unchanged final BF16 epilogue. No global workspace or reduction locks; the same CTA-local segment reductions, K order and fused ReLU2 rounding remain. MARLINX_PDL=0 disables; optional ABI, eager rejected-launch fallback, no retry in capture, and MARLINX_NO_PDL build fallback follow fp8small. CPU-reviewed port; CUDA compilation, byte-exact M1-8 graph/chain tests and emitted-token gates still required on Spark."
     },
     {
       "file": "vllm/model_executor/layers/fused_moe/experts/humming_zskip.py; vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py; harness/kernels/zskip",
@@ -194,6 +194,10 @@
     {
       "file": "harness/kernels/pzskip/{csrc/pzskip.cu,py/__init__.py,build.sh,tests/exact.py}, vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
       "why": "Prefill routed down only (humming block_m 64 calls, 9..8192 tokens): pzskip skips the w2 weight rows whose relu^2 input is zero in every row of humming's 64-row expert block, with zskip's fp32 chain and bf16 epilogue, so outputs are bitwise equal to humming. Load-time 496-token bitwise check per layer; on a mismatch the layer keeps config 405 / humming. PZSKIP=0 disables."
+    },
+    {
+      "file": "harness/kernels/zskip/csrc/zskip_pair.cuh, zskip.cu, py/__init__.py, build.sh; vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
+      "why": "Port dadon 12f98e36-35d1-41c0-ba8d-8fd101ffeee1 (31889a414e3f4b414b7aaca41f28daad6b4c0919) decode c113: swap2 paired 64-column tiles, one warp, ring 3. Compose fkiene bc524594 fused prep as c118, retaining c113, checked c108/c100 and all original load-time/prefill checks. Additional byte-preserving swap2 w2 copy leaves pzskip and c405 unchanged. Per-layer bitwise M4/M5/M8 guard, crowded routing and signed/empty zeros; ZSKIP_DADON=0 disables. Static CPU-only port: not CUDA-compiled, GPU-checked or timed locally."
     }
   ]
 }

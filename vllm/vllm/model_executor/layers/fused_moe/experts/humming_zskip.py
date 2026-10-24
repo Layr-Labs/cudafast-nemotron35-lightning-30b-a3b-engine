@@ -55,6 +55,9 @@ CONFIG = 100
 FUSED_PREP = os.environ.get("ZSKIP_FUSED_PREP", "1") != "0"
 FUSED_CONFIG = 108
 MAX_TOKENS = 8
+PAIR_ENABLED = os.environ.get("ZSKIP_DADON", "1") != "0"
+PAIR_CONFIG = 113
+PAIR_FUSED_CONFIG = 118
 # Prefill: MoE layers whose relu^2 activations are sparse enough for the skip to beat humming's
 # 64-row blocks on GB10 (measured per layer on prefill-length calls; the others lose). Layer 51,
 # the last, is left out: the boot prefill graph routes all its rows through one row's experts.
@@ -144,6 +147,92 @@ def finalize(layer: torch.nn.Module) -> None:
             "zskip: prefill routed down projection enabled on layers %s",
             ",".join(map(str, sorted(PREFILL_LAYERS))),
         )
+
+    # Preserve all original checks and fallback choices before trying the new decode path.
+    layer.zskip_pair_w2 = None
+    layer.zskip_pair_config = None
+    if PAIR_ENABLED:
+        _prepare_pair(layer)
+
+
+def _prepare_pair(layer: torch.nn.Module) -> None:
+    """New buffers and kernels are optional; any failure leaves checked 108/100 intact."""
+    try:
+        # Check library support before allocating another copy of w2.
+        _zskip.config_info(PAIR_CONFIG)
+        pair = _zskip.to_swap2(layer.zskip_w2)
+        if not _pair_check(layer, pair, PAIR_CONFIG):
+            return
+        config = PAIR_CONFIG
+        if FUSED_PREP:
+            try:
+                _zskip.config_info(PAIR_FUSED_CONFIG)
+                if _pair_check(layer, pair, PAIR_FUSED_CONFIG):
+                    config = PAIR_FUSED_CONFIG
+            except Exception as exc:  # noqa: BLE001
+                logger.warning_once("zskip: paired fused prep unavailable (%r); config 113", exc)
+        layer.zskip_pair_w2 = pair
+        layer.zskip_pair_config = config
+        logger.info_once("zskip: dadon paired decode config %d enabled for M=5", config)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning_once("zskip: paired decode unavailable (%r); checked legacy config retained", exc)
+
+
+def _pair_check(layer: torch.nn.Module, packed: Any, config: int) -> bool:
+    """Load-time, bitwise against humming: M=4/5/8, independent plus crowded routing.
+
+    Compare all slots, including exact negative-zero activations and all-zero groups.
+    The new config never serves prefill. No random state is taken from a request.
+    """
+    import json
+
+    from vllm import envs
+    from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
+        _humming_batch_invariant,
+    )
+    from vllm.model_executor.layers.fused_moe.experts.humming_tuned_moe import tuned_moe_configs
+    from vllm.utils.humming import GemmType, HummingMethod
+
+    configs = tuned_moe_configs(layer)
+    if configs is None:
+        return False
+    dev = layer.w2_global_scale.device
+    compute_config = json.dumps({
+        "use_batch_invariant": _humming_batch_invariant(),
+        "use_f16_accum": envs.VLLM_HUMMING_USE_F16_ACCUM,
+        "gemm_type": GemmType.INDEXED.value,
+    })
+    for m in (4, 5, 8):
+        for crowded in (False, True):
+            ids = [[(29*i + (0 if crowded else 17*t)) % NUM_EXPERTS
+                    for i in range(TOP_K)] for t in range(m)]
+            topk_ids = torch.tensor(ids, dtype=torch.int32, device=dev)
+            gen = torch.Generator(device=dev)
+            gen.manual_seed(8713 + m)
+            u = torch.randn(m*TOP_K, INTER, generator=gen, device=dev)
+            keep = torch.rand(m*TOP_K, INTER, generator=gen, device=dev) < 0.1
+            act = (u.relu().square() * keep).to(torch.bfloat16).contiguous()
+            act[:, :16] = 0  # a wholly empty k16 group
+            # All-zero rows exercise empty lists; signed zeros exercise the bitmask semantics.
+            act[0].zero_()
+            bits = act.view(torch.int16)
+            bits[bits == 0] = -32768
+            sorted_ids, expert_ids, ntp = _align(topk_ids, 16)
+            ref = torch.empty(m*TOP_K, HIDDEN, dtype=torch.bfloat16, device=dev)
+            HummingMethod.forward_layer(
+                layer=layer, inputs=act, input_scale=None, outputs=ref, sublayer_name="w2",
+                sorted_ids=sorted_ids, expert_ids=expert_ids, num_tokens_padded=ntp,
+                compute_config=compute_config, valid_shape_m=m*TOP_K, top_k=1,
+                tuning_config=json.dumps(configs[1]),
+            )
+            out = torch.empty_like(ref)
+            _zskip.down(act, sorted_ids, expert_ids, ntp, packed, out,
+                        mode=_zskip.SKIP, config=config, max_blocks=m*TOP_K)
+            if not torch.equal(out.view(torch.int16), ref.view(torch.int16)):
+                logger.warning("zskip: paired config %d differs from humming on %s; legacy retained",
+                               config, getattr(layer, "layer_name", "?"))
+                return False
+    return True
 
 
 def _pz_self_check(layer: torch.nn.Module) -> bool:
@@ -407,15 +496,18 @@ def maybe_down(
             max_blocks=sorted_ids.numel() // PREFILL_BM,
         )
         return True
+    # M=5 is depth-4 verify. Other shapes keep main's checked decode selection.
+    pair = getattr(layer, "zskip_pair_w2", None)
+    use_pair = num_tokens == 5 and pair is not None
     _zskip.down(
         inputs,
         moe_kwargs["sorted_ids"],
         moe_kwargs["expert_ids"],
         moe_kwargs["num_tokens_padded"],
-        packed,
+        pair if use_pair else packed,
         outputs,
         mode=_zskip.SKIP,
-        config=getattr(layer, "zskip_config", CONFIG),
+        config=layer.zskip_pair_config if use_pair else getattr(layer, "zskip_config", CONFIG),
         max_blocks=rows,
     )
     return True

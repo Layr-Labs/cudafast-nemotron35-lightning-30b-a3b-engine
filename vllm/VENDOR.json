@@ -66,6 +66,10 @@
     {
       "file": "vllm/model_executor/models/nemotron_h_mtp.py",
       "why": "Pin the MTP predictor to ONE Inductor combo-kernel choice in its own compilation context: combined kernels, never benchmarked (combo_kernels=True, benchmark_combo_kernel=False; VLLM_MTP_COMBO=off pins separate kernels, =bench restores the timed pick). Drafter reduction order is fixed across boots, with target compilation settings and frozen formats unchanged."
+    },
+    {
+      "file": "vllm/model_executor/layers/mamba/ops/ssd_prefill_fused.py (+ ssd_combined.py)",
+      "why": "Own GB10 prefill two-stage SSD: fuse chunk-state formation with unchanged FP32 state recurrence, and compute each CB row tile once per group in registers before all eight head scans. Removes raw chunk-state and FP32 CB global scratch while retaining every boundary state, cumsum, final gather, original numerical formats and target acceptance. Chunk sizes 128/256 and exact-shape guards; unsupported layouts retain the original path."
     }
   ]
 }

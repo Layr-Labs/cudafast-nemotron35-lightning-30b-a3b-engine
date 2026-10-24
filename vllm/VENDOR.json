@@ -209,7 +209,7 @@
     },
     {
       "file": "harness/kernels/l2pf/py/__init__.py",
-      "why": "Carry useful04706ad7-c4e8-44b9-b8ba-77f14d8b8adf MoE-window immutable prefetch default6to12MB. Its complete official2.19195352041462 is within0.1% of fulla484, but only budget mechanism is combined here on higherfulla484. Prefix pair/SSM combination unverified."
+      "why": "Candidate variation of04706ad7-c4e8-44b9-b8ba-77f14d8b8adf's MoE-window immutable prefetch: default9MB rather than12MB to test reduced contention in the shorter confidence-prefix decode windows on leader7fac1f9. The next Mamba in_proj tensor and all arithmetic, acceptance, and valid-row behavior are unchanged; the leader's paired zskip, SSM prefix pruning, and Marlin PDL remain intact."
     }
   ]
 }

@@ -30,7 +30,7 @@ MAMBA_BYTES = int(float(os.environ.get("L2PF_MAMBA_MB", "5")) * (1 << 20))
 ATTN_BYTES = int(float(os.environ.get("L2PF_ATTN_MB", "3")) * (1 << 20))
 # The routed down projection of a small call (zskip) is latency-bound and leaves
 # DRAM about half idle: prefetch the head of the next Mamba layer's in_proj then.
-MOE_BYTES = int(float(os.environ.get("L2PF_MOE_MB", "12")) * (1 << 20))
+MOE_BYTES = int(float(os.environ.get("L2PF_MOE_MB", "9")) * (1 << 20))
 # Drafter window: the latency-bound down projection of the single-row MTP MoE
 # prefetches the head of the draft screen's coarse matrix (0 disables).
 DRAFT_BYTES = int(float(os.environ.get("L2PF_DRAFT_MB", "3")) * (1 << 20))

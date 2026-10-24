@@ -396,6 +396,11 @@ def base_output(q, boundary, tl):
 
 def fused_result(q, tl):
     state = Tensor(np.full((q.nc, q.heads, q.h, q.n), np.nan, np.float32))
+    final_cache = Tensor(
+        np.full((1, q.heads, q.h, q.n), np.nan, np.float32)
+    )
+    final_index = Tensor(np.array([-1], np.int32))
+    write_final = q.last.numel() == 1
     ns = dict(tl=tl, fast_exp=exp)
     fn = function(FUSED, "_state_pass_kernel", ns)
     istrides = q.initial.stride() if q.initial is not None else (0, 0, 0, 0)
@@ -411,6 +416,8 @@ def fused_result(q, tl):
         LAST=q.last,
         INIT=q.initial,
         OUT=state,
+        FINAL_CACHE=final_cache,
+        FINAL_INDEX=final_index,
         H=q.h,
         N=q.n,
         RATIO=q.heads // q.groups,
@@ -422,6 +429,9 @@ def fused_result(q, tl):
         IS=istrides,
         OS=state.stride(),
         HAS_INIT=q.initial is not None,
+        WRITE_FINAL=write_final,
+        FS=final_cache.stride(),
+        CACHE_SLOTS=1 if write_final else 0,
         BM=64,
         BN=128,
         BK=32,
@@ -467,7 +477,7 @@ def fused_result(q, tl):
         BC=32,
         DN=128,
     )
-    return state.data.copy(), q.out.data.copy()
+    return state.data.copy(), q.out.data.copy(), final_cache.data.copy()
 
 
 class KernelTests(unittest.TestCase):
@@ -477,12 +487,17 @@ class KernelTests(unittest.TestCase):
         state = base_states(q, tl)
         output = base_output(q, state, tl)
         q.out.data.fill(np.nan)
-        actual, y = fused_result(q, tl)
+        actual, y, final_cache = fused_result(q, tl)
         self.assertTrue(np.isfinite(actual).all() and np.isfinite(y).all())
         np.testing.assert_array_equal(
             actual.view(np.uint32), state.data.view(np.uint32)
         )
         np.testing.assert_array_equal(y.view(np.uint32), output.view(np.uint32))
+        if q.last.numel() == 1:
+            self.assertTrue(np.isfinite(final_cache).all())
+            np.testing.assert_array_equal(
+                final_cache[0].view(np.uint32), state.data[-1].view(np.uint32)
+            )
         if init is not None:
             np.testing.assert_array_equal(q.initial.data, init)
 
@@ -664,7 +679,7 @@ class DispatchTests(unittest.TestCase):
         torch = torch_double()
         torch.empty = lambda shape, dtype, device: Tensor(np.empty(shape, np.float32))
         torch.accelerator = NS(device_index=lambda index: nullcontext())
-        ns.update(torch=torch, triton=NS(cdiv=lambda a, b: (a + b - 1) // b))
+        ns.update(torch=torch, triton=NS(cdiv=lambda a, b: (a + b - 1) // b), os=os)
         function(FUSED, "fused_prefill", ns)(
             q.x,
             q.b,

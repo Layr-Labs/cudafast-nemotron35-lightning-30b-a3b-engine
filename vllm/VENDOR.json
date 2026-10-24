@@ -184,8 +184,16 @@
       "why": "Drafter-only: in the MTP layer's single-row MoE the draft pass evaluates the three routed experts with the highest router weight (from the router's existing selection, ordered by weight) instead of all six; the MTP router, shared expert and head weights are unchanged and the target decides every emitted token. MTP_DRAFT_TOPK=0 keeps all six. Carried unchanged from i34-9 b5616630-9603-44d1-a221-a7b2b4ec1d7d."
     },
     {
-      "file": "harness/kernels/zskip/{csrc/zskip.cu,py/__init__.py,build.sh}, vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
-      "why": "Decode routed down only (<=8 tokens): config 108 is config 100's down4 with prep_kernel's row list and build_lists run in that CTA's dynamic shared memory (5120 bytes), so the prep launch is not issued. Same block info, same MMA and epilogue. Load-time bitwise check against humming on the 4- and 8-token cases; any mismatch, or a library built with -DZSKIP_NO_FUSED, keeps config 100. Prefill stays config 405. ZSKIP_FUSED_PREP=0 keeps config 100. Budget, not measured on this host: README times config 100 at 70.7 us per MoE layer at M=4; 23 MoE layers. The prep launch plus the global block-info round trip is taken as 5 us/layer, about 0.12 ms per forward. The brief's +1% line is about 0.6 ms/round, so this is under that if a round is one forward; it removes the prep kernel from the decode w2 pair."
+      "file": "harness/kernels/zskip; vllm/model_executor/layers/fused_moe/experts/humming_zskip.py; vllm/model_executor/layers/quantization/utils/humming_utils.py",
+      "why": "zskip kernel update: decode (1..8 tokens) runs config 113 (one warp per 128-column pair, register ring of 3) on the swap2 repack (the two 64-column tiles of a pair interleaved per lane: one 64-byte segment per k row and warp); the 496-token prefill runs config 212 (two 8-row n-blocks per warp share each dequantised weight fragment) on a block-16 alignment of the call, on every MoE layer but 51. Same arithmetic as humming per output element (bit-identical on all 23 layers for M = 1..8 and 496, captured prompts and decode windows, adversarial activations); measured on the same inputs: prefill 26.5 vs 29.7 ms (main's config 405 on 15 layers) over the 22 full layers, decode 71.2 vs 79.2 us per 5-row call. Both kernels of a call keep main's programmatic dependent launch (ZSKIP_PDL=0 turns it off). routed_sparse is no longer repacked while zskip is active (ZSKIP=0 brings it back)."
+    },
+    {
+      "file": "harness/kernels/head_fused; models/nemotron_h_mtp_screen.py; smallk; nemotron_h_mtp_kernels; llm_base_proposer; gpu_model_runner",
+      "why": "New native partialNVFP4 scoring/radix/topk/globalID fusion on ENTIRE latest12f98e36-35d1-41c0-ba8d-8fd101ffeee1 source. Complete swap2 decode113/prefill212 and no-routed_sparse repack retained. Useful ca5c19dd-da37-4328-880a-152f8c7b3651 confidence stop/kept prefix+rowmask and40e344ca-fb8c-4dc1-8218-2f6e9932a12a top2 draft method composed. Same fullK/BF16/minIDfinal, freshgraph-ownedworkspaces, finite remote admission, no local execution."
+    },
+    {
+      "file": "harness/kernels/marlinx/{build.sh,csrc/marlinx.cu,py/__init__.py}",
+      "why": "Exact3file PDL port from usefulpending732c3711-b4f8-4d68-8d5f-158639bffb62: immutableB/Sprologue beforewait, coherentA/maskread afterwait, oldlivecursors/reductions/math. OptionalABI/noPDLbuild/eager-onlylaunchfallback. C2packingnotcopied."
     }
   ]
 }

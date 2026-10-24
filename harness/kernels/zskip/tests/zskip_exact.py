@@ -80,11 +80,12 @@ def phase_probe(args, ctx):
     res = {"seconds": round(time.time() - t0, 1), "kinds": {}}
     ok = True
     for k, name in enumerate(PROBE_KINDS):
-        c = tot[k * 8: k * 8 + 6]
+        c = tot[k * 8: k * 8 + 8]
         row = {"elements": c[0], "mismatch_c_not_neg0": c[1], "mismatch_c_neg0": c[2], "c_neg0": c[3],
-               "zeroA_identity_violations": c[4], "zeroA_checked": c[5]}
+               "zeroA_identity_violations": c[4], "zeroA_checked": c[5],
+               "neg0_vs_pos0_acc_mismatch": c[6], "neg0_vs_pos0_checked": c[7]}
         res["kinds"][name] = row
-        ok &= c[1] == 0 and c[4] == 0
+        ok &= c[1] == 0 and c[2] == 0 and c[4] == 0 and c[6] == 0
         log(f"probe {name}: {row}")
     res["ok"] = ok
     res["samples"] = samples[:64]
@@ -339,14 +340,13 @@ def block_masks(act, kw2):
 
 
 def exact_variants(ctx, li):
-    """(packed, mode, name, config): v3 on the first non-swap layout, v4 on swap."""
-    out = []
+    """(packed, mode, name, config): v4 on both layouts, DENSE and SKIP."""
     pks = ctx["packed"][li]
-    v3 = next((k for k in pks if k != "swap"), None)
-    if v3 is not None:
-        out += [(pks[v3], zskip.DENSE, "v3dense", 1), (pks[v3], zskip.SKIP, "v3skip", 1)]
-    if "swap" in pks:
-        out += [(pks["swap"], zskip.DENSE, "v4dense", 100), (pks["swap"], zskip.SKIP, "v4skip", 100)]
+    out = []
+    for cfg, name in ((100, "v4"), (ctx.get("v4b_config", 110), "v4b")):
+        pk = pks.get(zskip.layout_of(cfg))
+        if pk is not None:
+            out += [(pk, zskip.DENSE, name + "dense", cfg), (pk, zskip.SKIP, name + "skip", cfg)]
     return out
 
 
@@ -358,7 +358,6 @@ def phase_exact(args, ctx):
     agg = {}
     for li, L in enumerate(ctx["layer_ids"]):
         ex = ctx["ex"][li]
-        packed = ctx["packed"][li]["rows"]
         cases = realistic_cases(ctx, li, args.ms, args.windows) + synthetic_cases(ctx, li, args.ms, args.kinds, args.reps)
         for name, x, tid, tw in cases:
             st = hme.run_stages(ex, x, tid, tw)
@@ -409,7 +408,7 @@ def phase_exact(args, ctx):
         kw1, kw2 = ex.prepare_humming_moe_kwargs(tid, None, None)
         ref = stock_w2(ex, st["act"], kw2)
         for lay, pk in ctx["packed"][li].items():
-            for cfg in (zskip.CONFIGS4 if lay == "swap" else zskip.CONFIGS):
+            for cfg in [c for c in zskip.CONFIGS if zskip.layout_of(c) == lay]:
                 got = mine_w2(pk, st["act"], kw2, zskip.SKIP, config=cfg, stats=stats)
                 eq = hme.bits_equal(got, ref)
                 a = agg.setdefault(f"configs/{lay}", {"cases": 0, "ok": 0})
@@ -434,6 +433,142 @@ def phase_exact(args, ctx):
 
 def graph_time(fn, reps):
     return hme.graph_time(fn, reps)
+
+
+def prefill_inputs(ctx, li, seqs):
+    """(name, x [496, H], topk_ids, topk_weights) per captured sequence: the prompt rows."""
+    L = ctx["layer_ids"][li]
+    gate_w, bias, _ = ctx["routers"][li]
+    out = []
+    for c in ctx["caps"][:seqs]:
+        x = c["x"][L][: c["n_prompt"]].to("cuda").contiguous()
+        tid, tw = hme.route(x, gate_w, bias)
+        out.append((f"prefill:{c['name']}", x, tid, tw))
+    return out
+
+
+def align16(tid):
+    from vllm.model_executor.layers.fused_moe.moe_align_block_size import moe_align_block_size
+
+    return moe_align_block_size(topk_ids=tid, block_size=16, num_experts=NUM_EXPERTS, expert_map=None,
+                                ignore_invalid_experts=True)
+
+
+def prefill_stats(act, tid):
+    """Union-zero statistics: per 16-slot block (what the kernel skips) and per expert."""
+    nz = (act.view(torch.int16) & 0x7FFF) != 0  # [slots, K]
+    ids = tid.reshape(-1)
+    rows_per_expert, blk_bytes, exp_bytes, nblk = [], 0, 0, 0
+    for e in ids.unique().tolist():
+        slots = (ids == e).nonzero().flatten()
+        rows_per_expert.append(int(slots.numel()))
+        u = nz[slots].any(0)
+        exp_bytes += int(u.sum()) * (HIDDEN // 2) + int(u.view(-1, 16).any(1).sum()) * HIDDEN
+        for b0 in range(0, slots.numel(), 16):
+            ub = nz[slots[b0:b0 + 16]].any(0)
+            blk_bytes += int(ub.sum()) * (HIDDEN // 2) + int(ub.view(-1, 16).any(1).sum()) * HIDDEN
+            nblk += 1
+    dense = len(rows_per_expert) * (INTER * HIDDEN // 2 + (INTER // 16) * HIDDEN)
+    return {"experts": len(rows_per_expert), "blocks16": nblk, "dense_MB": dense / 1e6,
+            "block_union_MB": blk_bytes / 1e6, "expert_union_MB": exp_bytes / 1e6}
+
+
+def alignment_for(cfg, kw2, sid16, eid16, ntp16):
+    """Configs covering 32 rows read humming's own block-64 layout as 32-slot halves; the others
+    take a block-16 moe_align of the call."""
+    if zskip.rows_of(cfg) >= 32:
+        sid, eid = kw2["sorted_ids"], kw2["expert_ids"]
+        return {"sid": sid, "eid": eid, "ntp": kw2["num_tokens_padded"], "slots": 32, "ediv": 2,
+                "blocks": sid.numel() // 32}
+    return {"sid": sid16, "eid": eid16, "ntp": ntp16, "slots": 16, "ediv": 1, "blocks": eid16.numel()}
+
+
+def phase_prefill(args, ctx):
+    """M = 496 (prefill): stock humming w2 (block 64 alignment, prefill tuned config) vs zskip on
+    a block-16 alignment of the same call, bitwise; then CUDA-graph time over the layers."""
+    zskip.init()
+    stats = torch.zeros(4, dtype=torch.int32, device="cuda")
+    cfgs = [int(c) for c in args.prefill_configs.split(",")]
+    agg, all_ok, per_layer = {}, True, []
+    st_tot = {"dense_MB": 0.0, "block_union_MB": 0.0, "expert_union_MB": 0.0, "experts": 0, "blocks16": 0}
+    for li, L in enumerate(ctx["layer_ids"]):
+        ex = ctx["ex"][li]
+        pk = ctx["packed"][li]["swap2"]
+        for name, x, tid, tw in prefill_inputs(ctx, li, args.prefill_seqs):
+            stg = hme.run_stages(ex, x, tid, tw)
+            kw1, kw2 = ex.prepare_humming_moe_kwargs(tid, None, None)
+            ref = stock_w2(ex, stg["act"], kw2)
+            ok_ref = hme.bits_equal(ref, stg["w2"])
+            sid16, eid16, ntp16 = align16(tid)
+            for cfg in cfgs:
+                lay = alignment_for(cfg, kw2, sid16, eid16, ntp16)
+                for mode, mn in ((zskip.DENSE, "dense"), (zskip.SKIP, "skip")):
+                    out = torch.empty_like(ref)
+                    out.view(torch.int16).fill_(0x7FBF)
+                    zskip.down(stg["act"], lay["sid"], lay["eid"], lay["ntp"], pk, out, mode=mode, config=cfg,
+                               max_blocks=lay["blocks"], stats=stats, slots=lay["slots"], ediv=lay["ediv"])
+                    eq = hme.bits_equal(out, ref)
+                    a = agg.setdefault(f"c{cfg}/{mn}", {"cases": 0, "ok": 0})
+                    a["cases"] += 1
+                    a["ok"] += int(eq)
+                    if not eq:
+                        all_ok = False
+                        log(f"MISMATCH prefill L{L} {name} c{cfg} {mn}: {hme.diff_count(out, ref)} elements "
+                            f"(ref self-consistent {ok_ref})")
+            if name == f"prefill:{ctx['caps'][0]['name']}":
+                sts = prefill_stats(stg["act"], tid)
+                for k in st_tot:
+                    st_tot[k] += sts[k]
+                per_layer.append({"ex": ex, "act": stg["act"], "kw2": kw2, "pk": pk, "sid": sid16, "eid": eid16,
+                                  "ntp": ntp16, "tid": tid, "out": torch.empty_like(ref)})
+        torch.cuda.synchronize()
+        log(f"prefill exact L{L}: running all_ok={all_ok}; stats {stats.tolist()}")
+    log(f"prefill exact summary: {json.dumps(agg)}; ALL PREFILL BIT-IDENTICAL: {all_ok}")
+    Lc = len(per_layer)
+    info = {k: (round(v / Lc, 2) if isinstance(v, float) else round(v / Lc, 1)) for k, v in st_tot.items()}
+    log(f"prefill per layer (first sequence): {info}")
+
+    def stock_fn():
+        from vllm.utils.humming import HummingMethod
+
+        for q in per_layer:
+            HummingMethod.forward_layer(layer=q["ex"].layer, inputs=q["act"], input_scale=None,
+                                        outputs=q["out"], sublayer_name="w2", **q["kw2"])
+
+    def mk(mode, cfg, with_align):
+        def fn():
+            for q in per_layer:
+                if with_align:
+                    sid, eid, ntp = align16(q["tid"])
+                else:
+                    sid, eid, ntp = q["sid"], q["eid"], q["ntp"]
+                lay = alignment_for(cfg, q["kw2"], sid, eid, ntp)
+                zskip.down(q["act"], lay["sid"], lay["eid"], lay["ntp"], q["pk"], q["out"], mode=mode, config=cfg,
+                           max_blocks=lay["blocks"], slots=lay["slots"], ediv=lay["ediv"])
+        return fn
+
+    variants = [("stock", stock_fn)]
+    for cfg in cfgs:
+        if zskip.rows_of(cfg) < 32:
+            variants.append((f"skip+align16/c{cfg}", mk(zskip.SKIP, cfg, True)))
+        variants.append((f"skip/c{cfg}", mk(zskip.SKIP, cfg, False)))
+        variants.append((f"loadonly/c{cfg}", mk(zskip.LOADONLY, cfg, False)))
+        if cfg in cfgs[:1]:
+            variants.append((f"dense/c{cfg}", mk(zskip.DENSE, cfg, False)))
+    times = {k: [] for k, _ in variants}
+    for _ in range(args.rounds):
+        for k, fn in variants:
+            times[k] += graph_time(fn, max(3, args.time_reps // 4))
+    rows = []
+    for k, _ in variants:
+        us = statistics.median(times[k]) * 1000 / Lc
+        rows.append({"variant": k, "us_per_layer": round(us, 1), "ms_per_prefill_23": round(us * 23 / 1000, 2)})
+    rows.sort(key=lambda r: r["us_per_layer"])
+    for r in rows:
+        log(f"   prefill {r['variant']:24s} {r['us_per_layer']:9.1f} us/layer  {r['ms_per_prefill_23']:6.2f} ms/prefill")
+    dump("prefill", {"all_ok": all_ok, "summary": agg, "per_layer_stats": info, "rows": rows})
+    if not all_ok:
+        ctx["exact_failed"] = True
 
 
 def phase_time(args, ctx):
@@ -493,15 +628,13 @@ def phase_time(args, ctx):
                     assert routed_sparse.forward(a_, i_, o_, pk_)
 
             variants.append(("routed_sparse", rs_fn))
-        configs = list(zskip.CONFIGS) + list(zskip.CONFIGS4) if args.time_configs == "all" else [
+        configs = list(zskip.CONFIGS) if args.time_configs == "all" else [
             int(c) for c in args.time_configs.split(",")]
         for lay in ctx["packed"][0]:
-            for cfg in configs:
-                if (cfg >= 100) != (lay == "swap"):
-                    continue
+            for cfg in [c for c in configs if zskip.layout_of(c) == lay]:
                 for mode, mn in ((zskip.SKIP, "skip"), (zskip.LOADONLY, "loadonly"), (zskip.SETUPONLY, "setuponly"),
                                  (zskip.DENSE, "dense"), (zskip.LOADONLY_DENSE, "loadonly_dense")):
-                    if mn in ("dense", "loadonly_dense") and cfg not in (1, 101) and not args.time_all_dense:
+                    if mn in ("dense", "loadonly_dense") and cfg not in (100, 110) and not args.time_all_dense:
                         continue
                     if mn in ("loadonly", "setuponly") and not args.time_loadonly:
                         continue
@@ -540,13 +673,16 @@ def main():
     ap.add_argument("--reps", type=int, default=2)
     ap.add_argument("--windows", type=int, default=2)
     ap.add_argument("--capture", default="", help="'' (none), 'all' or comma-separated sequence names")
-    ap.add_argument("--layouts", default="rows,swap")
-    ap.add_argument("--time-ms", default="4")
+    ap.add_argument("--layouts", default="swap,swap2")
+    ap.add_argument("--v4b-config", type=int, default=110)
+    ap.add_argument("--time-ms", default="4,5")
     ap.add_argument("--time-configs", default="all")
     ap.add_argument("--time-all-dense", action="store_true")
     ap.add_argument("--time-loadonly", action="store_true")
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--time-reps", type=int, default=20)
+    ap.add_argument("--prefill-configs", default="300,301,302,303,212")
+    ap.add_argument("--prefill-seqs", type=int, default=2)
     ap.add_argument("--probe-blocks", type=int, default=2048)
     ap.add_argument("--probe-iters", type=int, default=128)
     ap.add_argument("--probe-launches", type=int, default=8)
@@ -562,18 +698,18 @@ def main():
     log(f"args: {vars(args)}")
     assert zskip.available(), zskip.load_error()
     torch.cuda.set_device(0)
-    for cfg in list(zskip.CONFIGS) + list(zskip.CONFIGS4):
+    for cfg in zskip.CONFIGS:
         log(f"zskip config {cfg}: {zskip.config_info(cfg)}")
     log(f"routed_sparse available: {routed_sparse is not None}")
     phases = args.phase.split(",")
-    ctx = {}
+    ctx = {"v4b_config": args.v4b_config}
     if "probe" in phases:
         phase_probe(args, ctx)
     if "capture" in phases or args.capture:
         if not args.capture:
             args.capture = "all"
         phase_capture(args, ctx)
-    if any(p in phases for p in ("exact", "time", "epi")) and ("exact" in phases or "time" in phases):
+    if any(p in phases for p in ("exact", "time", "prefill")):
         from vllm.model_executor.layers.fused_moe.experts import humming_tuned_moe  # noqa
 
         snap = hme.Snapshot(os.environ["NEMO_SNAPSHOT"])
@@ -608,6 +744,8 @@ def main():
         phase_exact(args, ctx)
     if "time" in phases:
         phase_time(args, ctx)
+    if "prefill" in phases:
+        phase_prefill(args, ctx)
     log("done")
     if ctx.get("exact_failed"):
         sys.exit(3)

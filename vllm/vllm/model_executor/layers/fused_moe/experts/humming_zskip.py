@@ -37,25 +37,26 @@ except ImportError:
     _zskip = None
 
 ENABLED = os.environ.get("ZSKIP", "1") != "0"
-# kernel v4 (warp per 64-column tile, weights as the MMA A operand) on the "swap" repack
-LAYOUT = "swap"
-CONFIG = 100
-FUSED_PREP = os.environ.get("ZSKIP_FUSED_PREP", "1") != "0"
-FUSED_CONFIG = 108
+# kernel down4 config 113 (one warp per 128-column pair, ring of 3 groups, weights as the MMA A
+# operand) on the "swap2" repack (one 64-byte segment per k row and warp)
+LAYOUT = "swap2"
+CONFIG = 113
 MAX_TOKENS = 8
-# Prefill: MoE layers whose relu^2 activations are sparse enough for the skip to beat humming's
-# 64-row blocks on GB10 (measured per layer on prefill-length calls; the others lose). Layer 51,
-# the last, is left out: the boot prefill graph routes all its rows through one row's experts.
+# Prefill: config 212 (two 8-row n-blocks per warp share each dequantised weight fragment) on a
+# block-16 alignment of the call. Measured per layer on prefill-length calls it beats humming's
+# 64-row blocks on every MoE layer (nemo-exec-zsvm). Layer 51, the last, is left out: the boot
+# prefill graph routes all its rows through one row's experts.
 PREFILL_ENABLED = ENABLED and os.environ.get("ZSKIP_PREFILL", "1") != "0"
 PREFILL_LAYERS = frozenset(
     int(v)
     for v in os.environ.get(
-        "ZSKIP_PREFILL_LAYERS", "1,3,6,8,10,13,15,34,36,38,40,43,45,47,49"
+        "ZSKIP_PREFILL_LAYERS",
+        "1,3,6,8,10,13,15,17,20,22,24,27,29,31,34,36,38,40,43,45,47,49",
     ).split(",")
     if v.strip()
 )
-PREFILL_CONFIG = 405
-PREFILL_BM = 32
+PREFILL_CONFIG = 212
+PREFILL_BM = 16
 PREFILL_MAX_TOKENS = 4096
 TOP_K = 6
 HIDDEN = 2688
@@ -110,13 +111,9 @@ def finalize(layer: torch.nn.Module) -> None:
         return
     _zskip.scratch(gs.device)
     layer.zskip_prefill = PREFILL_ENABLED and _layer_index(layer) in PREFILL_LAYERS
-    layer.zskip_config = CONFIG
     if not _self_check(layer):
         layer.zskip_w2 = None
         return
-    if FUSED_PREP and _fused_check(layer):
-        layer.zskip_config = FUSED_CONFIG
-        logger.info_once("zskip: fused prep config %d for <= 8 tokens", FUSED_CONFIG)
     logger.info_once("zskip: zero-row-skipping routed down projection enabled for <= 8 tokens")
     if layer.zskip_prefill:
         logger.info_once(
@@ -146,22 +143,7 @@ def _align(topk_ids: torch.Tensor, block_size: int):
     )
 
 
-def _fused_check(layer: torch.nn.Module) -> bool:
-    """Decode-sized load-time check of FUSED_CONFIG. False keeps CONFIG (prefill already checked)."""
-    try:
-        _zskip.config_info(FUSED_CONFIG)
-        return _self_check(layer, config=FUSED_CONFIG, quiet=True, prefill=False)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning_once("zskip: fused prep unavailable (%r); config %d", exc, CONFIG)
-        return False
-
-
-def _self_check(
-    layer: torch.nn.Module,
-    config: int = CONFIG,
-    quiet: bool = False,
-    prefill: bool | None = None,
-) -> bool:
+def _self_check(layer: torch.nn.Module) -> bool:
     """Load-time guard: humming's w2 and zskip on deterministic 4- and 8-token calls, bitwise."""
     import json
 
@@ -189,8 +171,7 @@ def _self_check(
         }
     )
     ok = True
-    if prefill is None:
-        prefill = bool(getattr(layer, "zskip_prefill", False))
+    prefill = bool(getattr(layer, "zskip_prefill", False))
     for m in (4, MAX_TOKENS) + ((40,) if prefill else ()):
         ids = [[(17 * t + 29 * i) % NUM_EXPERTS for i in range(TOP_K)] for t in range(m)]
         ids[1][0] = ids[0][0]  # one block with two rows
@@ -225,9 +206,9 @@ def _self_check(
         out = torch.empty_like(ref)
         if m > MAX_TOKENS:
             sorted_ids, expert_ids, ntp = _align(topk_ids, PREFILL_BM)
-            cfg, mb = PREFILL_CONFIG, sorted_ids.numel() // PREFILL_BM
+            cfg, mb = PREFILL_CONFIG, expert_ids.numel()
         else:
-            cfg, mb = config, m * TOP_K
+            cfg, mb = CONFIG, m * TOP_K
         _zskip.down(
             act,
             sorted_ids,
@@ -240,9 +221,7 @@ def _self_check(
             max_blocks=mb,
         )
         ok = ok and torch.equal(out.view(torch.int16), ref.view(torch.int16))
-    if not ok and quiet:
-        logger.warning_once("zskip: fused prep differs from humming at load; config %d", CONFIG)
-    elif not ok:
+    if not ok:
         logger.warning(
             "zskip: load-time check differs from humming on %s; humming keeps the down projection",
             getattr(layer, "layer_name", "?"),
@@ -304,7 +283,7 @@ def maybe_down(
             outputs,
             mode=_zskip.SKIP,
             config=PREFILL_CONFIG,
-            max_blocks=sorted_ids.numel() // PREFILL_BM,
+            max_blocks=expert_ids.numel(),
         )
         return True
     _zskip.down(
@@ -315,7 +294,7 @@ def maybe_down(
         packed,
         outputs,
         mode=_zskip.SKIP,
-        config=getattr(layer, "zskip_config", CONFIG),
+        config=CONFIG,
         max_blocks=rows,
     )
     return True

@@ -44,7 +44,7 @@ except ImportError:
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 
-from .nemotron_h_mtp_kernels import mtp_pdl
+from .nemotron_h_mtp_kernels import DEPTH_THETA, _gate_args, depth_gate_init, mtp_pdl
 
 logger = init_logger(__name__)
 
@@ -110,6 +110,8 @@ def _nvfp4_rows_dot(
     BR: tl.constexpr,
     BB: tl.constexpr,
     INDEX32: tl.constexpr = False,
+    gate_ptr=None,
+    GATED: tl.constexpr = False,
     launch_pdl: tl.constexpr = False,
 ):
     if launch_pdl:
@@ -118,6 +120,10 @@ def _nvfp4_rows_dot(
     pid = tl.program_id(0)
     r = pid * BR + tl.arange(0, BR)
     rmask = r < R
+    # weight/scale-load mask: off once the depth gate stopped the draft loop (zeros out)
+    wr = rmask
+    if GATED:
+        wr = rmask & (tl.load(gate_ptr) == 0)
     if GATHER:
         if INDEX32:
             rows = tl.load(rows_ptr + r, mask=rmask, other=0).to(tl.int32)
@@ -133,14 +139,14 @@ def _nvfp4_rows_dot(
         ob = b0 + tl.arange(0, BB)
         wb = tl.load(
             w_ptr + rows[:, None] * NBYTES + ob[None, :],
-            mask=rmask[:, None],
+            mask=wr[:, None],
             other=0,
             eviction_policy="evict_first",
         ).to(tl.int32)
         og = (b0 // 8) + tl.arange(0, BB // 8)
         sc = tl.load(
             s_ptr + rows[:, None] * (NBYTES // 8) + og[None, :],
-            mask=rmask[:, None],
+            mask=wr[:, None],
             other=0.0,
         ).to(tl.float32)
         hl = tl.load(h_ptr + 2 * ob)
@@ -152,7 +158,7 @@ def _nvfp4_rows_dot(
     tl.store(out_ptr + r, acc * gscale, mask=rmask)
 
 
-def _rows_dot(h, w, s, rows, gscale, out, gather):
+def _rows_dot(h, w, s, rows, gscale, out, gather, gated=False):
     n_out = out.numel()
     nbytes = w.shape[1]
     br = 64 if not gather else 16
@@ -162,9 +168,12 @@ def _rows_dot(h, w, s, rows, gscale, out, gather):
         and max_rows * (nbytes // 8) < 2**31
         and n_out + br - 1 < 2**31
     )
+    gate, ok = _gate_args(out)
+    gated = gated and ok
     _nvfp4_rows_dot[(triton.cdiv(n_out, br),)](
         h, w, s, rows if gather else out, out, n_out, gscale,
         NBYTES=nbytes, GATHER=gather, BR=br, BB=64, INDEX32=index32,
+        gate_ptr=gate, GATED=gated,
         num_warps=4, num_stages=2,
         launch_pdl=mtp_pdl(),
     )
@@ -173,6 +182,9 @@ def _rows_dot(h, w, s, rows, gscale, out, gather):
 @triton.jit
 def _select_token(
     logits, ids, out, N: tl.constexpr, BLOCK: tl.constexpr,
+    gate_ptr=None,
+    GATED: tl.constexpr = False,
+    THETA: tl.constexpr = 0.0,
     launch_pdl: tl.constexpr = False,
 ):
     """Stock BF16 maximum, then minimum token id among ties, in one launch."""
@@ -189,6 +201,15 @@ def _select_token(
     any_nan = tl.max(((i < N) & (v != v)).to(tl.int32), axis=0)
     chosen = tl.min(tl.where((i < N) & (v == best), token, 1 << 30), axis=0)
     tl.store(out, tl.where(any_nan != 0, 1 << 30, chosen))
+    if GATED:
+        # Depth gate (nemotron_h_mtp_kernels.py): while a draft loop is active and
+        # not stopped, count this draft as kept, then stop the loop if its top-1
+        # probability over the candidate logits is below THETA (NaN never stops it).
+        if (tl.load(gate_ptr + 2) != 0) & (tl.load(gate_ptr) == 0):
+            tl.store(gate_ptr + 1, tl.load(gate_ptr + 1) + 1)
+            denom = tl.sum(tl.where(i < N, tl.exp(v - best), 0.0), axis=0)
+            if 1.0 / denom < THETA:
+                tl.store(gate_ptr, 1)
 
 
 class DraftHeadScreen:
@@ -270,38 +291,70 @@ class DraftHeadScreen:
         if _l2pf is not None and self.cascade:
             _l2pf.DRAFT_SCREEN[:] = [self.w_coarse]
         self.graph = None
+        self.native_selector = None
         self._h = torch.empty(k, dtype=torch.float32, device=device)
         self._out = torch.empty(1, dtype=torch.int32, device=device)
+        # Official remote boot only. Real checkpoint weights, synthetic current
+        # hidden vectors and the original full085 proposal path are compared.
+        # This finite admission is not a universal arithmetic equivalence proof.
+        if (device.type == "cuda" and self.cascade
+                and os.environ.get("MTP_HEAD_FUSED", "1") != "0"):
+            try:
+                from head_fused import Selector
+                native = Selector(self, device)
+                i = torch.arange(k, device=device, dtype=torch.float32)
+                ok = True
+                for seed in (3, 17, 41):
+                    h = (((i * seed + 11).remainder(257) - 128) / 64).contiguous()
+                    original = self._greedy_row(h)
+                    proposed = self._finish_row(h, native.candidates(h))
+                    if not torch.equal(original, proposed):
+                        ok = False
+                        break
+                if ok:
+                    self.native_selector = native
+                logger.info("MTP fused head finite admission: %s", ok)
+            except (ImportError, OSError, RuntimeError, AssertionError) as exc:
+                logger.warning("MTP fused head declined: %r", exc)
         if device.type == "cuda" and screen_graph_enabled():
+            # The captured one-row screen is the gated one (depth gate): allocate
+            # the gate first so the graph captures its address.
+            gate = depth_gate_init(device)
             try:
                 self._h.zero_()
                 for _ in range(2):
-                    self._out.copy_(self._greedy_row(self._h))
+                    self._out.copy_(self._greedy_row(self._h, gated=True))
                 torch.cuda.synchronize(device)
                 self.graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(
                     self.graph, pool=torch.cuda.graph_pool_handle()
                 ):
-                    self._out.copy_(self._greedy_row(self._h))
+                    self._out.copy_(self._greedy_row(self._h, gated=True))
                 torch.cuda.synchronize(device)
             except Exception as exc:
                 self.graph = None
                 logger.warning("MTP draft-head screen graph disabled: %s", exc)
+            if gate is not None:
+                gate.zero_()  # the warm-up rows above may have counted or stopped
         logger.info(
             "MTP draft-head screen: %d of %d groups, %d candidates, cascade=%s, graph=%s",
             SCREEN_FRAC_GROUPS, ng, self.cand_logits.numel(), self.cascade,
             self.graph is not None,
         )
 
-    def _greedy_row(self, h: torch.Tensor) -> torch.Tensor:
+    def _greedy_row(self, h: torch.Tensor, gated: bool = False) -> torch.Tensor:
         """One row h [K] float32: the cascade (or the single screen) and the
         argmax tie rule. Every buffer it touches is fixed-address, so the body
         is capturable as-is."""
+        if self.native_selector is not None:
+            gate, ok = _gate_args(h)
+            cand = self.native_selector.candidates(h, gate if gated and ok else None)
+            return self._finish_row(h, cand, gated)
         if self.cascade:
             hc = h.index_select(0, self.coarse_cols)
             _rows_dot(
                 hc, self.w_coarse, self.s_coarse, None,
-                self.gscale, self.scores, False,
+                self.gscale, self.scores, False, gated,
             )
             # Every consumer below is order-independent (index-aligned gathers,
             # then the max with the lowest-id tie rule), so the candidate sets
@@ -313,7 +366,7 @@ class DraftHeadScreen:
             hs = h.index_select(0, self.cols)
             _rows_dot(
                 hs, self.w_scr, self.s_scr, coarse_cand.reshape(-1),
-                self.gscale, self.refine_scores, True,
+                self.gscale, self.refine_scores, True, gated,
             )
             # Scores retain the [original chunk, coarse candidate] layout.
             # Gather global IDs; adding chunk_off here would offset twice.
@@ -323,17 +376,28 @@ class DraftHeadScreen:
             cand = coarse_cand.gather(1, refined).reshape(-1)
         else:
             hs = h.index_select(0, self.cols)
-            _rows_dot(hs, self.w_scr, self.s_scr, None, self.gscale, self.scores, False)
+            _rows_dot(
+                hs, self.w_scr, self.s_scr, None, self.gscale, self.scores, False, gated
+            )
             cand = (
                 self.scores.view(-1, SCREEN_CHUNK)
                 .topk(SCREEN_PER, dim=-1, sorted=False).indices
                 + self.chunk_off
             ).reshape(-1)
-        _rows_dot(h, self.w_full, self.s_full, cand, self.gscale, self.cand_logits, True)
+        return self._finish_row(h, cand, gated)
+
+    def _finish_row(self, h, cand, gated=False):
+        # Retain original full-K/BF16/min-ID selector and imported confidence
+        # update. Prefix admission and the stop/kept state share this one path.
+        _rows_dot(
+            h, self.w_full, self.s_full, cand, self.gscale, self.cand_logits, True, gated
+        )
         out = torch.empty((), dtype=torch.int32, device=h.device)
+        gate, ok = _gate_args(out)
         _select_token[(1,)](
             self.cand_logits, cand, out, N=self.cand_logits.numel(),
             BLOCK=triton.next_power_of_2(self.cand_logits.numel()),
+            gate_ptr=gate, GATED=gated and ok, THETA=DEPTH_THETA,
             launch_pdl=mtp_pdl(),
         )
         return out

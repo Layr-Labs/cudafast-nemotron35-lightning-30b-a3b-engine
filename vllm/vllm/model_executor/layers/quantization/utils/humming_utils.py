@@ -1039,8 +1039,10 @@ def convert_to_humming_moe_kernel_format(
 
     # Preserve only a byte permutation of the original NVFP4 down weights.
     # Humming's ordinary format remains available for prefill and fallbacks.
+    # (cudafast-nemotron35: not needed while zskip serves these calls; ZSKIP=0
+    # brings it back.)
     layer.routed_sparse_down = None
-    if tuned and all(
+    if tuned and getattr(layer, "zskip_w2", None) is None and all(
         hasattr(layer, name)
         for name in ("w2_weight", "w2_weight_scale", "w2_weight_scale_2")
     ):

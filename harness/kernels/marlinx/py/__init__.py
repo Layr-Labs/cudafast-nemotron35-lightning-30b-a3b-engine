@@ -32,17 +32,10 @@ _lib = None
 _load_error: str | None = None
 _ready = False
 _sms: dict[int, int] = {}
-# Optional ABI: old/no-PDL libraries keep the ordinary launch. A rejected
-# eager PDL launch disables all PDL entry points; capture errors never retry.
-_PDL_ENABLED = os.environ.get("MARLINX_PDL", "1") != "0"
-_pdl_active = False
-_init_pdl = None
-_ops = {}
-_ops_pdl = {}
 
 
 def _load():
-    global _lib, _load_error, _init_pdl, _ops, _ops_pdl
+    global _lib, _load_error
     if _lib is not None or _load_error is not None:
         return _lib
     try:
@@ -68,28 +61,6 @@ def _load():
         lib.marlinx_hog.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
                                     ctypes.c_longlong, ctypes.c_void_p, ctypes.c_void_p]
         lib.marlinx_hog.restype = ctypes.c_int
-        _ops = {"gemm": lib.marlinx_gemm}
-        for mode in ("relu2", "zs"):
-            op = getattr(lib, "marlinx_gemm_" + mode, None)
-            if op is not None:
-                _ops[mode] = op
-        if _PDL_ENABLED:
-            try:
-                init_pdl = lib.marlinx_init_pdl
-                ops_pdl = {
-                    "gemm": lib.marlinx_gemm_pdl,
-                    "relu2": lib.marlinx_gemm_relu2_pdl,
-                    "zs": lib.marlinx_gemm_zs_pdl,
-                }
-            except AttributeError:  # old library or MARLINX_NO_PDL build
-                init_pdl = None
-            if init_pdl is not None:
-                init_pdl.argtypes = []
-                init_pdl.restype = ctypes.c_int
-                for mode, op in ops_pdl.items():
-                    op.argtypes = _ops[mode].argtypes
-                    op.restype = ctypes.c_int
-                _init_pdl, _ops_pdl = init_pdl, ops_pdl
         _lib = lib
     except OSError as exc:  # library missing or unloadable: callers fall back
         _load_error = str(exc)
@@ -102,7 +73,7 @@ def available() -> bool:
 
 def _init() -> bool:
     """Loads the kernels into the context (must run outside CUDA graph capture)."""
-    global _ready, _pdl_active
+    global _ready
     if _ready:
         return True
     lib = _load()
@@ -111,8 +82,6 @@ def _init() -> bool:
     rc = lib.marlinx_init()
     if rc != 0:
         raise RuntimeError(f"marlinx_init failed: {rc}")
-    if _init_pdl is not None and _init_pdl() == 0:
-        _pdl_active = True
     _ready = True
     return True
 
@@ -193,27 +162,18 @@ def gemm(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
          global_scale: torch.Tensor, n: int, k: int, depth: int = DEPTH,
          relu2: bool = False, zs: torch.Tensor | None = None) -> torch.Tensor:
     """out[M, n] for a 2-D bf16 x[M, k] (1 <= M <= 8); no guard beyond the C side's."""
-    global _pdl_active
     lib = _load()
     assert lib is not None, _load_error
     m = x.shape[0]
     out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
-    mode = "zs" if zs is not None else "relu2" if relu2 else "gemm"
-    use_pdl = _pdl_active
-    op = _ops_pdl[mode] if use_pdl else _ops[mode]
+    op = lib.marlinx_gemm_relu2 if relu2 else lib.marlinx_gemm
     args = (
         x.data_ptr(), x.stride(0), m,
         weight.data_ptr(), weight_scale.data_ptr(), global_scale.data_ptr(),
         out.data_ptr(), n, n, k, _sm_count(x.device), depth,
         torch.cuda.current_stream(x.device).cuda_stream,
     )
-    if zs is not None:
-        args += (zs.data_ptr(),)
-    rc = op(*args)
-    if rc and use_pdl and not torch.cuda.is_current_stream_capturing():
-        # Match fp8small: only rejected eager launches retry, never capture.
-        _pdl_active = False
-        rc = _ops[mode](*args)
+    rc = lib.marlinx_gemm_zs(*args, zs.data_ptr()) if zs is not None else op(*args)
     if rc != 0:
         raise RuntimeError(f"marlinx_gemm failed: {rc} (M={m} N={n} K={k} depth={depth})")
     return out

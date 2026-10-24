@@ -170,3 +170,108 @@ def rms_norm_gated(
     )
 
     return y.reshape(x_shape_og)
+
+
+@triton.jit
+def _grouped_gated_rms_kernel(
+    X,
+    Y,
+    W,
+    Z,
+    stride_x_row: tl.int64,
+    stride_y_row: tl.int64,
+    stride_z_row: tl.int64,
+    eps,
+    N: tl.constexpr,
+    BLOCK: tl.constexpr,
+    WEIGHT_FP32: tl.constexpr,
+):
+    """One (row, group): the grouped branch of Mixer2RMSNormGated.forward_native.
+
+    fp32 silu(gate) multiplies x, the mean of squares is over the group, then
+    x * (1 / sqrt(var + eps)). The result is rounded to bf16 and then multiplied
+    by the norm weight, which is what ``weight * x.to(bf16)`` does.
+    """
+    row = tl.program_id(0)
+    group = tl.program_id(1)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < N
+    base = group * N
+    x = tl.load(X + row * stride_x_row + base + cols, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    z = tl.load(Z + row * stride_z_row + base + cols, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    x = x * (z * tl.sigmoid(z))
+    var = tl.sum(x * x, axis=0) / N
+    x = x * (1.0 / tl.sqrt(var + eps))
+    x16 = x.to(tl.bfloat16)
+    w = tl.load(W + base + cols, mask=mask, other=0.0)
+    if WEIGHT_FP32:
+        y = w.to(tl.float32) * x16.to(tl.float32)
+    else:
+        y = x16 * w
+    tl.store(Y + row * stride_y_row + base + cols, y, mask=mask)
+
+
+def grouped_gated_rms(x, weight, gate, group_size, eps):
+    """Fused grouped gated RMSNorm, or None when the caller should use native.
+
+    None keeps the unfused path for dtypes, shapes and group sizes this kernel
+    does not cover. A returned tensor matches ``weight * x.to(x.dtype)`` in
+    dtype: bf16 weight gives bf16, fp32 weight gives fp32.
+    """
+    if (
+        not x.is_cuda
+        or x.dtype != torch.bfloat16
+        or gate.dtype != torch.bfloat16
+        or weight.dtype not in (torch.bfloat16, torch.float32)
+        or x.shape != gate.shape
+        or x.numel() == 0
+        or group_size <= 0
+        or x.shape[-1] % group_size != 0
+    ):
+        return None
+    block = triton.next_power_of_2(group_size)
+    if block != group_size or block > 1024:
+        return None
+    if x.stride(-1) != 1 or gate.stride(-1) != 1 or weight.stride(-1) != 1:
+        return None
+    if not weight.is_contiguous():
+        return None
+    cols = x.shape[-1]
+    rows = x.numel() // cols
+
+    def _rows(t):
+        if t.dim() == 2 and t.shape == (rows, cols):
+            return t
+        if t.is_contiguous() and t.numel() == rows * cols:
+            return t.view(rows, cols)
+        return None
+
+    x2 = _rows(x)
+    g2 = _rows(gate)
+    if x2 is None or g2 is None:
+        return None
+    groups = cols // group_size
+    out_dtype = (
+        torch.float32 if weight.dtype == torch.float32 else torch.bfloat16
+    )
+    out = torch.empty((rows, x.shape[-1]), device=x.device, dtype=out_dtype)
+    with torch.accelerator.device_index(x.device.index):
+        _grouped_gated_rms_kernel[(rows, groups)](
+            x2,
+            out,
+            weight,
+            g2,
+            x2.stride(0),
+            out.stride(0),
+            g2.stride(0),
+            eps,
+            N=group_size,
+            BLOCK=block,
+            WEIGHT_FP32=weight.dtype == torch.float32,
+            num_warps=max(block // 256, 1),
+        )
+    return out.view(x.shape)

@@ -210,6 +210,18 @@
     {
       "file": "harness/kernels/l2pf/py/__init__.py",
       "why": "Carry useful04706ad7-c4e8-44b9-b8ba-77f14d8b8adf MoE-window immutable prefetch default6to12MB. Its complete official2.19195352041462 is within0.1% of fulla484, but only budget mechanism is combined here on higherfulla484. Prefix pair/SSM combination unverified."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_kernels.py, harness/kernels/pzskip/csrc/pzskip.cu, vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
+      "why": "Tuning only. MTP_DEPTH_THETA default 0.4 -> 0.5 (the confidence gate stops drafting at a higher top-1 probability; drafts only, the target decides every token). pzskip config 333 (32-row blocks, 384 columns, 2 k16 groups per stage, 3 stages) replaces 322 as the prefill default: same arithmetic, load-time bitwise check per layer with fallback."
+    },
+    {
+      "file": "vllm/model_executor/layers/mamba/mamba_mixer2.py, vllm/model_executor/layers/mamba/ops/layernorm_gated.py",
+      "why": "Grouped Mamba gated RMSNorm (n_groups=8, group 512) was the native aten chain inside the captured verify graph. One Triton kernel per layer does fp32 silu, the group mean of squares, rsqrt, the bf16 round, then the weight multiply. n_groups==1 is unchanged. Shapes the kernel does not cover stay on the native chain."
+    },
+    {
+      "file": "vllm/v1/worker/gpu_model_runner.py",
+      "why": "Async sampled-token D2H waited on the whole default stream, so get_output blocked until the MTP drafter finished and the next step's host prep ran with the GPU idle. The copy stream now waits on an event recorded after sampling (and the routed-expert snapshot) and before the drafter, so the D2H and the following host prep overlap the drafter. The token values are unchanged. EP fault query, when enabled, still waits for the default stream."
     }
   ]
 }

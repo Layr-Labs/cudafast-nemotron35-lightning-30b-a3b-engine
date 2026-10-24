@@ -769,6 +769,7 @@ int pzskip_down(const void* A, long long lda, int shape_m, const int* sorted_ids
     case 323: return pzskip::launch_smem4<1, 4, 7, 2, 32>(p, st);   // 448 columns, 7 warps
     case 324: return pzskip::launch_smem4<1, 6, 3, 4, 32>(p, st);
     case 325: return pzskip::launch_smem4<2, 4, 3, 4, 32>(p, st);
+    case 333: return pzskip::launch_smem4<2, 3, 6, 3, 32>(p, st);
     // 16-row blocks: one warp per 64-column tile, 2 token tiles
     case 340: return pzskip::launch_smem4<1, 4, 2, 8, 16>(p, st);
     case 341: return pzskip::launch_smem4<1, 4, 3, 6, 16>(p, st);

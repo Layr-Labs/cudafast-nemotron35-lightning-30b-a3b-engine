@@ -94,6 +94,10 @@
     {
       "file": "vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py, vllm/model_executor/layers/fused_moe/moe_align_block_size.py (opt-in)",
       "why": "smallk's fused sigmoid top-k + moe_align kernel (bit-identical to ops.grouped_topk and the two align kernels for <= 32 ids) is off by default: the routing chain overlaps the shared-expert GEMMs, so shortening it gave no end-to-end gain (SMALLK_TOPK=1 SMALLK_ALIGN=1 enable it)"
+    },
+    {
+      "file": "vllm/model_executor/kernels/linear/scaled_mm/flashinfer.py",
+      "why": "SM120-family small-M static FP8 Mamba in/out projections: consume the inherited FP8 A/B and scalar FP32 scales with the existing compiled CUTLASS scaled_mm backend, shape/layout guarded; prefill and unsupported cases retain FlashInfer. New unvalidated backend/reduction choice, no quantization change."
     }
   ]
 }

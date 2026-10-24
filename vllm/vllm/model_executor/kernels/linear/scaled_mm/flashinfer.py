@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+from collections.abc import Sequence
 from typing import ClassVar
 
 import torch
 
 import vllm.envs as envs
+from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
@@ -14,6 +16,9 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     QuantKey,
     kFp8StaticTensorSym,
+)
+from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
+    CUTLASS_FP8_SUPPORTED,
 )
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import (
@@ -37,6 +42,19 @@ from .ScaledMMLinearKernel import (
 
 
 class FlashInferFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
+    def __init__(
+        self, c: FP8ScaledMMLinearLayerConfig, layer_param_names: Sequence[str]
+    ) -> None:
+        super().__init__(c, layer_param_names)
+        # Device/configuration metadata only; input quantization stays in the
+        # inherited apply_weights path. No weight conversion or runtime probe.
+        self._nemotron_small_m_cutlass = (
+            current_platform.is_device_capability_family(120)
+            and CUTLASS_FP8_SUPPORTED
+            and c.activation_quant_key == kFp8StaticTensorSym
+            and c.weight_quant_key == kFp8StaticTensorSym
+        )
+
     @classmethod
     def is_supported(
         cls, compute_capability: int | None = None
@@ -80,6 +98,35 @@ class FlashInferFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         bias: torch.Tensor | None,
         output_shape: list,
     ) -> torch.Tensor:
+        # The pinned Mamba in/out projections have K,N = 2688,10304 and
+        # 4096,2688. The compiled SM120 CUTLASS path uses a 16x64x128 tile
+        # at small M. Keep the same quantized tensors and scalar FP32 scales;
+        # all other shapes/layouts retain the FlashInfer path below.
+        if (
+            self._nemotron_small_m_cutlass
+            and 1 <= A.shape[0] <= 4
+            and (B.shape[0], B.shape[1]) in ((2688, 10304), (4096, 2688))
+            and A.shape[1] == B.shape[0]
+            and out_dtype == torch.bfloat16
+            and bias is None
+            and A.dtype == torch.float8_e4m3fn
+            and B.dtype == torch.float8_e4m3fn
+            and As.numel() == 1
+            and Bs.numel() == 1
+            and As.dtype == torch.float32
+            and Bs.dtype == torch.float32
+            and As.is_contiguous()
+            and Bs.is_contiguous()
+            and A.stride(1) == 1
+            and A.stride(0) % 16 == 0
+            and B.stride(0) == 1
+            and B.stride(1) % 16 == 0
+            and A.storage_offset() % 16 == 0
+            and B.storage_offset() % 16 == 0
+        ):
+            return ops.cutlass_scaled_mm(
+                A, B, out_dtype=out_dtype, scale_a=As, scale_b=Bs, bias=None
+            )
         return flashinfer_scaled_fp8_mm(
             A, B, out_dtype=out_dtype, scale_a=As, scale_b=Bs, bias=bias
         )

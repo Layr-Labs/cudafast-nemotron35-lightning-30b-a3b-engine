@@ -47,6 +47,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
 )
 from vllm.v1.sample.sampler import _SAMPLING_EPS
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.mtp_screen_stage_graph import MTPScreenStageGraphs
 from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
     compute_new_slot_mapping,
@@ -91,6 +92,20 @@ class SpecDecodeBaseProposer:
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
         self.eplb_state: EplbState | None = None
         self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
+        parallel = vllm_config.parallel_config
+        self._use_mtp_screen_graphs = (
+            self.method == "mtp"
+            and self.draft_model_config.hf_config.model_type == "nemotron_h_mtp"
+            and self.speculative_config.num_speculative_tokens == 3
+            and parallel.tensor_parallel_size == 1
+            and parallel.pipeline_parallel_size == 1
+            and parallel.data_parallel_size == 1
+            and not parallel.enable_eplb
+            and not self.speculative_config.parallel_drafting
+            and not self.speculative_config.enforce_eager
+            and not vllm_config.model_config.enforce_eager
+        )
+        self._mtp_screen_graphs: MTPScreenStageGraphs | None = None
 
         # We need to get the hidden size from the draft model config because
         # the draft model's hidden size can be different from the target model's
@@ -479,8 +494,26 @@ class SpecDecodeBaseProposer:
         self,
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata,
+        draft_index: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if not self._enable_probabilistic_draft_probs or sampling_metadata.all_greedy:
+            screen = getattr(self, "_draft_head_screen", None)
+            if (
+                draft_index is not None
+                and self._use_mtp_screen_graphs
+                and screen is not None
+                and self.eplb_state is None
+                and not self.use_local_argmax_reduction
+                and not self.use_heterogeneous_vocab
+            ):
+                if self._mtp_screen_graphs is None:
+                    self._mtp_screen_graphs = MTPScreenStageGraphs(
+                        screen.greedy, screen, self.model,
+                        self.speculative_config.num_speculative_tokens,
+                    )
+                graphs = self._mtp_screen_graphs
+                if graphs.screen_owner is screen and graphs.model_owner is self.model:
+                    return graphs.sample(hidden_states, draft_index), None
             return self._greedy_sample(hidden_states), None
         logits = self.model.compute_logits(hidden_states)
         if self.use_heterogeneous_vocab:
@@ -668,7 +701,7 @@ class SpecDecodeBaseProposer:
             self.positions[:batch_size] = positions
 
         draft_token_ids, draft_probs = self._sample_draft_tokens(
-            sample_hidden_states, sampling_metadata
+            sample_hidden_states, sampling_metadata, draft_index=0
         )
         draft_probs_list = None if draft_probs is None else [draft_probs]
 
@@ -810,7 +843,8 @@ class SpecDecodeBaseProposer:
 
             hidden_states = hidden_states[:batch_size]
             draft_token_ids, draft_probs = self._sample_draft_tokens(
-                last_hidden_states[:batch_size], sampling_metadata
+                last_hidden_states[:batch_size], sampling_metadata,
+                draft_index=token_index + 1,
             )
             if draft_probs is not None:
                 assert draft_probs_list is not None
@@ -820,6 +854,8 @@ class SpecDecodeBaseProposer:
         if set_moe_row_src is not None:
             set_moe_row_src(max(num_input_tokens, input_batch_size), None)
 
+        # The same-stream stack consumes every stage-owned token tensor before
+        # a later proposal can replay that stage and overwrite its output.
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
         if draft_probs_list is not None:

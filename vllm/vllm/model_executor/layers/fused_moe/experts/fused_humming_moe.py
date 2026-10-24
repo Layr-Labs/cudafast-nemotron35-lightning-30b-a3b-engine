@@ -662,7 +662,7 @@ class HummingIndexedExperts(HummingExpertsBase):
         topk_ids: torch.Tensor,
         expert_map: torch.Tensor | None,
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
+    ) -> tuple[dict[str, Any], dict[str, Any], int]:
         valid_shape_m = self.estimate_local_valid_shape_m(topk_ids)
 
         moe_block_size = None
@@ -687,6 +687,37 @@ class HummingIndexedExperts(HummingExpertsBase):
             ignore_invalid_experts=True,
         )
 
+        min_output_row = 0
+        if (
+            getattr(self.layer, "prefill_last_tile_only", False)
+            and getattr(self, "_fused_relu2", False)
+            and self.compute_config["use_batch_invariant"]
+            and not self.compute_config["use_f16_accum"]
+            and expert_map is None
+            and self.num_experts == self.global_num_experts == 128
+            and tuple(topk_ids.shape) == (496, 6)
+            and valid_shape_m == 2976
+            and moe_block_size == 64
+        ):
+            # FreshPrefillGraph selects row 495 and MoeRunner gives all 496
+            # rows its six distinct experts. Each expert therefore owns eight
+            # consecutive M64 blocks, including 16 sentinel entries. Locate
+            # row 495 on-device rather than assuming a stable token sort.
+            # Keep its containing block verbatim, preserving its actual lane.
+            # Materialize before copy_ because source and destination overlap.
+            by_expert = sorted_ids[:3072].view(6, 512)
+            is_last = (by_expert >= 2970) & (by_expert < 2976)
+            lane = is_last.to(torch.int32).argmax(dim=1)
+            block_start = (lane // 64) * 64
+            offsets = torch.arange(64, device=sorted_ids.device)
+            gather_at = block_start[:, None] + offsets[None, :]
+            tail_ids = by_expert.gather(1, gather_at)
+            tail_experts = expert_ids[:48:8].contiguous()
+            sorted_ids[:384].copy_(tail_ids.view(-1))
+            expert_ids[:6].copy_(tail_experts)
+            num_tokens_padded.fill_(384)
+            min_output_row = 495
+
         moe_common_kwargs = {
             "sorted_ids": sorted_ids,
             "expert_ids": expert_ids,
@@ -701,7 +732,7 @@ class HummingIndexedExperts(HummingExpertsBase):
         moe_kwargs1.update(moe_common_kwargs)
         moe_kwargs2.update(moe_common_kwargs)
 
-        return moe_kwargs1, moe_kwargs2
+        return moe_kwargs1, moe_kwargs2, min_output_row
 
     def apply(
         self,
@@ -741,7 +772,7 @@ class HummingIndexedExperts(HummingExpertsBase):
             activation,
         )
 
-        moe_kwargs1, moe_kwargs2 = self.prepare_humming_moe_kwargs(
+        moe_kwargs1, moe_kwargs2, min_output_row = self.prepare_humming_moe_kwargs(
             topk_ids=topk_ids,
             expert_map=expert_map,
             expert_tokens_meta=expert_tokens_meta,
@@ -843,6 +874,7 @@ class HummingIndexedExperts(HummingExpertsBase):
             topk_ids=topk_ids,
             expert_map=expert_map,
             outputs=output,
+            min_output_row=min_output_row,
         )
 
 

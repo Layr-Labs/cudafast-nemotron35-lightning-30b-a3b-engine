@@ -117,23 +117,3 @@ to end (8.732 ms/token), because it takes more bandwidth from the routed-expert
 kernel that runs beside it; it is slower for lm_head (850-870 us). L2 prefetch
 ahead of the register ring and a persistent grid were slower for lm_head. Ring
 depths 4-16 perform the same.
-
-## Zero-row skip for the shared expert down projection
-
-The shared expert's down projection (3712 -> 2688) multiplies a ReLU^2
-activation; on real prompts about 70% of its 3712 columns are exactly zero in
-all four rows of an MTP-3 verify call. `prepare()` makes a k-row-major copy of
-that layer's Marlin weight (`zs_repack`, about 5 MB per layer, byte-for-byte
-the same nibbles): for k16 block `kb`, row `kr`, half column `c` and lane group
-`g`, one u32 whose byte `j` holds features `16j+g` (low nibble) and `16j+g+8`
-(high nibble). A lane of Marlin's warp needs rows `2t, 2t+1, 2t+8, 2t+9` of
-each k16 block; it reads those four u32 (32 contiguous bytes per row and half
-column across the eight lane groups) and rebuilds exactly Marlin's weight word
-`j` from them (`zs_word`). At kernel start each CTA builds a 16-bit mask per
-k16 block from the activations (bit `kr` set when column `16*kb+kr` is nonzero
-in some row < M); a row whose bit is clear is not read and its nibbles are
-zero. Those weights only multiply activations that are zero in every row.
-Scales, dequant, MMA operands, segments and every fp32 add are unchanged.
-`MARLINX_ZS=0` disables it. `tests/marlinx_zs_exact.py` compares against stock
-Marlin and marlinx on all 23 layers (M = 1..8, synthetic and real dumped
-activations, signed zeros, CUDA graph replay with in-place inputs).

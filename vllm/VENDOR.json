@@ -160,8 +160,8 @@
       "why": "In the one captured 496-token prefill forward that reads a single row of the final hidden states (logits row 495), every row of the last layer's MoE (the model's last layer) takes that row's six experts: the flag is set inside the whole-forward capture's forward helper and cleared in a finally, so it is baked into the recorded graph and no later or earlier forward sees it; the graph is replayed only for a request that reads that one row, with no prompt logprobs. M and valid_shape_m are unchanged, the last layer's other rows reach only the per-row final norm and are unread, and row 495 keeps its own input, experts, weights and K order, so its logits are bit-identical; six experts' weights are read instead of nearly all 128."
     },
     {
-      "file": "harness/kernels/marlinx/{csrc/marlinx.cu,py/__init__.py,README.md,tests/marlinx_zs_exact.py}",
-      "why": "Shared expert down projection (3712->2688, ReLU^2 input): read only the k rows whose activation is nonzero in some row, from a byte-preserving k-row-major copy of the Marlin weight; the lane rebuilds Marlin's exact weight word, so dequant, MMA, segments and fp32 reductions are unchanged. Bit-exact vs stock Marlin on all 23 layers (4416 synthetic + 1380 real-activation cases, CUDA graph replay). MARLINX_ZS=0 disables."
+      "file": "vllm/model_executor/models/nemotron_h.py; vllm/v1/worker/prefill_graph.py; vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py; vllm/model_executor/layers/fused_moe/moe_fused_mul_sum.py",
+      "why": "Fresh M496 final MoE: retain each unified expert's M64 alignment block containing row 495, and mask uncomputed rows in the original FP32 combine. Target states, full-M dispatch, K chains and row 495 are preserved by construction; earlier final hidden rows are drafter-only perturbations requiring acceptance measurement. Decode is unchanged."
     }
   ]
 }

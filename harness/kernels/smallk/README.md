@@ -82,3 +82,12 @@ the routing chain runs while the shared-expert Marlin GEMMs stream on the side s
 shorter chain only moves that DRAM traffic into the humming window. The router GEMM ran alone
 before the fork, so its saving is real; running it after the fork (early router) hides most of
 what is left. Hence top-k/align are opt-in.
+
+## bf16 gate read (SMALLK_ROUTER_W16, on by default)
+
+The checkpoint stores each gate weight in bf16; vLLM upcasts it to fp32 on GB10. `gate_w16` keeps a
+bf16 copy of a gate only if its fp32 values widen back bit for bit (int32 compare, once per gate,
+outside capture), and the router kernel widens each element with `bits << 16` into the same fma
+chains. Same operands, same logits; half the gate bytes (0.69 MB per MoE layer per verify). A gate
+that is not bf16-exact keeps the fp32 read. `tests/exact.py` checks the W16 launches against
+`F.linear` and logs the checkpoint dtype.

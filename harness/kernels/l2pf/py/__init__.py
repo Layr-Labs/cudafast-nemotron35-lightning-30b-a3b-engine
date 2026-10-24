@@ -16,7 +16,8 @@ import os
 import torch
 
 __all__ = [
-    "LIB_PATH", "ENABLED", "MAMBA_BYTES", "ATTN_BYTES", "MOE_BYTES", "AHEAD", "AHEAD_MOE",
+    "LIB_PATH", "ENABLED", "MAMBA_BYTES", "ATTN_BYTES", "MOE_BYTES", "DRAFT_BYTES",
+    "AHEAD", "AHEAD_MOE", "DRAFT_SCREEN",
     "prefetch", "join",
 ]
 
@@ -30,6 +31,11 @@ ATTN_BYTES = int(float(os.environ.get("L2PF_ATTN_MB", "3")) * (1 << 20))
 # The routed down projection of a small call (zskip) is latency-bound and leaves
 # DRAM about half idle: prefetch the head of the next Mamba layer's in_proj then.
 MOE_BYTES = int(float(os.environ.get("L2PF_MOE_MB", "6")) * (1 << 20))
+# Drafter window: the latency-bound down projection of the single-row MTP MoE
+# prefetches the head of the draft screen's coarse matrix (0 disables).
+DRAFT_BYTES = int(float(os.environ.get("L2PF_DRAFT_MB", "3")) * (1 << 20))
+# The draft screen's coarse weight matrix (set by the screen at construction).
+DRAFT_SCREEN: list[torch.Tensor] = []
 # attention layer name -> the module whose .weight follows that attention
 # (filled by the model at construction).
 AHEAD: dict[str, torch.nn.Module] = {}

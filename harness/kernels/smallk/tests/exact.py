@@ -4,6 +4,7 @@ Run on Atom with `bin/atom nemo exec <sha> harness/kernels/smallk/tests/exact.py
 Parts (default router,rtree,topk,sweep,align,timing). Writes $NEMO_OUT/exact-<part>.json.
 
 - router: torch.equal(F.linear(x, W), smallk.router_gemm(x, W)) on the 23 target gate weights,
+  and the same for the bf16-shadow read (smallk.gate_w16) on every gate that has one,
           M = 4, for normal, heavy-tailed, wide-exponent, bf16-rounded and cancellation-heavy x,
           every launch variant (rows per CTA 1/2/4/8) and both chain modes (fma / mul+add).
 - rtree:  the cancellation-probe masks of smallk.router_gemm equal cuBLAS's on random queries.
@@ -58,7 +59,10 @@ def gate_tensors():
         for kind, store in (("weight", W), ("e_score_correction_bias", B)):
             name = f"backbone.layers.{li}.mixer.gate.{kind}"
             with safe_open(os.path.join(SNAP, idx[name]), framework="pt", device="cuda") as f:
-                store[li] = f.get_tensor(name).float().contiguous()
+                t = f.get_tensor(name)
+                if kind == "weight" and li == layers[0]:
+                    log("gate weight checkpoint dtype", str(t.dtype))
+                store[li] = t.float().contiguous()
     return layers, W, B
 
 
@@ -89,6 +93,8 @@ def part_router(layers, W, trials=40):
     M, K = 4, W[layers[0]].shape[1]
     variants = [(rows, mode) for mode in (0, 1) for rows in (1, 2, 4, 8)]
     tot = {v: [0, 0] for v in variants}
+    w16 = {li: smallk.gate_w16(W[li]) for li in layers}
+    tot16 = {rows: [0, 0] for rows in (1, 2, 4, 8)}
     per_kind = {}
     for t in range(trials):
         xs = router_inputs(1000 + t, M, K)
@@ -104,8 +110,16 @@ def part_router(layers, W, trials=40):
                         pk = per_kind.setdefault(kind, [0, 0])
                         pk[0] += bad
                         pk[1] += ref.numel()
+                if w16[li] is not None:
+                    for rows in tot16:
+                        y = smallk.router_gemm(x, W[li], rows=rows, w16=w16[li])
+                        tot16[rows][0] += int((ref.view(torch.int32) != y.view(torch.int32)).sum())
+                        tot16[rows][1] += ref.numel()
     for v, (bad, n) in tot.items():
         res["variants"][f"rows={v[0]} mode={'fma' if v[1] == 0 else 'mul+add'}"] = {"mismatches": bad, "outputs": n}
+    res["w16_gates"] = sum(v is not None for v in w16.values())
+    for rows, (bad, n) in tot16.items():
+        res["variants"][f"rows={rows} mode=fma w16"] = {"mismatches": bad, "outputs": n}
     res["per_kind_rows4_fma"] = per_kind
     log("router", json.dumps(res))
     save("exact-router.json", res)

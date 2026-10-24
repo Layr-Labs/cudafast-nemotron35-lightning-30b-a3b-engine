@@ -51,12 +51,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# l2pf (harness/kernels/l2pf); absent, nothing changes.
-try:
-    import l2pf as _l2pf
-except ImportError:
-    _l2pf = None
-
 
 def validate_kv_sharing_target(
     current_layer_name, target_layer_name, static_forward_context
@@ -839,16 +833,6 @@ def unified_attention_with_output(
     layer_name = _resolve_layer_name(layer_name)
     attn_metadata, self, kv_cache, _ = get_attention_context(layer_name)
 
-    # LOCAL PATCH (cudafast-nemotron35): small batches only: prefetch the head
-    # of the following projection's weight into L2 on a side stream while the
-    # (latency-bound) attention kernel runs, then rejoin. Moves no value.
-    ahead = _l2pf.AHEAD.get(layer_name) if _l2pf is not None else None
-    pf = (
-        ahead is not None
-        and query.shape[0] <= 8
-        and _l2pf.ATTN_BYTES > 0
-        and _l2pf.prefetch(ahead.weight, max_bytes=_l2pf.ATTN_BYTES)
-    )
     self.impl.forward(
         self,
         query,
@@ -860,8 +844,6 @@ def unified_attention_with_output(
         output_scale=output_scale,
         output_block_scale=output_block_scale,
     )
-    if pf:
-        _l2pf.join(query.device)
 
 
 def unified_attention_with_output_fake(

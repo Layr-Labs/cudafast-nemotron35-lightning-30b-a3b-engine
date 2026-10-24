@@ -93,13 +93,6 @@ try:
 except ImportError:
     _smallk = None
 
-# l2pf (harness/kernels/l2pf): the attention op prefetches o_proj's weight; absent,
-# nothing changes.
-try:
-    import l2pf as _l2pf
-except ImportError:
-    _l2pf = None
-
 
 class NemotronHMLP(nn.Module):
     def __init__(
@@ -513,10 +506,6 @@ class NemotronHAttention(nn.Module):
             prefix=f"{prefix}.attn",
             per_layer_sliding_window=sliding_window,
         )
-        # LOCAL PATCH (cudafast-nemotron35): let the attention op prefetch the
-        # head of o_proj's weight into L2 while it runs (harness/kernels/l2pf).
-        if _l2pf is not None:
-            _l2pf.AHEAD[f"{prefix}.attn"] = self.o_proj
 
     def forward(
         self,
@@ -641,20 +630,6 @@ class NemotronHModel(nn.Module, EagleModelMixin):
         self.start_layer, self.end_layer, self.layers = make_layers(
             len(config.hybrid_override_pattern), get_layer, prefix=f"{prefix}.layers"
         )
-        # LOCAL PATCH (cudafast-nemotron35): let each MoE layer's small-call
-        # routed down projection prefetch the head of the following Mamba
-        # layer's in_proj weight into L2 (harness/kernels/l2pf).
-        if _l2pf is not None:
-            for i in range(self.start_layer, self.end_layer - 1):
-                cur, nxt = self.layers[i], self.layers[i + 1]
-                if isinstance(cur, NemotronHMoEDecoderLayer) and isinstance(
-                    nxt, NemotronHMambaDecoderLayer
-                ):
-                    experts = getattr(cur.mixer, "experts", None)
-                    name = getattr(experts, "layer_name", None)
-                    if name is None:
-                        name = f"{prefix}.layers.{i}.mixer.experts"
-                    _l2pf.AHEAD_MOE[str(name)] = nxt.mixer.in_proj
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )

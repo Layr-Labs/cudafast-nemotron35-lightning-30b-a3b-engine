@@ -266,12 +266,9 @@ class DraftHeadScreen:
                 hc, self.w_coarse, self.s_coarse, None,
                 self.gscale, self.scores, False,
             )
-            # Every consumer below is order-independent (index-aligned gathers,
-            # then the max with the lowest-id tie rule), so the candidate sets
-            # need not be sorted: sorted=False skips a segmented sort per stage.
             coarse_cand = (
                 self.scores.view(-1, SCREEN_CHUNK)
-                .topk(CASCADE_PER, dim=-1, sorted=False).indices + self.chunk_off
+                .topk(CASCADE_PER, dim=-1).indices + self.chunk_off
             )
             hs = h.index_select(0, self.cols)
             _rows_dot(
@@ -281,15 +278,14 @@ class DraftHeadScreen:
             # Scores retain the [original chunk, coarse candidate] layout.
             # Gather global IDs; adding chunk_off here would offset twice.
             refined = self.refine_scores.view(-1, CASCADE_PER).topk(
-                SCREEN_PER, dim=-1, sorted=False
+                SCREEN_PER, dim=-1
             ).indices
             cand = coarse_cand.gather(1, refined).reshape(-1)
         else:
             hs = h.index_select(0, self.cols)
             _rows_dot(hs, self.w_scr, self.s_scr, None, self.gscale, self.scores, False)
             cand = (
-                self.scores.view(-1, SCREEN_CHUNK)
-                .topk(SCREEN_PER, dim=-1, sorted=False).indices
+                self.scores.view(-1, SCREEN_CHUNK).topk(SCREEN_PER, dim=-1).indices
                 + self.chunk_off
             ).reshape(-1)
         _rows_dot(h, self.w_full, self.s_full, cand, self.gscale, self.cand_logits, True)

@@ -69,9 +69,7 @@ def _start_projection(
     """
     previous_hidden_states_normed = layer.hnorm(hidden_states)
     if embeds_projected:
-        # W_h (14.5 MB) is read by every draft pass of a cycle; ordinary loads
-        # let it stay in L2 between passes while the rest stream evict-first.
-        h_part = torch.ops.vllm.mtp_small_linear_keep(
+        h_part = torch.ops.vllm.mtp_small_linear(
             previous_hidden_states_normed, layer.eh_w_h
         )
         return (h_part.float() + inputs_embeds).to(h_part.dtype)

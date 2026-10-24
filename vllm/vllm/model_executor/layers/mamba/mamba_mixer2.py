@@ -69,18 +69,6 @@ from vllm.v1.worker import prefill_fast
 
 logger = init_logger(__name__)
 
-# l2pf (harness/kernels/l2pf): L2 prefetch of out_proj's weight; absent, nothing
-# changes.
-try:
-    import l2pf as _l2pf
-except ImportError:
-    _l2pf = None
-
-
-def _out_proj_weight(mixer) -> torch.Tensor:
-    packed = getattr(mixer.out_proj, "_fp8small_weight", None)
-    return packed if packed is not None else mixer.out_proj.weight
-
 # Added by the IBM Team, 2024
 
 
@@ -1276,22 +1264,7 @@ def mamba_mixer2(
     layer_name = _resolve_layer_name(layer_name)
     forward_context: ForwardContext = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
-    # LOCAL PATCH (cudafast-nemotron35): small batches only (decode / verify):
-    # prefetch the first 5 MB (L2PF_MAMBA_MB) of the weight out_proj will read (its fp8small
-    # pack when present) into L2 on a side stream while the conv and SSM
-    # kernels below (latency-bound, DRAM mostly idle) run, then rejoin, so
-    # out_proj reads that part from L2. Moves no value. More than the window can
-    # fetch stalls the rejoin (the whole 11 MB measured -0.7% decode, 5 MB
-    # +0.8%). harness/kernels/l2pf; L2PF=0 disables.
-    pf = (
-        _l2pf is not None
-        and projected_states.shape[0] <= 8
-        and _l2pf.MAMBA_BYTES > 0
-        and _l2pf.prefetch(_out_proj_weight(self), max_bytes=_l2pf.MAMBA_BYTES)
-    )
     self.conv_ssm_forward(projected_states=projected_states, output=output)
-    if pf:
-        _l2pf.join(projected_states.device)
 
 
 def mamba_mixer2_fake(

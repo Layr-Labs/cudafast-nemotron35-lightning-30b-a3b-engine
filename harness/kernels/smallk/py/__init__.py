@@ -14,8 +14,9 @@ reproduces and README.md the evidence:
 
 Switches (environment, read at import): SMALLK=0 disables everything; SMALLK_ROUTER=0 and
 SMALLK_EARLY_ROUTER=0 (both on by default) disable the router GEMM and its schedule change;
-SMALLK_TOPK=1 / SMALLK_ALIGN=1 opt into the top-k and align kernels (off by default: no
-end-to-end gain), SMALLK_FUSE=0 then keeps them separate.
+SMALLK_TOPK=0 / SMALLK_ALIGN=0 disable the top-k and align kernels (default on in
+this new composition); SMALLK_FUSE=0 keeps them separate. The older carrier
+reported no end-to-end gain on its preceding overlap context.
 SMALLK_EARLY_ROUTER=0 keeps the router GEMM in the compiled graph (before the shared-expert stream
 forks) instead of inside the MoE custom op. A call outside a kernel's verified guard returns None
 and the caller runs the stock op.
@@ -41,10 +42,11 @@ def _flag(name: str, default: str = "1") -> bool:
 
 ENABLED = _flag("SMALLK")
 ROUTER_ON = ENABLED and _flag("SMALLK_ROUTER")
-# Opt-in: exact, but no end-to-end gain at depth 3 (the routing chain overlaps the shared-expert
-# GEMMs on the side stream; a shorter chain only moves that overlap into the routed-expert GEMM).
-TOPK_ON = ENABLED and _flag("SMALLK_TOPK", "0")
-ALIGN_ON = ENABLED and _flag("SMALLK_ALIGN", "0")
+# Retest the existing routing fusion with the complete MarlinX overlap carrier.
+# Old-base author evidence found no gain; this new default-on composition needs
+# official validation. SMALLK_TOPK=0 / SMALLK_ALIGN=0 retain the stock paths.
+TOPK_ON = ENABLED and _flag("SMALLK_TOPK", "1")
+ALIGN_ON = ENABLED and _flag("SMALLK_ALIGN", "1")
 FUSE_ON = TOPK_ON and ALIGN_ON and _flag("SMALLK_FUSE")
 # models/nemotron_h.py: the gate runs inside the MoE custom op after the shared-expert stream fork
 EARLY_ROUTER_ON = ENABLED and _flag("SMALLK_EARLY_ROUTER")

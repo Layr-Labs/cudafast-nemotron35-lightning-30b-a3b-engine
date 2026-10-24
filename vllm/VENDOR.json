@@ -94,6 +94,10 @@
     {
       "file": "vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py, vllm/model_executor/layers/fused_moe/moe_align_block_size.py (opt-in)",
       "why": "smallk's fused sigmoid top-k + moe_align kernel (bit-identical to ops.grouped_topk and the two align kernels for <= 32 ids) is off by default: the routing chain overlaps the shared-expert GEMMs, so shortening it gave no end-to-end gain (SMALLK_TOPK=1 SMALLK_ALIGN=1 enable it)"
+    },
+    {
+      "file": "../harness/kernels/smallk/py/__init__.py; ../harness/kernels/smallk/README.md; vllm/model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "On complete highest100549d4-51c4-4f56-b3ca-2604731ab8a4 enableitsalreadyincludedTOPK/ALIGN/FUSEsource bydefault forsingle-groupFP32routerwith<=32IDs alignguard; no kernelbodychanges. Retest innewMarlinXoverlapcontext; earlieroldbaseno-gain evidence preserved. Composeusefulpending87a68cc7-24d0-42a2-a580-aa441e6f810d widerfinalfullKrescore64perchunk/4096rows instead32/2048, same32/64partialscreenand16384refinepool/FP32dots/BF16selection. No theoremofhigheracceptance orstabletimedoracle; partial-scoretiescanaltertopksets andlargergathercostrequiresofficialmeasurement. Pendingada slotwhole1.73840213981183regresses>0.1vs100andisexcluded; noada slot/proposercopy/cast changes here. Complete100target/nativeformats/depth3/sampler/replay retained. All executionofficialremoteonly."
     }
   ]
 }

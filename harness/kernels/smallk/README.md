@@ -14,8 +14,8 @@ Hooks (vLLM tree): `fused_moe/router/gate_linear.py` (custom op `vllm::smallk_ro
 change in `models/nemotron_h.py` + `fused_moe/runner/moe_runner.py` (early router).
 
 Switches (environment): `SMALLK=0` (all), `SMALLK_ROUTER=0`, `SMALLK_EARLY_ROUTER=0` (both on
-by default); `SMALLK_TOPK=1 SMALLK_ALIGN=1` opt into the top-k/align kernels (off by default, see
-below), `SMALLK_FUSE=0` then keeps them separate. Every call outside a kernel's verified guard runs
+by default); `SMALLK_TOPK=0 SMALLK_ALIGN=0` disable the top-k/align kernels (default on in this
+new composition; the older overlap evidence below is adverse, not a current measurement), `SMALLK_FUSE=0` then keeps them separate. Every call outside a kernel's verified guard runs
 the stock op.
 
 ## Arithmetic

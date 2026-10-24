@@ -742,16 +742,24 @@ class HummingIndexedExperts(HummingExpertsBase):
             and inputs.dtype == torch.bfloat16
             and input_scale is None
         ):
-            from vllm.model_executor.layers.fused_moe.experts.humming_relu2_epilogue import (  # noqa: E501
-                forward_relu2,
-            )
+            from vllm.model_executor.layers.fused_moe.experts.humming_raw_up import maybe_up
 
-            forward_relu2(
-                layer=self.layer,
-                inputs=inputs,
-                outputs=buffers["activation_output"],
-                **moe_kwargs1,
+            raw_up_done = expert_map is None and maybe_up(
+                self.layer, inputs, input_scale, buffers["activation_output"],
+                topk_ids.size(0), topk_ids.size(1),
+                getattr(self, "_moe_block_size", None), moe_kwargs1,
             )
+            if not raw_up_done:
+                from vllm.model_executor.layers.fused_moe.experts.humming_relu2_epilogue import (  # noqa: E501
+                    forward_relu2,
+                )
+
+                forward_relu2(
+                    layer=self.layer,
+                    inputs=inputs,
+                    outputs=buffers["activation_output"],
+                    **moe_kwargs1,
+                )
         else:
             HummingMethod.forward_layer(
                 layer=self.layer,

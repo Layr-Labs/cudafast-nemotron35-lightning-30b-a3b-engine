@@ -1032,9 +1032,10 @@ def convert_to_humming_moe_kernel_format(
 
     # LOCAL PATCH (cudafast-nemotron35): zskip keeps a k-row-major repack of
     # the checkpoint w2 next to humming's (humming_zskip.py); tuned layers only.
-    from vllm.model_executor.layers.fused_moe.experts import humming_zskip
+    from vllm.model_executor.layers.fused_moe.experts import humming_raw_up, humming_zskip
 
     if tuned:
+        humming_raw_up.prepare_raw(layer, _extract_sublayer_tensors(layer, "w13"))
         humming_zskip.prepare_raw(layer, _extract_sublayer_tensors(layer, "w2"))
 
     # Preserve only a byte permutation of the original NVFP4 down weights.
@@ -1079,3 +1080,4 @@ def convert_to_humming_moe_kernel_format(
 
     if tuned:
         humming_zskip.finalize(layer)
+        humming_raw_up.finalize(layer)

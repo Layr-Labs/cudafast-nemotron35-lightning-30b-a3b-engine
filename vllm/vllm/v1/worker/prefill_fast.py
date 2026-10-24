@@ -21,7 +21,7 @@ in a live engine (harness/bench/prefill_lab.py ab).
 """
 
 import os
-from dataclasses import fields, is_dataclass
+from dataclasses import fields, is_dataclass, replace
 
 import torch
 
@@ -45,6 +45,11 @@ SPIN_OUTPUT_WAIT = _flag("VLLM_PREFILL_SPIN_OUTPUT_WAIT")
 # indices, which update_block_table recomputes from the group's block table.
 MAMBA_META_REUSE = _flag("VLLM_PREFILL_MAMBA_META_REUSE")
 
+# A separate switch for same-step speculative decode metadata. The runner
+# admits only the exact Mamba2 builder; update_block_table must still rebind
+# every group's state indices and its own persistent CUDA-graph buffers.
+MAMBA_DECODE_META_REUSE = _flag("VLLM_MAMBA_DECODE_META_REUSE")
+
 # One copy kernel instead of the gather + scatter of each prefill's final state.
 STATE_COPY = _flag("VLLM_PREFILL_STATE_COPY")
 
@@ -62,6 +67,40 @@ def mamba_reusable(metadata) -> bool:
         MAMBA_META_REUSE
         and getattr(metadata, "num_decodes", None) == 0
         and getattr(metadata, "num_prefills", 0) > 0
+    )
+
+
+def mamba_decode_reusable(builder, metadata) -> bool:
+    """Reuse common metadata within one pure-decode step, never across steps.
+
+    The caller checks the exact Mamba2 builder type and identical KVCacheSpec.
+    Prefix caching, ReplaySSM, mixed batches and decode rows lacking
+    speculative bookkeeping retain fresh builds. Destination-owned buffers are
+    refreshed by the existing update_block_table implementation.
+    """
+    return (
+        MAMBA_DECODE_META_REUSE
+        and builder.use_spec_decode
+        and builder.vllm_config.cache_config.mamba_cache_mode == "none"
+        and not builder.use_replayssm
+        and metadata.num_prefills == 0
+        and metadata.num_prefill_tokens == 0
+        and 0 < metadata.num_decodes == metadata.num_reqs
+        and metadata.num_reqs <= builder.decode_cudagraph_max_bs
+        and metadata.num_accepted_tokens is not None
+        and metadata.query_start_loc_d is not None
+    )
+
+
+def snapshot_metadata(metadata):
+    """Freeze tensor values before a diagnostic build overwrites its buffers."""
+    return replace(
+        metadata,
+        **{
+            field.name: value.clone()
+            for field in fields(metadata)
+            if isinstance(value := getattr(metadata, field.name), torch.Tensor)
+        },
     )
 
 

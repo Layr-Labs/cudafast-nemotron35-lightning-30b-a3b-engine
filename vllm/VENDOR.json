@@ -210,6 +210,10 @@
     {
       "file": "harness/kernels/l2pf/py/__init__.py",
       "why": "Carry useful04706ad7-c4e8-44b9-b8ba-77f14d8b8adf MoE-window immutable prefetch default6to12MB. Its complete official2.19195352041462 is within0.1% of fulla484, but only budget mechanism is combined here on higherfulla484. Prefix pair/SSM combination unverified."
+    },
+    {
+      "file": "harness/kernels/marlinx/{csrc/marlinx.cu,py/__init__.py,build.sh,tests/test_pdl_dispatch.py}",
+      "why": "Original-segment shared-down from jacklightChen f8766cda-e78f-4d5c-8abe-163f534af907 (ade3d7dc3c71a0386f97c17eca4cb80d8c129a1e), with the research direction credited to newjordan 3e519ff4-4664-434d-b412-fc3c96227f25. Preserve each Marlin cut, ascending-K four-warp MMA chain, acc0+(acc1+(acc3+acc2)), FP32 partials and bottom-up RN P+R fold before the original scale/BF16 epilogue. Segment producer and merge deliberately use ordinary launches in the current stream, independently of MARLINX_PDL; no PDL scratch edge. Keep donor per-layer M1/4/5/8 bitwise admission unchanged and legacy ZS on mismatch, absent ABI, non-sm121 or MARLINX_ZS_SEGMENTS=0. Build tries both features, PDL-only, segments-only, then neither; failed output is removed on each attempt. The radix selector was reviewed but excluded because candidate permutation can alter the confidence gate's FP32 denominator and ties can change membership. No drafter change in this increment. CPU-only integration on f89867f plus dm (a4849952); CUDA compilation, runtime admission, exact tokens and gain remain untested here."
     }
   ]
 }

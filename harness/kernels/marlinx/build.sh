@@ -15,22 +15,34 @@ arch=${arch// /}
 arch=${arch%+PTX}
 sm=${arch/./}
 "$nvcc" --version | tail -n 2
-rm -f "$out/libmarlinx.so"  # the fallback below tests for this build's output, not a stale one
 # No --use_fast_math: the reductions must stay plain IEEE fp32 adds and multiplies.
-"$nvcc" -O3 -std=c++17 -shared -Xcompiler -fPIC -lineinfo \
-  -gencode "arch=compute_${sm},code=sm_${sm}" \
-  -Xptxas -v \
-  -o "$out/libmarlinx.so" "$here/csrc/marlinx.cu" 2>&1 || true
-# If the PDL variant does not build, build once more without it (-DMARLINX_NO_PDL
-# removes every PDL line: the previous source; the Python side then keeps the
-# ordinary launch).
-if ! test -f "$out/libmarlinx.so"; then
-  echo "marlinx: PDL build failed; rebuilding with -DMARLINX_NO_PDL" >&2
-  "$nvcc" -O3 -std=c++17 -shared -Xcompiler -fPIC -lineinfo \
+# Cover both optional features independently. Prefer retaining dm's PDL if
+# segments fail to compile, then try segments without PDL, then neither.
+# A failed compiler may leave an output file: remove it before EVERY attempt,
+# and accept only a successful compiler exit with nonempty output.
+built=0
+for variant in full no-segments no-pdl legacy; do
+  set --
+  case "$variant" in
+    no-segments) set -- -DMARLINX_NO_SEGMENTS ;;
+    no-pdl) set -- -DMARLINX_NO_PDL ;;
+    legacy) set -- -DMARLINX_NO_PDL -DMARLINX_NO_SEGMENTS ;;
+  esac
+  rm -f "$out/libmarlinx.so"
+  echo "marlinx: building $variant" >&2
+  if "$nvcc" -O3 -std=c++17 -shared -Xcompiler -fPIC -lineinfo \
     -gencode "arch=compute_${sm},code=sm_${sm}" \
-    -Xptxas -v -DMARLINX_NO_PDL \
-    -o "$out/libmarlinx.so" "$here/csrc/marlinx.cu" 2>&1 || true
+    -Xptxas -v "$@" \
+    -o "$out/libmarlinx.so" "$here/csrc/marlinx.cu" 2>&1 \
+      && test -s "$out/libmarlinx.so"; then
+    built=1
+    break
+  fi
+done
+if test "$built" != 1; then
+  rm -f "$out/libmarlinx.so"
+  echo "marlinx: all four builds failed" >&2
+  exit 1
 fi
-test -f "$out/libmarlinx.so" || { echo "marlinx: build failed" >&2; exit 1; }
 cp "$here/py/__init__.py" "$out/__init__.py"
 echo "marlinx: built $out/libmarlinx.so for sm_${sm}"

@@ -153,6 +153,18 @@ def _small_linear_supported(x: torch.Tensor, w: torch.Tensor) -> bool:
 
 
 def mtp_small_linear_impl(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    return _small_linear(x, w, _EVICT_W)
+
+
+def mtp_small_linear_keep_impl(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """mtp_small_linear with ordinary (not evict-first) weight loads, for a
+    weight every draft pass of a cycle reads again: the drafter's other weight
+    streams are evict-first, so this one can stay in the 24 MB L2 between
+    passes. Same arithmetic as mtp_small_linear."""
+    return _small_linear(x, w, False)
+
+
+def _small_linear(x: torch.Tensor, w: torch.Tensor, evict: bool) -> torch.Tensor:
     M = x.shape[0]
     if M == 0 or M > _DOT_MAX_M or not _small_linear_supported(x, w):
         return F.linear(x, w)
@@ -169,7 +181,7 @@ def mtp_small_linear_impl(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
             K,
             w.stride(0),
             BN=_GEMV_BN,
-            EVICT=_EVICT_W,
+            EVICT=evict,
             BK=_GEMV_BK,
             num_warps=_GEMV_WARPS,
             num_stages=_GEMV_STAGES,
@@ -187,7 +199,7 @@ def mtp_small_linear_impl(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
             y.stride(0),
             BM=16,
             BN=_DOT_BN,
-            EVICT=_EVICT_W,
+            EVICT=evict,
             BK=_DOT_BK,
             num_warps=_DOT_WARPS,
             num_stages=_DOT_STAGES,
@@ -202,6 +214,12 @@ def _mtp_small_linear_fake(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
 direct_register_custom_op(
     op_name="mtp_small_linear",
     op_func=mtp_small_linear_impl,
+    fake_impl=_mtp_small_linear_fake,
+)
+
+direct_register_custom_op(
+    op_name="mtp_small_linear_keep",
+    op_func=mtp_small_linear_keep_impl,
     fake_impl=_mtp_small_linear_fake,
 )
 

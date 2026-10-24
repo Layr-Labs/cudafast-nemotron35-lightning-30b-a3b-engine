@@ -4648,6 +4648,10 @@ class GPUModelRunner(
             # kv_connector_output
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
 
+        # LOCAL PATCH (cudafast-nemotron35): the verify forward is queued; let
+        # the bookkeeping that follows it overlap an L2 prefetch of the
+        # drafter's first weight (harness/kernels/l2pf, moves no value).
+        self._l2pf_prefetch("draft")
         # Unpack ephemeral state.
         (
             scheduler_output,
@@ -5144,6 +5148,41 @@ class GPUModelRunner(
             return None
         return torch.cat(draft_probs_rows, dim=0).contiguous()
 
+    # LOCAL PATCH (cudafast-nemotron35): L2 prefetch hooks (harness/kernels/l2pf).
+    # Single-request spec decode only; eager calls, so the side stream needs no
+    # join. Capped below the 24 MB L2.
+    _l2pf_tensors: dict | None = None
+
+    def _l2pf_prefetch(self, which: str) -> None:
+        try:
+            import l2pf
+        except ImportError:
+            return
+        if not l2pf.ENABLED or self.speculative_config is None or self.max_num_reqs != 1:
+            return
+        if self._l2pf_tensors is None:
+            found: dict = {}
+            target = dict(self.get_model().named_parameters())
+            target.update(dict(self.get_model().named_buffers()))
+            for name in ("layers.0.mixer.in_proj._fp8small_weight", "layers.0.mixer.in_proj.weight"):
+                hit = [t for n, t in target.items() if n.endswith(name)]
+                if hit and "target" not in found:
+                    found["target"] = hit[0]
+            drafter_model = getattr(getattr(self, "drafter", None), "model", None)
+            if drafter_model is not None:
+                # With the projected-embedding table (nemotron_h_mtp.py) the
+                # first weight a draft pass reads is the hidden half eh_w_h,
+                # not eh_proj.weight.
+                for name, b in drafter_model.named_buffers():
+                    if name.endswith("eh_w_h"):
+                        found["draft"] = b
+                if "draft" not in found:
+                    for name, p in drafter_model.named_parameters():
+                        if name.endswith("eh_proj.weight"):
+                            found["draft"] = p
+            self._l2pf_tensors = found
+        l2pf.prefetch(self._l2pf_tensors.get(which), max_bytes=20 << 20)
+
     def propose_draft_token_ids(
         self,
         scheduler_output: "SchedulerOutput",
@@ -5431,6 +5470,10 @@ class GPUModelRunner(
                     self._draft_probs = draft_probs
                     self._draft_prob_req_ids = self.input_batch.req_ids.copy()
 
+        # LOCAL PATCH (cudafast-nemotron35): the last draft step is queued; let
+        # the gap before the next verify overlap an L2 prefetch of the target's
+        # first weight.
+        self._l2pf_prefetch("target")
         return draft_token_ids
 
     def update_config(self, overrides: dict[str, Any]) -> None:

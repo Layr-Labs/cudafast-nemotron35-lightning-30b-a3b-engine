@@ -58,6 +58,18 @@
     {
       "file": "vllm/model_executor/layers/fused_moe/experts/humming_tuned_moe.py (TUNED_PAD_K)",
       "why": "the tuned routed experts padded K to a multiple of 128, so the down projection's K 1856 became 1920 and every w2 tile streamed and multiplied two all-zero 32-wide K blocks; K now pads only to humming's BF16 pack granule (32), the smallest it accepts. Each element keeps the same K blocks in the same order; the dropped steps were mma(+0, +0, acc), which only turned an acc of -0 into +0, and a signed zero changes no later value's magnitude, logit or token"
+    },
+    {
+      "file": "vllm/model_executor/layers/mamba/ops/ssd_prefill_fused.py (+ ssd_combined.py)",
+      "why": "Own GB10 prefill two-stage SSD: fuse chunk-state formation with unchanged FP32 state recurrence, and compute each CB row tile once per group in registers before all eight head scans. Removes raw chunk-state and FP32 CB global scratch while retaining every boundary state, cumsum, final gather, original numerical formats and target acceptance. Chunk sizes 128/256 and exact-shape guards; unsupported layouts retain the original path."
+    },
+    {
+      "file": "vllm/model_executor/layers/mamba/ops/ssd_state_passing.py (+ ssd_combined.py and mamba_mixer2.py)",
+      "why": "Own single-request FP32 prefill state sink: store each terminal state directly from the existing state-passing recurrence into its request cache block. Keep nonterminal boundaries for chunk scan; omit terminal temporary writes, final gather and indexed copy. Same recurrence, pinned tile and formats; no request/phase reuse. Unsupported layouts and prefix-cache paths retain the original route."
+    },
+    {
+      "file": "vllm/model_executor/layers/mamba/ops/ssd_prefill_fused.py (+ ssd_combined.py)",
+      "why": "Combine our two-stage SSD fusion and terminal cache sink: fused FP32 recurrence writes the final state directly to the request cache, retains only nonterminal scratch boundaries, and skips the final gather/cache scatter. Initial state is a separate per-call tensor. Unsupported fusion shapes retain the original state-passing sink; cache-all callers keep all boundaries. No numerical-format, depth, request-lifetime or acceptance change."
     }
   ]
 }

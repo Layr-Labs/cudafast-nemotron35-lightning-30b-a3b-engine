@@ -15,6 +15,7 @@ from vllm.triton_utils import triton
 from .ssd_bmm import _bmm_chunk_fwd
 from .ssd_chunk_scan import _chunk_scan_fwd
 from .ssd_chunk_state import _chunk_cumsum_fwd, _chunk_state_fwd
+from .ssd_prefill_fused import can_fuse_prefill, fused_prefill
 from .ssd_state_passing import _state_passing_fwd
 
 TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
@@ -22,6 +23,23 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
 
 def is_int_pow_2(n):
     return isinstance(n, int) and n > 0 and (n & (n - 1)) == 0
+
+
+def prefill_state_sink_supported(state_cache, state_indices, batch, shape):
+    """Metadata-only guard: no device readback or change in cache ownership."""
+    return (
+        batch == 1
+        and state_indices is not None
+        and state_cache.is_cuda
+        and state_cache.dtype == torch.float32
+        and state_cache.ndim == 4
+        and tuple(state_cache.shape[1:]) == tuple(shape)
+        and state_cache.stride(3) == 1
+        and state_cache.stride(2) == state_cache.shape[3]
+        and state_indices.shape == (batch,)
+        and state_indices.dtype in (torch.int32, torch.int64)
+        and state_indices.device == state_cache.device
+    )
 
 
 def _mamba_chunk_scan_combined_fwd(
@@ -44,6 +62,8 @@ def _mamba_chunk_scan_combined_fwd(
     dt_softplus=False,
     dt_limit=(0.0, float("inf")),
     state_dtype=None,
+    final_states_out=None,
+    final_states_indices=None,
 ):
     assert is_int_pow_2(chunk_size), "chunk_size must be integer power of 2"
     seqlen, nheads, headdim = x.shape
@@ -74,6 +94,8 @@ def _mamba_chunk_scan_combined_fwd(
     if D is not None and D.stride(-1) != 1:
         D = D.contiguous()
     assert cu_seqlens is not None, "Assuming varlen input - must supply cu_seqlens"
+    assert (final_states_out is None) == (final_states_indices is None)
+    assert final_states_out is None or not return_intermediate_states
 
     if initial_states is not None:
         assert initial_states.shape == (len(cu_seqlens) - 1, nheads, headdim, dstate)
@@ -99,6 +121,21 @@ def _mamba_chunk_scan_combined_fwd(
         dt_limit=dt_limit,
     )
 
+    # Own prefill path: keep cumsum unchanged, remove raw-state and CB scratch.
+    if can_fuse_prefill(
+        x, B, C, dt, dA_cumsum, cu_chunk_seqlens, last_chunk_indices,
+        seq_idx, initial_states, state_dtype,
+    ):
+        states = fused_prefill(
+            x, B, C, dt, dA_cumsum, cu_chunk_seqlens, last_chunk_indices,
+            seq_idx, out, D=D, z=z, initial=initial_states,
+            final_states_out=final_states_out,
+            final_states_indices=final_states_indices,
+        )
+        if final_states_out is not None:
+            return None
+        return states if return_intermediate_states else states[last_chunk_indices]
+
     # 2. Compute the state for each intra-chunk
     # (right term of low-rank factorization of off-diagonal blocks; B terms)
     states = _chunk_state_fwd(
@@ -117,6 +154,8 @@ def _mamba_chunk_scan_combined_fwd(
         if initial_states is not None
         else None,  # (batch, nheads, headdim*dstate)
         out_dtype=state_dtype if state_dtype is not None else C.dtype,
+        final_states_out=final_states_out,
+        final_states_indices=final_states_indices,
     )
     states = rearrange(states, "... (p n) -> ... p n", n=dstate)
 
@@ -148,7 +187,10 @@ def _mamba_chunk_scan_combined_fwd(
         initial_states=initial_states,
     )
 
-    if return_intermediate_states:
+    if final_states_out is not None:
+        # Terminal scratch entries are intentionally unwritten, not gathered.
+        return None
+    elif return_intermediate_states:
         return states
     else:
         return states[last_chunk_indices]
@@ -174,6 +216,8 @@ def mamba_chunk_scan_combined_varlen(
     dt_limit=(0.0, float("inf")),
     return_intermediate_states=False,
     state_dtype=None,
+    final_states_out=None,
+    final_states_indices=None,
 ):
     """
     Argument:
@@ -195,8 +239,11 @@ def mamba_chunk_scan_combined_varlen(
         dt_softplus: Whether to apply softplus to dt
         out: (seqlen, nheads, headdim) preallocated output tensor
         state_dtype: The data type of the ssm state
+        final_states_out: Optional single-request FP32 cache sink; the state
+            passing kernel stores the terminal boundary directly here.
+        final_states_indices: Request cache block indices for that sink.
     Return:
-        varlen_states: (batch, nheads, headdim, dstate)
+        varlen_states: (batch, nheads, headdim, dstate), or None with a sink.
     """
 
     assert cu_seqlens is not None, "cu_seqlens must be provided assuming varlen input"
@@ -222,6 +269,8 @@ def mamba_chunk_scan_combined_varlen(
         dt_softplus=dt_softplus,
         dt_limit=dt_limit,
         state_dtype=state_dtype,
+        final_states_out=final_states_out,
+        final_states_indices=final_states_indices,
     )
 
     return varlen_states

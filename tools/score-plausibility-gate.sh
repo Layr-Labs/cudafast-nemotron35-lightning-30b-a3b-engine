@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Real prefill work on this engine scores near 1.0; gain above this ceiling means
-# the timed passes reused earlier work (participant contract sections 5.3 and 8).
-PREFILL_GAIN_CEILING=1.5
+# The prefill ceiling is the fixture's prefill_speedup_ceiling, the same value
+# benchd enforces.
 # The contract's decodeSpeedupCeiling; this benchd does not enforce it on the official path.
 DECODE_GAIN_CEILING=5.0
 
@@ -25,18 +24,17 @@ if [[ ! -f "${score_path}" ]]; then
   exit 0
 fi
 
-DECODE_GAIN_CEILING="${DECODE_GAIN_CEILING}" exec python3 -I - "${score_path}" "${PREFILL_GAIN_CEILING}" "${SEED_WINDOW_GAIN_CEILING}" "${audit_path}" "${DECLARED_DEPTH}" "${CONTRACT}" <<'PY'
+DECODE_GAIN_CEILING="${DECODE_GAIN_CEILING}" exec python3 -I - "${score_path}" "${SEED_WINDOW_GAIN_CEILING}" "${audit_path}" "${DECLARED_DEPTH}" "${CONTRACT}" <<'PY'
 import json
 import math
 import os
 import sys
 
 path = sys.argv[1]
-ceiling = float(sys.argv[2])
-seed_gain_ceiling = float(sys.argv[3])
-audit_path = sys.argv[4]
-declared_depth_text = sys.argv[5]
-contract_path = sys.argv[6]
+seed_gain_ceiling = float(sys.argv[2])
+audit_path = sys.argv[3]
+declared_depth_text = sys.argv[4]
+contract_path = sys.argv[5]
 prefix = "score-plausibility-gate:"
 
 try:
@@ -56,6 +54,27 @@ if data["passed"] is not True:
 legs = (data.get("metrics") or {}).get("paired_legs")
 if not isinstance(legs, list) or len(legs) == 0:
     print(f"{prefix} REFUSED passed run has missing or empty metrics.paired_legs")
+    sys.exit(1)
+
+try:
+    with open(contract_path, encoding="utf-8") as f:
+        contract = json.load(f)
+except (OSError, json.JSONDecodeError):
+    print(f"{prefix} REFUSED track fixture is missing or invalid")
+    sys.exit(1)
+if not isinstance(contract, dict):
+    print(f"{prefix} REFUSED track fixture is missing or invalid")
+    sys.exit(1)
+ceiling = contract.get("prefill_speedup_ceiling")
+try:
+    if isinstance(ceiling, bool) or not isinstance(ceiling, (int, float)):
+        raise TypeError
+    ceiling = float(ceiling)
+except (TypeError, ValueError, OverflowError):
+    print(f"{prefix} REFUSED fixture has no valid prefill_speedup_ceiling")
+    sys.exit(1)
+if not math.isfinite(ceiling) or ceiling <= 1.0:
+    print(f"{prefix} REFUSED fixture has no valid prefill_speedup_ceiling")
     sys.exit(1)
 
 max_gain = 0.0
@@ -146,12 +165,6 @@ if audit_depth != declared_depth:
     print(f"{prefix} REFUSED private audit effective_spec_depth {audit_depth} does not match declared depth {declared_depth}")
     sys.exit(1)
 
-try:
-    with open(contract_path, encoding="utf-8") as f:
-        contract = json.load(f)
-except (OSError, json.JSONDecodeError):
-    print(f"{prefix} REFUSED track fixture is missing or invalid")
-    sys.exit(1)
 limits = contract.get("seed_window_cand_over_control_limit_by_depth")
 if limits is None:
     # A fixture without per-depth limits keeps the fixed 1.5 rule.

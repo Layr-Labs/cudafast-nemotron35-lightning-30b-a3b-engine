@@ -95,6 +95,17 @@ def default_unquantized_gemm(
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
 ):
+    if (
+        bias is None
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and weight.shape in ((4608, 2688), (2688, 4096))
+        and x.shape[-1] == weight.shape[1]
+        and 2 <= x.numel() // weight.shape[1] <= 8
+    ):
+        from vllm.model_executor.layers.batch_invariant import matmul_batch_invariant
+
+        return matmul_batch_invariant(x, weight.t())
     return torch.nn.functional.linear(x, weight, bias)
 
 

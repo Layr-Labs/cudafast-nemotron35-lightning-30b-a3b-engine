@@ -181,6 +181,18 @@ def matmul_persistent(
             "num_warps": 8,
         },
     }
+    config = configs[dtype]
+    if dtype == torch.bfloat16 and bias is None and 1 < M <= 8:
+        block_n = {(4608, 2688): 64, (2688, 4096): 64}.get((N, K))
+        if block_n is not None:
+            config = {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": block_n,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 8,
+                "num_stages": 4,
+                "num_warps": 4,
+            }
     matmul_kernel_persistent[grid](
         a,
         b,
@@ -200,7 +212,7 @@ def matmul_persistent(
         B_LARGE=b.numel() > 2**31,
         C_LARGE=c.numel() > 2**31,
         HAS_BIAS=bias is not None,
-        **configs[dtype],
+        **config,
     )
     return c
 

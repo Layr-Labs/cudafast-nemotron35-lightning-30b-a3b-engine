@@ -342,12 +342,22 @@ def exact_variants(ctx, li):
     """(packed, mode, name, config): v3 on the first non-swap layout, v4 on swap."""
     out = []
     pks = ctx["packed"][li]
-    v3 = next((k for k in pks if k != "swap"), None)
+    v3 = next((k for k in pks if k not in ("swap", "swap2")), None)
     if v3 is not None:
         out += [(pks[v3], zskip.DENSE, "v3dense", 1), (pks[v3], zskip.SKIP, "v3skip", 1)]
     if "swap" in pks:
         out += [(pks["swap"], zskip.DENSE, "v4dense", 100), (pks["swap"], zskip.SKIP, "v4skip", 100)]
+    if "swap2" in pks:
+        for cfg in ctx["pair_configs"]:
+            for mode, name in ((zskip.DENSE, "dense"), (zskip.SKIP, "skip")):
+                out.append((pks["swap2"], mode, f"pair{cfg}/{name}", cfg))
     return out
+
+
+def configs_for_layout(ctx, lay):
+    if lay == "swap2":
+        return ctx["pair_configs"]
+    return zskip.CONFIGS4 if lay == "swap" else zskip.CONFIGS
 
 
 def phase_exact(args, ctx):
@@ -409,7 +419,7 @@ def phase_exact(args, ctx):
         kw1, kw2 = ex.prepare_humming_moe_kwargs(tid, None, None)
         ref = stock_w2(ex, st["act"], kw2)
         for lay, pk in ctx["packed"][li].items():
-            for cfg in (zskip.CONFIGS4 if lay == "swap" else zskip.CONFIGS):
+            for cfg in configs_for_layout(ctx, lay):
                 got = mine_w2(pk, st["act"], kw2, zskip.SKIP, config=cfg, stats=stats)
                 eq = hme.bits_equal(got, ref)
                 a = agg.setdefault(f"configs/{lay}", {"cases": 0, "ok": 0})
@@ -493,11 +503,11 @@ def phase_time(args, ctx):
                     assert routed_sparse.forward(a_, i_, o_, pk_)
 
             variants.append(("routed_sparse", rs_fn))
-        configs = list(zskip.CONFIGS) + list(zskip.CONFIGS4) if args.time_configs == "all" else [
+        configs = list(zskip.CONFIGS) + list(zskip.CONFIGS4) + ctx.get("pair_configs", []) if args.time_configs == "all" else [
             int(c) for c in args.time_configs.split(",")]
         for lay in ctx["packed"][0]:
             for cfg in configs:
-                if (cfg >= 100) != (lay == "swap"):
+                if cfg not in configs_for_layout(ctx, lay):
                     continue
                 for mode, mn in ((zskip.SKIP, "skip"), (zskip.LOADONLY, "loadonly"), (zskip.SETUPONLY, "setuponly"),
                                  (zskip.DENSE, "dense"), (zskip.LOADONLY_DENSE, "loadonly_dense")):
@@ -541,6 +551,7 @@ def main():
     ap.add_argument("--windows", type=int, default=2)
     ap.add_argument("--capture", default="", help="'' (none), 'all' or comma-separated sequence names")
     ap.add_argument("--layouts", default="rows,swap")
+    ap.add_argument("--pair", action="store_true", help="also check/time swap2 decode 113 and fused 118")
     ap.add_argument("--time-ms", default="4")
     ap.add_argument("--time-configs", default="all")
     ap.add_argument("--time-all-dense", action="store_true")
@@ -567,6 +578,16 @@ def main():
     log(f"routed_sparse available: {routed_sparse is not None}")
     phases = args.phase.split(",")
     ctx = {}
+    if args.pair:
+        assert "swap" in args.layouts.split(","), "--pair needs the original swap layout"
+        ctx["pair_configs"] = []
+        for cfg in (113, 118):
+            try:
+                log(f"pair config {cfg}: {zskip.config_info(cfg)}")
+                ctx["pair_configs"].append(cfg)
+            except ValueError as exc:
+                log(f"pair config {cfg} unavailable: {exc}")
+        assert ctx["pair_configs"], "no paired config built"
     if "probe" in phases:
         phase_probe(args, ctx)
     if "capture" in phases or args.capture:
@@ -589,6 +610,8 @@ def main():
             assert torch.equal(hgs, raw["w2_weight_scale_2"].float().reshape(-1)), "humming w2 global scale != raw"
             pk = {lay: zskip.repack(raw["w2_weight"], raw["w2_weight_scale"], hgs, lay)
                   for lay in args.layouts.split(",")}
+            if args.pair:
+                pk["swap2"] = zskip.to_swap2(pk["swap"])
             gs_values += hgs[:2].tolist()
             if routed_sparse is not None:
                 ctx.setdefault("rs", []).append(routed_sparse.prepare(
@@ -606,6 +629,8 @@ def main():
         phase_epi(args, ctx)
     if "exact" in phases:
         phase_exact(args, ctx)
+    if ctx.get("exact_failed"):
+        raise SystemExit("zskip exactness failed; see exact.json")
     if "time" in phases:
         phase_time(args, ctx)
     log("done")

@@ -81,7 +81,15 @@ struct Params {
   int* queue;               // work-item counter (reset by prep_kernel)
   int max_blocks;           // expert blocks covered (grid of prep_kernel)
   unsigned long long* trace;  // optional timing trace: 8 words per item (see down3_kernel)
+  const int* verify_rows;  // optional confidence prefix, paired M5 only
 };
+
+__device__ __forceinline__ int prefix_row_limit(const Params& p) {
+  if (p.verify_rows == nullptr) return p.shape_m;
+  const int rows = *p.verify_rows;
+  // Avoid multiplying the ALL_ROWS sentinel. Eligible calls have 5 tokens x6.
+  return rows >= 5 ? p.shape_m : (rows < 1 ? 1 : rows) * 6;
+}
 
 __device__ __forceinline__ unsigned long long gtimer() {
   unsigned long long t;
@@ -217,6 +225,7 @@ __device__ __forceinline__ void build_lists(uint8_t* dst, int nrows_valid, const
   uint16_t* act_g = reinterpret_cast<uint16_t*>(dst + BI_ACTG);
   uint16_t* act_k = reinterpret_cast<uint16_t*>(dst + BI_ACTK);
   __shared__ int s_tot[2];
+  const int row_limit = prefix_row_limit(p);
   for (int g = tid; g < 128; g += NT) {
     uint32_t m = 0;
     if (g < G) {
@@ -224,6 +233,7 @@ __device__ __forceinline__ void build_lists(uint8_t* dst, int nrows_valid, const
         m = 0xFFFFu;
       } else {
         for (int r = 0; r < nrows_valid; ++r) {
+          if (rows[r] >= row_limit) continue;
           const uint4* q = reinterpret_cast<const uint4*>(p.A + (long long)rows[r] * p.lda + 16 * g);
           m |= nz_mask8(__ldg(q)) | (nz_mask8(__ldg(q + 1)) << 8);
         }
@@ -855,6 +865,8 @@ __global__ void __launch_bounds__(WPC * 32) down4_kernel(const Params p) {
   }
 }
 
+
+#include "zskip_pair.cuh"
 
 // v6: down4 with the -0 guard moved to the end. With skipped rows read as +0, every step keeps
 // the accumulator equal to stock's or both zero (the two differ at most in the sign of a zero), so
@@ -1727,6 +1739,30 @@ static int launch4f(const Params& p, cudaStream_t stream) {
 #define ZSKIP4F_CONFIGS(X) X(108, 2, 4, 1, 16)
 #endif
 
+#ifndef ZSKIP_NO_PAIR
+template <bool Fused>
+static int launch_pair(const Params& p, cudaStream_t stream) {
+  constexpr int SM = Fused ? BI_BYTES : 0;
+#ifndef ZSKIP_NO_PDL
+  if (g_pdl) {
+    cudaError_t e = cudaSuccess;
+    if constexpr (!Fused)
+      e = launch_pdl(prep_kernel<16, 8>, dim3(p.max_blocks), dim3(128), stream, p);
+    if (e == cudaSuccess)
+      e = launch_pdl(down_pair_kernel<Fused>, dim3(21, p.max_blocks), dim3(32), stream, p, SM);
+    if (e != cudaSuccess) {
+      cudaGetLastError();
+      return (int)e;
+    }
+    return (int)cudaGetLastError();
+  }
+#endif
+  if constexpr (!Fused) prep_kernel<16, 8><<<p.max_blocks, 128, 0, stream>>>(p);
+  down_pair_kernel<Fused><<<dim3(21, p.max_blocks), 32, SM, stream>>>(p);
+  return (int)cudaGetLastError();
+}
+#endif
+
 // v4 config id, warps per CTA, ring depth (active groups in flight per warp), 8-row MMA halves per
 // block (rows per block cap = 8 NH), moe_align block size. 100..107: decode (<= 8 tokens, block 16);
 // 120..: prefill (block_m 16 / 32 / 64, every valid row of the block)
@@ -1874,15 +1910,34 @@ int zskip_config(int id, int* info) {
   ZSKIP4F_CONFIGS(X4F)
 #undef X4F
 #endif
+#ifndef ZSKIP_NO_PAIR
+#define PAIR_INFO(ID, FUSED) \
+  if (id == ID) { \
+    constexpr int SM = FUSED ? BI_BYTES : 0; \
+    if (cudaFuncGetAttributes(&attr, down_pair_kernel<FUSED>) != cudaSuccess) return -1; \
+    info[0] = attr.numRegs; info[1] = SM; info[2] = 1; \
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&info[3], down_pair_kernel<FUSED>, 32, SM) != cudaSuccess) \
+      return -1; \
+    return 0; \
+  }
+  PAIR_INFO(113, false)
+#ifndef ZSKIP_NO_FUSED
+  PAIR_INFO(118, true)
+#endif
+#undef PAIR_INFO
+#endif
   return -2;
 }
 
-int zskip_down(const void* A, long long lda, int shape_m, const int* sorted_ids, const int* expert_ids,
+static int zskip_down_impl(const void* A, long long lda, int shape_m, const int* sorted_ids, const int* expert_ids,
                const int* num_tokens_padded, int max_blocks, const void* W, const void* S, const float* GS,
                void* C, long long ldc, long long w_expert, long long w_tile, long long w_k, long long s_expert,
                long long s_tile, long long s_g, int mode, int* stats, int config, void* ws, int* queue,
-               int ctas_per_sm, void* trace, void* stream) {
+               int ctas_per_sm, void* trace, void* stream, const int* verify_rows) {
+  if (verify_rows != nullptr && (shape_m != 30 || mode != SKIP ||
+      (config != 113 && config != 118))) return -5;
   Params p;
+  p.verify_rows = verify_rows;
   p.A = reinterpret_cast<const __nv_bfloat16*>(A);
   p.lda = lda;
   p.shape_m = shape_m;
@@ -1939,7 +1994,29 @@ int zskip_down(const void* A, long long lda, int shape_m, const int* sorted_ids,
   if (config == ID) return launch8<W_, R_, NH_, BM_>(p, st);
   ZSKIP8_CONFIGS(X8)
 #undef X8
+#ifndef ZSKIP_NO_PAIR
+  if (config == 113) return launch_pair<false>(p, st);
+#ifndef ZSKIP_NO_FUSED
+  if (config == 118) return launch_pair<true>(p, st);
+#endif
+#endif
   return -2;
+}
+
+int zskip_down(const void* A, long long lda, int shape_m, const int* sorted_ids, const int* expert_ids,
+               const int* num_tokens_padded, int max_blocks, const void* W, const void* S, const float* GS,
+               void* C, long long ldc, long long w_expert, long long w_tile, long long w_k, long long s_expert,
+               long long s_tile, long long s_g, int mode, int* stats, int config, void* ws, int* queue,
+               int ctas_per_sm, void* trace, void* stream) {
+  return zskip_down_impl(A, lda, shape_m, sorted_ids, expert_ids, num_tokens_padded, max_blocks, W, S, GS, C, ldc, w_expert, w_tile, w_k, s_expert, s_tile, s_g, mode, stats, config, ws, queue, ctas_per_sm, trace, stream, nullptr);
+}
+
+int zskip_down_prefix(const void* A, long long lda, int shape_m, const int* sorted_ids, const int* expert_ids,
+               const int* num_tokens_padded, int max_blocks, const void* W, const void* S, const float* GS,
+               void* C, long long ldc, long long w_expert, long long w_tile, long long w_k, long long s_expert,
+               long long s_tile, long long s_g, int mode, int* stats, int config, void* ws, int* queue,
+               int ctas_per_sm, void* trace, void* stream, const int* verify_rows) {
+  return zskip_down_impl(A, lda, shape_m, sorted_ids, expert_ids, num_tokens_padded, max_blocks, W, S, GS, C, ldc, w_expert, w_tile, w_k, s_expert, s_tile, s_g, mode, stats, config, ws, queue, ctas_per_sm, trace, stream, verify_rows);
 }
 
 int zskip_probe(unsigned long long seed, int blocks, int iters, unsigned long long* counts, uint32_t* samples,

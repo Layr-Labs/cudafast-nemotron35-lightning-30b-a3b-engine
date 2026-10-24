@@ -22,6 +22,11 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 
 from .BlockScaledMMLinearKernel import Fp8BlockScaledMMLinearKernel
+
+try:
+    import fp8n32 as _fp8n32
+except ImportError:
+    _fp8n32 = None
 from .ScaledMMLinearKernel import (
     FP8ScaledMMLinearKernel,
     FP8ScaledMMLinearLayerConfig,
@@ -262,6 +267,10 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         if pad_n > 0 and bias is not None:
             bias = self._pad_to_alignment(bias, dim=0, alignment=16)
 
+        if bias is None and out_dtype == torch.bfloat16 and _fp8n32 is not None:
+            out = _fp8n32.maybe_apply(A, B, As, Bs)
+            if out is not None:
+                return out.view(*output_shape[:-1], output_size)
         output = ops.cutlass_scaled_mm(
             A, B, out_dtype=out_dtype, scale_a=As, scale_b=Bs, bias=bias
         )

@@ -2498,6 +2498,15 @@ class GPUModelRunner(
             tuple[KVCacheSpec, type[AttentionMetadataBuilder]], AttentionMetadata
         ] = {}
 
+        def _can_reuse_mamba_metadata(builder, metadata) -> bool:
+            return isinstance(builder, Mamba2AttentionMetadataBuilder) and (
+                prefill_fast.mamba_reusable(metadata)
+                or (
+                    type(builder) is Mamba2AttentionMetadataBuilder
+                    and prefill_fast.mamba_decode_reusable(builder, metadata)
+                )
+            )
+
         def _build_attn_group_metadata(
             kv_cache_gid: int,
             attn_gid: int,
@@ -2558,12 +2567,14 @@ class GPUModelRunner(
                 )
             elif (
                 # LOCAL PATCH (cudafast-nemotron35): reuse the Mamba-2 metadata
-                # of a prefill-only batch across KV-cache groups
-                # (v1/worker/prefill_fast.py, VLLM_PREFILL_MAMBA_META_REUSE=0
-                # disables).
-                isinstance(builder, Mamba2AttentionMetadataBuilder)
-                and cache_key in cached_attn_metadata
-                and prefill_fast.mamba_reusable(cached_attn_metadata[cache_key])
+                # across KV-cache groups in this invocation. Prefill retains
+                # its existing path; speculative decode is narrowly guarded
+                # in prefill_fast.mamba_decode_reusable. Neither branch reuses
+                # model work or carries metadata into another step.
+                cache_key in cached_attn_metadata
+                and _can_reuse_mamba_metadata(
+                    builder, cached_attn_metadata[cache_key]
+                )
             ):
                 attn_metadata_i = builder.update_block_table(
                     cached_attn_metadata[cache_key],
@@ -2571,8 +2582,11 @@ class GPUModelRunner(
                     common_attn_metadata.slot_mapping,
                 )
                 if prefill_fast.CHECK:
+                    # build() writes the destination builder's graph buffers.
+                    # Snapshot first so comparison cannot pass by aliasing.
+                    reused_snapshot = prefill_fast.snapshot_metadata(attn_metadata_i)
                     prefill_fast.check_same(
-                        attn_metadata_i,
+                        reused_snapshot,
                         builder.build(
                             common_prefix_len=cascade_attn_prefix_len,
                             common_attn_metadata=common_attn_metadata,
@@ -2586,9 +2600,8 @@ class GPUModelRunner(
                     common_attn_metadata=common_attn_metadata,
                     **extra_attn_metadata_args,
                 )
-                if builder.supports_update_block_table or (
-                    isinstance(builder, Mamba2AttentionMetadataBuilder)
-                    and prefill_fast.mamba_reusable(attn_metadata_i)
+                if builder.supports_update_block_table or _can_reuse_mamba_metadata(
+                    builder, attn_metadata_i
                 ):
                     cached_attn_metadata[cache_key] = attn_metadata_i
 

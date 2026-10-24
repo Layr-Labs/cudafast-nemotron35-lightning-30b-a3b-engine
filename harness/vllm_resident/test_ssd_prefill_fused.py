@@ -394,7 +394,7 @@ def base_output(q, boundary, tl):
     return q.out.data.copy()
 
 
-def fused_result(q, tl):
+def fused_result(q, tl, final_cache=None, final_index=None, write_final=False):
     state = Tensor(np.full((q.nc, q.heads, q.h, q.n), np.nan, np.float32))
     ns = dict(tl=tl, fast_exp=exp)
     fn = function(FUSED, "_state_pass_kernel", ns)
@@ -411,6 +411,8 @@ def fused_result(q, tl):
         LAST=q.last,
         INIT=q.initial,
         OUT=state,
+        FINAL_CACHE=final_cache,
+        FINAL_INDEX=final_index,
         H=q.h,
         N=q.n,
         RATIO=q.heads // q.groups,
@@ -422,6 +424,9 @@ def fused_result(q, tl):
         IS=istrides,
         OS=state.stride(),
         HAS_INIT=q.initial is not None,
+        WRITE_FINAL=write_final,
+        FS=final_cache.stride() if write_final else (0, 0, 0, 0),
+        CACHE_SLOTS=final_cache.shape[0] if write_final else 0,
         BM=64,
         BN=128,
         BK=32,
@@ -518,6 +523,63 @@ class KernelTests(unittest.TestCase):
         q = case([33], 256)
         q.d = Tensor(np.array([0.25, -0.5], np.float32))
         self.compare(q)
+
+    def test_terminal_cache_sink_slots_and_alias(self):
+        for chunk, length, index, initial in (
+            (128, 1, 0, False),
+            (128, 129, 2, True),
+            (256, 496, -1, True),
+        ):
+            with self.subTest(chunk=chunk, length=length, index=index):
+                q = case([length], chunk, initial=initial)
+                cache = Tensor(
+                    np.arange(4 * q.heads * q.h * q.n, dtype=np.float32)
+                    .reshape(4, q.heads, q.h, q.n) / 4096
+                )
+                # Mirror the caller: a gathered initial state is independent,
+                # while the terminal sink aliases the actual request cache.
+                sink = Tensor(cache.data)
+                self.assertTrue(np.shares_memory(cache.data, sink.data))
+                if initial:
+                    q.initial = cache[Tensor([index], np.int32)]
+                    self.assertFalse(np.shares_memory(q.initial.data, cache.data))
+                before = cache.data.copy()
+                initial_before = q.initial.data.copy() if initial else None
+                tl = TL()
+                expected_states = base_states(q, tl)
+                expected_output = base_output(q, expected_states, tl)
+                q.out.data.fill(np.nan)
+                states, output = fused_result(
+                    q, tl, sink, Tensor([index], np.int32), write_final=True
+                )
+                expected_cache = before.copy()
+                expected_cache[index] = expected_states.data[q.last.data[0]]
+                np.testing.assert_array_equal(
+                    cache.data.view(np.uint32), expected_cache.view(np.uint32)
+                )
+                np.testing.assert_array_equal(
+                    states.view(np.uint32), expected_states.data.view(np.uint32)
+                )
+                np.testing.assert_array_equal(
+                    output.view(np.uint32), expected_output.view(np.uint32)
+                )
+                if initial:
+                    np.testing.assert_array_equal(q.initial.data, initial_before)
+
+    def test_disabled_terminal_sink_does_not_write_cache(self):
+        q = case([3, 129, 17], 128)
+        tl = TL()
+        expected_states = base_states(q, tl)
+        expected_output = base_output(q, expected_states, tl)
+        cache = Tensor(np.full((4, q.heads, q.h, q.n), -73.25, np.float32))
+        before = cache.data.copy()
+        q.out.data.fill(np.nan)
+        states, output = fused_result(
+            q, tl, cache, Tensor([1], np.int64), write_final=False
+        )
+        np.testing.assert_array_equal(cache.data, before)
+        np.testing.assert_array_equal(states, expected_states.data)
+        np.testing.assert_array_equal(output, expected_output)
 
 
 def torch_double():
@@ -624,7 +686,11 @@ class DispatchTests(unittest.TestCase):
         )
 
     def test_wrapper_launch_binding(self):
-        ns = {}
+        ns = dict(
+            os=NS(environ={}),
+            _final_logged=False,
+            logger=NS(info=lambda message: None),
+        )
         calls = []
         for name in ("_state_pass_kernel", "_cb_scan_kernel"):
             f = function(FUSED, name, dict(tl=TL(), fast_exp=exp))
@@ -638,8 +704,10 @@ class DispatchTests(unittest.TestCase):
                     def run(*args, **kw):
                         warps = kw.pop("num_warps")
                         stages = kw.pop("num_stages")
-                        self.sig.bind(*args, **kw)
-                        calls.append((self.which, grid, warps, stages, kw))
+                        bound = self.sig.bind(*args, **kw)
+                        calls.append(
+                            (self.which, grid, warps, stages, kw, bound.arguments)
+                        )
 
                     return run
 
@@ -665,7 +733,8 @@ class DispatchTests(unittest.TestCase):
         torch.empty = lambda shape, dtype, device: Tensor(np.empty(shape, np.float32))
         torch.accelerator = NS(device_index=lambda index: nullcontext())
         ns.update(torch=torch, triton=NS(cdiv=lambda a, b: (a + b - 1) // b))
-        function(FUSED, "fused_prefill", ns)(
+        run = function(FUSED, "fused_prefill", ns)
+        result = run(
             q.x,
             q.b,
             q.c,
@@ -679,6 +748,12 @@ class DispatchTests(unittest.TestCase):
             z=q.z,
             initial=q.initial,
         )
+        self.assertEqual(result.shape, (q.nc, q.heads, q.h, q.n))
+        self.assertFalse(calls[0][5]["WRITE_FINAL"])
+        self.assertIsNone(calls[0][5]["FINAL_CACHE"])
+        self.assertIsNone(calls[0][5]["FINAL_INDEX"])
+        self.assertEqual(calls[0][5]["FS"], (0, 0, 0, 0))
+        self.assertEqual(calls[0][5]["CACHE_SLOTS"], 0)
         self.assertEqual(
             [x[:4] for x in calls],
             [
@@ -698,6 +773,48 @@ class DispatchTests(unittest.TestCase):
             ),
             (64, 64, 64, 32),
         )
+
+        cache = Tensor(np.zeros((4, q.heads, q.h, q.n), np.float32))
+        index = Tensor([2], np.int64)
+        cache.device = index.device = device
+
+        def invoke(**overrides):
+            calls.clear()
+            kwargs = dict(final_cache=cache, final_index=index)
+            kwargs.update(overrides)
+            return run(
+                q.x, q.b, q.c, q.dt, q.da, q.cu, q.last, q.seq, q.out,
+                D=q.d, z=q.z, initial=q.initial, **kwargs,
+            )
+
+        self.assertIsNone(invoke())
+        self.assertEqual(len(calls), 2)
+        bound = calls[0][5]
+        self.assertTrue(bound["WRITE_FINAL"])
+        self.assertIs(bound["FINAL_CACHE"], cache)
+        self.assertIs(bound["FINAL_INDEX"], index)
+        self.assertEqual(bound["FS"], cache.stride())
+        self.assertEqual(bound["CACHE_SLOTS"], 4)
+        # The scan must still consume the just-computed chunk boundaries.
+        self.assertIs(calls[1][5]["STATES"], bound["OUT"])
+
+        for disabled, supplied_index, bad_dtype in (
+            (True, index, False),
+            (False, None, False),
+            (False, index, True),
+        ):
+            with self.subTest(disabled=disabled, missing=supplied_index is None,
+                              bad_dtype=bad_dtype):
+                ns["os"].environ["VLLM_PREFILL_FINAL_CACHE"] = "0" if disabled else "1"
+                cache.dtype = "bf16" if bad_dtype else np.dtype("float32")
+                result = invoke(final_index=supplied_index)
+                self.assertEqual(result.shape, (q.nc, q.heads, q.h, q.n))
+                bound = calls[0][5]
+                self.assertFalse(bound["WRITE_FINAL"])
+                self.assertIsNone(bound["FINAL_CACHE"])
+                self.assertIsNone(bound["FINAL_INDEX"])
+                self.assertEqual(bound["FS"], (0, 0, 0, 0))
+                self.assertEqual(bound["CACHE_SLOTS"], 0)
 
     def test_combined_selects_two_stages_or_original_four(self):
         q = self.q
@@ -754,6 +871,47 @@ class DispatchTests(unittest.TestCase):
                     answer.shape,
                     (q.nc if intermediate else q.last.numel(), 64, 64, 128),
                 )
+
+    def test_combined_propagates_completed_terminal_sink(self):
+        q = self.q
+        cache = Tensor(np.zeros((4, 64, 64, 128), np.float32))
+        index = Tensor([2], np.int32)
+        calls = []
+
+        def fused(*args, **kwargs):
+            calls.append(kwargs)
+            self.assertIs(kwargs["final_cache"], cache)
+            self.assertIs(kwargs["final_index"], index)
+            return None  # The state kernel completed the cache store.
+
+        def unexpected(*args, **kwargs):
+            self.fail("Completed terminal sink must not run fallback stages")
+
+        ns = dict(
+            torch=torch_double(),
+            is_int_pow_2=lambda n: n > 0 and n & (n - 1) == 0,
+            rearrange=lambda x, *a, **kw: x,
+            _chunk_cumsum_fwd=lambda *a, **kw: (q.da, q.dt),
+            can_fuse_prefill=lambda *a: True,
+            fused_prefill=fused,
+            _chunk_state_fwd=unexpected,
+            _state_passing_fwd=unexpected,
+            _bmm_chunk_fwd=unexpected,
+            _chunk_scan_fwd=unexpected,
+        )
+        run = function(OPS / "ssd_combined.py", "_mamba_chunk_scan_combined_fwd", ns)
+        for intermediate in (False, True):
+            self.assertIsNone(run(
+                q.x, Tensor(np.zeros((1, 64), np.float32)),
+                Tensor(np.zeros(64, np.float32)), q.b, q.c, 128, q.out,
+                initial_states=q.initial,
+                return_intermediate_states=intermediate,
+                seq_idx=q.seq, cu_seqlens=Tensor([0, 1], np.int32),
+                cu_chunk_seqlens=q.cu, last_chunk_indices=q.last,
+                state_dtype=np.dtype("float32"), final_state_out=cache,
+                final_state_indices=index,
+            ))
+        self.assertEqual(len(calls), 2)
 
 
 if __name__ == "__main__":

@@ -360,6 +360,12 @@ def install_mtp_small_linear(module: torch.nn.Module) -> int:
 
     class MTPSmallLinearMethod(UnquantizedLinearMethod):
         def apply(self, layer, x, bias=None):
+            if hasattr(layer, "_mtp_pk_sm"):
+                return torch.ops.vllm.mtp_packed_linear(
+                    x, layer._mtp_pk_sm, layer._mtp_pk_ex,
+                    layer._mtp_pk_base, layer._mtp_pk_ri, layer._mtp_pk_raw,
+                    layer._mtp_pk_n, layer._mtp_pk_k, layer.weight,
+                )
             if bias is None and x.dim() == 2:
                 return torch.ops.vllm.mtp_small_linear(x, layer.weight)
             return super().apply(layer, x, bias)
@@ -737,28 +743,38 @@ def mtp_moe_row(
     topk = ids.numel()
     E, inter, H = w13.shape
     h = torch.empty((topk + n_shared, inter), dtype=x.dtype, device=x.device)
+    from .nemotron_h_mtp_packed import PackedBF16, packed_moe_up
+
     gate, gated = _gate_args(x)
-    _mtp_moe_up_kernel[(triton.cdiv(inter, _MOE_UP_BN), topk + n_shared)](
-        x,
-        w13,
-        su,
-        ids,
-        h,
-        inter,
-        H,
-        w13.stride(0),
-        w13.stride(1),
-        su.stride(0),
-        TOPK=topk,
-        BN=_MOE_UP_BN,
-        EVICT=_EVICT_W,
-        BK=_MOE_UP_BK,
-        gate_ptr=gate,
-        GATED=gated,
-        num_warps=_MOE_UP_WARPS,
-        num_stages=_MOE_UP_STAGES,
-        launch_pdl=mtp_pdl(),
-    )
+    if isinstance(w13, PackedBF16):
+        packed_moe_up[(triton.cdiv(inter, _MOE_UP_BN), topk + n_shared)](
+            x, *w13.planes, *su.planes, ids, h, inter, H,
+            inter * H, H, H, gate, TOPK=topk, BN=_MOE_UP_BN, BK=_MOE_UP_BK,
+            EVICT=_EVICT_W, GATED=gated, num_warps=_MOE_UP_WARPS,
+            num_stages=_MOE_UP_STAGES, launch_pdl=mtp_pdl(),
+        )
+    else:
+        _mtp_moe_up_kernel[(triton.cdiv(inter, _MOE_UP_BN), topk + n_shared)](
+            x,
+            w13,
+            su,
+            ids,
+            h,
+            inter,
+            H,
+            w13.stride(0),
+            w13.stride(1),
+            su.stride(0),
+            TOPK=topk,
+            BN=_MOE_UP_BN,
+            EVICT=_EVICT_W,
+            BK=_MOE_UP_BK,
+            gate_ptr=gate,
+            GATED=gated,
+            num_warps=_MOE_UP_WARPS,
+            num_stages=_MOE_UP_STAGES,
+            launch_pdl=mtp_pdl(),
+        )
     y = torch.empty((M, H), dtype=x.dtype, device=x.device)
     if _RELU2_MODE:
         relu2_down(h, w2, sd, ids, tw, y, routed_scale)
@@ -794,7 +810,7 @@ def mtp_moe_row(
 
 # LOCAL PATCH (cudafast-nemotron35): routed experts the MTP draft evaluates per
 # token (the router's top 6 by weight, highest first); MTP_DRAFT_TOPK=0 keeps all.
-_DRAFT_TOPK = int(os.environ.get("MTP_DRAFT_TOPK", "3"))
+_DRAFT_TOPK = int(os.environ.get("MTP_DRAFT_TOPK", "2"))
 
 
 def mtp_moe_single_row_impl(

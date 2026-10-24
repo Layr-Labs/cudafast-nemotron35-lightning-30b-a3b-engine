@@ -138,20 +138,34 @@ class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
         residual: torch.Tensor | None = None,
         embeds_projected: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        # Start projections (Fusion)
-        if self.has_start_projections:
-            assert inputs_embeds is not None
-            hidden_states = _start_projection(
-                self, inputs_embeds, hidden_states, embeds_projected
-            )
-
-        # Call parent forward (Attention)
-        # Parent forward expects: hidden_states, residual
-        hidden_states, residual = super().forward(
-            positions=positions,
-            hidden_states=hidden_states,
-            residual=residual,
+        mode = getattr(self, "_mtp_start_norm_mode", None)
+        prepared_start = (
+            self.has_start_projections and embeds_projected
+            and residual is None and mode is not None
+            and hidden_states.shape == (1, 2688)
+            and hidden_states.dtype == torch.bfloat16
+            and inputs_embeds.shape == (1, 2688)
+            and inputs_embeds.dtype == torch.float32
+            and inputs_embeds.is_contiguous() and hidden_states.is_contiguous()
         )
+        if prepared_start:
+            h_norm = self.hnorm(hidden_states)
+            h_part = torch.ops.vllm.mtp_small_linear_keep(h_norm, self.eh_w_h)
+            hidden_states, residual = torch.ops.vllm.mtp_projected_start_norm(
+                h_part, inputs_embeds, self.norm.weight,
+                self.norm.variance_epsilon, mode,
+            )
+            # The parent performs exactly this mixer after its input norm.
+            hidden_states = self.mixer(hidden_states=hidden_states)
+        else:
+            if self.has_start_projections:
+                assert inputs_embeds is not None
+                hidden_states = _start_projection(
+                    self, inputs_embeds, hidden_states, embeds_projected
+                )
+            hidden_states, residual = super().forward(
+                positions=positions, hidden_states=hidden_states, residual=residual,
+            )
 
         # End norm
         if self.has_end_norm:
@@ -509,6 +523,9 @@ class NemotronHMTP(nn.Module, SupportsPP):
 
     def process_weights_after_loading(self) -> None:
         prepare_mtp_relu2(self.model)
+        from .nemotron_h_mtp_packed import prepare_mtp_packed
+
+        prepare_mtp_packed(self.model)
 
     def prepare_draft_head_screen(self):
         """The drafter's greedy head over the shared NVFP4 lm_head (see
@@ -538,6 +555,11 @@ class NemotronHMTP(nn.Module, SupportsPP):
             self.model.eh_table = None
             return False
         if built:
+            first = self.model.layers["0"]
+            if isinstance(first, NemotronHMTPAttentionDecoderLayer):
+                from .nemotron_h_mtp_start import prepare_projected_start
+
+                prepare_projected_start(first)
             logger.info(
                 "MTP eh_proj: projected-embedding table %s built",
                 tuple(self.model.eh_table.shape),

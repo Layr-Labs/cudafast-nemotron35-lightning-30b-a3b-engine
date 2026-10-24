@@ -211,6 +211,7 @@ from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_chang
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker import hostfast, mamba_utils
+from vllm.v1.worker.token_copy_pool import TokenCopyPool
 from vllm.v1.worker.block_table import SlotMappingMode
 from vllm.v1.worker.cp_utils import (
     check_attention_cp_compatibility,
@@ -267,13 +268,22 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         vocab_size: int,
         routed_experts: RoutedExpertsTensors | None = None,
         check_ep_fault: bool = False,
+        token_copy_pool: TokenCopyPool | None = None,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
 
         # Event on the copy stream so we can synchronize the non-blocking copy.
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
-        self.async_copy_ready_event = torch.cuda.Event(blocking=True)
+        self._token_copy_slot = (
+            token_copy_pool.acquire(sampled_token_ids)
+            if token_copy_pool is not None else None
+        )
+        self.async_copy_ready_event = (
+            self._token_copy_slot.event
+            if self._token_copy_slot is not None
+            else torch.cuda.Event(blocking=True)
+        )
 
         # Keep a reference to the device tensor to avoid it being
         # deallocated until we finish copying it to the host.
@@ -287,9 +297,17 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         default_stream = torch.cuda.current_stream()
         with torch.cuda.stream(async_output_copy_stream):
             async_output_copy_stream.wait_stream(default_stream)
-            self.sampled_token_ids_cpu = self._sampled_token_ids.to(
-                "cpu", non_blocking=True
-            )
+            if self._token_copy_slot is None:
+                self.sampled_token_ids_cpu = self._sampled_token_ids.to(
+                    "cpu", non_blocking=True
+                )
+            else:
+                self.sampled_token_ids_cpu = self._token_copy_slot.view(
+                    sampled_token_ids.shape[1]
+                )
+                self.sampled_token_ids_cpu.copy_(
+                    self._sampled_token_ids, non_blocking=True
+                )
             self._logprobs_tensors_cpu = (
                 self._logprobs_tensors.to_cpu_nonblocking()
                 if self._logprobs_tensors
@@ -313,6 +331,16 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         max_gen_len = self.sampled_token_ids_cpu.shape[-1]
         self.async_copy_ready_event.synchronize()
 
+        # A synchronization failure must not return a possibly live buffer.
+        # After a successful wait, release even if CPU parsing raises.
+        try:
+            return self._materialize_output(max_gen_len)
+        finally:
+            if self._token_copy_slot is not None:
+                self._token_copy_slot.in_use = False
+                self._token_copy_slot = None
+
+    def _materialize_output(self, max_gen_len: int) -> ModelRunnerOutput:
         # Release the device tensors once the copy has completed.
         del self._logprobs_tensors
         del self._sampled_token_ids
@@ -733,6 +761,7 @@ class GPUModelRunner(
         # Separate cuda stream for overlapping transfer of sampled token ids from
         # GPU to CPU when async scheduling is enabled.
         self.async_output_copy_stream: torch.cuda.Stream | None = None
+        self._token_copy_pool = TokenCopyPool()
         # cuda event to synchronize use of reused CPU tensors between steps
         # when async scheduling is enabled.
         self.prepare_inputs_event: torch.Event | None = None
@@ -4851,6 +4880,13 @@ class GPUModelRunner(
                 vocab_size=self.input_batch.vocab_size,
                 routed_experts=routed_experts_snapshot,
                 check_ep_fault=self.check_ep_fault,
+                # Output-id consumers retain the CPU tensor/event beyond
+                # get_output. Pool only when that second owner is absent.
+                token_copy_pool=(
+                    self._token_copy_pool
+                    if not self.input_batch.sampling_metadata.output_token_ids
+                    else None
+                ),
             )
         with record_function_or_nullcontext(
             "gpu_model_runner: set_async_sampled_token_ids"

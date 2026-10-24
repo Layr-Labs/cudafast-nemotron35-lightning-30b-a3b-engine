@@ -207,6 +207,7 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import (
 )
 from vllm.v1.spec_decode.step3p5 import Step3p5MTPProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
+from vllm.v1.spec_decode.target_head_graph import TargetHeadGraph, TargetHeadTicket
 from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
@@ -448,6 +449,7 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+    target_head_ticket: TargetHeadTicket | None = None
 
 
 class GPUModelRunner(
@@ -670,6 +672,42 @@ class GPUModelRunner(
                 self.effective_drafter_max_model_len = self.max_model_len
         self.use_async_spec_decode = (
             self.use_async_scheduling and self.num_spec_tokens > 0
+        )
+
+        # No graph allocation during construction, profiling, or model capture.
+        # The first fully eligible ordinary execute owns the sole private pool.
+        self._target_head_graph: TargetHeadGraph | None = None
+        self._target_head_uniform_metadata: SpecDecodeMetadata | None = None
+        self._target_head_graph_enabled = (
+            self.device.type == "cuda"
+            and self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+            and self.speculative_config.draft_model_config is not None
+            and self.speculative_config.draft_model_config.hf_config.model_type
+            == "nemotron_h_mtp"
+            and self.model_config.hf_config.model_type == "nemotron_h"
+            and 1 <= self.num_spec_tokens <= 6
+            and not self.speculative_config.parallel_drafting
+            and not self.speculative_config.use_heterogeneous_vocab
+            and not self.speculative_config.disable_padded_drafter_batch
+            and self.parallel_config.distributed_executor_backend == "uni"
+            and self.parallel_config.tensor_parallel_size == 1
+            and self.parallel_config.pipeline_parallel_size == 1
+            and self.parallel_config.data_parallel_size == 1
+            and self.parallel_config.prefill_context_parallel_size == 1
+            and self.parallel_config.decode_context_parallel_size == 1
+            and not self.parallel_config.use_ubatching
+            and not self.parallel_config.enable_eplb
+            and self.lora_config is None
+            and not self.model_config.is_encoder_decoder
+            and not self.model_config.enable_sleep_mode
+            and self.vllm_config.weight_transfer_config is None
+            and not self.model_config.enforce_eager
+            and self.compilation_config.cudagraph_mode is not None
+            and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+            and not self.cache_config.kv_sharing_fast_prefill
+            and self.offload_config.uva.cpu_offload_gb == 0
+            and self.offload_config.prefetch.offload_group_size == 0
         )
 
         # Request states.
@@ -2917,7 +2955,7 @@ class GPUModelRunner(
         draft_token_ids = self.input_ids.gpu[logits_indices]
         draft_token_ids = draft_token_ids[target_logits_indices + 1]
 
-        return SpecDecodeMetadata(
+        metadata = SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
             num_draft_tokens=num_draft_tokens.tolist(),
             cu_num_draft_tokens=cu_num_draft_tokens,
@@ -2926,6 +2964,23 @@ class GPUModelRunner(
             bonus_logits_indices=bonus_logits_indices,
             logits_indices=logits_indices,
         )
+        # Prove uniform index VALUES from the unchanged host builder, rather
+        # than inferring them from a repeated GPU tensor shape at replay time.
+        self._target_head_uniform_metadata = None
+        if (
+            self._target_head_graph_enabled
+            and self.input_batch.num_reqs == 1
+            and num_draft_tokens.shape == (1,)
+            and num_draft_tokens.dtype == np.dtype(np.int32)
+            and int(num_draft_tokens[0]) == self.num_spec_tokens
+            and cu_num_scheduled_tokens.shape == (1,)
+            and cu_num_scheduled_tokens.dtype == np.dtype(np.int64)
+            and int(cu_num_scheduled_tokens[0]) == self.num_spec_tokens + 1
+            and self.input_batch.num_computed_tokens_cpu[0]
+            >= self.input_batch.num_prompt_tokens[0]
+        ):
+            self._target_head_uniform_metadata = metadata
+        return metadata
 
     def _prepare_kv_sharing_fast_prefill(
         self,
@@ -3693,10 +3748,149 @@ class GPUModelRunner(
             ec_connector_output,
         )
 
+    def _target_head_owner_key(self) -> tuple[object, ...] | None:
+        # Capture only the pinned stock callbacks. Unknown Python hooks or
+        # replacements retain the ordinary head/sampler invocation semantics.
+        from vllm.model_executor.layers.logits_processor import LogitsProcessor
+        from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+        from vllm.model_executor.models.nemotron_h import NemotronHForCausalLM
+
+        raw_model = self.get_model()
+        rejection = getattr(self, "rejection_sampler", None)
+        if (
+            type(raw_model) is not NemotronHForCausalLM
+            or "compute_logits" in vars(raw_model)
+            or type(rejection) is not RejectionSampler
+            or rejection.sampler is not self.sampler
+            or type(self.sampler) is not Sampler
+        ):
+            return None
+        head = raw_model.lm_head
+        processor = raw_model.logits_processor
+        if type(head) is not ParallelLMHead or type(processor) is not LogitsProcessor:
+            return None
+        module_globals = torch.nn.modules.module
+        if (
+            module_globals._global_forward_hooks
+            or module_globals._global_forward_pre_hooks
+            or any(m._forward_hooks or m._forward_pre_hooks
+                   for m in (raw_model, head, processor, rejection, self.sampler))
+        ):
+            return None
+        quant_method = head.quant_method
+        if not type(quant_method).__module__.startswith((
+            "vllm.model_executor.layers.quantization.",
+            "vllm.model_executor.layers.vocab_parallel_embedding",
+        )):
+            return None
+        kernel = getattr(quant_method, "kernel", None)
+        # Pointer/layout changes invalidate capture. Supported weight/config
+        # mutators also synchronize and disable it, covering in-place reloads.
+        tensors = list(head.named_parameters()) + list(head.named_buffers())
+        tensors += [(name, value) for name, value in vars(head).items()
+                    if isinstance(value, torch.Tensor)]
+        tensors += [("quant." + name, value)
+                    for name, value in vars(quant_method).items()
+                    if isinstance(value, torch.Tensor)]
+        if kernel is not None:
+            tensors += [("kernel." + name, value)
+                        for name, value in vars(kernel).items()
+                        if isinstance(value, torch.Tensor)]
+        tensor_key = tuple(
+            (name, id(t), t.data_ptr(), tuple(t.shape), tuple(t.stride()),
+             t.dtype, t.device) for name, t in tensors
+        )
+        return (
+            id(self.model), id(raw_model), id(head), id(processor),
+            id(quant_method), type(quant_method), id(kernel), type(kernel),
+            id(rejection), id(self.sampler),
+            id(self.model_config), id(self.load_config), self.num_spec_tokens,
+            processor.scale, processor.vocab_size, processor.org_vocab_size,
+            processor.logits_as_input, processor.soft_cap, processor.use_all_gather,
+            processor.head_dtype, head.tp_size, tensor_key,
+        )
+
+    def _target_head_prepare(
+        self, hidden: torch.Tensor, metadata: SpecDecodeMetadata | None,
+        scheduler_output: "SchedulerOutput",
+    ) -> tuple[torch.Tensor, TargetHeadTicket] | None:
+        if (
+            not self._target_head_graph_enabled or metadata is None
+            or metadata is not self._target_head_uniform_metadata
+            or self.input_batch.num_reqs != 1 or self.num_prompt_logprobs
+            or self.broadcast_pp_output or self.is_pooling_model
+            or scheduler_output.total_num_scheduled_tokens != self.num_spec_tokens + 1
+            or scheduler_output.has_structured_output_requests
+            or self.discard_request_mask.np[0]
+            or torch.cuda.is_current_stream_capturing()
+            or (self._target_head_graph is not None
+                and self._target_head_graph.disabled)
+        ):
+            return None
+        req_ids = tuple(self.input_batch.req_ids)
+        if (
+            len(req_ids) != 1
+            or scheduler_output.num_scheduled_tokens.get(req_ids[0])
+            != self.num_spec_tokens + 1
+            or len(scheduler_output.scheduled_spec_decode_tokens.get(req_ids[0], []))
+            != self.num_spec_tokens
+        ):
+            return None
+        owner_key = self._target_head_owner_key()
+        if owner_key is None or not self.rejection_sampler._can_use_greedy_argmax(
+            self.input_batch.sampling_metadata
+        ):
+            return None
+        if self._target_head_graph is None:
+            self._target_head_graph = TargetHeadGraph(self.num_spec_tokens, self.device)
+        captured_owners: tuple[object, ...] = ()
+        if self._target_head_graph.entry is None:
+            # A model reference alone does not retain a parameter which is
+            # later replaced on that model. Keep exact captured allocations.
+            raw_model = self.get_model()
+            head = raw_model.lm_head
+            quant_method = head.quant_method
+            kernel = getattr(quant_method, "kernel", None)
+            owners: list[object] = [
+                raw_model, head, raw_model.logits_processor, quant_method, kernel
+            ]
+            owners.extend(head.parameters())
+            owners.extend(head.buffers())
+            for owner in (head, quant_method, kernel):
+                if owner is not None:
+                    owners.extend(value for value in vars(owner).values()
+                                  if isinstance(value, torch.Tensor))
+            captured_owners = tuple(owners)
+        return self._target_head_graph.prepare(
+            hidden, metadata, scheduler_output, req_ids, owner_key,
+            self.model, self.rejection_sampler, captured_owners,
+            self.model.compute_logits,
+            self.rejection_sampler._greedy_argmax_sample,
+        )
+
+    def _invalidate_target_head_graph(self, disable: bool = True) -> None:
+        if disable:
+            self._target_head_graph_enabled = False
+        graph = self._target_head_graph
+        if graph is not None:
+            # Rare model/config mutation boundary, never a per-step barrier.
+            graph.poison()
+            torch.cuda.synchronize(self.device)
+            graph.release_after_sync()
+            self._target_head_graph = None
+        state = self.execute_model_state
+        if state is not None and state.target_head_ticket is not None:
+            # An explicit model/config mutation aborts the outstanding graph
+            # frame. Do not retain its entry/old weight owners through state.
+            self.execute_model_state = None
+        self._target_head_uniform_metadata = None
+
     def _sample(
         self,
         logits: torch.Tensor | None,
         spec_decode_metadata: SpecDecodeMetadata | None,
+        target_head_ticket: TargetHeadTicket | None = None,
+        target_head_no_grammar: bool = False,
     ) -> SamplerOutput:
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
@@ -3716,6 +3910,29 @@ class GPUModelRunner(
             self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
 
         draft_probs = self._get_spec_decode_draft_probs(spec_decode_metadata)
+        if target_head_ticket is not None:
+            assert logits is not None and self._target_head_graph is not None
+            owner_key = self._target_head_owner_key()
+            if (
+                owner_key != target_head_ticket.owner_key
+                and logits is target_head_ticket.logits
+            ):
+                # Also protect an unexpected owner change during the original
+                # CPU prefix before handing logits to an unknown fallback.
+                logits = self._target_head_graph.resolve_logits(
+                    target_head_ticket, logits,
+                    target_head_ticket.scheduler_output, spec_decode_metadata,
+                    tuple(self.input_batch.req_ids), owner_key,
+                )
+            precomputed = self._target_head_graph.take_tokens(
+                target_head_ticket, logits, spec_decode_metadata,
+                owner_key,
+                owner_key is not None and target_head_no_grammar
+                and logits.dtype in (torch.float16, torch.bfloat16, torch.float32)
+                and self.rejection_sampler._can_use_greedy_argmax(sampling_metadata),
+            )
+            if precomputed is not None:
+                return precomputed
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
             draft_probs,
@@ -4172,6 +4389,20 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        try:
+            return self._execute_model_with_target_head(
+                scheduler_output, intermediate_tensors
+            )
+        except BaseException:
+            if self._target_head_graph is not None:
+                self._target_head_graph.poison()
+            raise
+
+    def _execute_model_with_target_head(
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -4490,10 +4721,18 @@ class GPUModelRunner(
                     )
 
                 sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
+                prepared_head = self._target_head_prepare(
+                    sample_hidden_states, spec_decode_metadata, scheduler_output
+                )
+                if prepared_head is None:
+                    logits = self.model.compute_logits(sample_hidden_states)
+                    target_head_ticket = None
+                else:
+                    logits, target_head_ticket = prepared_head
             else:
                 # Rare case.
                 assert not self.is_pooling_model
+                target_head_ticket = None
 
                 sample_hidden_states = hidden_states[logits_indices]
                 if not get_pp_group().is_last_rank:
@@ -4532,6 +4771,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            target_head_ticket,
         )
         self.kv_connector_output = kv_connector_output
 
@@ -4578,6 +4818,19 @@ class GPUModelRunner(
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        try:
+            return self._sample_tokens_with_target_head(grammar_output)
+        except BaseException:
+            if self._target_head_graph is not None:
+                self._target_head_graph.poison()
+            raise
+        finally:
+            if self._target_head_graph is not None:
+                self._target_head_graph.finish_frame()
+
+    def _sample_tokens_with_target_head(
+        self, grammar_output: "GrammarOutput | None"
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
         if self.execute_model_state is None:
             kv_connector_output = self.kv_connector_output
             self.kv_connector_output = None
@@ -4600,9 +4853,20 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            target_head_ticket,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
+
+        if target_head_ticket is not None:
+            assert self._target_head_graph is not None
+            # Resolve borrowed storage BEFORE grammar can mutate it. A stream
+            # change clones on producer A, waits on B and record_stream(B).
+            logits = self._target_head_graph.resolve_logits(
+                target_head_ticket, logits, scheduler_output,
+                spec_decode_metadata, tuple(self.input_batch.req_ids),
+                self._target_head_owner_key(),
+            )
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -4611,7 +4875,10 @@ class GPUModelRunner(
             )
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+            sampler_output = self._sample(
+                logits, spec_decode_metadata, target_head_ticket,
+                target_head_no_grammar=grammar_output is None,
+            )
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
@@ -5374,6 +5641,7 @@ class GPUModelRunner(
         return draft_token_ids
 
     def update_config(self, overrides: dict[str, Any]) -> None:
+        self._invalidate_target_head_graph()
         allowed_config_names = {"load_config", "model_config"}
         for config_name, config_overrides in overrides.items():
             if config_name not in allowed_config_names:
@@ -5392,6 +5660,7 @@ class GPUModelRunner(
         Args:
             load_dummy_weights: load dummy weights instead of real weights.
         """
+        self._invalidate_target_head_graph(disable=hasattr(self, "model"))
         logger.info_once(
             "Starting to load model %s...",
             self.model_config.model,
@@ -5638,6 +5907,7 @@ class GPUModelRunner(
             is_checkpoint_format: set to False if weights have already been
                 processed into kernel format (repacking, renaming, etc.)
         """
+        self._invalidate_target_head_graph()
         # TODO(@kylesayrs): generalize to all runners and loaders
         # argument validation
         if weights_iterator is None and not is_checkpoint_format:
@@ -6642,6 +6912,14 @@ class GPUModelRunner(
 
         # Calls torch.accelerator.synchronize()
         self._cleanup_profiling_kv_cache()
+        # Release private pools/callbacks only after the existing device sync,
+        # so in-process engine destruction does not retain the prior weights.
+        if self._target_head_graph is not None:
+            self._target_head_graph.release_after_sync()
+            self._target_head_graph = None
+        self.execute_model_state = None
+        self._target_head_uniform_metadata = None
+        self._target_head_graph_enabled = False
         if current_platform.is_rocm():
             # Drop captured graphs before distributed teardown. On ROCm, delayed
             # graph destruction can surface HSA faults in the next engine startup.

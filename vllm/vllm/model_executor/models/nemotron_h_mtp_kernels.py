@@ -617,6 +617,11 @@ def mtp_moe_row(
     return y
 
 
+# LOCAL PATCH (cudafast-nemotron35): routed experts the MTP draft evaluates per
+# token (the router's top 6 by weight, highest first); MTP_DRAFT_TOPK=0 keeps all.
+_DRAFT_TOPK = int(os.environ.get("MTP_DRAFT_TOPK", "3"))
+
+
 def mtp_moe_single_row_impl(
     hidden_states: torch.Tensor, row_src: torch.Tensor, layer_name: str
 ) -> torch.Tensor:
@@ -639,10 +644,18 @@ def mtp_moe_single_row_impl(
     topk_weights, topk_ids = mixer.experts.router.select_experts(
         hidden_states=x, router_logits=router_logits
     )
+    ids = topk_ids.reshape(-1)
+    tw = topk_weights.reshape(-1).to(torch.float32)
+    if 0 < _DRAFT_TOPK < ids.numel():
+        # LOCAL PATCH (cudafast-nemotron35): the draft keeps the _DRAFT_TOPK
+        # highest-weight routed experts of the MTP layer (drafter-only).
+        tw, order = torch.sort(tw, descending=True)
+        tw = tw[:_DRAFT_TOPK].contiguous()
+        ids = ids.index_select(0, order[:_DRAFT_TOPK]).contiguous()
     return mtp_moe_row(
         x,
-        topk_ids.reshape(-1),
-        topk_weights.reshape(-1).to(torch.float32),
+        ids,
+        tw,
         w13,
         w2,
         su,

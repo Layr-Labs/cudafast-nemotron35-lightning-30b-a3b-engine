@@ -210,6 +210,22 @@
     {
       "file": "harness/kernels/l2pf/py/__init__.py",
       "why": "Carry useful04706ad7-c4e8-44b9-b8ba-77f14d8b8adf MoE-window immutable prefetch default6to12MB. Its complete official2.19195352041462 is within0.1% of fulla484, but only budget mechanism is combined here on higherfulla484. Prefix pair/SSM combination unverified."
+    },
+    {
+      "file": "harness/kernels/smallk/csrc/smallk.cu",
+      "why": "PDL ordering audit: the router GEMM, top-k, align and route kernels read their predecessor's output through pointers passed through an empty asm after griddepcontrol.wait (after_wait), with plain loads. A __restrict__ (noalias) pointer's loads may legally be moved above the wait's memory clobber, and __ldg / non-coherent loads assume the data is read-only for the whole kernel, which a PDL grid that starts before its producer has finished cannot assume. Same addresses, same values, same arithmetic."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "Drafter-only, bit-identical drafts: the cascaded draft screen reads h at its column indices inside the coarse and refine dot kernels (no gathered copies of h), forms the refine rows as first-stage top-k index + chunk offset and the full-K rows and the select kernel's token ids as the second stage's picks among them (no offset add, no candidate gather), and writes the token straight into the captured output (no copy): five fewer kernels per draft pass. Same elements, same row ids, same arithmetic. A load-time bitwise check of every stage against the unfolded path keeps the unfolded path on any difference; VLLM_MTP_SCREEN_FOLD=0 restores it."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_kernels.py",
+      "why": "Drafter-only router tail: a one-row MTP MoE call uses the row itself (row_src[0] can only be 0) instead of an index_select, and the top-_DRAFT_TOPK selection is one kernel (rank = weights above plus equal ones at a lower slot, scattered below KEEP) instead of torch.sort + slice + index_select. The same experts in the same descending order for distinct weights; MTP_TOPK_KEEP_KERNEL=0 restores the sort."
+    },
+    {
+      "file": "vllm/model_executor/layers/mamba/ops/mamba_ssm_spec_replay.py (lazy anchor); harness/tests/mamba_spec_replay_exact.py",
+      "why": "Spec-replay verify writes the 2 MiB fp32 anchor state per Mamba layer only when the replay distance reaches T (VLLM_MAMBA_KANCHOR_T, default 8; 0 restores writing it every verify) instead of every verify, replaying the committed tokens since the anchor from the ring (ring_len >= T + 2d). One header per state row in slot 1 after the ring holds the anchor position and a 32-bit hash of the raw bits of all of that row's anchor words; a program uses its rows' headers only if they agree on the position and every row's hash equals the hash of the row it just loaded from slot 0, so any other writer of slot 0 (prefill, reference kernel) falls back to the reference relation A = P - num_accepted. Same per-token fp32 update on the same 16-bit inputs in the same order: state and outputs bit-identical; about 2/3 fewer anchor writes at depth 4 Composes with the confidence-prefix limit (927589d0): the main loop runs the valid prefix only (compute_len >= 1, so token 0 and the anchor write always run), and every position the lazy replay reads is a committed token, which lies in its verify's valid prefix and so was written to the ring. A launch failure before the first successful lazy-anchor launch falls back to the anchor-every-verify kernel."
     }
   ]
 }

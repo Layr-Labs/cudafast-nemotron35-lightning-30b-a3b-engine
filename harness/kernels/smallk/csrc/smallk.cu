@@ -42,6 +42,17 @@ __device__ __forceinline__ void pdl_launch_dependents() {
 #endif
 }
 
+// A pointer to data the preceding grid writes, for use after pdl_wait(). Passed through an empty
+// asm, it carries no __restrict__ (noalias) provenance, so the compiler can neither move its loads
+// above griddepcontrol.wait (a noalias pointer's loads may cross the wait's "memory" clobber) nor
+// turn them into non-coherent loads. Same addresses, same values.
+template <typename T>
+__device__ __forceinline__ const T* after_wait(const T* p) {
+  unsigned long long a = reinterpret_cast<unsigned long long>(p);
+  asm volatile("" : "+l"(a) :: "memory");
+  return reinterpret_cast<const T*>(a);
+}
+
 // ------------------------------------------------------------------------------------------------
 // router GEMM
 // ------------------------------------------------------------------------------------------------
@@ -76,8 +87,9 @@ __global__ void __launch_bounds__(kLanes * kMaxTiles)
   __shared__ float lane_sum[R * M][kLanes];
 
   pdl_wait();
+  const float* xs = after_wait(x);  // the preceding grid's output
   // verify-row count (nullptr: every row), loaded early so its latency hides under the main loop
-  const int vr = vrows == nullptr ? M : *vrows;
+  const int vr = vrows == nullptr ? M : *after_wait(vrows);
   if (j < J) {
     const int len = min(kLanes, (K - j * kTile) / kLanes);
     const int base = j * kTile + r;
@@ -102,7 +114,7 @@ __global__ void __launch_bounds__(kLanes * kMaxTiles)
       for (int i = 0; i < kLanes; ++i) {
         float xv[M];
 #pragma unroll
-        for (int m = 0; m < M; ++m) xv[m] = __ldg(x + m * ldx + base + i * kLanes);
+        for (int m = 0; m < M; ++m) xv[m] = xs[m * ldx + base + i * kLanes];
 #pragma unroll
         for (int a = 0; a < R; ++a)
 #pragma unroll
@@ -118,7 +130,7 @@ __global__ void __launch_bounds__(kLanes * kMaxTiles)
       for (int i = 0; i < len; ++i) {
         float xv[M];
 #pragma unroll
-        for (int m = 0; m < M; ++m) xv[m] = __ldg(x + m * ldx + base + i * kLanes);
+        for (int m = 0; m < M; ++m) xv[m] = xs[m * ldx + base + i * kLanes];
 #pragma unroll
         for (int a = 0; a < R; ++a) {
           const float wa = ldw<W16>(w, wrow[a] + i * kLanes);
@@ -185,7 +197,7 @@ __device__ __forceinline__ uint64_t make_key(float v, int idx) {
 
 // One warp ranks one token's E = 32 * C experts; writes values/indices (and the ids to s_ids).
 template <int C>
-__device__ __forceinline__ void topk_token(const float* __restrict__ s, const float* __restrict__ bias, int topk,
+__device__ __forceinline__ void topk_token(const float* s, const float* __restrict__ bias, int topk,
                                            int renormalize, float routed_scaling_factor,
                                            float* __restrict__ out_values, int32_t* __restrict__ out_indices,
                                            int32_t* s_ids) {
@@ -271,8 +283,9 @@ __global__ void __launch_bounds__(256)
                         int32_t* __restrict__ topk_indices) {
   const int token = blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp;
   pdl_wait();
+  const float* lg = after_wait(logits);  // the preceding grid's output
   if (token < num_tokens)
-    topk_token<E / kWarp>(logits + static_cast<long>(token) * E, bias, topk, renormalize, routed_scaling_factor,
+    topk_token<E / kWarp>(lg + static_cast<long>(token) * E, bias, topk, renormalize, routed_scaling_factor,
                           topk_values + static_cast<long>(token) * topk,
                           topk_indices + static_cast<long>(token) * topk, nullptr);
   pdl_launch_dependents();
@@ -336,7 +349,8 @@ __global__ void __launch_bounds__(kAlignExperts)
   __shared__ int32_t s_cum[kAlignExperts + 1];
   __shared__ int32_t s_wsum[kAlignExperts / kWarp];
   pdl_wait();
-  if (threadIdx.x < numel) s_ids[threadIdx.x] = topk_ids[threadIdx.x];
+  const int32_t* ids = after_wait(topk_ids);  // the preceding grid's output
+  if (threadIdx.x < numel) s_ids[threadIdx.x] = ids[threadIdx.x];
   __syncthreads();
   align_e128(s_ids, numel, block_size, sorted_ids, max_num_tokens_padded, expert_ids, max_num_m_blocks,
              num_tokens_post_pad, s_cum, s_wsum);
@@ -354,8 +368,9 @@ __global__ void __launch_bounds__(kAlignExperts)
   __shared__ int32_t s_cum[kAlignExperts + 1];
   __shared__ int32_t s_wsum[kAlignExperts / kWarp];
   pdl_wait();
+  const float* lg = after_wait(logits);  // the preceding grid's output
   for (int token = threadIdx.x / kWarp; token < num_tokens; token += kAlignExperts / kWarp)
-    topk_token<kAlignExperts / kWarp>(logits + static_cast<long>(token) * kAlignExperts, bias, topk, renormalize,
+    topk_token<kAlignExperts / kWarp>(lg + static_cast<long>(token) * kAlignExperts, bias, topk, renormalize,
                                       routed_scaling_factor, topk_values + static_cast<long>(token) * topk,
                                       topk_indices + static_cast<long>(token) * topk, s_ids + token * topk);
   __syncthreads();

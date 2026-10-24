@@ -728,11 +728,41 @@ class SpecDecodeBaseProposer:
         if set_moe_row_src is not None:
             # Padded rows of the single-token steps copy row 0.
             set_moe_row_src(input_batch_size, self._moe_row_zero)
+        fuse_mtp_staging = (
+            self.method == "mtp"
+            and self.device.type == "cuda"
+            and sampling_metadata.all_greedy
+            and not self.parallel_drafting
+            and not self.constant_draft_positions
+            and not self.use_heterogeneous_vocab
+            and not self.supports_mm_inputs
+            and self.pass_hidden_states_to_model
+            and not self.uses_mrope
+            and self.uses_xdrope_dim == 0
+            and self.draft_uses_xdrope_dim == 0
+            and batch_size == input_batch_size == 1
+            and self.hidden_size == 2688
+            and self.input_ids.dtype == torch.int32
+            and self.hidden_states.dtype == torch.bfloat16
+            and self.hidden_states.stride(1) == 1
+        )
         for token_index in range(self.num_speculative_tokens - 1):
             # Update the inputs.
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax() returns int64 by default.
-            input_ids = draft_token_ids_list[-1].int()
+            raw_input_ids = draft_token_ids_list[-1]
+            # Stage the single native-MTP row in the metadata launch. Keep
+            # the original token-list ownership and all other proposer modes.
+            fuse_draft_inputs = (
+                fuse_mtp_staging
+                and raw_input_ids.shape == (batch_size,)
+                and raw_input_ids.dtype == torch.int64
+                and raw_input_ids.stride(0) == 1
+                and hidden_states.shape == (batch_size, self.hidden_size)
+                and hidden_states.dtype == torch.bfloat16
+                and hidden_states.stride(1) == 1
+            )
+            input_ids = raw_input_ids if fuse_draft_inputs else raw_input_ids.int()
 
             if self.use_heterogeneous_vocab:
                 # Map target token IDs to draft vocab space (TLI algorithm)
@@ -746,6 +776,8 @@ class SpecDecodeBaseProposer:
                     batch_size,
                     input_batch_size,
                     block_size,
+                    draft_token_ids=raw_input_ids if fuse_draft_inputs else None,
+                    draft_hidden_states=hidden_states if fuse_draft_inputs else None,
                 )
 
             # Rebuild attention metadata. When draft positions are constant
@@ -767,8 +799,9 @@ class SpecDecodeBaseProposer:
                     self._draft_plan_event.record()
 
             # copy inputs to buffer for cudagraph
-            self.input_ids[:batch_size] = input_ids
-            self.hidden_states[:batch_size] = hidden_states
+            if not fuse_draft_inputs:
+                self.input_ids[:batch_size] = input_ids
+                self.hidden_states[:batch_size] = hidden_states
             if self.supports_mm_inputs:
                 self.inputs_embeds[:batch_size] = self.model.embed_input_ids(input_ids)
 
@@ -867,6 +900,9 @@ class SpecDecodeBaseProposer:
         batch_size: int,
         input_batch_size: int,
         block_size: int,
+        *,
+        draft_token_ids: torch.Tensor | None = None,
+        draft_hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Update positions, slot mappings, and sequence metadata for the
         next draft step. Returns the updated positions tensor."""
@@ -886,6 +922,14 @@ class SpecDecodeBaseProposer:
             out_clamped_positions=out_pos,
             out_slot_mapping=self._slot_mapping_buffer[:input_batch_size],
             input_batch_size=input_batch_size,
+            draft_token_ids=draft_token_ids,
+            draft_hidden_states=draft_hidden_states,
+            out_draft_token_ids=(
+                self.input_ids if draft_token_ids is not None else None
+            ),
+            out_draft_hidden_states=(
+                self.hidden_states if draft_token_ids is not None else None
+            ),
         )
         common_attn_metadata.slot_mapping = self._slot_mapping_buffer[:batch_size]
         if self.uses_mrope:

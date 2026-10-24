@@ -19,7 +19,7 @@ sm=${arch/./}
 "$nvcc" -O3 -std=c++17 -shared -Xcompiler -fPIC -lineinfo \
   -gencode "arch=compute_${sm},code=sm_${sm}" \
   -Xptxas -v \
-  -o "$out/libmarlinx.so" "$here/csrc/marlinx.cu" 2>&1 | grep -v '^$' || true
+  -o "$out/libmarlinx.so" "$here/csrc/marlinx.cu" 2>&1
 test -f "$out/libmarlinx.so" || { echo "marlinx: build failed" >&2; exit 1; }
 cp "$here/py/__init__.py" "$out/__init__.py"
 echo "marlinx: built $out/libmarlinx.so for sm_${sm}"

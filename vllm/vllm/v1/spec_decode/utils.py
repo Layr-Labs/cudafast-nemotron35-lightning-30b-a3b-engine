@@ -84,6 +84,89 @@ def eagle_step_slot_mapping_metadata_kernel(
     tl.store(out_slot_mapping_ptr + req_idx, slot_id)
     tl.store(seq_lens_ptr + req_idx, new_seq_len)
 
+@triton.jit
+def eagle_step_slot_mapping_metadata_inputs_kernel(
+    positions_ptr,  # [batch_size] - current positions (1D view for M-RoPE)
+    block_table_ptr,  # [batch_size, n_blocks_per_req]
+    block_table_stride,  # stride for block_table dim 1
+    seq_lens_ptr,  # [batch_size] - read and write
+    out_clamped_positions_ptr,  # [batch_size] (output)
+    out_slot_mapping_ptr,  # [input_batch_size] (output)
+    block_size: tl.constexpr,
+    max_model_len: tl.constexpr,
+    n_blocks_per_req: tl.constexpr,
+    PAD_ID: tl.constexpr,
+    batch_size,
+    draft_ids_ptr,
+    draft_hidden_ptr,
+    out_draft_ids_ptr,
+    out_draft_hidden_ptr,
+    draft_hidden_stride: tl.constexpr,
+    out_draft_hidden_stride: tl.constexpr,
+    HIDDEN_SIZE: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """
+    Fused kernel for EAGLE autoregressive step: updates positions, slot mapping,
+    and sequence lengths in a single kernel to reduce launch overhead.
+
+    Launched with input_batch_size threads. Threads with req_idx >= batch_size
+    are cudagraph padding slots and only write PADDING_SLOT_ID.
+
+    Each real thread handles one request in the batch. Computes:
+    - new_position = position + 1, clamped if exceeds max_model_len
+    - slot_mapping from block table lookup
+    - seq_lens += 1, or 1 if position exceeds max
+    """
+    req_idx = tl.program_id(0)
+
+    if req_idx >= batch_size:
+        tl.store(out_slot_mapping_ptr + req_idx, PAD_ID)
+        return
+
+    # Load current position and increment
+    position = tl.load(positions_ptr + req_idx)
+    new_position = position + 1
+
+    # Check bounds and compute clamped position
+    exceeds_max = new_position >= max_model_len
+    clamped_position = tl.where(exceeds_max, 0, new_position)
+
+    # Block table lookup: block_number = position // block_size
+    # Clamp block_number to avoid OOB when position is at max
+    block_number = clamped_position // block_size
+    block_number = tl.minimum(block_number, n_blocks_per_req - 1)
+
+    block_id = tl.load(block_table_ptr + req_idx * block_table_stride + block_number)
+    slot_id = block_id * block_size + (clamped_position % block_size)
+    slot_id = tl.where(exceeds_max, PAD_ID, slot_id)
+
+    # Update seq_lens: +1 normally, or 1 if exceeded
+    seq_len = tl.load(seq_lens_ptr + req_idx)
+    new_seq_len = tl.where(exceeds_max, 1, seq_len + 1)
+    new_seq_len = tl.minimum(new_seq_len, max_model_len)
+
+    # Store outputs
+    tl.store(out_clamped_positions_ptr + req_idx, clamped_position)
+    tl.store(out_slot_mapping_ptr + req_idx, slot_id)
+    tl.store(seq_lens_ptr + req_idx, new_seq_len)
+
+    # Same row/values as the following .int() and two buffer copies.
+    # No floating-point arithmetic or shared output storage is introduced.
+    draft_id = tl.load(draft_ids_ptr + req_idx).to(tl.int32)
+    tl.store(out_draft_ids_ptr + req_idx, draft_id)
+    h = tl.arange(0, BLOCK_H)
+    hidden = tl.load(
+        draft_hidden_ptr + req_idx * draft_hidden_stride + h,
+        mask=h < HIDDEN_SIZE,
+        other=0.0,
+    )
+    tl.store(
+        out_draft_hidden_ptr + req_idx * out_draft_hidden_stride + h,
+        hidden,
+        mask=h < HIDDEN_SIZE,
+    )
+
 
 def eagle_step_update_slot_mapping_and_metadata(
     positions_1d: torch.Tensor,
@@ -94,6 +177,11 @@ def eagle_step_update_slot_mapping_and_metadata(
     out_clamped_positions: torch.Tensor,
     out_slot_mapping: torch.Tensor,
     input_batch_size: int | None = None,
+    *,
+    draft_token_ids: torch.Tensor | None = None,
+    draft_hidden_states: torch.Tensor | None = None,
+    out_draft_token_ids: torch.Tensor | None = None,
+    out_draft_hidden_states: torch.Tensor | None = None,
 ) -> None:
     """
     Fused update of slot mapping and metadata for one EAGLE autoregressive step.
@@ -112,13 +200,37 @@ def eagle_step_update_slot_mapping_and_metadata(
         out_slot_mapping: [input_batch_size] output buffer for slot mapping
         input_batch_size: total batch size including cudagraph padding;
             defaults to batch_size (no padding)
+        draft_token_ids/draft_hidden_states: optional guarded MTP input row;
+            when present, cast/copy it into the matching out_draft buffers in
+            the metadata kernel. The caller must supply all four tensors.
     """
     batch_size = positions_1d.shape[0]
     if input_batch_size is None:
         input_batch_size = batch_size
 
+    if draft_token_ids is not None:
+        assert draft_hidden_states is not None
+        assert out_draft_token_ids is not None
+        assert out_draft_hidden_states is not None
+        hidden_size = draft_hidden_states.shape[1]
+        kernel = eagle_step_slot_mapping_metadata_inputs_kernel
+        input_kwargs = {
+            "draft_ids_ptr": draft_token_ids,
+            "draft_hidden_ptr": draft_hidden_states,
+            "out_draft_ids_ptr": out_draft_token_ids,
+            "out_draft_hidden_ptr": out_draft_hidden_states,
+            "draft_hidden_stride": draft_hidden_states.stride(0),
+            "out_draft_hidden_stride": out_draft_hidden_states.stride(0),
+            "HIDDEN_SIZE": hidden_size,
+            "BLOCK_H": triton.next_power_of_2(hidden_size),
+        }
+    else:
+        # Preserve the original call signature, including the CPU replacement.
+        kernel = eagle_step_slot_mapping_metadata_kernel
+        input_kwargs = {}
+
     n_blocks_per_req = block_table_tensor.shape[1]
-    eagle_step_slot_mapping_metadata_kernel[(input_batch_size,)](
+    kernel[(input_batch_size,)](
         positions_1d,
         block_table_tensor,
         block_table_tensor.stride(0),
@@ -130,6 +242,7 @@ def eagle_step_update_slot_mapping_and_metadata(
         n_blocks_per_req=n_blocks_per_req,
         PAD_ID=PADDING_SLOT_ID,
         batch_size=batch_size,
+        **input_kwargs,
     )
 
 

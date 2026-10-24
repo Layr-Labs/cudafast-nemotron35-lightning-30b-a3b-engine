@@ -291,8 +291,54 @@ class DraftHeadScreen:
         if _l2pf is not None and self.cascade:
             _l2pf.DRAFT_SCREEN[:] = [self.w_coarse]
         self.graph = None
+        self.native_selector = None
         self._h = torch.empty(k, dtype=torch.float32, device=device)
         self._out = torch.empty(1, dtype=torch.int32, device=device)
+        # Official remote boot only. Real checkpoint weights, synthetic current
+        # hidden vectors and the original full062 proposal path are compared.
+        # This finite admission is not a universal arithmetic equivalence proof.
+        if (device.type == "cuda" and self.cascade
+                and os.environ.get("MTP_HEAD_FUSED", "1") != "0"):
+            try:
+                from head_fused import Selector
+                native = Selector(self, device)
+                i = torch.arange(k, device=device, dtype=torch.float32)
+                ok = native.full_mma
+                for seed in ((3, 17, 41) if ok else ()):
+                    h = (((i * seed + 11).remainder(257) - 128) / 64).contiguous()
+                    candidates = self._candidate_rows(h)
+                    original = self._finish_row(h, candidates, allow_native=False)
+                    proposed = native.finish(h, candidates)
+                    if not torch.equal(original, proposed):
+                        ok = False
+                        break
+                    # Private synthetic gate state, never the live request gate.
+                    ref_gate = torch.tensor([0, 0, 1], dtype=torch.int32, device=device)
+                    proposed_gate = ref_gate.clone()
+                    ref_token = torch.empty((), dtype=torch.int32, device=device)
+                    _select_token[(1,)](
+                        self.cand_logits, candidates, ref_token,
+                        N=self.cand_logits.numel(),
+                        BLOCK=triton.next_power_of_2(self.cand_logits.numel()),
+                        gate_ptr=ref_gate, GATED=True, THETA=DEPTH_THETA,
+                        launch_pdl=mtp_pdl(),
+                    )
+                    gated_token = native.finish(h, candidates, proposed_gate, DEPTH_THETA)
+                    if not (torch.equal(ref_token, gated_token)
+                            and torch.equal(ref_gate, proposed_gate)):
+                        ok = False
+                        break
+                    stopped = torch.tensor([1, 3, 1], dtype=torch.int32, device=device)
+                    stopped_before = stopped.clone()
+                    native.finish(h, candidates, stopped, DEPTH_THETA)
+                    if not torch.equal(stopped, stopped_before):
+                        ok = False
+                        break
+                if ok:
+                    self.native_selector = native
+                logger.info("MTP full-K MMA finite admission: %s", ok)
+            except (ImportError, OSError, RuntimeError, AssertionError) as exc:
+                logger.warning("MTP fused head declined: %r", exc)
         if device.type == "cuda" and screen_graph_enabled():
             # The captured one-row screen is the gated one (depth gate): allocate
             # the gate first so the graph captures its address.
@@ -319,10 +365,12 @@ class DraftHeadScreen:
             self.graph is not None,
         )
 
-    def _greedy_row(self, h: torch.Tensor, gated: bool = False) -> torch.Tensor:
-        """One row h [K] float32: the cascade (or the single screen) and the
-        argmax tie rule. Every buffer it touches is fixed-address, so the body
-        is capturable as-is."""
+    def _greedy_row(self, h: torch.Tensor, gated: bool = False, allow_native: bool = True) -> torch.Tensor:
+        cand = self._candidate_rows(h, gated)
+        return self._finish_row(h, cand, gated, allow_native=allow_native)
+
+    def _candidate_rows(self, h, gated=False):
+        # Entire062 partial screens, topk and global-ID gather unchanged.
         if self.cascade:
             hc = h.index_select(0, self.coarse_cols)
             _rows_dot(
@@ -357,6 +405,15 @@ class DraftHeadScreen:
                 .topk(SCREEN_PER, dim=-1, sorted=False).indices
                 + self.chunk_off
             ).reshape(-1)
+        return cand
+
+    def _finish_row(self, h, cand, gated=False, allow_native=True):
+        if (allow_native and self.native_selector is not None
+                and self.native_selector.full_mma):
+            gate, ok = _gate_args(h)
+            return self.native_selector.finish(
+                h, cand, gate if gated and ok else None, DEPTH_THETA
+            )
         _rows_dot(
             h, self.w_full, self.s_full, cand, self.gscale, self.cand_logits, True, gated
         )
@@ -372,11 +429,14 @@ class DraftHeadScreen:
 
     def greedy(self, hidden: torch.Tensor) -> torch.Tensor:
         """Draft ids [B] for hidden [B, K] (B is small; one pass per row)."""
-        if self.graph is not None and hidden.shape[0] == 1:
+        if (self.graph is not None and hidden.shape[0] == 1
+                and hidden.dtype == torch.bfloat16):
             self._h.copy_(hidden[0])
             self.graph.replay()
             return self._out.clone()
         out = []
         for i in range(hidden.shape[0]):
-            out.append(self._greedy_row(hidden[i].float().contiguous()))
+            out.append(self._greedy_row(
+                hidden[i].float().contiguous(), allow_native=hidden.dtype == torch.bfloat16
+            ))
         return torch.stack(out)

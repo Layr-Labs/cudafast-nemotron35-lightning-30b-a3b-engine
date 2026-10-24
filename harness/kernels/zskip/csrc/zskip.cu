@@ -1724,7 +1724,7 @@ static int launch4f(const Params& p, cudaStream_t stream) {
   down4_kernel<WPC, R, NH, BM, true><<<dim3(42 / WPC, p.max_blocks), WPC * 32, BI_BYTES, stream>>>(p);
   return (int)cudaGetLastError();
 }
-#define ZSKIP4F_CONFIGS(X) X(108, 2, 4, 1, 16)
+#define ZSKIP4F_CONFIGS(X) X(108, 2, 4, 1, 16) X(111, 6, 4, 1, 16)
 #endif
 
 // v4 config id, warps per CTA, ring depth (active groups in flight per warp), 8-row MMA halves per

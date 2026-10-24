@@ -53,7 +53,7 @@ ENABLED = os.environ.get("ZSKIP", "1") != "0"
 LAYOUT = "swap"
 CONFIG = 100
 FUSED_PREP = os.environ.get("ZSKIP_FUSED_PREP", "1") != "0"
-FUSED_CONFIG = 108
+FUSED_CONFIG = 111
 MAX_TOKENS = 8
 # Prefill: MoE layers whose relu^2 activations are sparse enough for the skip to beat humming's
 # 64-row blocks on GB10 (measured per layer on prefill-length calls; the others lose). Layer 51,
@@ -126,19 +126,26 @@ def finalize(layer: torch.nn.Module) -> None:
     if not _self_check(layer):
         layer.zskip_w2 = None
         return
-    if FUSED_PREP and _fused_check(layer):
-        layer.zskip_config = FUSED_CONFIG
-        logger.info_once("zskip: fused prep config %d for <= 8 tokens", FUSED_CONFIG)
+    if FUSED_PREP:
+        for cfg in dict.fromkeys((FUSED_CONFIG, 108)):
+            if _fused_check(layer, cfg):
+                layer.zskip_config = cfg
+                logger.info_once("zskip: fused prep config %d for <= 8 tokens", cfg)
+                break
     logger.info_once("zskip: zero-row-skipping routed down projection enabled for <= 8 tokens")
     layer.pzskip_ok = False
+    layer.pzskip_config = PZ_CONFIG
     if PZ_ENABLED and _pzskip is not None and _pzskip.available():
         _pzskip.scratch(
             gs.device,
             _pzskip.max_blocks(PZ_MAX_TOKENS * TOP_K, NUM_EXPERTS, _pzskip.block_rows(PZ_CONFIG)),
         )
-        if _pz_self_check(layer):
-            layer.pzskip_ok = True
-            logger.info_once("pzskip: zero-row-skipping routed down projection enabled for prefill")
+        for cfg in dict.fromkeys((PZ_CONFIG, 300)):
+            if _pz_self_check(layer, cfg):
+                layer.pzskip_ok = True
+                layer.pzskip_config = cfg
+                logger.info_once("pzskip: prefill config %d enabled", cfg)
+                break
     if layer.zskip_prefill:
         logger.info_once(
             "zskip: prefill routed down projection enabled on layers %s",
@@ -146,7 +153,7 @@ def finalize(layer: torch.nn.Module) -> None:
         )
 
 
-def _pz_self_check(layer: torch.nn.Module) -> bool:
+def _pz_self_check(layer: torch.nn.Module, pz_config: int = PZ_CONFIG) -> bool:
     """Load-time guard: humming's w2 and pzskip on a deterministic 496-token call, bitwise."""
     import json
 
@@ -205,9 +212,9 @@ def _pz_self_check(layer: torch.nn.Module) -> bool:
         tuning_config=json.dumps(configs[1]),
     )
     out = torch.empty_like(ref)
-    if _pzskip.block_rows(PZ_CONFIG) != PZ_BLOCK_M:
-        sorted_ids, expert_ids, ntp = _align(topk_ids, _pzskip.block_rows(PZ_CONFIG))
-    _pzskip.down(act, sorted_ids, expert_ids, ntp, layer.zskip_w2, out, wpc=PZ_CONFIG)
+    if _pzskip.block_rows(pz_config) != PZ_BLOCK_M:
+        sorted_ids, expert_ids, ntp = _align(topk_ids, _pzskip.block_rows(pz_config))
+    _pzskip.down(act, sorted_ids, expert_ids, ntp, layer.zskip_w2, out, wpc=pz_config)
     ok = torch.equal(out.view(torch.int16), ref.view(torch.int16))
     if not ok:
         logger.warning(
@@ -238,11 +245,11 @@ def _align(topk_ids: torch.Tensor, block_size: int):
     )
 
 
-def _fused_check(layer: torch.nn.Module) -> bool:
+def _fused_check(layer: torch.nn.Module, fused_config: int = FUSED_CONFIG) -> bool:
     """Decode-sized load-time check of FUSED_CONFIG. False keeps CONFIG (prefill already checked)."""
     try:
-        _zskip.config_info(FUSED_CONFIG)
-        return _self_check(layer, config=FUSED_CONFIG, quiet=True, prefill=False)
+        _zskip.config_info(fused_config)
+        return _self_check(layer, config=fused_config, quiet=True, prefill=False)
     except Exception as exc:  # noqa: BLE001
         logger.warning_once("zskip: fused prep unavailable (%r); config %d", exc, CONFIG)
         return False
@@ -451,7 +458,8 @@ def _pz_down(
         or outputs.stride(0) % 2
     ):
         return False
-    bm = _pzskip.block_rows(PZ_CONFIG)
+    pz_config = getattr(layer, "pzskip_config", PZ_CONFIG)
+    bm = _pzskip.block_rows(pz_config)
     if bm == PZ_BLOCK_M:
         sorted_ids = moe_kwargs["sorted_ids"]
         expert_ids = moe_kwargs["expert_ids"]
@@ -460,5 +468,5 @@ def _pz_down(
         sorted_ids, expert_ids, ntp = _align(topk_ids, bm)
     else:
         return False
-    _pzskip.down(inputs, sorted_ids, expert_ids, ntp, layer.zskip_w2, outputs, wpc=PZ_CONFIG)
+    _pzskip.down(inputs, sorted_ids, expert_ids, ntp, layer.zskip_w2, outputs, wpc=pz_config)
     return True

@@ -195,5 +195,31 @@
       "file": "harness/kernels/pzskip/{csrc/pzskip.cu,py/__init__.py,build.sh,tests/exact.py}, vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
       "why": "Prefill routed down only (humming block_m 64 calls, 9..8192 tokens): pzskip skips the w2 weight rows whose relu^2 input is zero in every row of humming's 64-row expert block, with zskip's fp32 chain and bf16 epilogue, so outputs are bitwise equal to humming. Load-time 496-token bitwise check per layer; on a mismatch the layer keeps config 405 / humming. PZSKIP=0 disables."
     }
-  ]
+  ],
+  "cuda_full_head_on_858": {
+    "model": "GPT 6.1 Sol",
+    "harness": "Codex",
+    "effort": "ultra",
+    "fullVerifiedBase": "85890747-0e71-4c01-aaf1-0252b06d368b",
+    "baseCommit": "f89867fb2527b7df12921f0ab67ef9c311f77015",
+    "baseTree": "c741ed75b2cbff0800ab81898f33be6bd456c3d3",
+    "pendingPrefill": "Nowfullwinner858 config322/32rows retained; original062config300 admittedlayerfallbackadded",
+    "headCarrier": "d33ba2a4-c7e9-4463-8d15-84b46c0a3cb3 dequant/MMAhelper/APIpattern only; negativewhole+nativepartialCUBexcluded",
+    "newHead": [
+      "Original062partialscreen/topk/candidatebuilder retained",
+      "NEWfullKsplit4TensorCore+fusedBF16/NaN/minID/confidencecounterstop",
+      "Original062stop/kept/active lifecycle andallroutersuffixprotocolretained"
+    ],
+    "MarlinPDL": "732c3711-b4f8-4d68-8d5f-158639bffb62 selectednative/build/py/tests only",
+    "notSelected": [
+      "C2packing",
+      "negative d33 nativepartial/CUB",
+      "negative453depth5",
+      "top2"
+    ],
+    "policy": "originaldepth4/top3draft/six-target",
+    "validation": "entirecombinationunverified; officialremoteonly",
+    "localExecutionPerformed": false,
+    "pendingDecode": "Usefulunpublishedcancelledbf7bad6c-3e79-40dc-a2b7-a590fd60c3d3 config111; 108/100fallbackretained, no top2; publicUUIDcredited, officialedge deferreduntilpublished"
+  }
 }

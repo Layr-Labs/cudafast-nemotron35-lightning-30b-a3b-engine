@@ -59,12 +59,6 @@ def spec_replay_enabled() -> bool:
     return value not in ("0", "false", "off", "no")
 
 
-def _const_div_enabled() -> bool:
-    """Fold the ring length and head/group ratio into the kernel as constants."""
-    value = os.environ.get("VLLM_MAMBA_SPEC_REPLAY_CONST_DIV", "1").strip().lower()
-    return value not in ("0", "false", "off", "no")
-
-
 def spec_replay_ring_len(num_spec: int) -> int:
     """Ring entries per request: any value >= 2 * num_spec + 1 is hazard-free."""
     return 2 * (num_spec + 1)
@@ -155,20 +149,11 @@ def _selective_scan_update_spec_replay_kernel(
     HAS_Z: tl.constexpr,
     STORE_REPLAYED: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
-    RING_LEN: tl.constexpr = 0,
-    HG_RATIO: tl.constexpr = 0,
-    CONST_DIV: tl.constexpr = False,
 ):
     # The dt/A of a head are scalars (stride-0 expansion over head_dim); that is
     # the only layout the Mamba2 decode path produces and the only one the
     # ring stores.
     tl.static_assert(TIE_HDIM)
-    if CONST_DIV:
-        rl = RING_LEN
-        hr = HG_RATIO
-    else:
-        rl = ring_len
-        hr = nheads_ngroups_ratio
 
     pid_m = tl.program_id(axis=0)
     pid_b = tl.program_id(axis=1)
@@ -198,24 +183,24 @@ def _selective_scan_update_spec_replay_kernel(
     ring_ok = ring_batch_idx != null_block_id
     ring_base = ring_ptr + ring_batch_idx * stride_ring_batch
     ring_x_base = ring_base + pid_h * dim
-    ring_B_base = ring_base + rl * nheads * dim
-    ring_B_base += (pid_h // hr) * dstate
-    ring_dt_base = ring_base + rl * (nheads * dim + ngroups * dstate) + pid_h
+    ring_B_base = ring_base + ring_len * nheads * dim
+    ring_B_base += (pid_h // nheads_ngroups_ratio) * dstate
+    ring_dt_base = ring_base + ring_len * (nheads * dim + ngroups * dstate) + pid_h
     ring_stride_x = nheads * dim
     ring_stride_B = ngroups * dstate
     ring_stride_dt = nheads
     # One program per head writes dt, one per group writes B; every program
     # writes its own slice of x.
     is_dt_writer = pid_m == 0
-    is_B_writer = (pid_m == 0) & ((pid_h % hr) == 0)
+    is_B_writer = (pid_m == 0) & ((pid_h % nheads_ngroups_ratio) == 0)
 
     x_ptr += bos * stride_x_batch + pid_h * stride_x_head
     dt_ptr += bos * stride_dt_batch + pid_h * stride_dt_head
     if HAS_DT_BIAS:
         dt_bias_ptr += pid_h * stride_dt_bias_head
     A_ptr += pid_h * stride_A_head
-    B_ptr += bos * stride_B_batch + (pid_h // hr) * stride_B_group
-    C_ptr += bos * stride_C_batch + (pid_h // hr) * stride_C_group
+    B_ptr += bos * stride_B_batch + (pid_h // nheads_ngroups_ratio) * stride_B_group
+    C_ptr += bos * stride_C_batch + (pid_h // nheads_ngroups_ratio) * stride_C_group
     if HAS_Z:
         z_ptr += bos * stride_z_batch + pid_h * stride_z_head
     out_ptr += bos * stride_out_batch + pid_h * stride_out_head
@@ -241,7 +226,7 @@ def _selective_scan_update_spec_replay_kernel(
     for i_r in range(num_replay):
         # Non-negative even for garbage metadata (dummy runs), so the address
         # always stays inside slot 1's ring.
-        ring_pos = ((pos0 - num_replay + i_r) % rl + rl) % rl
+        ring_pos = ((pos0 - num_replay + i_r) % ring_len + ring_len) % ring_len
         x = tl.load(
             ring_x_base + ring_pos * ring_stride_x + offs_m,
             mask=(offs_m < dim) & ring_ok,
@@ -312,7 +297,7 @@ def _selective_scan_update_spec_replay_kernel(
             # The new anchor: the state after token 0, as the reference's slot 0.
             tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=mask)
         else:
-            ring_pos = ((pos0 + i_t) % rl + rl) % rl
+            ring_pos = ((pos0 + i_t) % ring_len + ring_len) % ring_len
             tl.store(
                 ring_x_base + ring_pos * ring_stride_x + offs_m,
                 x_raw,
@@ -550,8 +535,5 @@ def selective_state_update_spec_replay(
             dt_softplus,
             True,
             BLOCK_SIZE_M,
-            RING_LEN=ring_len,
-            HG_RATIO=nheads // ngroups,
-            CONST_DIV=_const_div_enabled(),
             num_warps=num_warps,
         )

@@ -82,6 +82,10 @@
     {
       "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py",
       "why": "Cascade the accepted 4e916237-ea0f-48f5-8cd6-503252f54bc8 draft screen: 32 importance-ranked groups score the complete vocabulary, keep 256 per 2048-row chunk, recompute original 64-group scores for those candidates, then retain 32 per original chunk for the unchanged full-K rescore/BF16/min-ID chain. The wider intermediate set is informed by the negative smaller-screen evidence of b27645a4-0e5b-477b-9502-933cb2eb8a79, without an assumed recall guarantee. New buffers contain exact input-independent NVFP4 byte/scale subsets. No target/native-MTP weights, formats or verification changes. Additional proposal pruning and gathered partial-score lowering can change drafts; recall, exact-token result and speed require official remote validation. VLLM_MTP_SCREEN_CASCADE=0 retains the original single screen."
+    },
+    {
+      "file": "vllm/v1/worker/gpu_model_runner.py; mtp-head.manifest.json",
+      "why": "On complete ff909c58 carrier, select native MTP depth 4 after a three-Spark depth sweep and enable the inherited boot-only fresh-496 prefill graph at depth 4 as well as 3. Metadata is constructed at the resident configured depth; every request still refreshes all captured input/metadata tensors. No kernel, target format, pruning or verification change."
     }
   ]
 }

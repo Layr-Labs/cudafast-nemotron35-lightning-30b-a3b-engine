@@ -51,11 +51,6 @@ def screen_enabled() -> bool:
     return os.environ.get("VLLM_MTP_SCREEN", "1") != "0"
 
 
-def screen_graph_enabled() -> bool:
-    """Kill switch for the per-draft-row capture: VLLM_MTP_SCREEN_GRAPH=0."""
-    return os.environ.get("VLLM_MTP_SCREEN_GRAPH", "1") != "0"
-
-
 @triton.jit
 def _e2m1(nib):
     # fp4 e2m1: s ee m -> +-{0, .5, 1, 1.5, 2, 3, 4, 6}
@@ -194,74 +189,46 @@ class DraftHeadScreen:
             (n // SCREEN_CHUNK) * SCREEN_PER, dtype=torch.float32, device=device
         )
         self.big = torch.tensor(1 << 30, dtype=torch.int64, device=device)
-        self.graph = None
-        self._h = torch.empty(k, dtype=torch.float32, device=device)
-        self._out = torch.empty(1, dtype=torch.int64, device=device)
-        if device.type == "cuda" and screen_graph_enabled():
-            try:
-                self._h.zero_()
-                for _ in range(2):
-                    self._out.copy_(self._greedy_row(self._h))
-                torch.cuda.synchronize(device)
-                self.graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(
-                    self.graph, pool=torch.cuda.graph_pool_handle()
-                ):
-                    self._out.copy_(self._greedy_row(self._h))
-                torch.cuda.synchronize(device)
-            except Exception as exc:
-                self.graph = None
-                logger.warning("MTP draft-head screen graph disabled: %s", exc)
         logger.info(
-            "MTP draft-head screen: %d of %d groups, %d candidates, cascade=%s, graph=%s",
+            "MTP draft-head screen: %d of %d groups, %d candidates, cascade=%s",
             SCREEN_FRAC_GROUPS, ng, self.cand_logits.numel(), self.cascade,
-            self.graph is not None,
         )
-
-    def _greedy_row(self, h: torch.Tensor) -> torch.Tensor:
-        """One row h [K] float32: the cascade (or the single screen) and the
-        argmax tie rule. Every buffer it touches is fixed-address, so the body
-        is capturable as-is."""
-        if self.cascade:
-            hc = h.index_select(0, self.coarse_cols)
-            _rows_dot(
-                hc, self.w_coarse, self.s_coarse, None,
-                self.gscale, self.scores, False,
-            )
-            coarse_cand = (
-                self.scores.view(-1, SCREEN_CHUNK)
-                .topk(CASCADE_PER, dim=-1).indices + self.chunk_off
-            )
-            hs = h.index_select(0, self.cols)
-            _rows_dot(
-                hs, self.w_scr, self.s_scr, coarse_cand.reshape(-1),
-                self.gscale, self.refine_scores, True,
-            )
-            # Scores retain the [original chunk, coarse candidate] layout.
-            # Gather global IDs; adding chunk_off here would offset twice.
-            refined = self.refine_scores.view(-1, CASCADE_PER).topk(
-                SCREEN_PER, dim=-1
-            ).indices
-            cand = coarse_cand.gather(1, refined).reshape(-1)
-        else:
-            hs = h.index_select(0, self.cols)
-            _rows_dot(hs, self.w_scr, self.s_scr, None, self.gscale, self.scores, False)
-            cand = (
-                self.scores.view(-1, SCREEN_CHUNK).topk(SCREEN_PER, dim=-1).indices
-                + self.chunk_off
-            ).reshape(-1)
-        _rows_dot(h, self.w_full, self.s_full, cand, self.gscale, self.cand_logits, True)
-        v = self.cand_logits.to(torch.bfloat16)
-        best = v.max()
-        return torch.where(v == best, cand, self.big).min()
 
     def greedy(self, hidden: torch.Tensor) -> torch.Tensor:
         """Draft ids [B] for hidden [B, K] (B is small; one pass per row)."""
-        if self.graph is not None and hidden.shape[0] == 1:
-            self._h.copy_(hidden[0].float())
-            self.graph.replay()
-            return self._out.clone()
         out = []
         for i in range(hidden.shape[0]):
-            out.append(self._greedy_row(hidden[i].float().contiguous()))
+            h = hidden[i].float().contiguous()
+            if self.cascade:
+                hc = h.index_select(0, self.coarse_cols)
+                _rows_dot(
+                    hc, self.w_coarse, self.s_coarse, None,
+                    self.gscale, self.scores, False,
+                )
+                coarse_cand = (
+                    self.scores.view(-1, SCREEN_CHUNK)
+                    .topk(CASCADE_PER, dim=-1).indices + self.chunk_off
+                )
+                hs = h.index_select(0, self.cols)
+                _rows_dot(
+                    hs, self.w_scr, self.s_scr, coarse_cand.reshape(-1),
+                    self.gscale, self.refine_scores, True,
+                )
+                # Scores retain the [original chunk, coarse candidate] layout.
+                # Gather global IDs; adding chunk_off here would offset twice.
+                refined = self.refine_scores.view(-1, CASCADE_PER).topk(
+                    SCREEN_PER, dim=-1
+                ).indices
+                cand = coarse_cand.gather(1, refined).reshape(-1)
+            else:
+                hs = h.index_select(0, self.cols)
+                _rows_dot(hs, self.w_scr, self.s_scr, None, self.gscale, self.scores, False)
+                cand = (
+                    self.scores.view(-1, SCREEN_CHUNK).topk(SCREEN_PER, dim=-1).indices
+                    + self.chunk_off
+                ).reshape(-1)
+            _rows_dot(h, self.w_full, self.s_full, cand, self.gscale, self.cand_logits, True)
+            v = self.cand_logits.to(torch.bfloat16)
+            best = v.max()
+            out.append(torch.where(v == best, cand, self.big).min())
         return torch.stack(out)

@@ -293,13 +293,10 @@ direct_register_custom_op(
 )
 
 
-def smallk_router_gemm_impl(
-    x: torch.Tensor, weight: torch.Tensor, row_mask: bool = False
-) -> torch.Tensor:
-    """Router logits x . weight^T in fp32: smallk for its verified shape, else torch.mm.
-    row_mask (early-router target gates): smallk honours its verify_rows buffer."""
+def smallk_router_gemm_impl(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Router logits x . weight^T in fp32: smallk for its verified shape, else torch.mm."""
     if _smallk is not None:
-        out = _smallk.maybe_router_gemm(x, weight, row_mask=row_mask)
+        out = _smallk.maybe_router_gemm(x, weight)
         if out is not None:
             return out
     if _routerbig is not None:

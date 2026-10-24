@@ -42,6 +42,9 @@ def _load():
         lib = ctypes.CDLL(LIB_PATH)
         lib.marlinx_init.argtypes = []
         lib.marlinx_init.restype = ctypes.c_int
+        if hasattr(lib, "marlinx_set_pdl"):
+            lib.marlinx_set_pdl.argtypes = [ctypes.c_int]
+            lib.marlinx_set_pdl.restype = ctypes.c_int
         lib.marlinx_regs.argtypes = [ctypes.c_int]
         lib.marlinx_regs.restype = ctypes.c_int
         lib.marlinx_gemm.argtypes = [
@@ -82,6 +85,11 @@ def _init() -> bool:
     rc = lib.marlinx_init()
     if rc != 0:
         raise RuntimeError(f"marlinx_init failed: {rc}")
+    # PDL (sm_90+): overlap each gemm launch with its predecessor's drain.
+    # MARLINX_PDL=0 keeps the ordinary serialized launch. Same pattern as zskip.
+    set_pdl = getattr(lib, "marlinx_set_pdl", None)
+    if set_pdl is not None and os.environ.get("MARLINX_PDL", "1") != "0":
+        set_pdl(1)
     _ready = True
     return True
 

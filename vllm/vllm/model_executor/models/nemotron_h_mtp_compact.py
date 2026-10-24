@@ -13,7 +13,7 @@ from vllm.triton_utils import tl, triton
 
 from .nemotron_h_mtp_kernels import mtp_pdl
 
-_ENABLED = os.environ.get("MTP_RELU2_COMPACT", "1") != "0"
+_ENABLED = os.environ.get("MTP_RELU2_COMPACT", "0") != "0"
 
 
 @triton.jit

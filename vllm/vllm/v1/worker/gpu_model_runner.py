@@ -4,7 +4,6 @@
 import functools
 import gc
 import itertools
-import sys
 import threading
 import time
 from collections import defaultdict
@@ -250,52 +249,6 @@ if TYPE_CHECKING:
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 logger = init_logger(__name__)
-
-
-def _smallk_module():
-    """The smallk kernel package when the model imported it (never imported here)."""
-    return sys.modules.get("smallk")
-
-
-def _verify_rows_buffer(logits: torch.Tensor | None) -> torch.Tensor | None:
-    """smallk's verify-row count (MTP depth gate), if the verify graph reads it."""
-    smallk = _smallk_module()
-    if smallk is None or logits is None or not hasattr(smallk, "live_verify_rows"):
-        return None
-    return smallk.live_verify_rows(logits.device)
-
-
-def _reject_unverified_drafts(
-    metadata: SpecDecodeMetadata, vrows: torch.Tensor
-) -> SpecDecodeMetadata:
-    """Draft slots at or past vrows - 1 set to -1 (rejected), for the one-request
-    batch the depth gate serves; a larger batch never has the count lowered
-    (nemotron_h_mtp_kernels.depth_gate_begin), so it is left as is."""
-    if len(metadata.num_draft_tokens) != 1:
-        return metadata
-    draft = metadata.draft_token_ids
-    slot = torch.arange(draft.numel(), device=draft.device, dtype=torch.int32)
-    draft = torch.where(slot >= vrows - 1, torch.full_like(draft, -1), draft)
-    return replace(metadata, draft_token_ids=draft)
-
-
-def _keep_verify_rows_for(
-    metadata: SpecDecodeMetadata | None, num_reqs: int, num_tokens: int
-) -> None:
-    """Resets smallk's verify-row count unless this forward is the one-request
-    verify of the drafts it was set for."""
-    smallk = _smallk_module()
-    if smallk is None or not getattr(smallk, "_vrows", None):
-        return
-    if (
-        metadata is not None
-        and num_reqs == 1
-        and len(metadata.num_draft_tokens) == 1
-        and metadata.num_draft_tokens[0] + 1 == num_tokens
-    ):
-        return
-    smallk.reset_verify_rows()
-
 
 # Protect asynchronous H2D sources; switchable for in-process cost screening.
 PINNED_SOURCE_GUARDS = True
@@ -3806,25 +3759,12 @@ class GPUModelRunner(
             self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
 
         draft_probs = self._get_spec_decode_draft_probs(spec_decode_metadata)
-        # LOCAL PATCH (cudafast-nemotron35): MTP depth gate. The verify masked the
-        # rows at or past smallk's verify-row count (they took the last valid row's
-        # experts), so every draft those rows would check or follow is rejected
-        # here: draft slot i is checked by row i, and slots >= count - 1 become -1,
-        # which the greedy kernel rejects, emitting row count - 1's own argmax.
-        # Then every row is valid again. See nemotron_h_mtp_kernels.py.
-        vrows = _verify_rows_buffer(logits)
-        if vrows is not None:
-            spec_decode_metadata = _reject_unverified_drafts(
-                spec_decode_metadata, vrows
-            )
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
             draft_probs,
             logits,
             sampling_metadata,
         )
-        if vrows is not None:
-            vrows.fill_(_smallk_module().VROWS_ALL)
         return sampler_output
 
     def _bookkeeping_sync(
@@ -4558,11 +4498,6 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
-            # LOCAL PATCH (cudafast-nemotron35): MTP depth gate. A verify-row count
-            # the last draft loop lowered belongs to the verify of its drafts only
-            # (one request, 1 + drafts rows); every other forward runs with every
-            # row valid.
-            _keep_verify_rows_for(spec_decode_metadata, num_reqs, num_tokens_unpadded)
             fresh_graph = getattr(self, "_fresh_prefill_graph", None)
             # The captured forward serves only the logits row (prefill_graph.py):
             # a request that asks for prompt logprobs reads every row of the
@@ -7186,7 +7121,7 @@ class GPUModelRunner(
             and self.scheduler_config.max_num_seqs == 1
             and self.parallel_config.tensor_parallel_size == 1
             and self.parallel_config.pipeline_parallel_size == 1
-            and self.num_spec_tokens in (3, 4)
+            and self.num_spec_tokens in (3, 4, 5)
             and not self.use_aux_hidden_state_outputs
         ):
             return

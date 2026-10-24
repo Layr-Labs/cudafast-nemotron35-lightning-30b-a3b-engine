@@ -29,15 +29,6 @@ by default); `SMALLK_TOPK=1 SMALLK_ALIGN=1` opt into the top-k/align kernels (of
 below), `SMALLK_FUSE=0` then keeps them separate. Every call outside a kernel's verified guard runs
 the stock op.
 
-Verify-row count (dormant until the spec loop calls `smallk.enable_verify_rows(device)` before
-graph capture; it returns an int32[1] buffer holding `VROWS_ALL`): the early-router path of
-target-model gates (not the MTP layer's) then passes it to the router kernel, which gives every row
-at or past its value the last valid row's logits bit for bit. Those rows route to experts the valid
-row already loads, so a verify that masks its trailing rows reads no extra expert weights for them.
-Valid rows are unchanged (each row's logits are its own chain). Only a spec loop whose sampler
-stops acceptance at the same row may lower it; write it in place, since the verify graph captures
-its address. Until it is enabled the kernel gets nullptr and runs the old code.
-
 ## Arithmetic
 
 **Router GEMM** (`M = 4, N = 128, K = 2688`, fp32): the cuBLAS summation tree was recovered by

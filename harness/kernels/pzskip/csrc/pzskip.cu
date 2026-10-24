@@ -119,7 +119,6 @@ __device__ __forceinline__ uint32_t ldg_u32_l1(const void* p) {
 }
 
 // one CTA per expert block: rows, masks (union over valid rows) and the active group list
-template <int BMT = BM>
 __global__ void __launch_bounds__(128) prep_kernel(const Params p) {
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const int mb = blockIdx.x;
@@ -127,12 +126,12 @@ __global__ void __launch_bounds__(128) prep_kernel(const Params p) {
   int* rows = reinterpret_cast<int*>(bi + BI_ROWS);
   uint16_t* mask = reinterpret_cast<uint16_t*>(bi + BI_MASK);
   uint16_t* actg = reinterpret_cast<uint16_t*>(bi + BI_ACTG);
-  __shared__ int s_rows[BMT];
+  __shared__ int s_rows[BM];
   __shared__ int s_n;
   __shared__ uint16_t s_mask[128];
-  const bool live = mb * BMT < *p.num_tokens_padded;
-  if (tid < BMT) {
-    const unsigned id = live ? static_cast<unsigned>(p.sorted_ids[mb * BMT + tid]) : 0xFFFFFFFFu;
+  const bool live = mb * BM < *p.num_tokens_padded;
+  if (tid < BM) {
+    const unsigned id = live ? static_cast<unsigned>(p.sorted_ids[mb * BM + tid]) : 0xFFFFFFFFu;
     const bool valid = id < static_cast<unsigned>(p.shape_m);
     rows[tid] = valid ? static_cast<int>(id) : -1;
     s_rows[tid] = valid ? static_cast<int>(id) : -1;
@@ -140,7 +139,7 @@ __global__ void __launch_bounds__(128) prep_kernel(const Params p) {
   __syncthreads();
   if (tid == 0) {
     int n = 0;
-    for (int r = 0; r < BMT; ++r) n += s_rows[r] >= 0 ? 1 : 0;
+    for (int r = 0; r < BM; ++r) n += s_rows[r] >= 0 ? 1 : 0;
     s_n = n;
     *reinterpret_cast<int*>(bi + BI_NROWS) = n;
     *reinterpret_cast<int*>(bi + BI_EXPERT) = live ? p.expert_ids[mb] : -1;
@@ -152,7 +151,7 @@ __global__ void __launch_bounds__(128) prep_kernel(const Params p) {
       if (p.dense == 1) {
         m = 0xFFFFu;
       } else {
-        for (int r = 0; r < BMT; ++r) {
+        for (int r = 0; r < BM; ++r) {
           const int row = s_rows[r];
           if (row < 0) continue;
           const uint4* q = reinterpret_cast<const uint4*>(p.A + (long long)row * p.lda + 16 * g);
@@ -335,11 +334,11 @@ __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0
 
 constexpr int XS = 48;  // activation row stride in shared memory (bytes): conflict-free reads
 
-template <int KG, int NS, int NTL, int BMT = BM>
+template <int KG, int NS, int NTL>
 struct SmemStage {
   uint8_t w[KG][16][32 * NTL];
   uint8_t s[KG][64 * NTL];
-  uint8_t x[KG][BMT][XS];
+  uint8_t x[KG][BM][XS];
 };
 
 template <int KG, int NS, int NTL, int MINB = 1>
@@ -511,48 +510,43 @@ __global__ void __launch_bounds__(64 * NTL, MINB) smem_kernel(const Params p) {
   }
 }
 
-// BMT = rows per expert block: 64 -> two 32-row halves (2 warps per 64-column tile); 32 or 16 ->
-// one warp per 64-column tile covering the whole block (4 or 2 token tiles). Smaller blocks have
-// sparser union masks (fewer weight rows loaded per block) at the cost of more blocks.
-template <int KG, int NS, int NTL, int MINB = 1, int BMT = BM>
-__global__ void __launch_bounds__(32 * NTL * (BMT == 64 ? 2 : 1), MINB) smem4_kernel(const Params p) {
-  constexpr int HALVES = BMT == 64 ? 2 : 1;
-  constexpr int TTW = BMT == 64 ? 4 : BMT / 8;  // token tiles per warp
-  constexpr int NTH = 32 * NTL * HALVES;
+template <int KG, int NS, int NTL, int MINB = 1>
+__global__ void __launch_bounds__(64 * NTL, MINB) smem4_kernel(const Params p) {
+  constexpr int NTH = 64 * NTL;
   extern __shared__ __align__(16) uint8_t smem_raw[];
-  using Stage = SmemStage<KG, NS, NTL, BMT>;
+  using Stage = SmemStage<KG, NS, NTL>;
   Stage* stg = reinterpret_cast<Stage*>(smem_raw);
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const int g8 = lane >> 2, t = lane & 3;
   const int P = blockIdx.x;  // tile of 64 * NTL columns
   const int mb = blockIdx.y;
-  if (mb * BMT >= *p.num_tokens_padded) return;
+  if (mb * BM >= *p.num_tokens_padded) return;
   const uint8_t* bi = p.ws + (long long)mb * BI_BYTES;
   const int nrows = *reinterpret_cast<const int*>(bi + BI_NROWS);
   const int e = *reinterpret_cast<const int*>(bi + BI_EXPERT);
   if (e < 0 || nrows == 0) return;
   // the block's lists in shared memory: no dependent global loads in the issue loop
-  __shared__ int rows[BMT];
+  __shared__ int rows[BM];
   __shared__ uint16_t gmask[128];
   __shared__ uint16_t gact[128];
   for (int q = tid; q < 128; q += NTH) {
-    if (q < BMT) rows[q] = reinterpret_cast<const int*>(bi + BI_ROWS)[q];
+    if (q < BM) rows[q] = reinterpret_cast<const int*>(bi + BI_ROWS)[q];
     gmask[q] = reinterpret_cast<const uint16_t*>(bi + BI_MASK)[q];
     gact[q] = reinterpret_cast<const uint16_t*>(bi + BI_ACTG)[q];
   }
   const int nag = *reinterpret_cast<const int*>(bi + BI_NAG);
   __syncthreads();
   const int ntt = (nrows + 7) >> 3;
-  const int Tl = warp / HALVES;      // which 64-column tile of the CTA
-  const int rh = warp % HALVES;      // which 32-row half of the block (BMT 64 only)
+  const int Tl = warp >> 1;          // which 64-column tile of the CTA
+  const int rh = warp & 1;           // which 32-row half of the block
   const int c0 = 0;
-  const int tt0 = TTW * rh;
+  const int tt0 = 4 * rh;
   const bool active = 32 * rh < nrows;
   const uint8_t* wexp = p.W + e * p.w_expert + (long long)(NTL * P) * 32;
   const uint8_t* sexp = p.S + e * p.s_expert + (long long)(NTL * P) * 64;
   const int kr[4] = {2 * t, 2 * t + 1, 2 * t + 8, 2 * t + 9};
 
-  float acc[TTW][4][4];
+  float acc[4][4][4];
   bool dense = p.dense == 1;
   const bool loadonly = p.dense == 2;
   const bool computeonly = p.dense == 3;
@@ -587,7 +581,7 @@ __global__ void __launch_bounds__(32 * NTL * (BMT == 64 ? 2 : 1), MINB) smem4_ke
       }
     };
 #pragma unroll
-    for (int tt = 0; tt < TTW; ++tt)
+    for (int tt = 0; tt < 4; ++tt)
 #pragma unroll
       for (int c = 0; c < 4; ++c)
 #pragma unroll
@@ -619,9 +613,9 @@ __global__ void __launch_bounds__(32 * NTL * (BMT == 64 ? 2 : 1), MINB) smem4_ke
         const uint32_t m23 = (m >> (2 * t + 8)) & 3u;
         const uint32_t keep01 = ((m01 & 1u) ? 0x0000FFFFu : 0u) | ((m01 & 2u) ? 0xFFFF0000u : 0u);
         const uint32_t keep23 = ((m23 & 1u) ? 0x0000FFFFu : 0u) | ((m23 & 2u) ? 0xFFFF0000u : 0u);
-        uint32_t xb[TTW][2];
+        uint32_t xb[4][2];
 #pragma unroll
-        for (int tt = 0; tt < TTW; ++tt) {
+        for (int tt = 0; tt < 4; ++tt) {
           if (tt0 + tt < ntt) {
             const uint8_t* xr = &S.x[gi][8 * (tt0 + tt) + g8][0];
             xb[tt][0] = *reinterpret_cast<const uint32_t*>(xr + 4 * t);
@@ -648,7 +642,7 @@ __global__ void __launch_bounds__(32 * NTL * (BMT == 64 ? 2 : 1), MINB) smem4_ke
           const uint32_t a2 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x23 << 12), kExp124), slo) & keep23;
           const uint32_t a3 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x23 << 8), kExp124), shi) & keep23;
 #pragma unroll
-          for (int tt = 0; tt < TTW; ++tt)
+          for (int tt = 0; tt < 4; ++tt)
             if (tt0 + tt < ntt) mma_bf16(acc[tt][ci], a0, a1, a2, a3, xb[tt][0], xb[tt][1]);
         }
       }
@@ -657,7 +651,7 @@ __global__ void __launch_bounds__(32 * NTL * (BMT == 64 ? 2 : 1), MINB) smem4_ke
     // final value; the insurance check (dense recompute) runs once on the final accumulators.
     if (!dense) {
 #pragma unroll
-      for (int tt = 0; tt < TTW; ++tt)
+      for (int tt = 0; tt < 4; ++tt)
 #pragma unroll
         for (int ci = 0; ci < 4; ++ci)
 #pragma unroll
@@ -671,7 +665,7 @@ __global__ void __launch_bounds__(32 * NTL * (BMT == 64 ? 2 : 1), MINB) smem4_ke
   }
   const float gs4 = mul_ftz(p.GS[e], 4.0f);
 #pragma unroll
-  for (int tt = 0; tt < TTW; ++tt) {
+  for (int tt = 0; tt < 4; ++tt) {
 #pragma unroll
     for (int ci = 0; ci < 4; ++ci) {
       const int col = (NTL * P + Tl) * 64 + 16 * (c0 + ci) + g8;
@@ -688,22 +682,18 @@ __global__ void __launch_bounds__(32 * NTL * (BMT == 64 ? 2 : 1), MINB) smem4_ke
   }
 }
 
-template <int KG, int NS, int NTL = 2, int MINB = 1, int BMT = BM>
+template <int KG, int NS, int NTL = 2, int MINB = 1>
 static int launch_smem4(const Params& p, cudaStream_t st) {
   static_assert(N % (64 * NTL) == 0, "the column tile must divide N");
-  static_assert(BMT == 16 || BMT == 32 || BMT == 64, "block rows");
-  prep_kernel<BMT><<<p.max_blocks, 128, 0, st>>>(p);
-  cudaError_t e0 = cudaGetLastError();
-  if (e0 != cudaSuccess) return (int)e0;
-  const int sm = (int)sizeof(SmemStage<KG, NS, NTL, BMT>) * NS;
+  const int sm = (int)sizeof(SmemStage<KG, NS, NTL>) * NS;
   static int attr = 0;
   if (sm > attr) {
-    cudaError_t e = cudaFuncSetAttribute(smem4_kernel<KG, NS, NTL, MINB, BMT>, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
+    cudaError_t e = cudaFuncSetAttribute(smem4_kernel<KG, NS, NTL, MINB>, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
     if (e != cudaSuccess) return (int)e;
     attr = sm;
   }
   dim3 grid(N / (64 * NTL), p.max_blocks);
-  smem4_kernel<KG, NS, NTL, MINB, BMT><<<grid, 32 * NTL * (BMT == 64 ? 2 : 1), sm, st>>>(p);
+  smem4_kernel<KG, NS, NTL, MINB><<<grid, 64 * NTL, sm, st>>>(p);
   return (int)cudaGetLastError();
 }
 
@@ -752,31 +742,6 @@ int pzskip_down(const void* A, long long lda, int shape_m, const int* sorted_ids
   p.dense = dense;
   p.stats = stats;
   cudaStream_t st = static_cast<cudaStream_t>(stream);
-  // configs 300-399 launch their own prep (with their block size); 3BB: BB = block rows 16/32
-  switch (wpc) {
-    case 300: return pzskip::launch_smem4<1, 4, 2, 4>(p, st);
-    case 301: return pzskip::launch_smem4<1, 4, 2, 3>(p, st);
-    case 302: return pzskip::launch_smem4<1, 5, 2, 4>(p, st);
-    case 303: return pzskip::launch_smem4<1, 4, 3, 2>(p, st);   // 192 columns, 6 warps
-    case 304: return pzskip::launch_smem4<2, 3, 2, 4>(p, st);
-    case 305: return pzskip::launch_smem4<1, 4, 6, 1>(p, st);   // 384 columns, 12 warps
-    case 306: return pzskip::launch_smem4<1, 4, 7, 1>(p, st);   // 448 columns, 14 warps
-    case 307: return pzskip::launch_smem4<1, 4, 3, 3>(p, st);
-    // 32-row blocks: one warp per 64-column tile, 4 token tiles
-    case 320: return pzskip::launch_smem4<1, 4, 2, 8, 32>(p, st);   // 128 columns, 2 warps
-    case 321: return pzskip::launch_smem4<1, 4, 3, 6, 32>(p, st);   // 192 columns, 3 warps
-    case 322: return pzskip::launch_smem4<1, 4, 6, 3, 32>(p, st);   // 384 columns, 6 warps
-    case 323: return pzskip::launch_smem4<1, 4, 7, 2, 32>(p, st);   // 448 columns, 7 warps
-    case 324: return pzskip::launch_smem4<1, 6, 3, 4, 32>(p, st);
-    case 325: return pzskip::launch_smem4<2, 4, 3, 4, 32>(p, st);
-    // 16-row blocks: one warp per 64-column tile, 2 token tiles
-    case 340: return pzskip::launch_smem4<1, 4, 2, 8, 16>(p, st);
-    case 341: return pzskip::launch_smem4<1, 4, 3, 6, 16>(p, st);
-    case 342: return pzskip::launch_smem4<1, 4, 6, 3, 16>(p, st);
-    case 343: return pzskip::launch_smem4<1, 4, 7, 2, 16>(p, st);
-    case 344: return pzskip::launch_smem4<1, 6, 3, 4, 16>(p, st);
-    default: break;
-  }
   pzskip::prep_kernel<<<max_blocks, 128, 0, st>>>(p);
   cudaError_t e = cudaGetLastError();
   if (e != cudaSuccess) return (int)e;
@@ -792,6 +757,13 @@ int pzskip_down(const void* A, long long lda, int shape_m, const int* sorted_ids
     case 223: return pzskip::launch_smem<2, 2, 2, 4>(p, st);
     case 224: return pzskip::launch_smem<4, 2, 2, 4>(p, st);
     case 225: return pzskip::launch_smem<1, 4, 2, 4>(p, st);
+    case 300: return pzskip::launch_smem4<1, 4, 2, 4>(p, st);
+    case 301: return pzskip::launch_smem4<1, 4, 2, 3>(p, st);
+    case 302: return pzskip::launch_smem4<1, 5, 2, 4>(p, st);
+    case 303: return pzskip::launch_smem4<1, 4, 3, 2>(p, st);   // 192 columns, 6 warps
+    case 305: return pzskip::launch_smem4<1, 4, 6, 1>(p, st);   // 384 columns, 12 warps
+    case 306: return pzskip::launch_smem4<1, 4, 7, 1>(p, st);   // 448 columns, 14 warps
+    case 307: return pzskip::launch_smem4<1, 4, 3, 3>(p, st);    case 304: return pzskip::launch_smem4<2, 3, 2, 4>(p, st);
     case 226: return pzskip::launch_smem<1, 4, 2, 5>(p, st);
     case 227: return pzskip::launch_smem<1, 4, 2, 6>(p, st);
     case 228: return pzskip::launch_smem<1, 3, 2, 5>(p, st);

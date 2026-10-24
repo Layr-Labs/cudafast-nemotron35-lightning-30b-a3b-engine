@@ -1059,14 +1059,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         verify requests. Its index buffers are the builder's persistent ones
         (plan() refreshes them in place), so a captured graph reads every
         replay's metadata at fixed addresses."""
-        key = num_reqs
-        num_reqs = 1 if key == 496 else num_reqs
-        wrapper = self._spec_prefill_wrappers_cudagraph.get(key)
+        wrapper = self._spec_prefill_wrappers_cudagraph.get(num_reqs)
         if wrapper is None:
             wrapper = BatchPrefillWithPagedKVCacheWrapper(
                 self._get_workspace_buffer(),
                 get_kv_cache_layout(),
-                use_cuda_graph=key != 496,
+                use_cuda_graph=True,
                 qo_indptr_buf=torch.zeros(
                     num_reqs + 1, dtype=torch.int32, device=self.device
                 ),
@@ -1075,7 +1073,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 paged_kv_last_page_len_buf=self.paged_kv_last_page_len.gpu[:num_reqs],
                 backend="auto",
             )
-            self._spec_prefill_wrappers_cudagraph[key] = wrapper
+            self._spec_prefill_wrappers_cudagraph[num_reqs] = wrapper
         return wrapper
 
     def _get_decode_wrapper(self, batch_size: int, use_cudagraph: bool = False):
@@ -1456,19 +1454,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     max_seq_len=max_seq_len,
                 )
             else:
-                fresh_496 = (
-                    self._spec_prefill_cudagraph
-                    and num_reqs == 1 and num_decodes == 0
-                    and num_prefill_tokens == 496
-                    and common_attn_metadata.max_query_len == 496
-                    and common_attn_metadata.max_seq_len == 496
-                    and self.model_config.hf_config.model_type == "nemotron_h"
-                )
-                if fresh_496:
-                    # Use the original native plan: graph-mode planning adds
-                    # merge kernels. Keep its buffer addresses stable below.
-                    prefill_wrapper = self._get_spec_prefill_wrapper(496)
-                elif (
+                if (
                     self._spec_prefill_cudagraph
                     and attn_metadata.causal
                     and num_decodes == 0
@@ -1540,10 +1526,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         fixed_split_size=self.prefill_fixed_split_size,
                         disable_split_kv=self.disable_split_kv,
                     )
-                if fresh_496:
-                    from vllm.v1.worker.prefill_graph import stabilize_native_plan
-
-                    stabilize_native_plan(prefill_wrapper)
                 attn_metadata.prefill = FIPrefill(wrapper=prefill_wrapper)
 
         ## DECODE PATHWAY

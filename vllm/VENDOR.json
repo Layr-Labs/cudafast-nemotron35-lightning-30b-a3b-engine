@@ -94,6 +94,10 @@
     {
       "file": "vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py, vllm/model_executor/layers/fused_moe/moe_align_block_size.py (opt-in)",
       "why": "smallk's fused sigmoid top-k + moe_align kernel (bit-identical to ops.grouped_topk and the two align kernels for <= 32 ids) is off by default: the routing chain overlaps the shared-expert GEMMs, so shortening it gave no end-to-end gain (SMALLK_TOPK=1 SMALLK_ALIGN=1 enable it)"
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "Compose the promoted boot-captured cascade with the exact native E2M1 pair decoder (including reference zero behavior), BF16/min-ID/NaN selector and two-stage rows-dot launch setting from published ae98b095-4cfd-4d97-bfbf-4a3209f1e6ec. Preserve the promoted 32-group coarse screen, 256 coarse survivors, 64-group refinement and 32 final survivors per chunk. No new pruning, target math or graph lifecycle change."
     }
   ]
 }

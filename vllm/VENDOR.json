@@ -181,7 +181,7 @@
     },
     {
       "file": "vllm/model_executor/models/nemotron_h_mtp_kernels.py",
-      "why": "Drafter-only: in the MTP layer's single-row MoE the draft pass evaluates the three routed experts with the highest router weight (from the router's existing selection, ordered by weight) instead of all six; the MTP router, shared expert and head weights are unchanged and the target decides every emitted token. MTP_DRAFT_TOPK=0 keeps all six. Carried unchanged from i34-9 b5616630-9603-44d1-a221-a7b2b4ec1d7d."
+      "why": "Drafter-only: in the MTP layer's single-row MoE the draft pass evaluates the two routed experts with the highest router weight (from the router's existing selection, ordered by weight) instead of all six, reducing the carrier's default of three. The MTP router, shared expert and head weights are unchanged and the target decides every emitted token. MTP_DRAFT_TOPK=0 keeps all six. The reduced-expert mechanism comes from i34-9 b5616630-9603-44d1-a221-a7b2b4ec1d7d; the two-expert default is new here."
     }
   ]
 }

@@ -210,6 +210,10 @@
     {
       "file": "harness/kernels/l2pf/py/__init__.py",
       "why": "Carry useful04706ad7-c4e8-44b9-b8ba-77f14d8b8adf MoE-window immutable prefetch default6to12MB. Its complete official2.19195352041462 is within0.1% of fulla484, but only budget mechanism is combined here on higherfulla484. Prefix pair/SSM combination unverified."
+    },
+    {
+      "file": "vllm/model_executor/layers/mamba/ops/gated_norm_fp8.py; mamba_mixer2.py",
+      "why": "Select priorcompletecorrect823867a3-d280-429c-bd43-c177dc25470a native-order groupedgatednorm/staticFP8 producer only onfulla484; add originalPDL wait-beforeallreads andexistingconfidenceprefixM5 earlyzero withoutweight/gate/SSMreads. Retainstaticcheckpointscale, bothBF16rounds, consumerQuantizedActivationguard, targetformats/fallback. Entirecombinationunverified; no localexecution."
     }
   ]
 }

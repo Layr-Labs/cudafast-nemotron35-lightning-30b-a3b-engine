@@ -35,6 +35,8 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
 from vllm.model_executor.layers.mamba.ops.layernorm_gated import rms_norm_gated
 from vllm.model_executor.layers.mamba.ops.mamba_ssm_spec_replay import (
     selective_state_update_spec_replay,
+    prepare_kanchor_positions,
+    invalidate_kanchor_positions,
     spec_replay_enabled,
     spec_replay_ring_len,
     spec_replay_supported,
@@ -852,8 +854,22 @@ class MambaMixer2(MambaBase, PluggableLayer):
             dim=0,
         )
 
+        # Freeze a mode that every captured replay can use. An older lazy
+        # anchor must never enter a different state writer implicitly.
+        incompatible_anchor_batch = num_decodes > 1 or (has_prefill and has_decode)
+        if incompatible_anchor_batch:
+            if getattr(self, "_kanchor_active", False):
+                raise RuntimeError("lazy SSM anchor cannot enter mixed-request state writers")
+            self._kanchor_positions_disabled = True
+            anchor_positions = None
+        else:
+            anchor_positions = prepare_kanchor_positions(self, ssm_state)
+
         # Process prefill requests
         if has_prefill:
+            # This invalidation runs on every real/warmup prefill, before any
+            # prefill state write. It does not reuse a previous phase's anchor.
+            invalidate_kanchor_positions(anchor_positions, state_indices_tensor_p)
             # 2. Convolution sequence transformation
             # - It will read the initial states for every sequence,
             #   that has "has_initial_states_p" == True,
@@ -1165,7 +1181,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     state_indices_tensor_d,
                 )
             ):
-                selective_state_update_spec_replay(
+                lazy_active = selective_state_update_spec_replay(
                     ssm_state,
                     hidden_states_d,
                     dt_d,
@@ -1182,8 +1198,13 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     seq_lens=attn_metadata.seq_lens,
                     ring_len=self.spec_replay_ring_len,
                     is_blackwell=self.is_blackwell,
+                    anchor_positions=anchor_positions,
                 )
+                self._kanchor_active = getattr(self, "_kanchor_active", False) or bool(lazy_active)
             else:
+                if getattr(self, "_kanchor_active", False):
+                    raise RuntimeError("lazy SSM anchor cannot switch to a non-replay writer before prefill")
+                invalidate_kanchor_positions(anchor_positions, state_indices_tensor_d_output)
                 selective_state_update(
                     ssm_state,
                     hidden_states_d,

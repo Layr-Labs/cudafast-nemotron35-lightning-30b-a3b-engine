@@ -6,6 +6,8 @@
 
 
 import functools
+import os
+import sys
 
 import numpy as np
 import torch
@@ -806,6 +808,8 @@ def _causal_conv1d_update_kernel(
     HAS_NULL_BLOCK: tl.constexpr,
     BLOCK_N: tl.constexpr,
     launch_pdl: tl.constexpr,
+    verify_rows_ptr=None,
+    PREFIX_LIMIT: tl.constexpr = False,
 ):
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
@@ -858,6 +862,10 @@ def _causal_conv1d_update_kernel(
         if launch_pdl:
             tl.extra.cuda.gdc_launch_dependents()
         return
+
+    compute_len = seqlen
+    if PREFIX_LIMIT:
+        compute_len = tl.minimum(seqlen, tl.maximum(tl.load(verify_rows_ptr).to(tl.int64), 1))
 
     if IS_SPEC_DECODING:
         # The rolling of conv state:
@@ -998,7 +1006,7 @@ def _causal_conv1d_update_kernel(
     if launch_pdl:
         tl.extra.cuda.gdc_launch_dependents()
 
-    for idx_token in tl.range(seqlen):
+    for idx_token in tl.range(compute_len):
         acc = acc_preload
 
         matrix_w = w_col0
@@ -1093,6 +1101,13 @@ def _causal_conv1d_update_kernel(
         )
 
         tl.store(o_ptrs, acc, mask=mask_1d)
+
+    if PREFIX_LIMIT:
+        # Cache shift/raw-input writes above remain complete. Only unused
+        # suffix convolution arithmetic is omitted; every output is initialized.
+        for idx_token in tl.range(compute_len, seqlen):
+            o_ptrs = o_ptr + o_offset + idx_token * stride_o_token + idx_feats * stride_o_dim
+            tl.store(o_ptrs, 0.0, mask=idx_feats < dim)
 
 
 @functools.cache
@@ -1243,6 +1258,18 @@ def causal_conv1d_update(
             triton.cdiv(dim, META["BLOCK_N"]),
         )
 
+    verify_rows = None
+    if (
+        batch == 1 and seqlen == 5 and query_start_loc is not None
+        and x.shape[0] == 5 and num_accepted_tokens is not None
+        and conv_state_indices is not None and conv_state_indices.ndim == 2
+        and conv_state_indices.shape[1] == 5
+        and os.environ.get("VLLM_MAMBA_CONV_PREFIX", "1") != "0"
+    ):
+        smallk = sys.modules.get("smallk")
+        if smallk is not None and hasattr(smallk, "live_verify_rows"):
+            verify_rows = smallk.live_verify_rows(x.device)
+
     _causal_conv1d_update_kernel[grid](
         # Pointers to matrices
         x,
@@ -1287,6 +1314,8 @@ def causal_conv1d_update(
         HAS_NULL_BLOCK=null_block_id is not None,
         BLOCK_N=block_n,
         launch_pdl=current_platform.is_arch_support_pdl(),
+        verify_rows_ptr=verify_rows,
+        PREFIX_LIMIT=verify_rows is not None,
     )
     if unsqueeze:
         out = out.squeeze(-1)

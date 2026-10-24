@@ -210,6 +210,14 @@
     {
       "file": "harness/kernels/l2pf/py/__init__.py",
       "why": "Carry useful04706ad7-c4e8-44b9-b8ba-77f14d8b8adf MoE-window immutable prefetch default6to12MB. Its complete official2.19195352041462 is within0.1% of fulla484, but only budget mechanism is combined here on higherfulla484. Prefix pair/SSM combination unverified."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_kernels.py, harness/kernels/pzskip/csrc/pzskip.cu, vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
+      "why": "Tuning only. MTP_DEPTH_THETA default 0.4 -> 0.5 (the confidence gate stops drafting at a higher top-1 probability; drafts only, the target decides every token). pzskip config 333 (32-row blocks, 384 columns, 2 k16 groups per stage, 3 stages) replaces 322 as the prefill default: same arithmetic, load-time bitwise check per layer with fallback."
+    },
+    {
+      "file": "vllm/model_executor/layers/mamba/ops/mamba_ssm_spec_replay.py; mamba/mamba_mixer2.py; mamba/ops/causal_conv1d.py",
+      "why": "Experimental explicit-lifecycle lazy FP32 anchor flush (T4) with original ordered replay bounded to actual committed count; separate per-slot/per-row int32 positions invalidated for all prefill/normal-state writers, no full-state hash. Freeze metadata mode before capture and refuse incompatible writer transitions after lazy launch. Select only own206 valid-prefix convolution arithmetic omission, retaining every original cache write. Highest51aa whole retained."
     }
   ]
 }

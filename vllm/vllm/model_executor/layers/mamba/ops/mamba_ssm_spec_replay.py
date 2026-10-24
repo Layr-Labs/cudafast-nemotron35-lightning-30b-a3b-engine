@@ -12,9 +12,10 @@ writes per Mamba layer per verify, of which ``d`` x 2 MiB are never read.
 
 This kernel computes the same thing with one state read and one state write:
 
-* Slot 0 is the anchor. It always holds the state after token 0 of the
-  previous verify, which is exactly what the reference leaves in slot 0 (and,
-  after a prefill, the prefill's final state, also as in the reference).
+* Slot 0 is the anchor. With the lazy anchor off it always holds the state
+  after token 0 of the previous verify, which is exactly what the reference
+  leaves in slot 0 (and, after a prefill, the prefill's final state, also as in
+  the reference); with it on, see "Lazy anchor" below.
 * Slot 1's first ~145 KB hold a ring of the raw kernel inputs (x, B, dt; the
   16-bit values the reference loads) of tokens 1..d of every verify, indexed by
   absolute token position mod ``ring_len``. ``ring_len >= 2d + 1`` makes the
@@ -38,6 +39,15 @@ code path reads those slots in mamba_cache_mode "none" except the reference
 kernel's next-verify load, which this kernel replaces.
 
 ``VLLM_MAMBA_SPEC_REPLAY=0`` restores the reference kernel.
+
+Lazy anchor: a separate per-layer int32 position plane is initialized before
+capture and explicitly invalidated on every prefill cache write. It stores one
+position per FP32 state row, indexed by the physical slot-0 cache block. No
+state hash is used to infer whether another writer changed an anchor. The
+mixer refuses a transition to an unsupported state writer while lazy state is
+active, so an older anchor is never silently handed to the original kernel.
+Between flushes, the original ordered recurrence replays actual committed raw
+inputs. Only the actual replay count executes; no fixed-RMAX inactive work.
 """
 
 import os
@@ -83,9 +93,78 @@ def _pdl_enabled() -> bool:
     return _PDL
 
 
+def kanchor_t() -> int:
+    """Lazy-anchor replay distance T (VLLM_MAMBA_KANCHOR_T, default 4; < 2 is
+    off: the anchor is written every verify)."""
+    try:
+        t = int(os.environ.get("VLLM_MAMBA_KANCHOR_T", "4"))
+    except ValueError:
+        return 0
+    return t if t >= 2 else 0
+
+
+@triton.jit
+def _invalidate_kanchor_positions(positions, indices, NSLOTS: tl.constexpr,
+                                  ROWS: tl.constexpr, BLOCK: tl.constexpr):
+    request = tl.program_id(0)
+    row = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    slot = tl.load(indices + request).to(tl.int64)
+    tl.store(positions + slot * ROWS + row, -1,
+             mask=(slot >= 0) & (slot < NSLOTS) & (row < ROWS))
+
+
+def prepare_kanchor_positions(owner, state):
+    """Allocate metadata outside capture; freeze to baseline if too late."""
+    if (not owner.use_spec_replay or kanchor_t() == 0
+            or owner._spec_replay_ok is False
+            or getattr(owner, "_kanchor_positions_disabled", False)):
+        return None
+    key = (state.data_ptr(), tuple(state.shape), tuple(state.stride()), state.device)
+    if getattr(owner, "_kanchor_cache_key", None) != key:
+        if torch.cuda.is_current_stream_capturing():
+            owner._kanchor_positions_disabled = True
+            return None
+        owner._kanchor_positions = torch.full(
+            state.shape[:3], -1, dtype=torch.int32, device=state.device)
+        owner._kanchor_cache_key = key
+        owner._kanchor_active = False
+    return owner._kanchor_positions
+
+
+def invalidate_kanchor_positions(positions, indices):
+    """Every explicit cache writer invalidates the matching slot-0 metadata."""
+    if positions is None or indices is None or indices.numel() == 0:
+        return
+    slots = indices.contiguous().view(-1)
+    rows = positions.shape[1] * positions.shape[2]
+    _invalidate_kanchor_positions[(slots.numel(), triton.cdiv(rows, 256))](
+        positions, slots, NSLOTS=positions.shape[0], ROWS=rows, BLOCK=256,
+        num_warps=4,
+    )
+
+
 def spec_replay_ring_len(num_spec: int) -> int:
-    """Ring entries per request: any value >= 2 * num_spec + 1 is hazard-free."""
-    return 2 * (num_spec + 1)
+    """Ring entries per request: any value >= 2 * num_spec + 1 is hazard-free,
+    and >= T + 2 * num_spec with the lazy anchor."""
+    t = kanchor_t()
+    base = 2 * (num_spec + 1)
+    return max(base, t + 2 * num_spec) if t else base
+
+
+def kanchor_plan(
+    t: int,
+    num_spec: int,
+    ring_len: int,
+    nheads: int,
+    dim: int,
+    ngroups: int,
+    dstate: int,
+) -> tuple[int, int, int]:
+    """(T, reserved ABI offset=0, maximum replay count), or all zero.
+    Positions are external metadata; the state/ring layout is unchanged."""
+    if t < 2 or ring_len < t + 2 * num_spec:
+        return 0, 0, 0
+    return t, 0, t + num_spec - 1
 
 
 def spec_replay_ring_elems(nheads: int, dim: int, ngroups: int, dstate: int) -> int:
@@ -108,6 +187,7 @@ def _selective_scan_update_spec_replay_kernel(
     # Pointers to matrices
     state_ptr,
     ring_ptr,
+    hdr_ptr,
     x_ptr,
     dt_ptr,
     dt_bias_ptr,
@@ -131,6 +211,7 @@ def _selective_scan_update_spec_replay_kernel(
     nheads_ngroups_ratio,
     ngroups,
     ring_len,
+    hdr_off,
     # Strides
     stride_state_batch,
     stride_state_head,
@@ -177,6 +258,8 @@ def _selective_scan_update_spec_replay_kernel(
     HG_RATIO: tl.constexpr = 0,
     CONST_DIV: tl.constexpr = False,
     launch_pdl: tl.constexpr = False,
+    KANCHOR_T: tl.constexpr = 0,
+    RMAX: tl.constexpr = 0,
     verify_rows_ptr=None,
     PREFIX_LIMIT: tl.constexpr = False,
 ):
@@ -271,7 +354,28 @@ def _selective_scan_update_spec_replay_kernel(
         D_ptr += pid_h * stride_D_head
         D_ptrs = D_ptr + offs_m * stride_D_dim
 
-    # Replay the accepted tokens 1..num_replay of the previous verify: the
+    # The anchor is written by token 0 below; the lazy anchor may skip it.
+    write_anchor = True
+    if KANCHOR_T > 0:
+        # A cache writer invalidates every row explicitly. This metadata is
+        # separate from state/ring storage and indexed by physical slot 0.
+        slot0_ok = state_batch_idx != null_block_id
+        row_ok = (offs_m < dim) & slot0_ok
+        hdr_rows = hdr_ptr + (state_batch_idx * nheads + pid_h) * dim + offs_m
+        hdr_pos = tl.load(hdr_rows, mask=row_ok, other=-1, volatile=True).to(tl.int64)
+        lo = tl.min(tl.where(offs_m < dim, hdr_pos, 1 << 40), axis=0)
+        hi = tl.max(tl.where(offs_m < dim, hdr_pos, -(1 << 40)), axis=0)
+        gap = pos0 - hi
+        valid = ring_ok & slot0_ok & (lo == hi) & (lo >= 0) & (gap >= 1) & (gap <= RMAX + 1)
+        # Invalid header: slot 0 holds the state after P - num_accepted, as
+        # in the reference; write the anchor so the header becomes valid.
+        num_replay = tl.where(valid, gap - 1, tl.minimum(num_replay, RMAX))
+        write_anchor = (~valid) | (gap >= KANCHOR_T)
+    # Execute only the actual committed replay count. The inherited lazy
+    # route unrolled RMAX masked steps, evaluating exp/softplus and state
+    # expressions even when those iterations did not update a row. This loop
+    # is the original ordered replay body, shared by lazy and normal mode.
+    # Replay the committed tokens since the selected anchor: the
     # reference's state update on the reference's inputs, no outputs.
     for i_r in range(num_replay):
         # Non-negative even for garbage metadata (dummy runs), so the address
@@ -345,8 +449,16 @@ def _selective_scan_update_spec_replay_kernel(
 
         if i_t == 0:
             # The new anchor: the state after token 0, as the reference's slot 0.
-            tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=mask)
-        else:
+            tl.store(
+                state_ptrs,
+                state.to(state_ptrs.dtype.element_ty),
+                mask=mask & write_anchor,
+            )
+            if KANCHOR_T > 0:
+                hdr_ok = ring_ok & slot0_ok & write_anchor
+                tl.store(hdr_rows, pos0.to(tl.int32), mask=(offs_m < dim) & hdr_ok)
+        # The lazy anchor also keeps token 0's inputs in the ring.
+        if (i_t != 0) | (KANCHOR_T > 0):
             ring_pos = ((pos0 + i_t) % rl + rl) % rl
             tl.store(
                 ring_x_base + ring_pos * ring_stride_x + offs_m,
@@ -477,6 +589,7 @@ def selective_state_update_spec_replay(
     ring_len=None,
     is_blackwell=False,
     replayed_out=None,
+    anchor_positions=None,
 ):
     """
     Spec-decode verify update with anchor + input-ring state handling.
@@ -486,7 +599,8 @@ def selective_state_update_spec_replay(
     cu_seqlens: (N + 1,)), plus
         seq_lens: (>= N,) total tokens per request including this verify's,
             so token 0 of request b sits at position seq_lens[b] - query_len[b].
-        ring_len: ring entries per request, >= 2 * d + 1.
+        ring_len: ring entries per request, >= 2 * d + 1 (>= T + 2 * d for
+            the lazy anchor, which is off for this call otherwise).
         replayed_out: test hook; if given, an (N, nheads, dim, dstate) fp32
             tensor that receives the state each request starts the verify from.
 
@@ -533,6 +647,12 @@ def selective_state_update_spec_replay(
     BLOCK_SIZE_M, num_warps = try_get_optimal_ssm_config(
         dim, dstate, N, nheads, cache_dtype, is_blackwell
     )
+    # Explicit lifecycle metadata is provided by the owning mixer before capture.
+    kt, hdr_off, rmax = kanchor_plan(
+        kanchor_t() if anchor_positions is not None else 0,
+        max_seqlen - 1, ring_len, nheads, dim, ngroups, dstate
+    )
+    hdr = anchor_positions if anchor_positions is not None else state.view(torch.int32)
 
     verify_rows = None
     if (
@@ -550,6 +670,7 @@ def selective_state_update_spec_replay(
         _selective_scan_update_spec_replay_kernel[grid](
             state,
             ring,
+            hdr,
             x,
             dt,
             dt_bias,
@@ -572,6 +693,7 @@ def selective_state_update_spec_replay(
             nheads // ngroups,
             ngroups,
             ring_len,
+            hdr_off,
             state.stride(0),
             state.stride(1),
             state.stride(2),
@@ -610,8 +732,11 @@ def selective_state_update_spec_replay(
             RING_LEN=ring_len,
             HG_RATIO=nheads // ngroups,
             CONST_DIV=_const_div_enabled(),
+            KANCHOR_T=kt,
+            RMAX=rmax,
             num_warps=num_warps,
             launch_pdl=_pdl_enabled(),
             verify_rows_ptr=verify_rows,
             PREFIX_LIMIT=verify_rows is not None,
         )
+        return kt > 0

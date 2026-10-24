@@ -58,12 +58,13 @@ def screen_graph_enabled() -> bool:
 
 @triton.jit
 def _e2m1(nib):
-    # fp4 e2m1: s ee m -> +-{0, .5, 1, 1.5, 2, 3, 4, 6}
-    e = (nib >> 1) & 3
-    m = (nib & 1).to(tl.float32)
-    p2 = tl.where(e == 1, 1.0, tl.where(e == 2, 2.0, 4.0))
-    mag = tl.where(e == 0, m * 0.5, (1.0 + m * 0.5) * p2)
-    return tl.where((nib & 8) != 0, -mag, mag)
+    magnitude = (nib & 0x07).to(tl.int32)
+    sign = (nib >> 3) & 1
+    fp32_bits = 0x3F000000 + (magnitude << 22)
+    val = fp32_bits.to(tl.float32, bitcast=True)
+    val = tl.where(magnitude == 0, 0.0, val)
+    val = tl.where(magnitude == 1, 0.5, val)
+    return tl.where(sign == 1, -val, val)
 
 
 @triton.jit
@@ -79,6 +80,7 @@ def _nvfp4_rows_dot(
     GATHER: tl.constexpr,
     BR: tl.constexpr,
     BB: tl.constexpr,
+    EVICT: tl.constexpr,
 ):
     pid = tl.program_id(0)
     r = pid * BR + tl.arange(0, BR)
@@ -90,18 +92,33 @@ def _nvfp4_rows_dot(
     acc = tl.zeros((BR,), dtype=tl.float32)
     for b0 in range(0, NBYTES, BB):
         ob = b0 + tl.arange(0, BB)
-        wb = tl.load(
-            w_ptr + rows[:, None] * NBYTES + ob[None, :],
-            mask=rmask[:, None],
-            other=0,
-            eviction_policy="evict_first",
-        ).to(tl.int32)
+        if EVICT:
+            wb = tl.load(
+                w_ptr + rows[:, None] * NBYTES + ob[None, :],
+                mask=rmask[:, None],
+                other=0,
+                eviction_policy="evict_first",
+            ).to(tl.int32)
+        else:
+            wb = tl.load(
+                w_ptr + rows[:, None] * NBYTES + ob[None, :],
+                mask=rmask[:, None],
+                other=0,
+            ).to(tl.int32)
         og = (b0 // 8) + tl.arange(0, BB // 8)
-        sc = tl.load(
-            s_ptr + rows[:, None] * (NBYTES // 8) + og[None, :],
-            mask=rmask[:, None],
-            other=0.0,
-        ).to(tl.float32)
+        if EVICT:
+            sc = tl.load(
+                s_ptr + rows[:, None] * (NBYTES // 8) + og[None, :],
+                mask=rmask[:, None],
+                other=0.0,
+                eviction_policy="evict_first",
+            ).to(tl.float32)
+        else:
+            sc = tl.load(
+                s_ptr + rows[:, None] * (NBYTES // 8) + og[None, :],
+                mask=rmask[:, None],
+                other=0.0,
+            ).to(tl.float32)
         hl = tl.load(h_ptr + 2 * ob)
         hh = tl.load(h_ptr + 2 * ob + 1)
         part = _e2m1(wb & 15) * hl[None, :] + _e2m1(wb >> 4) * hh[None, :]
@@ -114,9 +131,10 @@ def _rows_dot(h, w, s, rows, gscale, out, gather):
     n_out = out.numel()
     nbytes = w.shape[1]
     br = 64 if not gather else 16
+    evict = gather or nbytes != 256
     _nvfp4_rows_dot[(triton.cdiv(n_out, br),)](
         h, w, s, rows if gather else out, out, n_out, gscale,
-        NBYTES=nbytes, GATHER=gather, BR=br, BB=64, num_warps=4,
+        NBYTES=nbytes, GATHER=gather, BR=br, BB=64, EVICT=evict, num_warps=4,
     )
 
 

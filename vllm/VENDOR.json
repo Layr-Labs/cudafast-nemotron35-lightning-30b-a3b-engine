@@ -94,6 +94,10 @@
     {
       "file": "vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py, vllm/model_executor/layers/fused_moe/moe_align_block_size.py (opt-in)",
       "why": "smallk's fused sigmoid top-k + moe_align kernel (bit-identical to ops.grouped_topk and the two align kernels for <= 32 ids) is off by default: the routing chain overlaps the shared-expert GEMMs, so shortening it gave no end-to-end gain (SMALLK_TOPK=1 SMALLK_ALIGN=1 enable it)"
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "the cascaded draft screen's 32-group coarse dot is the same 36 MiB on all three depth-3 steps and was loaded evict_first, so steps 2 and 3 reread it from DRAM; that dot now keeps the lines, and its nibble decode is the same 16 values as the NVFP4 emulation decoder (bitcast plus the 0 and 0.5 patches). Gathered rescores stay evict_first. Scores and the argmax tie rule are unchanged"
     }
   ]
 }

@@ -27,6 +27,12 @@ different fp32 accumulation changes rounded logits. The target's verification de
 every committed token, and the timed window is still checked against its oracle.
 
 VLLM_MTP_SCREEN_CASCADE=0 restores the original 64-group single screen.
+VLLM_MTP_SCREEN_COARSE_MMA=0 restores the scalar coarse score. The new
+sm_121 coarse path decodes the same original FP4 and E4M3 coefficients into
+exact BF16 products and uses BF16 MMA with FP32 accumulation, only when the
+incoming hidden row is BF16. It keeps every group and survivor count; its
+different coarse accumulation tree can change proposals and needs the same
+official oracle validation as the existing screen.
 VLLM_MTP_SCREEN=0 restores the stock head.
 """
 
@@ -144,6 +150,46 @@ def _rows_dot(h, w, s, rows, gscale, out, gather):
 
 
 @triton.jit
+def _nvfp4_coarse_mma(
+    h, cols, w, scales, out, gscale,
+    N: tl.constexpr, K: tl.constexpr,
+    BR: tl.constexpr, BK: tl.constexpr,
+):
+    """Draft-only coarse scores from original NVFP4 bytes and group scales.
+
+    FP4 times E4M3 has at most six significant bits, so the product fits
+    BF16 exactly. The guarded caller supplies an originally BF16 hidden row.
+    Only the accumulation tree changes; refinement and full-K rescore retain
+    their existing FP32 implementation and survivor counts.
+    """
+    row = tl.program_id(0) * BR + tl.arange(0, BR)
+    kk = tl.arange(0, BK)
+    lane = tl.arange(0, 16)
+    acc = tl.zeros((BR, 16), tl.float32)
+    for start in range(0, K, BK):
+        k = start + kk
+        packed = tl.load(
+            w + row[:, None] * (K // 2) + k[None, :] // 2,
+            mask=row[:, None] < N, other=0,
+            eviction_policy="evict_first",
+        ).to(tl.int32)
+        lo, hi = _e2m1_pair(packed)
+        fp4 = tl.where((k[None, :] & 1) == 0, lo, hi)
+        scale = tl.load(
+            scales + row[:, None] * (K // 16) + k[None, :] // 16,
+            mask=row[:, None] < N, other=0,
+        ).to(tl.float32)
+        weight = (fp4 * scale).to(tl.bfloat16)
+        original_col = tl.load(cols + k)
+        hidden = tl.load(h + original_col).to(tl.bfloat16)
+        rhs = tl.where(lane[None, :] == 0, hidden[:, None], 0.0)
+        acc = tl.dot(weight, rhs.to(tl.bfloat16), acc)
+    # Only the first column has a nonzero RHS; all other columns are padding.
+    value = tl.sum(tl.where(lane[None, :] == 0, acc, 0.0), axis=1)
+    tl.store(out + row, value * gscale, mask=row < N)
+
+
+@triton.jit
 def _select_token(logits, ids, out, N: tl.constexpr, BLOCK: tl.constexpr):
     """Stock BF16 maximum, then minimum token id among ties, in one launch."""
     i = tl.arange(0, BLOCK)
@@ -184,6 +230,14 @@ class DraftHeadScreen:
         assert w.dtype == torch.uint8 and s.shape == (n, ng), (w.shape, s.shape)
         assert n % SCREEN_CHUNK == 0
         self.cascade = os.environ.get("VLLM_MTP_SCREEN_CASCADE", "1") != "0"
+        self.coarse_mma = (
+            self.cascade
+            and os.environ.get("VLLM_MTP_SCREEN_COARSE_MMA", "1") != "0"
+            and device.type == "cuda"
+            and torch.cuda.get_device_capability(device) == (12, 1)
+            and n == 131072 and k == 2688
+            and CASCADE_FRAC_GROUPS == 32
+        )
         if self.cascade:
             assert 0 < CASCADE_FRAC_GROUPS < SCREEN_FRAC_GROUPS <= ng
             assert SCREEN_PER <= CASCADE_PER <= SCREEN_CHUNK
@@ -251,21 +305,30 @@ class DraftHeadScreen:
                 self.graph = None
                 logger.warning("MTP draft-head screen graph disabled: %s", exc)
         logger.info(
-            "MTP draft-head screen: %d of %d groups, %d candidates, cascade=%s, graph=%s",
+            "MTP draft-head screen: %d of %d groups, %d candidates, cascade=%s, graph=%s, coarse_mma=%s",
             SCREEN_FRAC_GROUPS, ng, self.cand_logits.numel(), self.cascade,
-            self.graph is not None,
+            self.graph is not None, self.coarse_mma,
         )
 
-    def _greedy_row(self, h: torch.Tensor) -> torch.Tensor:
+    def _greedy_row(self, h: torch.Tensor, use_mma: bool = True) -> torch.Tensor:
         """One row h [K] float32: the cascade (or the single screen) and the
-        argmax tie rule. Every buffer it touches is fixed-address, so the body
-        is capturable as-is."""
+        argmax tie rule. use_mma requires an originally BF16 hidden row (the
+        initialization zero row also qualifies). Every buffer it touches is
+        fixed-address, so the body is capturable as-is."""
         if self.cascade:
-            hc = h.index_select(0, self.coarse_cols)
-            _rows_dot(
-                hc, self.w_coarse, self.s_coarse, None,
-                self.gscale, self.scores, False,
-            )
+            if self.coarse_mma and use_mma:
+                _nvfp4_coarse_mma[(triton.cdiv(self.n, 64),)](
+                    h, self.coarse_cols, self.w_coarse, self.s_coarse,
+                    self.scores, self.gscale,
+                    N=self.n, K=CASCADE_FRAC_GROUPS * 16,
+                    BR=64, BK=64, num_warps=4, num_stages=2,
+                )
+            else:
+                hc = h.index_select(0, self.coarse_cols)
+                _rows_dot(
+                    hc, self.w_coarse, self.s_coarse, None,
+                    self.gscale, self.scores, False,
+                )
             coarse_cand = (
                 self.scores.view(-1, SCREEN_CHUNK)
                 .topk(CASCADE_PER, dim=-1).indices + self.chunk_off
@@ -298,11 +361,17 @@ class DraftHeadScreen:
 
     def greedy(self, hidden: torch.Tensor) -> torch.Tensor:
         """Draft ids [B] for hidden [B, K] (B is small; one pass per row)."""
-        if self.graph is not None and hidden.shape[0] == 1:
+        use_mma = hidden.dtype == torch.bfloat16
+        if (
+            self.graph is not None and hidden.shape[0] == 1
+            and (not self.coarse_mma or use_mma)
+        ):
             self._h.copy_(hidden[0].float())
             self.graph.replay()
             return self._out.clone()
         out = []
         for i in range(hidden.shape[0]):
-            out.append(self._greedy_row(hidden[i].float().contiguous()))
+            out.append(self._greedy_row(
+                hidden[i].float().contiguous(), use_mma=use_mma
+            ))
         return torch.stack(out)

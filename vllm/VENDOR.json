@@ -112,8 +112,28 @@
       "why": "Compose dadon submission 03487090-f839-440b-8b4a-60295374154f (commit 21f55ad0facc8b68dd5934c169f06d069d2f8260): spinning copy-completion event, prefill-only Mamba metadata reuse, single final-state copy, and cuBLAS-order FP32 router for 480/496/512 rows. Preserve native FP8 and routed activation fusion. Compiler failures propagate."
     },
     {
-      "file": "vllm/model_executor/layers/quantization/utils/humming_utils.py; vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py; harness/kernels/routed_sparse",
-      "why": "Byte-exact NVFP4 down-weight packing at load and small-token sparse-sector kernel. Per-call masks skip weight reads only for exact-zero activation sectors, retaining ascending BF16 MMA, FP32 accumulation and original global-scale/RN epilogue. Existing Humming handles unsupported calls and prefill."
+      "file": "vllm/model_executor/layers/mamba/ops/ssd_prefill_fused.py, ssd_combined.py, mamba_mixer2.py",
+      "why": "On complete accepted31d30b53-14a9-44ec-bb99-bae7b70873a4, fuse the terminal FP32 state cache store into the existing prefill state recurrence. All chunk boundaries and CB scan arithmetic remain; eligible single nonempty sequence stores the same final registers to its cache row and omits the separate state-copy kernel. Full31 spin, metadata reuse, routerbig, native FP8 and activation fusion remain. Original single-copy fallback, cache-all and CPU paths remain. No local execution; first runtime validation is official remote."
+    },
+    {
+      "file": "vllm/model_executor/layers/mamba/ops/gated_norm_fp8.py, mamba_mixer2.py",
+      "why": "Guarded eight-group M1..8 BF16 gated RMSNorm plus checkpoint-static FP8 activation in one Triton producer. Preserve native-order gate/mean-square/rsqrt and both BF16 rounding boundaries around norm-weight multiplication; use existing QuantizedActivation static-key contract consumed by actual CutlassFP8 class, retaining native FP8 GEMM. Unsupported backend/dynamic scales/TP/bias/shape/padding retain original norm+quantization. Fixture declares n_groups8 and static Mamba W8A8; no local execution or bit-identity claim before official remote validation."
+    },
+    {
+      "file": "vllm/model_executor/layers/fused_moe/runner/shared_experts.py",
+      "why": "Retain complete highest valid5f31f929-693d-463d-b6ce-6bcb8e00884a early shared launch/join source exact91b9f547c89e4c53893bb6ab2d4288633b0d93b5. Same mechanism as creditedfd75aab7-ddbe-405f-8b78-4dc578d7539f, with only getenv killflag removal/docstring delta versus reviewedfdsource. Input wait/record_stream and join-before-output preserved, no duplicate launch; global shared-stream disable/NO_OVERLAP paths retain fallback. New terminalcache/gatednorm composition runtime unverified; no local execution."
+    },
+    {
+      "file": "models/nemotron_shared_up.py, models/nemotron_h.py; harness/kernels/marlinx/{csrc/marlinx.cu,py/__init__.py}",
+      "why": "New single-device prepared Marlin shared-expert up projection epilogue fuses ReLU squared for BF16 M1..8,N3712,K2688. Original GEMM BF16 rounding occurs first, then explicit RN FP32 square and RN BF16 output with canonical NaN; original Marlin accumulation, weights/scales/layout, dense/head/down ABI and unfused instantiations retained. Tensor-only opaque custom op has a full Marlin+activation fallback and fake schema; other sizes and unprepared/bias/TP paths retain original layer/activation. Source-only; no local execution."
+    },
+    {
+      "file": "harness/kernels/routed_sparse; vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py; layers/quantization/utils/humming_utils.py",
+      "why": "Retain complete new promoted ba4785fa-b450-48fc-8a62-be684f21caee sparse source, official c3b89ccaecff5465fe15a746ff5fb3ca91c4be05/local9906ad7 whole tree989222e4 exact, official fullcorrect1.80100417773543. All sparse runtime/test blobs and executable modes retained: byte-preserving NVFP4 sector layout, fresh per-call exact-zero masks, ascending K16 BF16 MMA including zero sectors, FTZ global epilogue, original Humming prefill/fallback. Selected independent fusions from previous823867a3 are a new unverified composition with this complete highest source."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "New draft-only coarse TensorCore scoring on sm121. Dequantize original FP4 and E4M3 group scales exactly into BF16 inside each tile; use original BF16 hidden values and FP32 MMA accumulation. Fuse coarse-column gather into producer. Preserve 32 coarse groups,256 survivors,64-group refinement,32 final survivors,unchanged full-K FP32/BF16/min-ID rescore and target verification. New coarse accumulation tree can change proposals; official oracle and full score decide. BF16 input guard, original scalar path and environment disable retained. No local execution."
     }
   ]
 }

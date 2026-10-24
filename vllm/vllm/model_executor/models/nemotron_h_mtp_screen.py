@@ -5,15 +5,14 @@ screens plus a full-K rescore of the survivors.
 
 DRAFTER ONLY. The target's lm_head, logits and verification are untouched;
 the drafter's lm_head is the target's shared NVFP4 head (131072 x 2688, about
-198 MB), and the drafter reads all of it three times per depth-3 cycle only to
+198 MB), and the drafter would read all of it repeatedly per native-MTP cycle only to
 take one argmax per draft. This replaces that argmax:
 
-1. screen every vocabulary row on the 32 most important whole NVFP4
-   16-element groups, chosen once from weight-only importance, in fp32;
-2. keep the top CASCADE_PER rows of every SCREEN_CHUNK-row chunk;
-3. rescore those candidates on the original 64 importance groups and keep
-   the top SCREEN_PER candidates of each original chunk;
-4. rescore those rows on the full K in fp32, round to bf16 as the stock head
+1. screen all vocabulary rows on the 8 most important whole NVFP4 groups;
+2. keep 512 rows per original 2048-row vocabulary chunk;
+3. rescore those rows on the original 32 importance groups and keep 256;
+4. rescore on the original 64 importance groups and keep 32 per chunk;
+5. rescore those 2048 survivors on the full K in fp32, round to bf16 as the stock head
    does, and take the maximum with the lowest token id among equals (the rule
    torch.argmax applies to the stock bf16 logits).
 
@@ -26,6 +25,7 @@ proposal can differ when either screen removes a candidate or the rescore's
 different fp32 accumulation changes rounded logits. The target's verification decides
 every committed token, and the timed window is still checked against its oracle.
 
+VLLM_MTP_SCREEN_ULTRA=0 restores the original 32/64/full-K cascade.
 VLLM_MTP_SCREEN_CASCADE=0 restores the original 64-group single screen.
 VLLM_MTP_SCREEN=0 restores the stock head.
 """
@@ -53,6 +53,8 @@ SCREEN_CHUNK = 2048
 SCREEN_PER = 32
 CASCADE_FRAC_GROUPS = 32
 CASCADE_PER = 256
+ULTRA_FRAC_GROUPS = 8
+ULTRA_PER = 512
 
 
 def screen_enabled() -> bool:
@@ -238,6 +240,10 @@ class DraftHeadScreen:
         assert w.dtype == torch.uint8 and s.shape == (n, ng), (w.shape, s.shape)
         assert n % SCREEN_CHUNK == 0
         self.cascade = os.environ.get("VLLM_MTP_SCREEN_CASCADE", "1") != "0"
+        self.ultra = self.cascade and os.environ.get("VLLM_MTP_SCREEN_ULTRA", "1") != "0"
+        if self.ultra:
+            assert 0 < ULTRA_FRAC_GROUPS < CASCADE_FRAC_GROUPS
+            assert CASCADE_PER <= ULTRA_PER <= SCREEN_CHUNK
         if self.cascade:
             assert 0 < CASCADE_FRAC_GROUPS < SCREEN_FRAC_GROUPS <= ng
             assert SCREEN_PER <= CASCADE_PER <= SCREEN_CHUNK
@@ -278,6 +284,19 @@ class DraftHeadScreen:
                 (n // SCREEN_CHUNK) * CASCADE_PER,
                 dtype=torch.float32, device=device,
             )
+        if self.ultra:
+            ultra_groups = ranked_groups[:ULTRA_FRAC_GROUPS].sort().values
+            ultra_cols = (ultra_groups[:, None] * 16 + torch.arange(16)[None, :]).reshape(-1)
+            self.w_ultra = (
+                w.view(n, ng, 8)[:, ultra_groups, :]
+                .reshape(n, -1).to(device).contiguous()
+            )
+            self.s_ultra = s[:, ultra_groups].to(device).contiguous()
+            self.ultra_cols = ultra_cols.to(device)
+            self.coarse_refine_scores = torch.empty(
+                (n // SCREEN_CHUNK) * ULTRA_PER,
+                dtype=torch.float32, device=device,
+            )
         self.chunk_off = (
             torch.arange(n // SCREEN_CHUNK, device=device) * SCREEN_CHUNK
         )[:, None]
@@ -289,7 +308,7 @@ class DraftHeadScreen:
         # l2pf: the coarse matrix is registered for the MTP MoE's down
         # projection window (nemotron_h_mtp_kernels.py), which prefetches its head.
         if _l2pf is not None and self.cascade:
-            _l2pf.DRAFT_SCREEN[:] = [self.w_coarse]
+            _l2pf.DRAFT_SCREEN[:] = [self.w_ultra if self.ultra else self.w_coarse]
         self.graph = None
         self._h = torch.empty(k, dtype=torch.float32, device=device)
         self._out = torch.empty(1, dtype=torch.int32, device=device)
@@ -314,8 +333,8 @@ class DraftHeadScreen:
             if gate is not None:
                 gate.zero_()  # the warm-up rows above may have counted or stopped
         logger.info(
-            "MTP draft-head screen: %d of %d groups, %d candidates, cascade=%s, graph=%s",
-            SCREEN_FRAC_GROUPS, ng, self.cand_logits.numel(), self.cascade,
+            "MTP draft-head screen: %d of %d groups, %d candidates, cascade=%s, ultra=%s, graph=%s",
+            SCREEN_FRAC_GROUPS, ng, self.cand_logits.numel(), self.cascade, self.ultra,
             self.graph is not None,
         )
 
@@ -325,17 +344,35 @@ class DraftHeadScreen:
         is capturable as-is."""
         if self.cascade:
             hc = h.index_select(0, self.coarse_cols)
-            _rows_dot(
-                hc, self.w_coarse, self.s_coarse, None,
-                self.gscale, self.scores, False, gated,
-            )
-            # Every consumer below is order-independent (index-aligned gathers,
-            # then the max with the lowest-id tie rule), so the candidate sets
-            # need not be sorted: sorted=False skips a segmented sort per stage.
-            coarse_cand = (
-                self.scores.view(-1, SCREEN_CHUNK)
-                .topk(CASCADE_PER, dim=-1, sorted=False).indices + self.chunk_off
-            )
+            if self.ultra:
+                hu = h.index_select(0, self.ultra_cols)
+                _rows_dot(
+                    hu, self.w_ultra, self.s_ultra, None,
+                    self.gscale, self.scores, False, gated,
+                )
+                ultra_cand = (
+                    self.scores.view(-1, SCREEN_CHUNK)
+                    .topk(ULTRA_PER, dim=-1, sorted=False).indices + self.chunk_off
+                )
+                _rows_dot(
+                    hc, self.w_coarse, self.s_coarse, ultra_cand.reshape(-1),
+                    self.gscale, self.coarse_refine_scores, True, gated,
+                )
+                coarse_indices = self.coarse_refine_scores.view(-1, ULTRA_PER).topk(
+                    CASCADE_PER, dim=-1, sorted=False
+                ).indices
+                # Entries remain grouped by original vocabulary chunk. Gather
+                # global IDs rather than applying the original chunk offset twice.
+                coarse_cand = ultra_cand.gather(1, coarse_indices)
+            else:
+                _rows_dot(
+                    hc, self.w_coarse, self.s_coarse, None,
+                    self.gscale, self.scores, False, gated,
+                )
+                coarse_cand = (
+                    self.scores.view(-1, SCREEN_CHUNK)
+                    .topk(CASCADE_PER, dim=-1, sorted=False).indices + self.chunk_off
+                )
             hs = h.index_select(0, self.cols)
             _rows_dot(
                 hs, self.w_scr, self.s_scr, coarse_cand.reshape(-1),

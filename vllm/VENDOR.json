@@ -210,6 +210,18 @@
     {
       "file": "harness/kernels/l2pf/py/__init__.py",
       "why": "Carry useful04706ad7-c4e8-44b9-b8ba-77f14d8b8adf MoE-window immutable prefetch default6to12MB. Its complete official2.19195352041462 is within0.1% of fulla484, but only budget mechanism is combined here on higherfulla484. Prefix pair/SSM combination unverified."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "Original extra8-group firsttier: 8groupsallV ->512/chunk ->original32groups256/chunk ->original64groups32/chunk ->originalfullK2048 BF16/minID/confidence selector. Importance-ranked groups/rawNVFP4 bytes unchanged, allnewrowdots originalstopmasks/PDL, prefetchpointsfirstmatrix. Full927baseline retained. Proposal/acceptance/newcomposition unverified; all executionofficialremote."
+    },
+    {
+      "file": "harness/kernels/marlinx/{csrc/marlinx.cu,py/__init__.py,build.sh,tests/test_pdl_dispatch.py}",
+      "why": "Select pendingc8ff4551-1e29-4a0c-b46b-ffd6bb624c65 exactfourfiles6ea937e161af1d40abc1521c720ecba8da1dcd6c, integrating original ownf8766cda-e78f-4d5c-8abe-163f534af907 orderedshared-downsegments with existingPDL. Direction3e519ff4-4664-434d-b412-fc3c96227f25. Preservewhole927 and newultracascade; segmentproducer/merge ordinarysame-stream, oldPDL independent, per-layerbitwiseadmission and fourbuildfallbacks. Pendingcompositionunverified; no isolatedgain claimed."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_kernels.py; harness/kernels/pzskip/csrc/pzskip.cu; vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
+      "why": "Select usefulpending51aa1545-b946-46da-bb0f-e0628924c7a1 exactthreeruntimefiles45e5db099d54717fb0a7cce5bb5b667c9ad1bf9e: theta0.5 and PZ333(2k16/stage,3stages,M32/N384). Entire927preservedexceptselectedtuning, plusnewultracascade/orderedsharedsegments. Originaltargetvalidation/per-layerbitadmission preserved. Pendingfullcombinationunverified; nolocalexecution."
     }
   ]
 }

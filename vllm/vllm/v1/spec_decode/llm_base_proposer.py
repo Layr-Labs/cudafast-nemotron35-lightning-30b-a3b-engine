@@ -65,6 +65,9 @@ from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
 
+# Protect asynchronous H2D sources; switchable for in-process cost screening.
+PINNED_SOURCE_GUARDS = True
+
 
 class SpecDecodeBaseProposer:
     def __init__(
@@ -477,6 +480,13 @@ class SpecDecodeBaseProposer:
         if not self._enable_probabilistic_draft_probs or sampling_metadata.all_greedy:
             return self._greedy_sample(hidden_states), None
         logits = self.model.compute_logits(hidden_states)
+        full_vocab = self.vllm_config.model_config.get_vocab_size()
+        if logits.shape[-1] < full_vocab:
+            # Drafter restricted to the leading ids: ids beyond it get
+            # probability 0 (a valid proposal distribution).
+            logits = torch.nn.functional.pad(
+                logits, (0, full_vocab - logits.shape[-1]), value=float("-inf")
+            )
         if self.use_heterogeneous_vocab:
             assert self.vocab_mapping is not None
             logits = self.vocab_mapping.constrain_draft_logits(logits)
@@ -1198,6 +1208,16 @@ class SpecDecodeBaseProposer:
         is not sampled and comes from `request.get_token_id()` instead. This is denoted
         the "backup" token id. It also counts rejected tokens via `sampled_token_ids`.
         """
+        event = None
+        if PINNED_SOURCE_GUARDS:
+            # The previous backup H2D may still be behind async work,
+            # including startup paths without a valid-count wait. Protect its
+            # pinned CPU source before reusing it.
+            event = getattr(self, "_backup_tokens_h2d_event", None)
+            if event is None:
+                event = self._backup_tokens_h2d_event = torch.cuda.Event()
+            else:
+                event.synchronize()
         # Precompute backup token IDs for discarded requests.
         num_reqs = gpu_input_batch.num_reqs
         for i in range(num_reqs):
@@ -1205,6 +1225,8 @@ class SpecDecodeBaseProposer:
                 gpu_input_batch.req_ids[i]
             ].get_token_id(gpu_input_batch.num_tokens_no_spec[i] - 1)
         self.backup_next_token_ids.copy_to_gpu(num_reqs)
+        if event is not None:
+            event.record()
         backup_tokens_gpu = self.backup_next_token_ids.gpu
 
         batch_size, num_tokens = sampled_token_ids.shape
@@ -1719,6 +1741,15 @@ class SpecDecodeBaseProposer:
                         logger.info(
                             "Shared target model lm_head with MTP shared_head.head."
                         )
+
+            # Drafter-only head over the leading token ids (proposals only;
+            # the target keeps the full shared head). See nemotron_h_mtp.py.
+            draft_model = self.model
+            if isinstance(draft_model, BreakableCUDAGraphWrapper):
+                draft_model = draft_model.unwrap()
+            restrict = getattr(draft_model, "restrict_draft_vocab", None)
+            if callable(restrict):
+                restrict()
 
         if hasattr(target_language_model.model, "topk_indices_buffer"):
             target_buffer = target_language_model.model.topk_indices_buffer

@@ -156,6 +156,7 @@ class VllmBackend:
             # same tensors: it changes load time only, not numerics.
             safetensors_load_strategy="eager",
             disable_log_stats=True,
+            additional_config={"hostov_direct_output": True},
         )
         self._engine = LLMEngine.from_engine_args(args)
         # Startup is done: keep this process's threads on the fastest cores

@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """NemotronH-MTP model with attention layers."""
 
+import os
+import types
 import typing
 from collections.abc import Callable, Iterable
 
@@ -11,6 +13,7 @@ import torch.nn as nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.config.parallel import ParallelConfig
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
@@ -37,9 +40,80 @@ from .nemotron_h import (
 )
 from .nemotron_h_mtp_kernels import (
     install_mtp_small_linear,
+    prepare_mtp_relu2,
     mtp_fast_enabled as _mtp_fast_enabled,
     register_mtp_moe_layer,
 )
+
+logger = init_logger(__name__)
+
+# Drafter vocabulary restriction (affects draft proposals only).
+# The MTP drafter shares the target's lm_head. Draft argmax is taken over the
+# leading MTP_DRAFT_VOCAB token ids only: the drafter gets its own copy of rows
+# [0, N) of that same head (same quantized values and scales, sliced at load
+# time, no re-quantization). Target logits, verification and sampling still use
+# the full shared head, so the emitted tokens are unchanged; a token id >= N
+# is never proposed, only produced by the target. The subset is fixed by id
+# order (prompt-independent). Read at import; a value >= vocab_size turns the
+# restriction off. Module-level so in-process screening can switch it.
+MTP_DRAFT_VOCAB: int = int(os.environ.get("VLLM_MTP_DRAFT_VOCAB", "81920"))
+
+
+def _truncate_lm_head(lm_head: nn.Module, n: int) -> object | None:
+    """Return a head computing rows [0, n) of lm_head, or None if the head's
+    weight format is not supported. The returned object reuses lm_head's
+    quant_method; its tensors are copies of the leading n output rows."""
+    qm = getattr(lm_head, "quant_method", None)
+    weight = getattr(lm_head, "weight", None)
+    if qm is None or not isinstance(weight, torch.Tensor):
+        return None
+    if getattr(lm_head, "tp_size", 1) != 1 or getattr(lm_head, "bias", None) is not None:
+        return None
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        UnquantizedEmbeddingMethod,
+    )
+
+    if isinstance(qm, UnquantizedEmbeddingMethod):
+        # weight: [vocab, hidden]
+        return types.SimpleNamespace(
+            quant_method=qm, tp_size=1, bias=None, weight=weight[:n].contiguous()
+        )
+    kernel = getattr(qm, "kernel", None)
+    from vllm.model_executor.kernels.linear.nvfp4.marlin import (
+        MarlinNvFp4LinearKernel,
+    )
+
+    if not isinstance(kernel, MarlinNvFp4LinearKernel):
+        return None
+    # Marlin NVFP4 (W4A16) layout after repack, size_n = vocab (no padding):
+    #   weight       int32 [size_k / 16, size_n * 2]: one row per 16-deep k
+    #                tile, 64-wide n tiles laid out in n order (128 int32 each)
+    #   weight_scale fp8   [size_k / 16, size_n]: permuted within 64-col groups
+    # so the leading n output rows (n % 64 == 0) are the leading columns of
+    # each packed row. Global scale and workspace are shared unchanged.
+    size_n = lm_head.output_size_per_partition
+    size_k = lm_head.input_size_per_partition
+    ws = lm_head.weight_scale
+    if (
+        n % 64 != 0
+        or weight.dim() != 2
+        or weight.dtype != torch.int32
+        or tuple(weight.shape) != (size_k // 16, size_n * 2)
+        or tuple(ws.shape) != (size_k // 16, size_n)
+    ):
+        return None
+    return types.SimpleNamespace(
+        quant_method=qm,
+        tp_size=1,
+        bias=None,
+        weight=weight[:, : n * 2].contiguous(),
+        weight_scale=ws[:, :n].contiguous(),
+        weight_global_scale=lm_head.weight_global_scale,
+        workspace=lm_head.workspace,
+        output_size_per_partition=n,
+        input_size_per_partition=size_k,
+    )
+
 
 
 class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
@@ -410,6 +484,9 @@ class NemotronHMTP(nn.Module, SupportsPP):
             self.model.make_empty_intermediate_tensors
         )
 
+    def process_weights_after_loading(self) -> None:
+        prepare_mtp_relu2(self.model)
+
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
 
@@ -463,11 +540,91 @@ class NemotronHMTP(nn.Module, SupportsPP):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
-        """Compute logits for DRAFT token generation."""
+        """Compute logits for DRAFT token generation (draft ids [0, N) only,
+        N = MTP_DRAFT_VOCAB; see restrict_draft_vocab)."""
         assert self.lm_head is not None, (
             "lm_head not initialized - must be shared from target model"
         )
-        return self.logits_processor(self.lm_head, hidden_states)
+        return self.logits_processor(self._draft_head(), hidden_states)
+
+    def _draft_head(self):
+        n = MTP_DRAFT_VOCAB
+        if n >= self.config.vocab_size:
+            return self.lm_head
+        heads = self.__dict__.setdefault("_draft_heads", {})
+        head = heads.get(n)
+        if head is None:
+            head = self.restrict_draft_vocab(n)
+        return self.lm_head if head is False else head
+
+    @torch.inference_mode()
+    def restrict_draft_vocab(self, n: int | None = None):
+        """Build the drafter-only head for the leading n token ids: a copy of
+        rows [0, n) of the shared lm_head (same quantized weights and scales,
+        no re-quantization). Called once after the target lm_head is shared;
+        the target keeps using the full head. Returns the head, or False when
+        the head format is not supported (the full head is then used)."""
+        n = MTP_DRAFT_VOCAB if n is None else n
+        heads = self.__dict__.setdefault("_draft_heads", {})
+        if n >= self.config.vocab_size:
+            return False
+        if n in heads:
+            return heads[n]
+        head = _truncate_lm_head(self.lm_head, n) or False
+        if head is False:
+            logger.warning(
+                "MTP draft vocab restriction to %d ids not applied: "
+                "unsupported lm_head format.",
+                n,
+            )
+        else:
+            # Check the slice against the full head on fixed random inputs:
+            # the leading n logits must agree (layout sanity check).
+            w = self.lm_head.weight
+            g = torch.Generator(device=w.device).manual_seed(0)
+            x = torch.randn(
+                4,
+                self.config.hidden_size,
+                generator=g,
+                device=w.device,
+                dtype=self.vllm_config.model_config.dtype,
+            )
+
+            def logits(h) -> torch.Tensor:
+                # one M=4 call plus four M=1 calls (the drafter samples 1 row)
+                out = [self.logits_processor(h, x)]
+                out += [self.logits_processor(h, x[i : i + 1]) for i in range(4)]
+                return torch.cat(out).float()
+
+            full = logits(self.lm_head)[:, :n]
+            part = logits(head)
+            err = (full - part).abs().max().item()
+            scale = full.abs().max().item()
+            ndiff = int((full != part).sum().item())
+            same_argmax = bool((full.argmax(-1) == part.argmax(-1)).all())
+            if not (err <= 1e-2 * max(scale, 1e-6) and same_argmax):
+                logger.warning(
+                    "MTP draft vocab restriction to %d ids disabled: sliced "
+                    "head disagrees with the full head (max err %.4g, scale "
+                    "%.4g).",
+                    n,
+                    err,
+                    scale,
+                )
+                head = False
+            else:
+                logger.info(
+                    "MTP drafter proposes token ids [0, %d) only (sliced copy "
+                    "of the shared lm_head; target head unchanged). Check "
+                    "(M=4 and M=1): %d of %d leading logits differ from the "
+                    "full head, max abs err %.3g.",
+                    n,
+                    ndiff,
+                    full.numel(),
+                    err,
+                )
+        heads[n] = head
+        return head
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load MTP weights with proper name remapping."""

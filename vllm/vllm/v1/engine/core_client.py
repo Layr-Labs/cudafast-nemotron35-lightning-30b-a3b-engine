@@ -7,13 +7,13 @@ import sys
 import uuid
 import weakref
 from abc import ABC, abstractmethod
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass
 from multiprocessing.connection import Connection
 from multiprocessing.queues import Queue
-from threading import Thread
+from threading import Lock, Thread
 from typing import Any, TypeAlias, TypeVar
 
 import msgspec
@@ -806,6 +806,16 @@ class SyncMPClient(MPClient):
     def __init__(
         self, vllm_config: VllmConfig, executor_class: type[Executor], log_stats: bool
     ):
+        # Opt-in for synchronous, single-caller LLMEngine users. Receive on
+        # the caller thread to avoid an extra Python queue and thread wakeup.
+        extra = vllm_config.additional_config
+        self._direct_output = (
+            isinstance(extra, dict)
+            and extra.get("hostov_direct_output", False)
+            and vllm_config.parallel_config.data_parallel_size == 1
+        )
+        self._direct_recv_lock = Lock()
+        self._direct_pending: deque[EngineCoreOutputs] = deque()
         super().__init__(
             asyncio_mode=False,
             vllm_config=vllm_config,
@@ -814,6 +824,10 @@ class SyncMPClient(MPClient):
         )
 
         self.is_dp = self.vllm_config.parallel_config.data_parallel_size > 1
+        if self._direct_output:
+            # BackgroundResources retains ownership of this socket. All direct
+            # reads and shutdown cleanup are serialized by _direct_recv_lock.
+            return
         self.outputs_queue = queue.Queue[EngineCoreOutputs | Exception]()
 
         # Ensure that the outputs socket processing thread does not have
@@ -869,7 +883,44 @@ class SyncMPClient(MPClient):
         # The thread takes on responsibility for closing the socket.
         self.resources.output_socket = None
 
+    def _receive_direct(self) -> EngineCoreOutputs:
+        out_socket = self.resources.output_socket
+        assert isinstance(out_socket, zmq.Socket)
+        try:
+            # A bounded poll lets the engine monitor interrupt a blocked read.
+            while True:
+                self.ensure_alive()
+                if out_socket.poll(timeout=1000):
+                    break
+            frames = out_socket.recv_multipart(copy=False)
+            self.resources.validate_alive(frames)
+            return self.decoder.decode(frames)
+        except Exception as e:
+            raise self._format_exception(e) from None
+
+    def shutdown(self, timeout: float | None = None) -> None:
+        if not self._direct_output:
+            return super().shutdown(timeout)
+        # Never close a ZMQ socket while another thread is polling/receiving.
+        # The receiver observes engine_dead within one poll interval.
+        self.resources.engine_dead = True
+        with self._direct_recv_lock:
+            super().shutdown(timeout)
+
     def get_output(self) -> EngineCoreOutputs:
+        if self._direct_output:
+            with self._direct_recv_lock:
+                while True:
+                    outputs = (
+                        self._direct_pending.popleft()
+                        if self._direct_pending else self._receive_direct()
+                    )
+                    if outputs.utility_output:
+                        _process_utility_output(outputs.utility_output, self.utility_results)
+                        continue
+                    if outputs.wave_complete is not None:
+                        self.engines_running = False
+                    return outputs
         # If an exception arises in process_outputs_socket task,
         # it is forwarded to the outputs_queue so we can raise it
         # from this (run_output_handler) task to shut down the server.
@@ -896,6 +947,16 @@ class SyncMPClient(MPClient):
         self.utility_results[call_id] = future
         self._send_input(EngineCoreRequestType.UTILITY, (0, call_id, method, args))
 
+        if self._direct_output:
+            with self._direct_recv_lock:
+                while not future.done():
+                    outputs = self._receive_direct()
+                    if outputs.utility_output:
+                        _process_utility_output(outputs.utility_output, self.utility_results)
+                    else:
+                        # A utility can follow already-published token outputs.
+                        # Preserve them in order for subsequent get_output().
+                        self._direct_pending.append(outputs)
         return future.result()
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:

@@ -35,8 +35,16 @@ import os
 
 import torch
 
+# l2pf (harness/kernels/l2pf); absent, nothing changes.
+try:
+    import l2pf as _l2pf
+except ImportError:
+    _l2pf = None
+
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
+
+from .nemotron_h_mtp_kernels import mtp_pdl
 
 logger = init_logger(__name__)
 
@@ -101,7 +109,11 @@ def _nvfp4_rows_dot(
     GATHER: tl.constexpr,
     BR: tl.constexpr,
     BB: tl.constexpr,
+    launch_pdl: tl.constexpr = False,
 ):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     pid = tl.program_id(0)
     r = pid * BR + tl.arange(0, BR)
     rmask = r < R
@@ -140,12 +152,19 @@ def _rows_dot(h, w, s, rows, gscale, out, gather):
     _nvfp4_rows_dot[(triton.cdiv(n_out, br),)](
         h, w, s, rows if gather else out, out, n_out, gscale,
         NBYTES=nbytes, GATHER=gather, BR=br, BB=64, num_warps=4, num_stages=2,
+        launch_pdl=mtp_pdl(),
     )
 
 
 @triton.jit
-def _select_token(logits, ids, out, N: tl.constexpr, BLOCK: tl.constexpr):
+def _select_token(
+    logits, ids, out, N: tl.constexpr, BLOCK: tl.constexpr,
+    launch_pdl: tl.constexpr = False,
+):
     """Stock BF16 maximum, then minimum token id among ties, in one launch."""
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     i = tl.arange(0, BLOCK)
     # Round before reduction: FP32 logit differences can disappear in BF16.
     v = tl.load(logits + i, mask=i < N, other=-float("inf"))
@@ -232,6 +251,10 @@ class DraftHeadScreen:
             (n // SCREEN_CHUNK) * SCREEN_PER, dtype=torch.float32, device=device
         )
         self.big = torch.tensor(1 << 30, dtype=torch.int64, device=device)
+        # l2pf: the coarse matrix is registered for the MTP MoE's down
+        # projection window (nemotron_h_mtp_kernels.py), which prefetches its head.
+        if _l2pf is not None and self.cascade:
+            _l2pf.DRAFT_SCREEN[:] = [self.w_coarse]
         self.graph = None
         self._h = torch.empty(k, dtype=torch.float32, device=device)
         self._out = torch.empty(1, dtype=torch.int64, device=device)
@@ -297,6 +320,7 @@ class DraftHeadScreen:
         _select_token[(1,)](
             self.cand_logits, cand, out, N=self.cand_logits.numel(),
             BLOCK=triton.next_power_of_2(self.cand_logits.numel()),
+            launch_pdl=mtp_pdl(),
         )
         return out
 

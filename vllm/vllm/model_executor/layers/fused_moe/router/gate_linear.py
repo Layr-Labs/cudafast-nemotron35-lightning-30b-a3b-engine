@@ -18,6 +18,10 @@ logger = init_logger(__name__)
 # SMALLK=0 or SMALLK_ROUTER=0 disables it; without the package, or for any call outside its
 # shape guard (M, N, K) = (4, 128, 2688), the op runs torch.mm(x, weight.t()) as before.
 try:
+    import l2pf as _l2pf
+except ImportError:
+    _l2pf = None
+try:
     import smallk as _smallk
 except ImportError:
     _smallk = None
@@ -295,15 +299,18 @@ direct_register_custom_op(
 
 def smallk_router_gemm_impl(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """Router logits x . weight^T in fp32: smallk for its verified shape, else torch.mm."""
+    out = None
     if _smallk is not None:
         out = _smallk.maybe_router_gemm(x, weight)
-        if out is not None:
-            return out
-    if _routerbig is not None:
+    if out is None and _routerbig is not None:
         out = _routerbig.maybe_router_gemm(x, weight)
-        if out is not None:
-            return out
-    return torch.mm(x, weight.t())
+    if out is None:
+        out = torch.mm(x, weight.t())
+    # LOCAL PATCH (cudafast-nemotron35): rejoin the router-weight L2 prefetch the
+    # previous Mamba layer's out_proj queued (l2pf.AHEAD_ROUTER). Moves no value.
+    if _l2pf is not None and getattr(_l2pf, "_pending", None):
+        _l2pf.join_pending(x.device)
+    return out
 
 
 def smallk_router_gemm_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:

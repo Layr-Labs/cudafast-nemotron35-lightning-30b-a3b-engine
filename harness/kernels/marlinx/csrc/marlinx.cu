@@ -53,9 +53,20 @@ __device__ __forceinline__ uint4 ld_stream_v4(const uint4* p) {
   return r;
 }
 
+// LOCAL PATCH (cudafast-nemotron35, zskip-l2sector): the zero-row-skip path reads each active k
+// row of zs_repack's copy ([K/16][16][N/64][8] u32, rows of 1344 = 21 x 64 bytes) as one 32-byte
+// sector per 64-feature half column, and every half column of an active row is read. An L2
+// prefetch-size hint (PTX 7.4, sm_75+; a performance hint only, no value moves) makes each miss
+// fetch the aligned 64 bytes (half columns 2c, 2c+1 of the same row), so no byte is fetched that
+// the call does not read. Only the zero-row-skip loads use this helper. -DMARLINX_NO_L2HINT
+// builds the plain load.
 __device__ __forceinline__ uint32_t ld_stream_u32(const uint32_t* p) {
   uint32_t r;
+#ifndef MARLINX_NO_L2HINT
+  asm volatile("ld.global.nc.L1::no_allocate.L2::64B.u32 %0, [%1];\n" : "=r"(r) : "l"(p));
+#else
   asm volatile("ld.global.nc.L1::no_allocate.u32 %0, [%1];\n" : "=r"(r) : "l"(p));
+#endif
   return r;
 }
 

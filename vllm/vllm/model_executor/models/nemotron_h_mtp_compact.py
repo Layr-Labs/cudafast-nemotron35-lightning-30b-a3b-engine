@@ -11,11 +11,19 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
+from .nemotron_h_mtp_kernels import mtp_pdl
+
 _ENABLED = os.environ.get("MTP_RELU2_COMPACT", "1") != "0"
 
 
 @triton.jit
-def _compact(h, indices, values, counts, I: tl.constexpr, BLOCK: tl.constexpr):
+def _compact(
+    h, indices, values, counts, I: tl.constexpr, BLOCK: tl.constexpr,
+    launch_pdl: tl.constexpr = False,
+):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     slot = tl.program_id(0)
     k = tl.arange(0, BLOCK)
     value = tl.load(h + slot * I + k, mask=k < I, other=0.0)
@@ -33,7 +41,11 @@ def _down(
     ROUTED_SCALE: tl.constexpr,
     TOPK: tl.constexpr, S: tl.constexpr,
     BN: tl.constexpr, BK: tl.constexpr,
+    launch_pdl: tl.constexpr = False,
 ):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     n = tl.program_id(0) * BN + tl.arange(0, BN)
     lane = tl.arange(0, BK)
     routed = tl.zeros((BN,), tl.float32)
@@ -94,10 +106,14 @@ def maybe_down(h, packed, ids, weights, y, routed_scale):
     indices = torch.empty(h.shape, dtype=torch.int32, device=h.device)
     values = torch.empty_like(h)
     counts = torch.empty(8, dtype=torch.int32, device=h.device)
-    _compact[(8,)](h, indices, values, counts, I=1856, BLOCK=2048, num_warps=4)
+    _compact[(8,)](
+        h, indices, values, counts, I=1856, BLOCK=2048, num_warps=4,
+        launch_pdl=mtp_pdl(),
+    )
     _down[(triton.cdiv(2688, 32),)](
         indices, values, counts, w2, sd, ids, weights, y,
         M=y.shape[0], H=2688, I=1856, ROUTED_SCALE=routed_scale,
         TOPK=6, S=2, BN=32, BK=64, num_warps=4, num_stages=2,
+        launch_pdl=mtp_pdl(),
     )
     return True

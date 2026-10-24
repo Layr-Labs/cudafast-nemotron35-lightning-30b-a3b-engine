@@ -32,6 +32,12 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
+# l2pf (harness/kernels/l2pf); absent, nothing changes.
+try:
+    import l2pf as _l2pf
+except ImportError:
+    _l2pf = None
+
 
 def mtp_fast_enabled(kind: str) -> bool:
     """Kill switches (default on): MTP_FAST_KERNELS=0 turns both off,
@@ -39,6 +45,25 @@ def mtp_fast_enabled(kind: str) -> bool:
     if os.environ.get("MTP_FAST_KERNELS", "1") == "0":
         return False
     return os.environ.get(f"MTP_FAST_{kind}", "1") != "0"
+
+
+_PDL: bool | None = None
+
+
+def mtp_pdl() -> bool:
+    """Programmatic dependent launch for the drafter's Triton kernels (sm_90+):
+    each waits for the preceding grid before any memory access, then lets the
+    next kernel launch, so a kernel's launch overlaps the one before it. The
+    target never runs these. MTP_PDL=0 disables."""
+    global _PDL
+    if _PDL is None:
+        from vllm.platforms import current_platform
+
+        _PDL = os.environ.get(
+            "MTP_PDL", "1"
+        ) != "0" and current_platform.is_arch_support_pdl()
+    return _PDL
+
 
 # --------------------------------------------------------------------------- #
 # Dense GEMV / small-M GEMM
@@ -74,7 +99,11 @@ def _mtp_gemv_kernel(
     BN: tl.constexpr,
     BK: tl.constexpr,
     EVICT: tl.constexpr,
+    launch_pdl: tl.constexpr = False,
 ):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     # y[n] = sum_k w[n, k] * x[k]   (one row, fp32 accumulation)
     pid = tl.program_id(0)
     offs_n = pid * BN + tl.arange(0, BN)
@@ -110,7 +139,11 @@ def _mtp_small_gemm_kernel(
     BN: tl.constexpr,
     BK: tl.constexpr,
     EVICT: tl.constexpr,
+    launch_pdl: tl.constexpr = False,
 ):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     # y[m, n] = sum_k x[m, k] * w[n, k]   (M <= BM rows, tensor cores)
     pid = tl.program_id(0)
     offs_n = pid * BN + tl.arange(0, BN)
@@ -185,6 +218,7 @@ def _small_linear(x: torch.Tensor, w: torch.Tensor, evict: bool) -> torch.Tensor
             BK=_GEMV_BK,
             num_warps=_GEMV_WARPS,
             num_stages=_GEMV_STAGES,
+            launch_pdl=mtp_pdl(),
         )
     else:
         _mtp_small_gemm_kernel[(triton.cdiv(N, _DOT_BN),)](
@@ -203,6 +237,7 @@ def _small_linear(x: torch.Tensor, w: torch.Tensor, evict: bool) -> torch.Tensor
             BK=_DOT_BK,
             num_warps=_DOT_WARPS,
             num_stages=_DOT_STAGES,
+            launch_pdl=mtp_pdl(),
         )
     return y
 
@@ -280,7 +315,11 @@ def _mtp_moe_up_kernel(
     BN: tl.constexpr,
     BK: tl.constexpr,
     EVICT: tl.constexpr,
+    launch_pdl: tl.constexpr = False,
 ):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     # slot j < TOPK: routed expert ids[j]; slot j >= TOPK: shared slice j-TOPK
     pid_n = tl.program_id(0)
     j = tl.program_id(1)
@@ -326,7 +365,11 @@ def _mtp_moe_down_kernel(
     BN: tl.constexpr,
     BK: tl.constexpr,
     EVICT: tl.constexpr,
+    launch_pdl: tl.constexpr = False,
 ):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     # y[n] = routed_scale * sum_j tw[j] * <w2[ids[j], n, :], h[j]>
     #        + sum_s <wsd[n, s*I:(s+1)*I], h[TOPK + s]>
     pid_n = tl.program_id(0)
@@ -390,7 +433,11 @@ def _mtp_moe_zero_down_kernel(
     BN: tl.constexpr,
     BK: tl.constexpr,
     EVICT: tl.constexpr,
+    launch_pdl: tl.constexpr = False,
 ):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     # y[n] = routed_scale * sum_j tw[j] * <w2[ids[j], n, :], h[j]>
     #        + sum_s <wsd[n, s*I:(s+1)*I], h[TOPK + s]>
     pid_n = tl.program_id(0)
@@ -461,6 +508,7 @@ def relu2_down(h, w2, sd, ids, tw, y, routed_scale, mode=None, bn=None, warps=No
     inter = h.shape[1]
     ns = h.shape[0] - topk
     H = y.shape[1]
+    pf = False
     if mode == 2:
         packed = relu2_prepare(w2, sd, inter, ns)
         if packed is False:
@@ -470,12 +518,26 @@ def relu2_down(h, w2, sd, ids, tw, y, routed_scale, mode=None, bn=None, warps=No
                 TOPK=topk, S=ns, BN=_MOE_DN_BN, BK=_MOE_DN_BK,
                 EVICT=_EVICT_W, num_warps=_MOE_DN_WARPS,
                 num_stages=_MOE_DN_STAGES,
+                launch_pdl=mtp_pdl(),
             )
             return
         wp, sp = packed
         from .nemotron_h_mtp_compact import maybe_down
 
+        # LOCAL PATCH (cudafast-nemotron35): the down projection over the
+        # transposed weights (compact or zero-load) is latency-bound; prefetch
+        # the head of the draft screen's coarse matrix, which the drafter
+        # streams next, into L2 meanwhile (moves no value). Joined after
+        # whichever down kernel runs.
+        pf = (
+            _l2pf is not None
+            and _l2pf.DRAFT_BYTES > 0
+            and bool(_l2pf.DRAFT_SCREEN)
+            and _l2pf.prefetch(_l2pf.DRAFT_SCREEN[0], max_bytes=_l2pf.DRAFT_BYTES)
+        )
         if maybe_down(h, packed, ids, tw, y, routed_scale):
+            if pf:
+                _l2pf.join(y.device)
             return
         strides = (wp.stride(0), 1, 1, H, H, inter * H)
     else:
@@ -486,7 +548,10 @@ def relu2_down(h, w2, sd, ids, tw, y, routed_scale, mode=None, bn=None, warps=No
         *strides, y.stride(0), routed_scale,
         TOPK=topk, S=ns, BN=bn, BK=1024, EVICT=_EVICT_W,
         num_warps=warps, num_stages=3,
+        launch_pdl=mtp_pdl(),
     )
+    if pf:
+        _l2pf.join(y.device)
 
 
 _MOE_LAYERS: dict[str, torch.nn.Module] = {}
@@ -586,6 +651,7 @@ def mtp_moe_row(
         BK=_MOE_UP_BK,
         num_warps=_MOE_UP_WARPS,
         num_stages=_MOE_UP_STAGES,
+        launch_pdl=mtp_pdl(),
     )
     y = torch.empty((M, H), dtype=x.dtype, device=x.device)
     if _RELU2_MODE:
@@ -613,6 +679,7 @@ def mtp_moe_row(
         BK=_MOE_DN_BK,
         num_warps=_MOE_DN_WARPS,
         num_stages=_MOE_DN_STAGES,
+        launch_pdl=mtp_pdl(),
     )
     return y
 

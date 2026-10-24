@@ -1283,15 +1283,33 @@ def mamba_mixer2(
     # out_proj reads that part from L2. Moves no value. More than the window can
     # fetch stalls the rejoin (the whole 11 MB measured -0.7% decode, 5 MB
     # +0.8%). harness/kernels/l2pf; L2PF=0 disables.
+    # Inside a FULL CUDA-graph capture the rejoin can wait for out_proj's fp8small op
+    # (pack present, no bias), which rejoins once its GEMM is queued (fp8small.py
+    # join_pending): the prefetch never holds the main stream and the window grows
+    # (L2PF_MAMBA_LAZY_MB). Not capturing (eager runs, or this splitting op between
+    # piecewise graph pieces) keeps the eager rejoin, so a fork never crosses pieces.
+    lazy = (
+        _l2pf is not None
+        and getattr(_l2pf, "MAMBA_LAZY_BYTES", 0) > 0
+        and getattr(self.out_proj, "_fp8small_weight", None) is not None
+        and getattr(self.out_proj, "bias", None) is None
+        and torch.cuda.is_current_stream_capturing()
+    )
     pf = (
         _l2pf is not None
         and projected_states.shape[0] <= 8
         and _l2pf.MAMBA_BYTES > 0
-        and _l2pf.prefetch(_out_proj_weight(self), max_bytes=_l2pf.MAMBA_BYTES)
+        and _l2pf.prefetch(
+            _out_proj_weight(self),
+            max_bytes=_l2pf.MAMBA_LAZY_BYTES if lazy else _l2pf.MAMBA_BYTES,
+        )
     )
     self.conv_ssm_forward(projected_states=projected_states, output=output)
     if pf:
-        _l2pf.join(projected_states.device)
+        if lazy:
+            _l2pf.defer(projected_states.device)
+        else:
+            _l2pf.join(projected_states.device)
 
 
 def mamba_mixer2_fake(

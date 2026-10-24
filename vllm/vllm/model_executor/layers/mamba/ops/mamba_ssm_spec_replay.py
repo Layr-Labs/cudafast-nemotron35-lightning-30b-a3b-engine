@@ -65,6 +65,23 @@ def _const_div_enabled() -> bool:
     return value not in ("0", "false", "off", "no")
 
 
+_PDL: bool | None = None
+
+
+def _pdl_enabled() -> bool:
+    """Launch the replay kernel with programmatic dependent launch (sm_90+):
+    it then overlaps its launch with the conv1d update before it, which
+    already signals its dependents. VLLM_MAMBA_REPLAY_PDL=0 disables."""
+    global _PDL
+    if _PDL is None:
+        from vllm.platforms import current_platform
+
+        _PDL = os.environ.get(
+            "VLLM_MAMBA_REPLAY_PDL", "1"
+        ) != "0" and current_platform.is_arch_support_pdl()
+    return _PDL
+
+
 def spec_replay_ring_len(num_spec: int) -> int:
     """Ring entries per request: any value >= 2 * num_spec + 1 is hazard-free."""
     return 2 * (num_spec + 1)
@@ -158,6 +175,7 @@ def _selective_scan_update_spec_replay_kernel(
     RING_LEN: tl.constexpr = 0,
     HG_RATIO: tl.constexpr = 0,
     CONST_DIV: tl.constexpr = False,
+    launch_pdl: tl.constexpr = False,
 ):
     # The dt/A of a head are scalars (stride-0 expansion over head_dim); that is
     # the only layout the Mamba2 decode path produces and the only one the
@@ -173,6 +191,12 @@ def _selective_scan_update_spec_replay_kernel(
     pid_m = tl.program_id(axis=0)
     pid_b = tl.program_id(axis=1)
     pid_h = tl.program_id(axis=2)
+
+    # Programmatic dependent launch (same pattern as gather_initial_states and
+    # causal_conv1d): every load below follows the wait for the preceding grid.
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
 
     bos = tl.load(cu_seqlens_ptr + pid_b).to(tl.int64)
     eos = tl.load(cu_seqlens_ptr + pid_b + 1).to(tl.int64)
@@ -554,4 +578,5 @@ def selective_state_update_spec_replay(
             HG_RATIO=nheads // ngroups,
             CONST_DIV=_const_div_enabled(),
             num_warps=num_warps,
+            launch_pdl=_pdl_enabled(),
         )

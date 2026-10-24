@@ -15,12 +15,21 @@ arch=${arch// /}
 arch=${arch%+PTX}
 sm=${arch/./}
 "$nvcc" --version | tail -n 2
+rm -f "$out/libzskip.so"  # the fallbacks below test for this build's output, not a stale one
 # No --use_fast_math: the epilogue's flush-to-zero multiplies (humming is NVRTC-compiled with
 # --use_fast_math) are written as explicit mul.rn.ftz.f32; nothing else in the kernel is fp32.
-"$nvcc" -O3 -std=c++17 -shared -Xcompiler -fPIC -lineinfo \
-  -gencode "arch=compute_${sm},code=sm_${sm}" \
-  -Xptxas -v \
-  -o "$out/libzskip.so" "$here/csrc/zskip.cu" "$here/csrc/gather.cu" 2>&1 | grep -v '^$' || true
+# Build with the PDL launch path and the L2 prefetch-size hints; if that does not build, without
+# the hints (-DZSKIP_NO_L2HINT), then without both (-DZSKIP_NO_PDL: the record's source; the
+# Python side then keeps the ordinary launch).
+for flags in "" "-DZSKIP_NO_L2HINT" "-DZSKIP_NO_PDL -DZSKIP_NO_L2HINT"; do
+  test -n "$flags" && echo "zskip: previous build failed; rebuilding with $flags" >&2
+  # shellcheck disable=SC2086
+  "$nvcc" -O3 -std=c++17 -shared -Xcompiler -fPIC -lineinfo \
+    -gencode "arch=compute_${sm},code=sm_${sm}" \
+    -Xptxas -v $flags \
+    -o "$out/libzskip.so" "$here/csrc/zskip.cu" "$here/csrc/gather.cu" 2>&1 | grep -v '^$' || true
+  test -f "$out/libzskip.so" && break
+done
 test -f "$out/libzskip.so" || { echo "zskip: build failed" >&2; exit 1; }
 cp "$here/py/__init__.py" "$out/__init__.py"
 echo "zskip: built $out/libzskip.so for sm_${sm}"

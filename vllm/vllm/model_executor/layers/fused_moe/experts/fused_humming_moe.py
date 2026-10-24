@@ -38,20 +38,34 @@ except ImportError:
     _l2pf = None
 
 
-def _l2pf_next_layer(layer, num_tokens: int) -> bool:
+def _l2pf_next_layer(layer, num_tokens: int) -> int:
     """LOCAL PATCH (cudafast-nemotron35): small calls only: queue an L2 prefetch
     of the head of the next Mamba layer's in_proj weight (its fp8small pack when
     present) on a side stream while the latency-bound routed down projection
-    runs. Moves no value; the caller rejoins after the down projection."""
+    runs. Moves no value. Returns 0 when nothing was queued, 1 when the caller
+    rejoins after the down projection, 2 when the rejoin is deferred
+    (l2pf.MOE_LAZY): in_proj then runs the fp8small custom op (pack present, no
+    bias), which rejoins after queuing its GEMM, in the same CUDA-graph piece
+    (fp8small.py; MoE ops are not splitting ops, mamba_mixer2 is)."""
     if _l2pf is None or num_tokens > 8 or _l2pf.MOE_BYTES <= 0:
-        return False
+        return 0
     nxt = _l2pf.AHEAD_MOE.get(str(getattr(layer, "layer_name", "")))
     if nxt is None:
-        return False
+        return 0
     w = getattr(nxt, "_fp8small_weight", None)
+    lazy = (
+        w is not None
+        and getattr(nxt, "bias", None) is None
+        and getattr(_l2pf, "MOE_LAZY", False)
+    )
     if w is None:
         w = getattr(nxt, "weight", None)
-    return _l2pf.prefetch(w, max_bytes=_l2pf.MOE_BYTES)
+    nbytes = _l2pf.MOE_BYTES
+    if not lazy:
+        nbytes = min(nbytes, getattr(_l2pf, "MOE_EAGER_BYTES", nbytes))
+    if not _l2pf.prefetch(w, max_bytes=nbytes):
+        return 0
+    return 2 if lazy else 1
 from vllm.model_executor.layers.fused_moe.moe_permute_unpermute import (
     MoEPermuteScratch,
     moe_permute,
@@ -802,8 +816,9 @@ class HummingIndexedExperts(HummingExpertsBase):
             self.layer, topk_ids.size(0)
         )
         # LOCAL PATCH (cudafast-nemotron35): zskip computes humming's w2 output
-        # for <= 4 tokens without loading the weight rows whose activations
-        # are zero (humming_zskip.py); otherwise routed_sparse or humming runs.
+        # for <= 8 tokens, and for prefill on the sparse layers, without loading
+        # the weight rows whose activations are zero (humming_zskip.py);
+        # otherwise routed_sparse or humming runs.
         sparse_done = expert_map is None and maybe_zskip_down(
             self.layer,
             inputs,
@@ -813,6 +828,7 @@ class HummingIndexedExperts(HummingExpertsBase):
             topk_ids.size(1),
             getattr(self, "_moe_block_size", None),
             moe_kwargs2,
+            topk_ids=topk_ids,
         )
         sparse_weights = getattr(self.layer, "routed_sparse_down", None)
         if (
@@ -834,7 +850,9 @@ class HummingIndexedExperts(HummingExpertsBase):
                 sublayer_name="w2",
                 **moe_kwargs2,
             )
-        if l2pf_pending:
+        if l2pf_pending == 2:
+            _l2pf.defer(down_output.device)
+        elif l2pf_pending:
             _l2pf.join(down_output.device)
 
         moe_fused_mul_sum(

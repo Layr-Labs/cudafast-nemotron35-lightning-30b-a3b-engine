@@ -162,6 +162,10 @@
     {
       "file": "harness/kernels/marlinx/{csrc/marlinx.cu,py/__init__.py,README.md,tests/marlinx_zs_exact.py}",
       "why": "Shared expert down projection (3712->2688, ReLU^2 input): read only the k rows whose activation is nonzero in some row, from a byte-preserving k-row-major copy of the Marlin weight; the lane rebuilds Marlin's exact weight word, so dequant, MMA, segments and fp32 reductions are unchanged. Bit-exact vs stock Marlin on all 23 layers (4416 synthetic + 1380 real-activation cases, CUDA graph replay). MARLINX_ZS=0 disables."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "Draft-head screen row addressing and token dtype. _nvfp4_rows_dot addresses weight and scale rows with int32 when every lane's row-relative offset, tail lanes included, is below 2**31 (checked in _rows_dot from shapes only; the shared NVFP4 head is 131072 x 1344 bytes, so it always qualifies), and int64 otherwise. The argmax buffer and the captured graph output are int32: the proposer casts every draft id to int32 before the next compiled step and the runner converts draft ids to int32 before verify, and the 1<<30 sentinel fits. The BF16 round, max and lowest-id tie rule are unchanged, so the drafted token is unchanged."
     }
   ]
 }

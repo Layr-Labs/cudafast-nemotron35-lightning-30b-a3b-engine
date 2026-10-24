@@ -856,6 +856,8 @@ __global__ void __launch_bounds__(WPC * 32) down4_kernel(const Params p) {
 }
 
 
+#include "zskip_pair.cuh"
+
 // v6: down4 with the -0 guard moved to the end. With skipped rows read as +0, every step keeps
 // the accumulator equal to stock's or both zero (the two differ at most in the sign of a zero), so
 // a nonzero final accumulator equals stock's. A warp whose valid outputs include an exact zero
@@ -1727,6 +1729,30 @@ static int launch4f(const Params& p, cudaStream_t stream) {
 #define ZSKIP4F_CONFIGS(X) X(108, 2, 4, 1, 16)
 #endif
 
+#ifndef ZSKIP_NO_PAIR
+template <bool Fused>
+static int launch_pair(const Params& p, cudaStream_t stream) {
+  constexpr int SM = Fused ? BI_BYTES : 0;
+#ifndef ZSKIP_NO_PDL
+  if (g_pdl) {
+    cudaError_t e = cudaSuccess;
+    if constexpr (!Fused)
+      e = launch_pdl(prep_kernel<16, 8>, dim3(p.max_blocks), dim3(128), stream, p);
+    if (e == cudaSuccess)
+      e = launch_pdl(down_pair_kernel<Fused>, dim3(21, p.max_blocks), dim3(32), stream, p, SM);
+    if (e != cudaSuccess) {
+      cudaGetLastError();
+      return (int)e;
+    }
+    return (int)cudaGetLastError();
+  }
+#endif
+  if constexpr (!Fused) prep_kernel<16, 8><<<p.max_blocks, 128, 0, stream>>>(p);
+  down_pair_kernel<Fused><<<dim3(21, p.max_blocks), 32, SM, stream>>>(p);
+  return (int)cudaGetLastError();
+}
+#endif
+
 // v4 config id, warps per CTA, ring depth (active groups in flight per warp), 8-row MMA halves per
 // block (rows per block cap = 8 NH), moe_align block size. 100..107: decode (<= 8 tokens, block 16);
 // 120..: prefill (block_m 16 / 32 / 64, every valid row of the block)
@@ -1874,6 +1900,22 @@ int zskip_config(int id, int* info) {
   ZSKIP4F_CONFIGS(X4F)
 #undef X4F
 #endif
+#ifndef ZSKIP_NO_PAIR
+#define PAIR_INFO(ID, FUSED) \
+  if (id == ID) { \
+    constexpr int SM = FUSED ? BI_BYTES : 0; \
+    if (cudaFuncGetAttributes(&attr, down_pair_kernel<FUSED>) != cudaSuccess) return -1; \
+    info[0] = attr.numRegs; info[1] = SM; info[2] = 1; \
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&info[3], down_pair_kernel<FUSED>, 32, SM) != cudaSuccess) \
+      return -1; \
+    return 0; \
+  }
+  PAIR_INFO(113, false)
+#ifndef ZSKIP_NO_FUSED
+  PAIR_INFO(118, true)
+#endif
+#undef PAIR_INFO
+#endif
   return -2;
 }
 
@@ -1939,6 +1981,12 @@ int zskip_down(const void* A, long long lda, int shape_m, const int* sorted_ids,
   if (config == ID) return launch8<W_, R_, NH_, BM_>(p, st);
   ZSKIP8_CONFIGS(X8)
 #undef X8
+#ifndef ZSKIP_NO_PAIR
+  if (config == 113) return launch_pair<false>(p, st);
+#ifndef ZSKIP_NO_FUSED
+  if (config == 118) return launch_pair<true>(p, st);
+#endif
+#endif
   return -2;
 }
 

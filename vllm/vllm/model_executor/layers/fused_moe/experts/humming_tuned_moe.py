@@ -44,6 +44,10 @@ from typing import Any
 import torch
 
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.experts.humming_prefill_wide_n import (
+    widen_prefill_w2_n,
+)
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
@@ -217,6 +221,10 @@ def tuned_moe_configs(layer: torch.nn.Module) -> tuple[list, list] | None:
     w2 = TUNED_CONFIGS[("w2", *TUNED_LAYER_SHAPES["w2"], TUNED_NUM_EXPERTS)]
     w13_list = _to_humming_list(w13)
     w2_list = _to_humming_list(w2)
+    # Resolve the shape-only prefill schedule before model warmup/capture.
+    # M alignment and the K accumulation/split chain remain unchanged.
+    if current_platform.is_device_capability(121):
+        w13_list, w2_list = widen_prefill_w2_n(w13_list, w2_list)
     for a, b in zip(w13_list, w2_list, strict=True):
         assert a[0] == b[0] and a[1] == b[1], "w13/w2 ranges differ"
         assert a[2]["block_shape"][0] == b[2]["block_shape"][0], "block_m differs"

@@ -154,6 +154,18 @@
     {
       "file": "harness/kernels/l2pf, layers/attention/attention.py, layers/mamba/mamba_mixer2.py, models/nemotron_h.py, v1/worker/gpu_model_runner.py",
       "why": "l2pf carried from e-man07 0a731363-6416-4fb9-aa94-b6f5f6e8155e (L2 prefetch of the next bandwidth-bound weight on a side stream during latency-bound windows; moves no value). Changed: the drafter hook prefetches the start projection's hidden half eh_w_h (what a draft pass reads first with the projected-embedding table) instead of eh_proj.weight. Added: a MoE-window hook (fused_humming_moe.py, nemotron_h.py, L2PF_MOE_MB default 6) that prefetches the head of the next Mamba layer's in_proj pack while the latency-bound small-call routed down projection runs, rejoining right after it."
+    },
+    {
+      "file": "harness/kernels/fp8small/{csrc/fp8small.cu,py/__init__.py}",
+      "why": "Independent substantial nativeFP8 Mamba projection experiment on complete highest8174c25a-097e-495c-843e-81e9e768aec9 source2.03701395496221: transposeMMAoperands toweightA16outputx8tokens, loadingtheoriginal31d30b53-14a9-44ec-bb99-bae7b70873a4 FP8packdirectly. Noextraweightpack oractivationrequantization; sameE4M3FP8 bytes, ascendingK32chain, FP32scaleBthenscaleARNandBF16store. Inspiredby a1c083d7-215a-4b8e-abeb-ea12e7cad022 transposedMMAidea, notcopyitsBF16decode. W4/R16in10304x2688 andW2/R16out2688x4096. Newremoteload-time checkpointprobes M1/4/5/8,twofinitepatterns compareBF16bits tooldnative; perpackweakref eligibility, oldfallbackonmismatch. Samplesnotuniversalproof, wholeofficialoracle/performanceundetermined. FP8SMALL_WEIGHT_A=0 oldpath. Nocandidateexecutionlocally; allbuild/load/probes onlyofficialremote. Fullpending647notbaselinewhilevalidating; all8174cache/prefetch/topk paths retained."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "Select useful pendingfa026cfb-5071-4792-85de-9c09d0337e12 exactoneconstant CASCADE_FRAC_GROUPS32to16, module601c0eafe2c7b4261c5ac40269dc7727c554edf7. Native draft-only coarseprojectiongroups halved; same64-group refine,256coarse/32refine candidates, fullKfinalrescore/lowestIDselect; no targetapproximation. Authorreported31/1512proposalchanges, noidenticaldraftclaim. Full8174highest remainsbase; combinedacceptance/performanceunknownuntilofficialremote. No071split/MTPupTC fromprior647 imported."
+    },
+    {
+      "file": "harness/kernels/marlinx/{csrc/marlinx.cu,py/__init__.py,README.md}",
+      "why": "Select useful compatible pending shared-expert nativeNVFP4 down zero-K16block skipping with current-call mask and load-time perlayer stockMarlin guard. No measuredwholegainassumed. Official98cdda6aa891dc53bd0ea92038d557f9eb2dd81a: exactmarlinx.cu d4600cb7c81ad8bbf3fd7c986b4cd108e2b2ff89, pybf16d8de41b999f339b8192391e11a2ac7310144, README101b7f4fb42522eb5074c076bf5d8c80562b7482. Both8elementhalves/allrows tested; skiponlyallzeroK16, samecursor/segment/fold; NaNscale guard andM1/4/8positive/negativezero stockMarlin comparison fallback. Samplesnotuniversalproof orM5oracle; blockdensityunmeasured."
     }
   ]
 }

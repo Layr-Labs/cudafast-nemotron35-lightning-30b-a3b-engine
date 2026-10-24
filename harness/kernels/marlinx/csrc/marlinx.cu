@@ -201,6 +201,20 @@ __device__ __forceinline__ __nv_bfloat16 round_output(float scaled) {
   return rounded;
 }
 
+// zskip-style activation test: bit 2i / 2i+1 of the 16-byte chunk is set when bf16
+// element 2i / 2i+1 has a nonzero magnitude (the sign bit is ignored, so +0 and -0
+// are both "zero").
+__device__ __forceinline__ uint32_t nz_mask8(uint4 v) {
+  uint32_t m = 0;
+  const uint32_t w[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    m |= ((w[i] & 0x7FFFu) != 0u ? 1u : 0u) << (2 * i);
+    m |= ((w[i] & 0x7FFF0000u) != 0u ? 1u : 0u) << (2 * i + 1);
+  }
+  return m;
+}
+
 // Marlin write_result: bf16_rn(R * global_scale), rows < M only (warp 0).
 template <bool Relu2>
 __device__ __forceinline__ void write_out(const Params& p, int col, int h, int lane,
@@ -234,14 +248,47 @@ __device__ __forceinline__ int column_first_cut(const Params& p, int col) {
 
 // One 64-feature half column (`unit`) per CTA of 4 warps; warp w runs Marlin's
 // warp-row chain w through a register ring of P k16 blocks.
-template <int P, bool Relu2 = false>
+//
+// Skip (shared-expert down projection only) drops the weight and scale loads and the
+// MMA of a k16 block whose 16 activations are zero in every row < M: that MMA only
+// adds a sum of +-0 to the accumulator, and acc is +0 from the start and stays +0
+// while it is zero, so every acc, every segment fold and the epilogue are identical.
+// The mask is built once per CTA from this call's activations (bit kb of `smask`),
+// and the k order, the segment cuts and the fold order are the dense ones.
+constexpr int SKIP_WORDS = 16;  // bits for k16 blocks 0..511 (K <= 8192)
+
+template <int P, bool Relu2 = false, bool Skip = false>
 __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
   __shared__ float red[2][3][16][32];
+  __shared__ uint32_t smask[Skip ? SKIP_WORDS : 1];
   const int unit = blockIdx.x;
   const int lane = threadIdx.x & 31;
   const int w = threadIdx.x >> 5;  // Marlin warp row (chain)
   const int col = unit >> 1;
   const int h = unit & 1;  // Marlin warp column (64-feature half)
+
+  if constexpr (Skip) {
+    // bit kb = 1 when some row < M has a nonzero activation in k16 block kb.
+    const int k16 = p.K >> 4;
+    const int nwords = (k16 + 31) >> 5;
+    for (int wi = w; wi < nwords; wi += 4) {
+      const int kb = 32 * wi + lane;
+      uint32_t nz = 0;
+      if (kb < k16) {
+        // The block is 16 bf16 = two uint4 loads: nz_mask8 covers elements 0..7 in
+        // bits 0..7, so both halves must be ORed or a block with a zero first half
+        // would be skipped while the mma still consumes elements 8..15.
+        for (int r = 0; r < p.M; ++r) {
+          const uint4* q = reinterpret_cast<const uint4*>(
+              p.A + (long long)r * p.lda + 16 * kb);
+          nz |= nz_mask8(__ldg(q)) | (nz_mask8(__ldg(q + 1)) << 8);
+        }
+      }
+      const uint32_t bits = __ballot_sync(0xFFFFFFFFu, nz != 0u);
+      if (lane == 0) smask[wi] = bits;
+    }
+    __syncthreads();
+  }
 
   // First internal segment cut of this column (k-tiles), k_tiles if none.
   const int first_cut = column_first_cut(p, col);
@@ -263,15 +310,26 @@ __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
   cursor_init(ld, first_cut, p.k_tiles, p.iters);
   cs = ld;
   const int total = 2 * p.k_tiles;
+  // does the k16 block at cursor position c have any nonzero activation? (Skip only)
+  auto live = [&](const Cursor& c) -> bool {
+    if constexpr (!Skip) {
+      return true;
+    } else {
+      const int kb = 8 * c.tau + 2 * w + c.k;
+      return ((smask[kb >> 5] >> (kb & 31)) & 1u) != 0u;
+    }
+  };
 
 #pragma unroll
   for (int s = 0; s < P; ++s) {
     if (s < total) {
       const int kb = 8 * ld.tau + 2 * w + ld.k;
-      rb[s] = ld_stream_v4(Bp + kb * nB);
-      rs[s] = ld_nc_v2(Sp + kb * nS);
-      ra[s][0] = arow ? ld_nc_u32(Ap + 8 * kb) : 0u;
-      ra[s][1] = arow ? ld_nc_u32(Ap + 8 * kb + 4) : 0u;
+      if (live(ld)) {
+        rb[s] = ld_stream_v4(Bp + kb * nB);
+        rs[s] = ld_nc_v2(Sp + kb * nS);
+        ra[s][0] = arow ? ld_nc_u32(Ap + 8 * kb) : 0u;
+        ra[s][1] = arow ? ld_nc_u32(Ap + 8 * kb + 4) : 0u;
+      }
       cursor_next(ld, p.iters);
     }
   }
@@ -293,14 +351,16 @@ __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
     for (int s = 0; s < P; ++s) {
       const int i = base + s;
       if (i < total) {
-        block_mma(rb[s], rs[s], ra[s], acc);
+        if (live(cs)) block_mma(rb[s], rs[s], ra[s], acc);
         const bool seg_end = cursor_next(cs, p.iters);
         if (i + P < total) {
           const int kb = 8 * ld.tau + 2 * w + ld.k;
-          rb[s] = ld_stream_v4(Bp + kb * nB);
-          rs[s] = ld_nc_v2(Sp + kb * nS);
-          ra[s][0] = arow ? ld_nc_u32(Ap + 8 * kb) : 0u;
-          ra[s][1] = arow ? ld_nc_u32(Ap + 8 * kb + 4) : 0u;
+          if (live(ld)) {
+            rb[s] = ld_stream_v4(Bp + kb * nB);
+            rs[s] = ld_nc_v2(Sp + kb * nS);
+            ra[s][0] = arow ? ld_nc_u32(Ap + 8 * kb) : 0u;
+            ra[s][1] = arow ? ld_nc_u32(Ap + 8 * kb + 4) : 0u;
+          }
           cursor_next(ld, p.iters);
         }
         if (seg_end) {  // uniform across the CTA: every chain has the same length
@@ -336,9 +396,9 @@ __global__ void hog_kernel(const uint4* __restrict__ src, long long n16, unsigne
   if (x == 0x9e3779b9u) sink[0] = x + (unsigned)(uintptr_t)hog_smem;
 }
 
-template <int P, bool Relu2 = false>
+template <int P, bool Relu2 = false, bool Skip = false>
 static int launch(const Params& p, cudaStream_t stream) {
-  gemm_kernel<P, Relu2><<<2 * p.n_tiles, 128, 0, stream>>>(p);
+  gemm_kernel<P, Relu2, Skip><<<2 * p.n_tiles, 128, 0, stream>>>(p);
   return (int)cudaGetLastError();
 }
 
@@ -355,6 +415,8 @@ int marlinx_init(void) {
   if ((e = cudaFuncGetAttributes(&attr, marlinx::gemm_kernel<8>)) != cudaSuccess) return (int)e;
   if ((e = cudaFuncGetAttributes(&attr, marlinx::gemm_kernel<4, true>)) != cudaSuccess) return (int)e;
   if ((e = cudaFuncGetAttributes(&attr, marlinx::gemm_kernel<8, true>)) != cudaSuccess) return (int)e;
+  if ((e = cudaFuncGetAttributes(&attr, marlinx::gemm_kernel<4, false, true>)) != cudaSuccess) return (int)e;
+  if ((e = cudaFuncGetAttributes(&attr, marlinx::gemm_kernel<8, false, true>)) != cudaSuccess) return (int)e;
   if ((e = cudaFuncGetAttributes(&attr, marlinx::hog_kernel<8>)) != cudaSuccess) return (int)e;
   return 0;
 }
@@ -374,9 +436,15 @@ int marlinx_regs(int depth) {
 // out[M, N] = Marlin NVFP4 GEMM of A[M, K]. sms is the SM count Marlin uses as
 // its grid (cudaDevAttrMultiProcessorCount). Returns 0, a cudaError_t value, or
 // a negative code for unsupported arguments.
+// mode 0: dense (every k16 block loaded, stock Marlin's arithmetic);
+// mode 1: dense with the fused relu^2 epilogue (shared-expert up);
+// mode 2: the shared-expert down projection, which also drops the k16 blocks whose
+//         activations are all zero in every row (identical output, see gemm_kernel).
+enum { MX_DENSE = 0, MX_RELU2 = 1, MX_SKIP = 2 };
+
 static int marlinx_gemm_impl(const void* A, long long lda, int M, const void* B, const void* S,
                  const void* GS, void* C, long long ldc, int N, int K, int sms, int depth,
-                 void* stream, bool relu2) {
+                 void* stream, int mode) {
   if (M < 1 || M > 8) return -1;
   if (N <= 0 || K <= 0 || N % 128 || K % 128) return -2;
   if (sms <= 0) return -3;
@@ -403,11 +471,20 @@ static int marlinx_gemm_impl(const void* A, long long lda, int M, const void* B,
   p.part1_cols = p.n_tiles - part2;
   p.iters = (p.k_tiles * part2 + sms - 1) / sms;
   cudaStream_t st = static_cast<cudaStream_t>(stream);
-  if (relu2) {
+  if (mode == MX_RELU2) {
     if (N != 3712 || K != 2688) return -6;
     switch (depth) {
       case 4: return marlinx::launch<4, true>(p, st);
       case 8: return marlinx::launch<8, true>(p, st);
+      default: return -5;
+    }
+  }
+  if (mode == MX_SKIP) {
+    if (N != 2688 || K != 3712) return -6;
+    if ((K >> 4) > 32 * marlinx::SKIP_WORDS) return -7;
+    switch (depth) {
+      case 4: return marlinx::launch<4, false, true>(p, st);
+      case 8: return marlinx::launch<8, false, true>(p, st);
       default: return -5;
     }
   }
@@ -422,13 +499,22 @@ static int marlinx_gemm_impl(const void* A, long long lda, int M, const void* B,
 int marlinx_gemm(const void* A, long long lda, int M, const void* B, const void* S,
                  const void* GS, void* C, long long ldc, int N, int K, int sms, int depth,
                  void* stream) {
-  return marlinx_gemm_impl(A, lda, M, B, S, GS, C, ldc, N, K, sms, depth, stream, false);
+  return marlinx_gemm_impl(A, lda, M, B, S, GS, C, ldc, N, K, sms, depth, stream, MX_DENSE);
 }
 
 int marlinx_gemm_relu2(const void* A, long long lda, int M, const void* B, const void* S,
                  const void* GS, void* C, long long ldc, int N, int K, int sms, int depth,
                  void* stream) {
-  return marlinx_gemm_impl(A, lda, M, B, S, GS, C, ldc, N, K, sms, depth, stream, true);
+  return marlinx_gemm_impl(A, lda, M, B, S, GS, C, ldc, N, K, sms, depth, stream, MX_RELU2);
+}
+
+// Same arguments and the same output as marlinx_gemm, for the shared-expert down
+// projection (N=2688, K=3712) with 1 <= M <= 8 rows: k16 blocks whose 16 activations
+// are zero in every row are not loaded and their MMA is omitted.
+int marlinx_gemm_skip(const void* A, long long lda, int M, const void* B, const void* S,
+                 const void* GS, void* C, long long ldc, int N, int K, int sms, int depth,
+                 void* stream) {
+  return marlinx_gemm_impl(A, lda, M, B, S, GS, C, ldc, N, K, sms, depth, stream, MX_SKIP);
 }
 
 // Streams nbytes from src with blocks x threads, reserving smem bytes of

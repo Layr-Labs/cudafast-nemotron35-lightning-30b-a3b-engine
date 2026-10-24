@@ -26,7 +26,7 @@
 #include <cmath>
 #include <cstdint>
 
-#define SK_VERSION 4
+#define SK_VERSION 5
 
 namespace {
 
@@ -66,7 +66,7 @@ __device__ __forceinline__ float ldw(const void* __restrict__ w, long i) {
 template <int R, int M, int MODE, bool W16 = false>
 __global__ void __launch_bounds__(kLanes * kMaxTiles)
     router_gemm_kernel(const float* __restrict__ x, long ldx, const void* __restrict__ w, int K,
-                       float* __restrict__ y, long ldy, int N) {
+                       float* __restrict__ y, long ldy, int N, const int* __restrict__ vrows) {
   const int t = threadIdx.x;
   const int r = t & (kLanes - 1);
   const int j = t / kLanes;
@@ -76,6 +76,8 @@ __global__ void __launch_bounds__(kLanes * kMaxTiles)
   __shared__ float lane_sum[R * M][kLanes];
 
   pdl_wait();
+  // verify-row count (nullptr: every row), loaded early so its latency hides under the main loop
+  const int vr = vrows == nullptr ? M : *vrows;
   if (j < J) {
     const int len = min(kLanes, (K - j * kTile) / kLanes);
     const int base = j * kTile + r;
@@ -150,9 +152,13 @@ __global__ void __launch_bounds__(kLanes * kMaxTiles)
   if (t < R * M) {
     const int a = t / M;
     const int m = t % M;
-    float s = lane_sum[t][0];
+    // rows at or past vr take the last valid row's logits bit for bit, so they route to experts
+    // that row already loads
+    const int src = min(m, max(vr, 1) - 1);
+    const int am = a * M + src;
+    float s = lane_sum[am][0];
 #pragma unroll
-    for (int lane = 1; lane < kLanes; ++lane) s = __fadd_rn(s, lane_sum[t][lane]);
+    for (int lane = 1; lane < kLanes; ++lane) s = __fadd_rn(s, lane_sum[am][lane]);
     if (n0 + a < N) y[m * ldy + n0 + a] = s;
   }
   pdl_launch_dependents();
@@ -376,16 +382,16 @@ int launch(Kern kernel, dim3 grid, dim3 block, int pdl, cudaStream_t stream, Arg
 
 template <int R, int MODE, bool W16 = false>
 int router_launch(const float* x, long ldx, int M, const void* w, int N, int K, float* y, long ldy, int pdl,
-                  cudaStream_t stream) {
+                  const int* vrows, cudaStream_t stream) {
   dim3 grid((N + R - 1) / R);
   dim3 block(kLanes * ((K + kTile - 1) / kTile));
   switch (M) {
     case 4:
-      return launch(router_gemm_kernel<R, 4, MODE, W16>, grid, block, pdl, stream, x, ldx, w, K, y, ldy, N);
+      return launch(router_gemm_kernel<R, 4, MODE, W16>, grid, block, pdl, stream, x, ldx, w, K, y, ldy, N, vrows);
     case 5:
       // Follow-on M5 specialization: reuse each independent M4 arithmetic
       // chain; equivalence to the M5 cuBLAS choice requires remote validation.
-      return launch(router_gemm_kernel<R, 5, MODE, W16>, grid, block, pdl, stream, x, ldx, w, K, y, ldy, N);
+      return launch(router_gemm_kernel<R, 5, MODE, W16>, grid, block, pdl, stream, x, ldx, w, K, y, ldy, N, vrows);
     default:
       return 2;
   }
@@ -434,40 +440,46 @@ int sk_init() {
 }
 
 // y[M][N] (row stride ldy) = x[M][K] (row stride ldx) . w[N][K]^T; w contiguous; K % 16 == 0, K <= 4096.
-int sk_router_gemm(const float* x, long ldx, int M, const float* w, int N, int K, float* y, long ldy, int rows,
-                   int mode, int pdl, void* stream) {
+// vrows (device int, may be nullptr): rows m >= *vrows get the logits of row max(*vrows, 1) - 1.
+int sk_router_gemm_v(const float* x, long ldx, int M, const float* w, int N, int K, float* y, long ldy, int rows,
+                     int mode, int pdl, const int* vrows, void* stream) {
   if (K % kLanes != 0 || K > kTile * kMaxTiles || K <= 0 || N <= 0) return 1;
   cudaStream_t s = static_cast<cudaStream_t>(stream);
   if (mode == 0) {
     switch (rows) {
-      case 1: return router_launch<1, 0>(x, ldx, M, w, N, K, y, ldy, pdl, s);
-      case 2: return router_launch<2, 0>(x, ldx, M, w, N, K, y, ldy, pdl, s);
-      case 4: return router_launch<4, 0>(x, ldx, M, w, N, K, y, ldy, pdl, s);
-      case 8: return router_launch<8, 0>(x, ldx, M, w, N, K, y, ldy, pdl, s);
+      case 1: return router_launch<1, 0>(x, ldx, M, w, N, K, y, ldy, pdl, vrows, s);
+      case 2: return router_launch<2, 0>(x, ldx, M, w, N, K, y, ldy, pdl, vrows, s);
+      case 4: return router_launch<4, 0>(x, ldx, M, w, N, K, y, ldy, pdl, vrows, s);
+      case 8: return router_launch<8, 0>(x, ldx, M, w, N, K, y, ldy, pdl, vrows, s);
     }
   } else {
     switch (rows) {
-      case 1: return router_launch<1, 1>(x, ldx, M, w, N, K, y, ldy, pdl, s);
-      case 2: return router_launch<2, 1>(x, ldx, M, w, N, K, y, ldy, pdl, s);
-      case 4: return router_launch<4, 1>(x, ldx, M, w, N, K, y, ldy, pdl, s);
-      case 8: return router_launch<8, 1>(x, ldx, M, w, N, K, y, ldy, pdl, s);
+      case 1: return router_launch<1, 1>(x, ldx, M, w, N, K, y, ldy, pdl, vrows, s);
+      case 2: return router_launch<2, 1>(x, ldx, M, w, N, K, y, ldy, pdl, vrows, s);
+      case 4: return router_launch<4, 1>(x, ldx, M, w, N, K, y, ldy, pdl, vrows, s);
+      case 8: return router_launch<8, 1>(x, ldx, M, w, N, K, y, ldy, pdl, vrows, s);
     }
   }
   return 3;
 }
 
+int sk_router_gemm(const float* x, long ldx, int M, const float* w, int N, int K, float* y, long ldy, int rows,
+                   int mode, int pdl, void* stream) {
+  return sk_router_gemm_v(x, ldx, M, w, N, K, y, ldy, rows, mode, pdl, nullptr, stream);
+}
+
 #ifndef SMALLK_NO_W16
-// sk_router_gemm with the gate weight read from w16 = bf16(w), which the caller built only when every
-// value of w is exactly a bf16 value (bit-identical result; fma chains only, mode 0).
+// sk_router_gemm_v with the gate weight read from w16 = bf16(w), which the caller built only when every
+// value of w is exactly a bf16 value (bit-identical result; fma chains only, mode 0). vrows may be nullptr.
 int sk_router_gemm_w16(const float* x, long ldx, int M, const void* w16, int N, int K, float* y, long ldy, int rows,
-                       int pdl, void* stream) {
+                       int pdl, const int* vrows, void* stream) {
   if (K % kLanes != 0 || K > kTile * kMaxTiles || K <= 0 || N <= 0) return 1;
   cudaStream_t s = static_cast<cudaStream_t>(stream);
   switch (rows) {
-    case 1: return router_launch<1, 0, true>(x, ldx, M, w16, N, K, y, ldy, pdl, s);
-    case 2: return router_launch<2, 0, true>(x, ldx, M, w16, N, K, y, ldy, pdl, s);
-    case 4: return router_launch<4, 0, true>(x, ldx, M, w16, N, K, y, ldy, pdl, s);
-    case 8: return router_launch<8, 0, true>(x, ldx, M, w16, N, K, y, ldy, pdl, s);
+    case 1: return router_launch<1, 0, true>(x, ldx, M, w16, N, K, y, ldy, pdl, vrows, s);
+    case 2: return router_launch<2, 0, true>(x, ldx, M, w16, N, K, y, ldy, pdl, vrows, s);
+    case 4: return router_launch<4, 0, true>(x, ldx, M, w16, N, K, y, ldy, pdl, vrows, s);
+    case 8: return router_launch<8, 0, true>(x, ldx, M, w16, N, K, y, ldy, pdl, vrows, s);
   }
   return 3;
 }

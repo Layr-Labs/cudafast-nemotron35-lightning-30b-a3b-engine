@@ -10,6 +10,11 @@ reproduces and README.md the evidence:
   maybe_router_gemm reads the gate weight from a bf16 shadow when every fp32 value of it is exactly
   a bf16 value (checked once per gate outside capture; the checkpoint stores the gate in bf16 and
   vLLM upcasts it on GB10): same fp32 operands, half the bytes. SMALLK_ROUTER_W16=0 turns it off.
+  enable_verify_rows(device) (dormant until called, outside graph capture) makes a one-int device
+  buffer (default: every row) that target-model gates then read inside the verify graph; rows at
+  or past its value take the last valid row's logits bit for bit, so a verify that masks its
+  trailing rows adds no distinct experts for them. The buffer never changes any valid row; only
+  the spec loop may lower it, and only when its sampler stops acceptance at the same row.
 - topk_sigmoid(logits, bias, ...): vLLM's fused grouped top-k for n_group = topk_group = 1,
   sigmoid scoring, fp32 logits and bias (128 experts).
 - align(topk_ids, ...): moe_align_block_size + count_and_sort_expert_tokens in one CTA.
@@ -35,7 +40,8 @@ import torch
 
 __all__ = ["LIB_PATH", "available", "load_error", "init", "router_gemm", "topk_sigmoid", "align", "route",
            "ROUTER_ON", "ROUTER_W16_ON", "TOPK_ON", "ALIGN_ON", "FUSE_ON", "EARLY_ROUTER_ON", "maybe_router_gemm",
-           "maybe_topk_sigmoid", "maybe_align", "gate_w16"]
+           "maybe_topk_sigmoid", "maybe_align", "VROWS_ALL", "enable_verify_rows", "verify_rows", "reset_verify_rows",
+           "gate_w16", "request_verify_rows", "live_verify_rows"]
 
 LIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "libsmallk.so")
 
@@ -72,12 +78,21 @@ _load_error: str | None = None
 _ready = False
 _align_bs: dict[int, int] = {}  # numel -> block size the experts asked for
 _parked: tuple | None = None  # (ids_ptr, numel, block_size, sorted_ids, expert_ids, num_tokens_post_pad)
+VROWS_ALL = 1 << 30  # verify_rows value meaning "every row is valid"
+_vrows: dict = {}  # torch.device -> int32[1] buffer (enable_verify_rows, outside graph capture)
+# request_verify_rows(): the first target-gate call outside graph capture creates the buffer, so it
+# exists before the verify graph is captured (each capture size is warmed up eagerly first).
+_vrows_wanted = False
+# A target gate was captured before the buffer existed: that graph ignores the buffer, so nobody
+# may lower it (live_verify_rows then returns None).
+_vrows_missed = False
+_has_vrows_entry = False
 _w16: dict = {}  # gate weight data_ptr -> (weight, bf16 shadow or None when not bf16-exact)
 _has_w16_entry = False
 
 
 def _load():
-    global _lib, _load_error, _has_w16_entry
+    global _lib, _load_error, _has_vrows_entry, _has_w16_entry
     if _lib is not None or _load_error is not None:
         return _lib
     try:
@@ -87,11 +102,21 @@ def _load():
         lib.sk_init.restype = ci
         lib.sk_router_gemm.argtypes = [vp, cl, ci, vp, ci, ci, vp, cl, ci, ci, ci, vp]
         lib.sk_router_gemm.restype = ci
+        # The verify-row and bf16 entry points below take these argument lists from
+        # library version 5 on (an older bf16 entry has no vrows argument): an older
+        # libsmallk.so keeps fp32 reads and no masking, same logits.
+        current = lib.sk_version() >= 5
         try:
-            lib.sk_router_gemm_w16.argtypes = [vp, cl, ci, vp, ci, ci, vp, cl, ci, ci, vp]
+            lib.sk_router_gemm_v.argtypes = [vp, cl, ci, vp, ci, ci, vp, cl, ci, ci, ci, vp, vp]
+            lib.sk_router_gemm_v.restype = ci
+            _has_vrows_entry = current
+        except AttributeError:
+            _has_vrows_entry = False
+        try:
+            lib.sk_router_gemm_w16.argtypes = [vp, cl, ci, vp, ci, ci, vp, cl, ci, ci, vp, vp]
             lib.sk_router_gemm_w16.restype = ci
-            _has_w16_entry = True
-        except AttributeError:  # older library: fp32 reads only
+            _has_w16_entry = current
+        except AttributeError:
             _has_w16_entry = False
         lib.sk_topk_sigmoid.argtypes = [vp, vp, ci, ci, ci, ci, cf, vp, vp, ci, ci, vp]
         lib.sk_topk_sigmoid.restype = ci
@@ -138,24 +163,33 @@ def _pdl(pdl: int | None) -> int:
 
 
 def router_gemm(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor | None = None, rows: int | None = None,
-                mode: int = 0, pdl: int | None = None, w16: torch.Tensor | None = None) -> torch.Tensor:
+                mode: int = 0, pdl: int | None = None, vrows: torch.Tensor | None = None,
+                w16: torch.Tensor | None = None) -> torch.Tensor:
     """y[M, N] = x[M, K] . w[N, K]^T in fp32 (x rows unit-stride, w contiguous). mode 1 (mul+add
-    chains) exists only to show the fma chain is the one cuBLAS uses. w16: bf16 copy of w that
-    holds the same values (gate_w16), read instead of w (mode 0 only)."""
+    chains) exists only to show the fma chain is the one cuBLAS uses. vrows (int32 device scalar):
+    rows m >= vrows get row max(vrows, 1) - 1's logits. w16: bf16 copy of w that holds the same
+    values (gate_w16), read instead of w (mode 0 only)."""
     lib = _load()
     assert lib is not None, _load_error
     m, k = x.shape
     n = w.shape[0]
     if out is None:
         out = torch.empty((m, n), dtype=torch.float32, device=x.device)
+    rows = ROUTER_ROWS if rows is None else rows
+    if vrows is not None:
+        assert _has_vrows_entry and vrows.dtype == torch.int32 and vrows.device == x.device
     if w16 is not None:
         assert _has_w16_entry and mode == 0 and w16.dtype == torch.bfloat16 and w16.shape == w.shape
         assert w16.is_contiguous() and w16.device == w.device
         rc = lib.sk_router_gemm_w16(x.data_ptr(), x.stride(0), m, w16.data_ptr(), n, k, out.data_ptr(),
-                                    out.stride(0), ROUTER_ROWS if rows is None else rows, _pdl(pdl), _stream(x))
+                                    out.stride(0), rows, _pdl(pdl), None if vrows is None else vrows.data_ptr(),
+                                    _stream(x))
+    elif vrows is not None:
+        rc = lib.sk_router_gemm_v(x.data_ptr(), x.stride(0), m, w.data_ptr(), n, k, out.data_ptr(),
+                                  out.stride(0), rows, mode, _pdl(pdl), vrows.data_ptr(), _stream(x))
     else:
         rc = lib.sk_router_gemm(x.data_ptr(), x.stride(0), m, w.data_ptr(), n, k, out.data_ptr(), out.stride(0),
-                                ROUTER_ROWS if rows is None else rows, mode, _pdl(pdl), _stream(x))
+                                rows, mode, _pdl(pdl), _stream(x))
     if rc != 0:
         raise RuntimeError(f"sk_router_gemm failed: {rc} (M={m} N={n} K={k})")
     return out
@@ -223,8 +257,55 @@ def _usable() -> bool:
     return _load() is not None and init()
 
 
-def maybe_router_gemm(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor | None:
-    """M4 router or follow-on M5 experiment; None for unsupported metadata."""
+def _cuda_device(device) -> torch.device:
+    dev = torch.device(device)
+    if dev.type == "cuda" and dev.index is None:
+        dev = torch.device("cuda", torch.cuda.current_device())
+    return dev
+
+
+def enable_verify_rows(device) -> torch.Tensor | None:
+    """Turns the verify-row count on for this device and returns its buffer (int32[1], VROWS_ALL
+    until the spec loop lowers it), or None if the router kernel or its verify-row entry point is
+    unavailable. Call before graph capture: the verify graph captures the buffer's address, so
+    write it in place (copy_ / fill_), never rebind it."""
+    if not ROUTER_ON or not _usable() or not _has_vrows_entry:
+        return None
+    dev = _cuda_device(device)
+    buf = _vrows.get(dev)
+    if buf is None:
+        if dev.type != "cuda" or torch.cuda.is_current_stream_capturing():
+            return None
+        buf = torch.full((1,), VROWS_ALL, dtype=torch.int32, device=dev)
+        _vrows[dev] = buf
+    return buf
+
+
+def verify_rows(device) -> torch.Tensor | None:
+    """The buffer enable_verify_rows made for this device, else None (gates then pass nullptr)."""
+    return _vrows.get(_cuda_device(device)) if _vrows else None
+
+
+def request_verify_rows() -> None:
+    """Asks for the verify-row buffer (see _vrows_wanted). Call at model load."""
+    global _vrows_wanted
+    _vrows_wanted = True
+
+
+def live_verify_rows(device) -> torch.Tensor | None:
+    """The verify-row buffer if every captured target-gate call reads it, else None."""
+    return None if _vrows_missed else verify_rows(device)
+
+
+def reset_verify_rows() -> None:
+    """Every row valid again on every device (stream-ordered fill)."""
+    for buf in _vrows.values():
+        buf.fill_(VROWS_ALL)
+
+
+def maybe_router_gemm(x: torch.Tensor, w: torch.Tensor, row_mask: bool = False) -> torch.Tensor | None:
+    """M4 router or follow-on M5 experiment; None for unsupported metadata. row_mask (target-model
+    gates only): honour verify_rows."""
     if not ROUTER_ON or x.dim() != 2 or x.shape[0] not in (4, 5) or w.dim() != 2:
         return None
     m, k = x.shape
@@ -243,7 +324,16 @@ def maybe_router_gemm(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor | None:
         return None
     if not _usable():
         return None
-    return router_gemm(x, w, w16=gate_w16(w))
+    vrows = None
+    if row_mask:
+        global _vrows_missed
+        capturing = torch.cuda.is_current_stream_capturing()
+        if _vrows_wanted and not _vrows and not capturing:
+            enable_verify_rows(x.device)
+        vrows = verify_rows(x.device)
+        if vrows is None and capturing:
+            _vrows_missed = True
+    return router_gemm(x, w, vrows=vrows, w16=gate_w16(w))
 
 
 def gate_w16(w: torch.Tensor) -> torch.Tensor | None:

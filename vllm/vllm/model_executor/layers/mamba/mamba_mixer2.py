@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os
+
 import torch
 from torch import nn
 
@@ -179,7 +181,10 @@ class Mixer2RMSNormGated(CustomOp):
             # Keep gate in float32 for numerical stability during silu
             return x * nn.functional.silu(gate.to(torch.float32)).to(input_dtype)
 
-        if ((self.n_groups % self.tp_size) != 0) or self.n_groups != 1:
+        if (self.n_groups % self.tp_size) != 0:
+            return self.forward_native(x, gate)
+        grouped = self.n_groups != 1
+        if grouped and os.environ.get("MAMBA_GROUPED_RMS", "1") == "0":
             return self.forward_native(x, gate)
 
         return rms_norm_gated(
@@ -188,7 +193,9 @@ class Mixer2RMSNormGated(CustomOp):
             bias=None,
             z=gate,
             eps=self.variance_epsilon,
+            group_size=self.group_size if grouped else None,
             norm_before_gate=False,
+            eager_round=grouped,
         )
 
 

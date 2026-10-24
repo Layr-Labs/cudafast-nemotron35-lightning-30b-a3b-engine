@@ -43,7 +43,11 @@ CONFIGS = {0: (4, 32, 4, 8, 6), 1: (4, 32, 3, 8, 4), 2: (2, 32, 4, 8, 6), 3: (2,
            4: (6, 32, 4, 8, 6), 5: (6, 32, 3, 8, 4), 6: (12, 32, 3, 8, 4), 7: (4, 16, 6, 8, 6),
            8: (7, 32, 3, 8, 4), 9: (3, 32, 4, 8, 6)}
 # v4 (layout "swap" only): config id -> (warps per CTA, ring depth)
-CONFIGS4 = {100: (2, 4), 101: (2, 8), 102: (3, 8), 103: (6, 4), 104: (6, 8), 105: (7, 8), 106: (2, 12), 107: (1, 8)}
+CONFIGS4 = {100: (2, 4, 1, 16), 160: (2, 4, 1, 16), 101: (2, 8, 1, 16), 102: (3, 8, 1, 16), 103: (6, 4, 1, 16), 104: (6, 8, 1, 16), 105: (7, 8, 1, 16), 106: (2, 12, 1, 16), 107: (1, 8, 1, 16), 120: (2, 4, 2, 16), 121: (2, 4, 4, 32), 122: (2, 4, 8, 64), 123: (1, 4, 8, 64), 124: (3, 4, 8, 64), 125: (2, 2, 8, 64), 126: (6, 4, 8, 64), 127: (2, 8, 4, 32), 130: (1, 4, 2, 16), 131: (1, 8, 2, 16), 132: (2, 8, 2, 16), 133: (3, 4, 2, 16), 134: (3, 8, 2, 16), 135: (6, 4, 2, 16), 136: (6, 8, 2, 16), 137: (7, 4, 2, 16), 138: (2, 2, 2, 16), 139: (1, 2, 2, 16), 141: (1, 4, 4, 32), 142: (1, 2, 4, 32), 143: (1, 1, 4, 32), 144: (2, 2, 4, 32), 145: (3, 2, 4, 32), 146: (1, 1, 8, 64), 147: (1, 2, 8, 64), 148: (1, 1, 2, 16), 149: (7, 2, 4, 32), 150: (6, 2, 4, 32), 151: (2, 1, 4, 32), 152: (1, 3, 4, 32)}
+CONFIGS4.update({200: (2, 4, 4, 32), 201: (2, 6, 4, 32), 202: (2, 8, 4, 32), 203: (1, 8, 4, 32), 204: (3, 6, 4, 32), 205: (3, 8, 4, 32), 206: (2, 12, 4, 32), 207: (1, 12, 4, 32), 208: (6, 4, 4, 32), 209: (1, 6, 4, 32), 210: (2, 6, 2, 16), 211: (1, 8, 2, 16), 212: (2, 6, 8, 64), 213: (1, 6, 8, 64)})
+CONFIGS4.update({300: (2, 2, 4, 32), 301: (1, 2, 4, 32), 302: (2, 4, 4, 32), 303: (3, 2, 4, 32), 304: (1, 4, 4, 32), 305: (2, 1, 4, 32), 306: (6, 2, 4, 32), 307: (2, 2, 2, 16), 308: (1, 2, 8, 64), 309: (2, 3, 4, 32)})
+CONFIGS4.update({400: (2, 2, 4, 32), 401: (3, 2, 4, 32), 402: (6, 2, 4, 32), 403: (7, 2, 4, 32), 404: (14, 2, 4, 32), 405: (6, 4, 4, 32), 406: (7, 4, 4, 32), 407: (6, 3, 4, 32), 408: (14, 3, 4, 32), 409: (6, 2, 2, 16), 410: (7, 2, 2, 16), 411: (6, 2, 8, 64), 412: (3, 4, 4, 32), 413: (21, 2, 4, 32)})
+CONFIGS4.update({500: (2, 2, 4, 32), 501: (6, 2, 4, 32), 502: (6, 4, 4, 32), 503: (6, 3, 4, 32), 504: (3, 4, 4, 32), 505: (7, 2, 4, 32), 506: (2, 4, 4, 32), 507: (6, 2, 2, 16), 508: (3, 2, 4, 32), 509: (6, 6, 4, 32)})
 DEFAULT_CONFIG = int(os.environ.get("ZSKIP_CONFIG", "0"))
 
 _lib = None
@@ -110,8 +114,8 @@ def config_info(config: int) -> dict:
             "shape": CONFIGS.get(config) or CONFIGS4.get(config)}
 
 
-BI_BYTES = 4864
-MAX_BLOCKS = 64
+BI_BYTES = 5120
+MAX_BLOCKS = 4096
 _scratch: dict = {}
 
 
@@ -194,6 +198,17 @@ def repack(w2_weight: torch.Tensor, w2_weight_scale: torch.Tensor, w2_global_sca
     return Packed(W, S, gs, layout, strides)
 
 
+@torch.no_grad()
+def to_swapc(pk: Packed) -> Packed:
+    """swap -> swapc: per expert, 64-column tile and k16 group, the 16 k rows (32 bytes each) and
+    the 64 scale bytes contiguous. Same bytes, input-independent."""
+    assert pk.layout == "swap"
+    E = pk.w.shape[0]
+    W = pk.w.view(E, G, 16, N // 64, 32).permute(0, 3, 1, 2, 4).contiguous()
+    S = pk.s.view(E, G, N // 64, 64).permute(0, 2, 1, 3).contiguous()
+    return Packed(W, S, pk.gs, "swapc", ((N // 64) * G * 512, G * 512, 512, (N // 64) * G * 64, G * 64, 64))
+
+
 def down(a: torch.Tensor, sorted_ids: torch.Tensor, expert_ids: torch.Tensor, num_tokens_padded: torch.Tensor,
          packed: Packed, out: torch.Tensor, mode: int = SKIP, config: int | None = None,
          max_blocks: int | None = None, stats: torch.Tensor | None = None, ctas_per_sm: int = 0,
@@ -203,7 +218,7 @@ def down(a: torch.Tensor, sorted_ids: torch.Tensor, expert_ids: torch.Tensor, nu
     lib = _load()
     assert lib is not None, _load_error
     if config is None:
-        config = DEFAULT_CONFIG
+        config = 100
     shape_m = a.shape[0]
     assert a.dtype == torch.bfloat16 and a.shape[1] == K and a.stride(1) == 1
     assert out.dtype == torch.bfloat16 and out.shape[1] == N and out.stride(1) == 1 and out.shape[0] >= shape_m

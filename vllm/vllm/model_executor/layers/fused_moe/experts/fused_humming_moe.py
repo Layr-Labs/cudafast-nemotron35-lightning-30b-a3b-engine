@@ -802,8 +802,9 @@ class HummingIndexedExperts(HummingExpertsBase):
             self.layer, topk_ids.size(0)
         )
         # LOCAL PATCH (cudafast-nemotron35): zskip computes humming's w2 output
-        # for <= 4 tokens without loading the weight rows whose activations
-        # are zero (humming_zskip.py); otherwise routed_sparse or humming runs.
+        # for <= 8 tokens, and for prefill on the sparse layers, without loading
+        # the weight rows whose activations are zero (humming_zskip.py);
+        # otherwise routed_sparse or humming runs.
         sparse_done = expert_map is None and maybe_zskip_down(
             self.layer,
             inputs,
@@ -813,6 +814,7 @@ class HummingIndexedExperts(HummingExpertsBase):
             topk_ids.size(1),
             getattr(self, "_moe_block_size", None),
             moe_kwargs2,
+            topk_ids=topk_ids,
         )
         sparse_weights = getattr(self.layer, "routed_sparse_down", None)
         if (

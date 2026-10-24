@@ -162,6 +162,18 @@
     {
       "file": "harness/kernels/marlinx/{csrc/marlinx.cu,py/__init__.py,README.md,tests/marlinx_zs_exact.py}",
       "why": "Shared expert down projection (3712->2688, ReLU^2 input): read only the k rows whose activation is nonzero in some row, from a byte-preserving k-row-major copy of the Marlin weight; the lane rebuilds Marlin's exact weight word, so dequant, MMA, segments and fp32 reductions are unchanged. Bit-exact vs stock Marlin on all 23 layers (4416 synthetic + 1380 real-activation cases, CUDA graph replay). MARLINX_ZS=0 disables."
+    },
+    {
+      "file": "vllm/model_executor/layers/fused_moe/experts/humming_zskip.py; vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py; harness/kernels/zskip",
+      "why": "zskip for prefill: on 15 sparse MoE layers (ZSKIP_PREFILL_LAYERS; 17-31 and the last layer keep humming), the routed w2 of calls over 8 tokens runs the zero-row-skipping kernel on the promoted swap repack, re-aligned to 32-row expert blocks (config 405: four 8-row MMAs share each dequantised weight fragment, block activations staged once per CTA in shared memory, -0 guard at the end with a dense redo). humming's indexed w2 is batch invariant, so the output equals humming's bit for bit (161 real prefill calls: 7 public prompts x 23 layers; load-time 40-token self-check). ZSKIP_PREFILL=0 disables."
+    },
+    {
+      "file": "harness/kernels/zskip/csrc/zskip.cu; harness/kernels/zskip/py/__init__.py; vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
+      "why": "Decode routed w2 (config 160, the shape of config 100: 2 warps, ring 4, one 8-row half, block 16) no longer launches prep_kernel. Each down4 CTA builds that expert block's row list and active-k lists in its own shared memory with the same build_lists the prep kernel uses, then reads them from smem. Dequant, MMA order, fp32 accumulation and the -0 dense redo are unchanged. Load-time 4- and 8-token check against humming; ZSKIP_FUSED_PREP=0 keeps config 100. Prefill stays on config 405 with its own prep launch."
+    },
+    {
+      "file": "vllm/model_executor/layers/mamba/mamba_mixer2.py; vllm/model_executor/layers/mamba/ops/layernorm_gated.py",
+      "why": "Mamba-2 gated RMSNorm with 8 groups of 512 (tp=1) was the eager chain (fp32 silu, per-group mean of squares, rsqrt, round to bf16, weight). The existing rms_norm_gated kernel already reduces one program per group; the call now passes group_size. EAGER_ROUND rounds the normalized value to bf16 before the weight multiply, matching weight * x.to(bf16). MAMBA_GROUPED_RMS=0 restores the eager chain. The n_groups==1 call is unchanged."
     }
   ]
 }

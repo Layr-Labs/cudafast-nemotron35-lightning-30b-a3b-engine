@@ -30,6 +30,7 @@ def _layer_norm_fwd_1pass_kernel(
     HAS_Z: tl.constexpr,
     NORM_BEFORE_GATE: tl.constexpr,
     IS_RMS_NORM: tl.constexpr,
+    EAGER_ROUND: tl.constexpr,
 ):
     # Map the program id to the row of X and Y it should compute.
     row = tl.program_id(0)
@@ -66,6 +67,8 @@ def _layer_norm_fwd_1pass_kernel(
     if HAS_BIAS:
         b = tl.load(B + cols, mask=mask).to(tl.float32)
     x_hat = (x - mean) * rstd if not IS_RMS_NORM else x * rstd
+    if EAGER_ROUND:
+        x_hat = x_hat.to(tl.bfloat16).to(tl.float32)
     y = x_hat * w + b if HAS_BIAS else x_hat * w
     if HAS_Z and NORM_BEFORE_GATE:
         z = tl.load(Z + cols, mask=mask).to(tl.float32)
@@ -84,6 +87,7 @@ def _layer_norm_fwd(
     group_size=None,
     norm_before_gate=True,
     is_rms_norm=False,
+    eager_round=False,
 ):
     M, N = x.shape
     if group_size is None:
@@ -137,13 +141,15 @@ def _layer_norm_fwd(
             BLOCK_N=BLOCK_N,
             NORM_BEFORE_GATE=norm_before_gate,
             IS_RMS_NORM=is_rms_norm,
+            EAGER_ROUND=eager_round,
             num_warps=num_warps,
         )
     return out, mean, rstd
 
 
 def rms_norm_gated(
-    x, weight, bias, z=None, eps=1e-6, group_size=None, norm_before_gate=True
+    x, weight, bias, z=None, eps=1e-6, group_size=None, norm_before_gate=True,
+    eager_round=False,
 ):
     x_shape_og = x.shape
     # reshape input data into 2D tensor
@@ -167,6 +173,7 @@ def rms_norm_gated(
         group_size=group_size,
         norm_before_gate=norm_before_gate,
         is_rms_norm=True,
+        eager_round=eager_round,
     )
 
     return y.reshape(x_shape_og)

@@ -17,7 +17,7 @@ import os
 
 import torch
 
-__all__ = ["LIB_PATH", "available", "prepare", "maybe_apply", "gemm", "hog", "regs", "SHAPES"]
+__all__ = ["LIB_PATH", "available", "prepare", "maybe_apply", "gemm", "hog", "regs", "SHAPES", "maybe_apply_relu2"]
 
 LIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "libmarlinx.so")
 
@@ -52,6 +52,9 @@ def _load():
             ctypes.c_void_p,  # stream
         ]
         lib.marlinx_gemm.restype = ctypes.c_int
+        if hasattr(lib, "marlinx_gemm_relu2"):
+            lib.marlinx_gemm_relu2.argtypes = lib.marlinx_gemm.argtypes
+            lib.marlinx_gemm_relu2.restype = ctypes.c_int
         lib.marlinx_hog.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
                                     ctypes.c_longlong, ctypes.c_void_p, ctypes.c_void_p]
         lib.marlinx_hog.restype = ctypes.c_int
@@ -124,13 +127,15 @@ def prepare(layer) -> bool:
 
 
 def gemm(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
-         global_scale: torch.Tensor, n: int, k: int, depth: int = DEPTH) -> torch.Tensor:
+         global_scale: torch.Tensor, n: int, k: int, depth: int = DEPTH,
+         relu2: bool = False) -> torch.Tensor:
     """out[M, n] for a 2-D bf16 x[M, k] (1 <= M <= 8); no guard beyond the C side's."""
     lib = _load()
     assert lib is not None, _load_error
     m = x.shape[0]
     out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
-    rc = lib.marlinx_gemm(
+    op = lib.marlinx_gemm_relu2 if relu2 else lib.marlinx_gemm
+    rc = op(
         x.data_ptr(), x.stride(0), m,
         weight.data_ptr(), weight_scale.data_ptr(), global_scale.data_ptr(),
         out.data_ptr(), n, n, k, _sm_count(x.device), depth,
@@ -174,3 +179,36 @@ def hog(src: torch.Tensor, blocks: int, threads: int, smem: int, sink: torch.Ten
                          sink.data_ptr(), torch.cuda.current_stream(src.device).cuda_stream)
     if rc != 0:
         raise RuntimeError(f"marlinx_hog failed: {rc}")
+
+
+def maybe_apply_relu2(x, weight, weight_scale, global_scale, n, k):
+    """Opaque-op runtime path for a prepared single-device shared up projection."""
+    if not ENABLED or not _ready or _load() is None:
+        return None
+    if not hasattr(_lib, "marlinx_gemm_relu2") or (n, k) != (3712, 2688):
+        return None
+    x2 = x.reshape(-1, k)
+    if (
+        not 1 <= x2.shape[0] <= MAX_M
+        or x2.dtype != torch.bfloat16
+        or not x2.is_cuda
+        or x.shape[-1] != k
+        or x2.stride(-1) != 1
+        or x2.stride(0) % 8
+        or x2.data_ptr() % 16
+        or weight.dtype != torch.int32
+        or weight.shape != (k // 16, 2 * n)
+        or not weight.is_contiguous()
+        or weight_scale.dtype != torch.float8_e4m3fn
+        or weight_scale.shape != (k // 16, n)
+        or not weight_scale.is_contiguous()
+        or global_scale.dtype != torch.float32
+        or global_scale.numel() != 1
+        or not global_scale.is_contiguous()
+        or weight.device != x.device
+        or weight_scale.device != x.device
+        or global_scale.device != x.device
+    ):
+        return None
+    out = gemm(x2, weight, weight_scale, global_scale, n, k, relu2=True)
+    return out.reshape(*x.shape[:-1], n)

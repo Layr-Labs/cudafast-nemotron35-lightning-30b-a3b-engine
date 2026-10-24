@@ -58,6 +58,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.models.nemotron_shared_up import maybe_shared_up_relu2
 from vllm.model_executor.models.interfaces import (
     EagleModelMixin,
     HasInnerState,
@@ -127,8 +128,12 @@ class NemotronHMLP(nn.Module):
         self.act_fn = ReLUSquaredActivation()
 
     def forward(self, x: torch.Tensor):
-        x, _ = self.up_proj(x)
-        x = self.act_fn(x)
+        fused = maybe_shared_up_relu2(self.up_proj, x)
+        if fused is None:
+            x, _ = self.up_proj(x)
+            x = self.act_fn(x)
+        else:
+            x = fused
         x, _ = self.down_proj(x)
         return x
 
@@ -901,6 +906,33 @@ class NemotronHForCausalLM(
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    def set_last_moe_row_src(self, row_src: torch.Tensor | None) -> bool:
+        """Route every row of the last layer's MoE through row `row_src` (a
+        1-element GPU index tensor), or restore per-row routing with None.
+
+        Only for a forward whose caller reads that row of the output alone.
+        The last MoE layer is the model's last layer, so its output reaches
+        only norm_f, a per-row RMSNorm. Returns False when the last layer is
+        not an MoE on this rank.
+        """
+        # A tuple, so nn.Module does not register the runner a second time.
+        cached = getattr(self, "_last_moe_runner", None)
+        if cached is None:
+            runner = None
+            model = self.model
+            layers = model.layers
+            if model.end_layer == len(layers):
+                last = layers[len(layers) - 1]
+                if isinstance(last, NemotronHMoEDecoderLayer):
+                    runner = last.mixer.experts
+            cached = (runner,)
+            self._last_moe_runner = cached
+        runner = cached[0]
+        if runner is None:
+            return False
+        runner.keep_m_row_src = row_src
+        return True
 
     def forward(
         self,

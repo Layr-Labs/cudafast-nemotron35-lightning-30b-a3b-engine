@@ -93,6 +93,13 @@ try:
 except ImportError:
     _smallk = None
 
+# l2pf (harness/kernels/l2pf): the attention op prefetches o_proj's weight; absent,
+# nothing changes.
+try:
+    import l2pf as _l2pf
+except ImportError:
+    _l2pf = None
+
 
 class NemotronHMLP(nn.Module):
     def __init__(
@@ -506,6 +513,10 @@ class NemotronHAttention(nn.Module):
             prefix=f"{prefix}.attn",
             per_layer_sliding_window=sliding_window,
         )
+        # LOCAL PATCH (cudafast-nemotron35): let the attention op prefetch the
+        # head of o_proj's weight into L2 while it runs (harness/kernels/l2pf).
+        if _l2pf is not None:
+            _l2pf.AHEAD[f"{prefix}.attn"] = self.o_proj
 
     def forward(
         self,

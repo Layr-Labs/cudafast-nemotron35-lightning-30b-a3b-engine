@@ -19,6 +19,11 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
 )
+from vllm.model_executor.layers.fused_moe.experts.humming_prefill_rows import (
+    make_prefill_row_configs,
+    prefill_row_split_supported,
+    split_prefill_row_plans,
+)
 from vllm.model_executor.layers.fused_moe.experts.humming_tuned_moe import (
     relu2_bf16,
     tuned_moe_configs,
@@ -228,6 +233,11 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
         self.compute_config_str = json.dumps(self.compute_config)
         self.w13_tuning_config_str = json.dumps(self.w13_tuning_config)
         self.w2_tuning_config_str = json.dumps(self.w2_tuning_config)
+        self._prefill_row_configs = (
+            make_prefill_row_configs(self.w13_tuning_config, self.w2_tuning_config)
+            if tuned is not None and current_platform.is_device_capability(121)
+            else None
+        )
 
     def _get_permute_scratch(self) -> MoEPermuteScratch | None:
         if self._permute_scratch is None and moe_permute_unpermute_supported():
@@ -720,6 +730,19 @@ class HummingIndexedExperts(HummingExpertsBase):
             expert_map=expert_map,
             expert_tokens_meta=expert_tokens_meta,
         )
+        plans = ((moe_kwargs1, moe_kwargs2),)
+        if prefill_row_split_supported(
+            topk_ids,
+            hidden_states,
+            expert_map,
+            self.global_num_experts,
+            self.num_experts,
+            self._prefill_row_configs,
+            moe_kwargs1["valid_shape_m"],
+        ):
+            plans = split_prefill_row_plans(
+                moe_kwargs1, moe_kwargs2, topk_ids.numel(), self._prefill_row_configs
+            )
 
         inputs, input_scale = HummingMethod.may_quant_input(
             layer=self.layer,
@@ -728,14 +751,15 @@ class HummingIndexedExperts(HummingExpertsBase):
             sublayer_name="w13",
         )
 
-        HummingMethod.forward_layer(
-            layer=self.layer,
-            inputs=inputs,
-            input_scale=input_scale,
-            outputs=buffers["gate_up_output"],
-            sublayer_name="w13",
-            **moe_kwargs1,
-        )
+        for up_kwargs, _ in plans:
+            HummingMethod.forward_layer(
+                layer=self.layer,
+                inputs=inputs,
+                input_scale=input_scale,
+                outputs=buffers["gate_up_output"],
+                sublayer_name="w13",
+                **up_kwargs,
+            )
 
         self.apply_activation(
             activation=activation,
@@ -750,14 +774,15 @@ class HummingIndexedExperts(HummingExpertsBase):
             sublayer_name="w2",
         )
 
-        HummingMethod.forward_layer(
-            layer=self.layer,
-            inputs=inputs,
-            input_scale=input_scale,
-            outputs=buffers["down_output"].view(-1, hidden_states.size(-1)),
-            sublayer_name="w2",
-            **moe_kwargs2,
-        )
+        for _, down_kwargs in plans:
+            HummingMethod.forward_layer(
+                layer=self.layer,
+                inputs=inputs,
+                input_scale=input_scale,
+                outputs=buffers["down_output"].view(-1, hidden_states.size(-1)),
+                sublayer_name="w2",
+                **down_kwargs,
+            )
 
         moe_fused_mul_sum(
             inputs=buffers["down_output"].view(*topk_ids.shape, -1),

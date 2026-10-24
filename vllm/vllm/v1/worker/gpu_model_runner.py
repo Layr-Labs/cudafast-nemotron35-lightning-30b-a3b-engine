@@ -4499,9 +4499,6 @@ class GPUModelRunner(
             ) as kv_connector_output,
         ):
             fresh_graph = getattr(self, "_fresh_prefill_graph", None)
-            # The captured forward serves only the logits row (prefill_graph.py):
-            # a request that asks for prompt logprobs reads every row of the
-            # final hidden states, so it keeps the ordinary path.
             use_fresh_graph = (
                 fresh_graph is not None
                 and num_tokens_unpadded == num_tokens_padded == 496
@@ -4511,7 +4508,6 @@ class GPUModelRunner(
                 and not self.use_aux_hidden_state_outputs
                 and intermediate_tensors is None and inputs_embeds is None
                 and not model_kwargs and not has_encoder_input
-                and not self.num_prompt_logprobs
             )
             fresh_logits = None
             if use_fresh_graph:

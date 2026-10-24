@@ -193,6 +193,9 @@ jobs:
       - name: Participant may edit the engine (manifest and static review)
         run: tools/test-participant-engine-edit.sh
 
+      - name: Score plausibility gate (prefill and seed-window ceilings)
+        run: tools/test-score-plausibility-gate.sh
+
       - name: Resident boot/stop verbs (per-leg serve convention)
         run: tools/test-serve-up-boot-stop.sh
 

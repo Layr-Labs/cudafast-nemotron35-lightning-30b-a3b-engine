@@ -69,9 +69,9 @@ else
   bad "(a) three plausible pairs" "rc=${rc} out=${out}"
 fi
 
-# (b) passed true, one pair at gain 2.0 -> exit 1, REFUSED names pair
+# (b) passed true, one pair at gain 2.5 -> exit 1, REFUSED names pair
 write_score '{"passed": true, "score": 9.0, "metrics": {"paired_legs": [
-  {"pair": 7, "control_prefill_seconds_per_token": 2.0, "candidate_prefill_seconds_per_token": 1.0, "control_decode_seconds_per_token": 0.0134, "candidate_decode_seconds_per_token": 0.0113}
+  {"pair": 7, "control_prefill_seconds_per_token": 2.5, "candidate_prefill_seconds_per_token": 1.0, "control_decode_seconds_per_token": 0.0134, "candidate_decode_seconds_per_token": 0.0113}
 ]}}'
 write_audit '{"score": 9.0, "metrics": {"paired_legs": [
   {"pair": 7, "control_seed_prefill_window_seconds_per_token": 0.001, "candidate_seed_prefill_window_seconds_per_token": 0.001}
@@ -144,16 +144,16 @@ else
   bad "(g) invalid JSON refused" "rc=${rc} out=${out}"
 fi
 
-# (h) gain exactly 1.5 -> exit 0
+# (h) gain exactly 2.0 -> exit 0
 write_score '{"passed": true, "score": 1.0, "metrics": {"paired_legs": [
-  {"pair": 1, "control_prefill_seconds_per_token": 1.5, "candidate_prefill_seconds_per_token": 1.0, "control_decode_seconds_per_token": 0.0134, "candidate_decode_seconds_per_token": 0.0113}
+  {"pair": 1, "control_prefill_seconds_per_token": 2.0, "candidate_prefill_seconds_per_token": 1.0, "control_decode_seconds_per_token": 0.0134, "candidate_decode_seconds_per_token": 0.0113}
 ]}}'
 write_audit '{"score": 1.0, "metrics": {"paired_legs": [
   {"pair": 1, "control_seed_prefill_window_seconds_per_token": 0.001, "candidate_seed_prefill_window_seconds_per_token": 0.001}
 ]}}'
 out="$(run_gate)"
 rc=$?
-if [[ "${rc}" -eq 0 && "${out}" == *"ok (max prefill gain 1.5000"* ]]; then
+if [[ "${rc}" -eq 0 && "${out}" == *"ok (max prefill gain 2.0000"* ]]; then
   ok "(h) gain exactly at ceiling passes"
 else
   bad "(h) gain exactly at ceiling passes" "rc=${rc} out=${out}"
@@ -371,6 +371,95 @@ if [[ "${rc}" -eq 1 && "${out}" == *"REFUSED pair 1:"* && "${out}" == *"fixed 1.
   ok "(w) old fixture ratio 1.6 refuses cleanly"
 else
   bad "(w) old fixture ratio 1.6 refuses cleanly" "rc=${rc} out=${out}"
+fi
+
+# (x) a fixture prefill ceiling of 1.5 refuses a gain of 1.6
+PREFILL_15_FIXTURE="${WORK}/prefill-1.5-fixture.json"
+jq '.prefill_speedup_ceiling = 1.5' \
+  "${REPO_ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json" > "${PREFILL_15_FIXTURE}"
+write_score '{"passed": true, "score": 1.0, "metrics": {"paired_legs": [
+  {"pair": 1, "control_prefill_seconds_per_token": 1.6, "candidate_prefill_seconds_per_token": 1.0, "control_decode_seconds_per_token": 1.0, "candidate_decode_seconds_per_token": 1.0}
+]}}'
+write_audit '{"score": 1.0, "metrics": {"effective_spec_depth": 3, "paired_legs": [
+  {"pair": 1, "control_seed_prefill_window_seconds_per_token": 1.0, "candidate_seed_prefill_window_seconds_per_token": 1.0}
+]}}'
+GATE_DECLARED_DEPTH=3
+GATE_CONTRACT="${PREFILL_15_FIXTURE}"
+out="$(run_gate)"; rc=$?
+unset GATE_CONTRACT
+if [[ "${rc}" -eq 1 && "${out}" == *"REFUSED pair 1:"* && "${out}" == *"ceiling 1.5"* ]]; then
+  ok "(x) fixture prefill ceiling 1.5 refuses gain 1.6"
+else
+  bad "(x) fixture prefill ceiling 1.5 refuses gain 1.6" "rc=${rc} out=${out}"
+fi
+
+# (y1) a fixture without a prefill ceiling refuses cleanly
+INVALID_FIXTURE="${WORK}/missing-prefill-ceiling-fixture.json"
+jq 'del(.prefill_speedup_ceiling)' \
+  "${REPO_ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json" > "${INVALID_FIXTURE}"
+GATE_CONTRACT="${INVALID_FIXTURE}"
+out="$(run_gate)"; rc=$?
+unset GATE_CONTRACT
+if [[ "${rc}" -eq 1 && "${out}" == *"no valid prefill_speedup_ceiling"* && "${out}" != *"Traceback"* ]]; then
+  ok "(y1) missing fixture prefill ceiling refuses cleanly"
+else
+  bad "(y1) missing fixture prefill ceiling refuses cleanly" "rc=${rc} out=${out}"
+fi
+
+# (y2) a boolean fixture prefill ceiling refuses cleanly
+INVALID_FIXTURE="${WORK}/boolean-prefill-ceiling-fixture.json"
+jq '.prefill_speedup_ceiling = true' \
+  "${REPO_ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json" > "${INVALID_FIXTURE}"
+GATE_CONTRACT="${INVALID_FIXTURE}"
+out="$(run_gate)"; rc=$?
+unset GATE_CONTRACT
+if [[ "${rc}" -eq 1 && "${out}" == *"no valid prefill_speedup_ceiling"* && "${out}" != *"Traceback"* ]]; then
+  ok "(y2) boolean fixture prefill ceiling refuses cleanly"
+else
+  bad "(y2) boolean fixture prefill ceiling refuses cleanly" "rc=${rc} out=${out}"
+fi
+
+# (y3) a fixture prefill ceiling of 1.0 refuses cleanly
+INVALID_FIXTURE="${WORK}/low-prefill-ceiling-fixture.json"
+jq '.prefill_speedup_ceiling = 1.0' \
+  "${REPO_ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json" > "${INVALID_FIXTURE}"
+GATE_CONTRACT="${INVALID_FIXTURE}"
+out="$(run_gate)"; rc=$?
+unset GATE_CONTRACT
+if [[ "${rc}" -eq 1 && "${out}" == *"no valid prefill_speedup_ceiling"* && "${out}" != *"Traceback"* ]]; then
+  ok "(y3) low fixture prefill ceiling refuses cleanly"
+else
+  bad "(y3) low fixture prefill ceiling refuses cleanly" "rc=${rc} out=${out}"
+fi
+
+# (y4) a 400-digit fixture prefill ceiling refuses cleanly
+INVALID_FIXTURE="${WORK}/huge-prefill-ceiling-fixture.json"
+BIG_CEILING="$(printf '9%.0s' {1..400})"
+jq --arg ceiling "${BIG_CEILING}" '.prefill_speedup_ceiling = ($ceiling | tonumber)' \
+  "${REPO_ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json" > "${INVALID_FIXTURE}"
+GATE_CONTRACT="${INVALID_FIXTURE}"
+out="$(run_gate)"; rc=$?
+unset GATE_CONTRACT
+if [[ "${rc}" -eq 1 && "${out}" == *"no valid prefill_speedup_ceiling"* && "${out}" != *"Traceback"* ]]; then
+  ok "(y4) huge fixture prefill ceiling refuses cleanly"
+else
+  bad "(y4) huge fixture prefill ceiling refuses cleanly" "rc=${rc} out=${out}"
+fi
+
+# (z) the repository fixture permits a prefill gain of 1.9
+write_score '{"passed": true, "score": 1.0, "metrics": {"paired_legs": [
+  {"pair": 1, "control_prefill_seconds_per_token": 1.9, "candidate_prefill_seconds_per_token": 1.0, "control_decode_seconds_per_token": 1.0, "candidate_decode_seconds_per_token": 1.0}
+]}}'
+write_audit '{"score": 1.0, "metrics": {"effective_spec_depth": 3, "paired_legs": [
+  {"pair": 1, "control_seed_prefill_window_seconds_per_token": 1.0, "candidate_seed_prefill_window_seconds_per_token": 1.0}
+]}}'
+GATE_CONTRACT="${REPO_ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json"
+out="$(run_gate)"; rc=$?
+unset GATE_CONTRACT
+if [[ "${rc}" -eq 0 && "${out}" == *"ok (max prefill gain 1.9000"* ]]; then
+  ok "(z) repository fixture permits gain 1.9"
+else
+  bad "(z) repository fixture permits gain 1.9" "rc=${rc} out=${out}"
 fi
 
 echo "score-plausibility-gate: ${passed} passed, ${failed} failed"

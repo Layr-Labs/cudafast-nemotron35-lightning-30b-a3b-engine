@@ -386,11 +386,13 @@ Each pair has one timed prefill pass after one unmeasured warm-up pass.
 The warm-up uses the pinned public golden and is never scored.
 
 **Prefill ceiling (workflow gate).** A ranked run whose prefill gain is above
-1.5 in any pair fails and gets no sealed score: no reveal block and no score
+2.0 in any pair fails and gets no sealed score: no reveal block and no score
 artifact (`tools/score-plausibility-gate.sh`, run after sandbox cleanup and
-before the reveal). This is a policy ceiling: real prefill work on this engine
-scores near 1.0, and a gain far above that usually means the timed passes
-reused earlier work, which section 8 bans. The gate does not detect all reuse;
+before the reveal). This is a policy ceiling. Honest kernel work on this engine
+reached a prefill gain of about 1.5 by 2026-10-24, when the ceiling moved from
+1.5 to 2.0. A gain far above that usually means the timed passes reused earlier
+work, which section 8 bans. The value is `prefill_speedup_ceiling` in the track
+fixture; benchd and the gate both read it. The gate does not detect all reuse;
 section 8 still applies below the ceiling. The same script also enforces the
 seed-prefill window ceilings described in section 5.1.1.
 
@@ -398,7 +400,7 @@ seed-prefill window ceilings described in section 5.1.1.
 
 benchd applies these guards only when the fixture enables them.
 
-- Prefill gain cannot exceed 1.5. Decode gain cannot exceed 5.0.
+- Prefill gain cannot exceed 2.0. Decode gain cannot exceed 5.0.
   The refusal is `SPEEDUP-ABOVE-CEILING`.
 - Each seed window must exist. It cannot exceed 1.7 times its timed prefill.
   Refusals are `SEED-WINDOW-NOT-OBSERVED` and `SEED-WINDOW-ABOVE-LIMIT`.

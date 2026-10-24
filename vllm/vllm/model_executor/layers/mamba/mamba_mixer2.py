@@ -927,6 +927,10 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 dt_limit=(0.0, float("inf")),
                 out=preallocated_ssm_out_p.view(num_prefill_tokens, -1, self.head_dim),
                 state_dtype=ssm_state.dtype,
+                # Optional terminal cache store in the existing FP32 recurrence.
+                # Cache-all still requires every boundary and keeps its old path.
+                final_state_out=ssm_state if not is_mamba_cache_all else None,
+                final_state_indices=state_indices_tensor_p,
             )
 
             if is_mamba_cache_all:
@@ -1013,18 +1017,21 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 # - varlen state is a (num_prefills, nheads, headdim, dstate)
                 #   tensor
                 assert state_indices_tensor_p is not None
-                if not (
-                    fused_state_copy
-                    and final_state_copy(
-                        ssm_state,
-                        state_indices_tensor_p,
-                        varlen_states,
-                        last_chunk_indices_p,
-                    )
-                ):
-                    if fused_state_copy:
-                        varlen_states = varlen_states[last_chunk_indices_p]
-                    ssm_state[state_indices_tensor_p] = varlen_states
+                if varlen_states is not None:
+                    # Preserve the verified parent's single-copy/fallback path
+                    # whenever the optional fused cache sink did not apply.
+                    if not (
+                        fused_state_copy
+                        and final_state_copy(
+                            ssm_state,
+                            state_indices_tensor_p,
+                            varlen_states,
+                            last_chunk_indices_p,
+                        )
+                    ):
+                        if fused_state_copy:
+                            varlen_states = varlen_states[last_chunk_indices_p]
+                        ssm_state[state_indices_tensor_p] = varlen_states
 
         # Process decode requests
         if has_decode:

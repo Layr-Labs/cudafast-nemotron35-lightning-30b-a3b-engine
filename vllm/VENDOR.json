@@ -210,6 +210,22 @@
     {
       "file": "harness/kernels/l2pf/py/__init__.py",
       "why": "Carry useful04706ad7-c4e8-44b9-b8ba-77f14d8b8adf MoE-window immutable prefetch default6to12MB. Its complete official2.19195352041462 is within0.1% of fulla484, but only budget mechanism is combined here on higherfulla484. Prefix pair/SSM combination unverified."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_kernels.py, harness/kernels/pzskip/csrc/pzskip.cu, vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
+      "why": "Tuning only. MTP_DEPTH_THETA default 0.4 -> 0.5 (the confidence gate stops drafting at a higher top-1 probability; drafts only, the target decides every token). pzskip config 333 (32-row blocks, 384 columns, 2 k16 groups per stage, 3 stages) replaces 322 as the prefill default: same arithmetic, load-time bitwise check per layer with fallback."
+    },
+    {
+      "file": "vllm/model_executor/layers/mamba/ops/causal_conv1d.py",
+      "why": "NEWconfidenceprefix convolution workomission onM5single-requestspecdecode: originalcachehistory/acceptedoffset/fullrawstatewrites untouched, runoriginalvalidprefix arithmetic only andzeroexplicitinvalidsuffix. Optionalexistingliveverifyrowbuffer afterPDLwait, missing/sentinel retainsfullcompute. No localexecution; completecausalstaticFP8 pathassumption andofficialoracle needed."
+    },
+    {
+      "file": "vllm/model_executor/layers/mamba/mamba_mixer2.py;ops/gated_norm_fp8.py",
+      "why": "Select07a7cdbd-c744-4464-bc18-191a532ce4a9 groupedgatednorm/staticFP8producer +PDL/prefixworkomission, origin823867a3-d280-429c-bd43-c177dc25470a. Onlytwofiles, full51aa baselineotherwise. 07afailedunscoredprefillceiling, no positiveorcorrectnessclaim, newcompositionnotwholebaseline."
+    },
+    {
+      "file": "vllm/v1/worker/gpu_model_runner.py",
+      "why": "Select additionalf1262849-e1cf-49ac-aa8c-4ed615b4382a one-CTAverifyreject+countreset fusion exactblobe789421919f5107872de3262e67ce5783a1a68e7. Targetforwardprefixreadsdonebefore_sample; singleCTAreadsoldcount,maskdraftsuffix,barrier,resetcount, originalsamplerunchanged. Guard1request/contiguousCUDA/n1..64/int32vrows; fallbackoriginalmask+laterfill. Nooptimisticcountschange; newcompositionunverified."
     }
   ]
 }

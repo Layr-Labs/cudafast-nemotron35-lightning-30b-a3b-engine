@@ -347,6 +347,126 @@ def _mtp_moe_down_kernel(
         tl.store(y_ptr + m * stride_ym + offs_n, out, mask=nmask)
 
 
+# Exact-zero loads retain the dense 1024-lane accumulator and expert order.
+@triton.jit
+def _mtp_moe_zero_down_kernel(
+    h_ptr,  # [TOPK + S, I] bf16
+    w2_ptr,  # [E, H, I] bf16
+    wsd_ptr,  # [H, S*I] bf16 (shared down)
+    ids_ptr,  # [TOPK] int
+    tw_ptr,  # [TOPK] fp32 routing weights
+    y_ptr,  # [M, H] out
+    M,
+    H,
+    I,
+    stride_we,
+    stride_wn,
+    stride_wsn,
+    stride_wk,
+    stride_wsk,
+    stride_wss,
+    stride_ym,
+    routed_scale,
+    TOPK: tl.constexpr,
+    S: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    EVICT: tl.constexpr,
+):
+    # y[n] = routed_scale * sum_j tw[j] * <w2[ids[j], n, :], h[j]>
+    #        + sum_s <wsd[n, s*I:(s+1)*I], h[TOPK + s]>
+    pid_n = tl.program_id(0)
+    offs_n = pid_n * BN + tl.arange(0, BN)
+    offs_k = tl.arange(0, BK)
+    nmask = offs_n < H
+    routed = tl.zeros((BN,), dtype=tl.float32)
+    for j in range(TOPK):
+        e = tl.load(ids_ptr + j).to(tl.int64)
+        wbase = w2_ptr + e * stride_we + offs_n[:, None].to(tl.int64) * stride_wn
+        acc = tl.zeros((BN, BK), dtype=tl.float32)
+        for k0 in range(0, I, BK):
+            kk = k0 + offs_k
+            kmask = kk < I
+            h = tl.load(h_ptr + j * I + kk, mask=kmask, other=0.0)
+            w = _load_w(wbase + kk[None, :] * stride_wk, nmask[:, None] & kmask[None, :] & (h[None, :] != 0), EVICT)
+            acc += w.to(tl.float32) * h[None, :].to(tl.float32)
+        routed += tl.load(tw_ptr + j).to(tl.float32) * tl.sum(acc, axis=1)
+    shared = tl.zeros((BN,), dtype=tl.float32)
+    sbase = wsd_ptr + offs_n[:, None].to(tl.int64) * stride_wsn
+    for s in range(S):
+        acc = tl.zeros((BN, BK), dtype=tl.float32)
+        for k0 in range(0, I, BK):
+            kk = k0 + offs_k
+            kmask = kk < I
+            h = tl.load(h_ptr + (TOPK + s) * I + kk, mask=kmask, other=0.0)
+            w = _load_w(
+                sbase + s * stride_wss + kk[None, :] * stride_wsk,
+                nmask[:, None] & kmask[None, :] & (h[None, :] != 0),
+                EVICT,
+            )
+            acc += w.to(tl.float32) * h[None, :].to(tl.float32)
+        shared += tl.sum(acc, axis=1)
+    out = (routed * routed_scale + shared).to(y_ptr.dtype.element_ty)
+    for m in range(M):
+        tl.store(y_ptr + m * stride_ym + offs_n, out, mask=nmask)
+
+
+# Default on; MTP_RELU2=0 selects the unchanged l2 down kernel at boot.
+# A screening process can retain separate CUDA graph dictionaries per mode.
+_RELU2_MODE = 0 if os.environ.get("MTP_RELU2", "1") == "0" else 2
+_RELU2_BN = 32
+_RELU2_WARPS = 8
+_RELU2_PACKED = {}
+
+
+def relu2_prepare(w2, sd, inter, n_shared):
+    """Input-independent BF16 transpose. Called before timed work/capture."""
+    key = (w2.data_ptr(), sd.data_ptr())
+    if key not in _RELU2_PACKED:
+        # A zero times an infinite/NaN weight cannot be omitted. Check once
+        # after loading, never on the timed path or inside graph capture.
+        if not bool(torch.isfinite(w2).all() & torch.isfinite(sd).all()):
+            _RELU2_PACKED[key] = False
+            return False
+        # No arithmetic, quantization, thresholding, or modification of originals.
+        wp = w2.transpose(1, 2).contiguous()
+        sp = sd.view(sd.shape[0], n_shared, inter).permute(1, 2, 0).contiguous()
+        _RELU2_PACKED[key] = (wp, sp)
+    return _RELU2_PACKED[key]
+
+
+def relu2_down(h, w2, sd, ids, tw, y, routed_scale, mode=None, bn=None, warps=None):
+    mode = _RELU2_MODE if mode is None else mode
+    bn = _RELU2_BN if bn is None else bn
+    warps = _RELU2_WARPS if warps is None else warps
+    topk = ids.numel()
+    inter = h.shape[1]
+    ns = h.shape[0] - topk
+    H = y.shape[1]
+    if mode == 2:
+        packed = relu2_prepare(w2, sd, inter, ns)
+        if packed is False:
+            _mtp_moe_down_kernel[(triton.cdiv(H, _MOE_DN_BN),)](
+                h, w2, sd, ids, tw, y, y.shape[0], H, inter,
+                w2.stride(0), w2.stride(1), sd.stride(0), y.stride(0), routed_scale,
+                TOPK=topk, S=ns, BN=_MOE_DN_BN, BK=_MOE_DN_BK,
+                EVICT=_EVICT_W, num_warps=_MOE_DN_WARPS,
+                num_stages=_MOE_DN_STAGES,
+            )
+            return
+        wp, sp = packed
+        strides = (wp.stride(0), 1, 1, H, H, inter * H)
+    else:
+        wp, sp = w2, sd
+        strides = (w2.stride(0), w2.stride(1), sd.stride(0), 1, 1, inter)
+    _mtp_moe_zero_down_kernel[(triton.cdiv(H, bn),)](
+        h, wp, sp, ids, tw, y, y.shape[0], H, inter,
+        *strides, y.stride(0), routed_scale,
+        TOPK=topk, S=ns, BN=bn, BK=1024, EVICT=_EVICT_W,
+        num_warps=warps, num_stages=3,
+    )
+
+
 _MOE_LAYERS: dict[str, torch.nn.Module] = {}
 
 
@@ -389,6 +509,27 @@ def mtp_moe_weights(layer: torch.nn.Module):
     return w13, w2, su, sd, I, su.shape[0] // I
 
 
+
+@torch.no_grad()
+def prepare_mtp_relu2(module: torch.nn.Module) -> None:
+    """Value-preserving MTP-only down-weight repack, after weight processing."""
+    if not _RELU2_MODE:
+        return
+    for layer in module.modules():
+        if not getattr(layer, "_fast_moe", False):
+            continue
+        weights = mtp_moe_weights(layer)
+        if weights is None:
+            continue
+        layer._fast_moe_weights = weights
+        _, w2, _, sd, inter, n_shared = weights
+        packed = relu2_prepare(w2, sd, inter, n_shared)
+        logger.info_once(
+            "MTP exact-zero down: %s",
+            "BF16 transpose ready" if packed is not False else "l2 fallback (nonfinite weights)",
+        )
+
+
 def mtp_moe_row(
     x: torch.Tensor,
     ids: torch.Tensor,
@@ -425,6 +566,9 @@ def mtp_moe_row(
         num_stages=_MOE_UP_STAGES,
     )
     y = torch.empty((M, H), dtype=x.dtype, device=x.device)
+    if _RELU2_MODE:
+        relu2_down(h, w2, sd, ids, tw, y, routed_scale)
+        return y
     _mtp_moe_down_kernel[(triton.cdiv(H, _MOE_DN_BN),)](
         h,
         w2,

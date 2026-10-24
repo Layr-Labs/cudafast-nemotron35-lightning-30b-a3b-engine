@@ -58,6 +58,14 @@
     {
       "file": "vllm/model_executor/layers/fused_moe/experts/humming_tuned_moe.py (TUNED_PAD_K)",
       "why": "the tuned routed experts padded K to a multiple of 128, so the down projection's K 1856 became 1920 and every w2 tile streamed and multiplied two all-zero 32-wide K blocks; K now pads only to humming's BF16 pack granule (32), the smallest it accepts. Each element keeps the same K blocks in the same order; the dropped steps were mma(+0, +0, acc), which only turned an acc of -0 into +0, and a signed zero changes no later value's magnitude, logit or token"
+    },
+    {
+      "file": "harness/protocol-adapter/src/resident.rs; harness/protocol-adapter/src/tests.rs; vllm/vllm/model_executor/models/nemotron_h_mtp.py; vllm/vllm/model_executor/models/nemotron_h_mtp_kernels.py; vllm/vllm/v1/spec_decode/llm_base_proposer.py; vllm/vllm/v1/worker/gpu_model_runner.py",
+      "why": "rkit rebased pack: 10-nlp.diff, 20-relu2.diff, 40-guards.diff. Drafter relu2 can change last bits; target arithmetic and frozen formats unchanged. In-process base consumes hostov when reported."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp.py",
+      "why": "Pin the MTP predictor to ONE Inductor combo-kernel choice in its own compilation context: combined kernels, never benchmarked (combo_kernels=True, benchmark_combo_kernel=False; VLLM_MTP_COMBO=off pins separate kernels, =bench restores the timed pick). Drafter reduction order is fixed across boots, with target compilation settings and frozen formats unchanged."
     }
   ]
 }

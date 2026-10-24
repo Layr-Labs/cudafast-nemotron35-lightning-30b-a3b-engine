@@ -771,14 +771,27 @@ class HummingIndexedExperts(HummingExpertsBase):
             sublayer_name="w2",
         )
 
-        HummingMethod.forward_layer(
-            layer=self.layer,
-            inputs=inputs,
-            input_scale=input_scale,
-            outputs=buffers["down_output"].view(-1, hidden_states.size(-1)),
-            sublayer_name="w2",
-            **moe_kwargs2,
-        )
+        down_output = buffers["down_output"].view(-1, hidden_states.size(-1))
+        sparse_weights = getattr(self.layer, "routed_sparse_down", None)
+        sparse_done = False
+        if (
+            sparse_weights is not None
+            and input_scale is None
+            and expert_map is None
+            and _humming_batch_invariant()
+        ):
+            from routed_sparse import forward
+
+            sparse_done = forward(inputs, topk_ids, down_output, sparse_weights)
+        if not sparse_done:
+            HummingMethod.forward_layer(
+                layer=self.layer,
+                inputs=inputs,
+                input_scale=input_scale,
+                outputs=down_output,
+                sublayer_name="w2",
+                **moe_kwargs2,
+            )
 
         moe_fused_mul_sum(
             inputs=buffers["down_output"].view(*topk_ids.shape, -1),

@@ -56,7 +56,6 @@ class SharedExperts(torch.nn.Module):
         self._moe_config = moe_config
 
         self._mk_can_overlap_shared_experts = mk_can_overlap_shared_experts
-        self._aux_open = False
 
         # Allow disabling of the separate shared experts stream for
         # debug purposes.
@@ -128,23 +127,6 @@ class SharedExperts(torch.nn.Module):
             # Mark sync start point for the aux stream since we will
             # run in parallel with router/gate.
             self._stream.wait_stream(current_stream())
-            self._launch_aux(shared_experts_input)
-
-    def _launch_aux(self, shared_experts_input: torch.Tensor) -> None:
-        """Queue shared work without immediately blocking the routed path."""
-        assert self._stream is not None
-        idx = self._output_idx
-        assert self._output[idx] is None
-        with torch.cuda.stream(self._stream):
-            self._output[idx] = self._layer(shared_experts_input)
-        self._aux_open = True
-
-    def _join_aux(self) -> None:
-        if not self._aux_open:
-            return
-        assert self._stream is not None
-        current_stream().wait_stream(self._stream)
-        self._aux_open = False
 
     def _run_in_aux_stream(
         self,
@@ -156,7 +138,6 @@ class SharedExperts(torch.nn.Module):
         with torch.cuda.stream(self._stream):
             output = self._layer(shared_experts_input)
         current_stream().wait_stream(self._stream)
-        self._aux_open = False
 
         return output
 
@@ -166,7 +147,6 @@ class SharedExperts(torch.nn.Module):
 
     @property
     def output(self) -> torch.Tensor:
-        self._join_aux()
         assert self._output[self._output_idx] is not None
         output = self._output[self._output_idx]
         self._output[self._output_idx] = None
@@ -180,12 +160,6 @@ class SharedExperts(torch.nn.Module):
         experts_order = self._determine_shared_experts_order(shared_experts_input)
 
         if order != experts_order:
-            return None
-
-        if (
-            order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
-            and self._output[self._output_idx] is not None
-        ):
             return None
 
         assert self._output[self._output_idx] is None

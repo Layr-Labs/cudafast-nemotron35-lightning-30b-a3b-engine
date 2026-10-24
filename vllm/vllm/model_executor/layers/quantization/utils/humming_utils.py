@@ -1030,6 +1030,22 @@ def convert_to_humming_moe_kernel_format(
     )
     layer.humming_tuned_moe = tuned
 
+    # Preserve only a byte permutation of the original NVFP4 down weights.
+    # Humming's ordinary format remains available for prefill and fallbacks.
+    layer.routed_sparse_down = None
+    if tuned and all(
+        hasattr(layer, name)
+        for name in ("w2_weight", "w2_weight_scale", "w2_weight_scale_2")
+    ):
+        try:
+            from routed_sparse import prepare
+        except ImportError:
+            pass
+        else:
+            layer.routed_sparse_down = prepare(
+                layer.w2_weight, layer.w2_weight_scale, layer.w2_weight_scale_2
+            )
+
     for sublayer_name, configs in sublayer_configs.items():
         final_weight_schema, final_input_schema = _process_single_sublayer(
             layer=layer,

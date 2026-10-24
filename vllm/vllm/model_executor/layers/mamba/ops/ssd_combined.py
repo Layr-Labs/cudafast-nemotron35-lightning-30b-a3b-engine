@@ -45,8 +45,6 @@ def _mamba_chunk_scan_combined_fwd(
     dt_softplus=False,
     dt_limit=(0.0, float("inf")),
     state_dtype=None,
-    final_state_out=None,
-    final_state_indices=None,
 ):
     assert is_int_pow_2(chunk_size), "chunk_size must be integer power of 2"
     seqlen, nheads, headdim = x.shape
@@ -110,11 +108,7 @@ def _mamba_chunk_scan_combined_fwd(
         states = fused_prefill(
             x, B, C, dt, dA_cumsum, cu_chunk_seqlens, last_chunk_indices,
             seq_idx, out, D=D, z=z, initial=initial_states,
-            final_cache=final_state_out,
-            final_index=final_state_indices,
         )
-        if states is None:
-            return None  # optional final cache sink completed in the state kernel
         return states if return_intermediate_states else states[last_chunk_indices]
 
     # 2. Compute the state for each intra-chunk
@@ -192,8 +186,6 @@ def mamba_chunk_scan_combined_varlen(
     dt_limit=(0.0, float("inf")),
     return_intermediate_states=False,
     state_dtype=None,
-    final_state_out=None,
-    final_state_indices=None,
 ):
     """
     Argument:
@@ -216,8 +208,7 @@ def mamba_chunk_scan_combined_varlen(
         out: (seqlen, nheads, headdim) preallocated output tensor
         state_dtype: The data type of the ssm state
     Return:
-        varlen_states: (batch, nheads, headdim, dstate), or None when the
-            optional final_state_out cache sink has completed
+        varlen_states: (batch, nheads, headdim, dstate)
     """
 
     assert cu_seqlens is not None, "cu_seqlens must be provided assuming varlen input"
@@ -243,11 +234,6 @@ def mamba_chunk_scan_combined_varlen(
         dt_softplus=dt_softplus,
         dt_limit=dt_limit,
         state_dtype=state_dtype,
-        # The CPU replacement has its original signature and ordinary return.
-        **({
-            "final_state_out": final_state_out,
-            "final_state_indices": final_state_indices,
-        } if final_state_out is not None and not current_platform.is_cpu() else {}),
     )
 
     return varlen_states

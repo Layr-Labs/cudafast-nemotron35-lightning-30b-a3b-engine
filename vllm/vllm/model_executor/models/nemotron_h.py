@@ -58,7 +58,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.models.nemotron_shared_up import maybe_shared_up_relu2
 from vllm.model_executor.models.interfaces import (
     EagleModelMixin,
     HasInnerState,
@@ -128,12 +127,8 @@ class NemotronHMLP(nn.Module):
         self.act_fn = ReLUSquaredActivation()
 
     def forward(self, x: torch.Tensor):
-        fused = maybe_shared_up_relu2(self.up_proj, x)
-        if fused is None:
-            x, _ = self.up_proj(x)
-            x = self.act_fn(x)
-        else:
-            x = fused
+        x, _ = self.up_proj(x)
+        x = self.act_fn(x)
         x, _ = self.down_proj(x)
         return x
 

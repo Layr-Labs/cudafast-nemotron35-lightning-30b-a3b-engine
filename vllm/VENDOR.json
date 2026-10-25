@@ -253,7 +253,27 @@
     },
     {
       "file": "model_executor/models/nemotron_h_attn_packed.py and nemotron_h_attn_packed_kernel.py (new); model_executor/models/nemotron_h.py; model_executor/layers/attention/attention.py (prefetch target); entrypoints/serve/instrumentator/static/swagger-ui-bundle.js (removed)",
-      "why": "the 5-row verify decodes the six attention layers' QKV and output projections from the drafter's lossless 12-bit BF16 codec in registers (one tl.dot chain over K tiles of 128 into fp32, rounded once to BF16) instead of cuBLAS reading 25% more bytes; a child process first compiles and runs the kernel on synthetic planes, every packed layer is compared bit for bit with F.linear and the cold-cache time must beat it at load, else the stock projection runs (ATTN_PACK12=0 disables). Prefill and M=1 keep F.linear. The unused API-docs swagger bundle is dropped to stay inside the editable byte cap Official measurement #2 of this stack (same code)."
+      "why": "the 5-row verify decodes the six attention layers' QKV and output projections from the drafter's lossless 12-bit BF16 codec in registers (one tl.dot chain over K tiles of 128 into fp32, rounded once to BF16) instead of cuBLAS reading 25% more bytes; a child process first compiles and runs the kernel on synthetic planes, every packed layer is compared bit for bit with F.linear and the cold-cache time must beat it at load, else the stock projection runs (ATTN_PACK12=0 disables). Prefill and M=1 keep F.linear. The unused API-docs swagger bundle is dropped to stay inside the editable byte cap"
+    },
+    {
+      "file": "models/nemotron_h_attn_packed*.py; models/nemotron_h_mtp*.py; layers/mamba/ops/ssd_prefill_fused.py; v1/attention/backends/{flashinfer,mamba2_attn}.py; v1/spec_decode/llm_base_proposer.py; v1/worker/{prefill_graph,block_table,gpu_model_runner}.py",
+      "why": "On ENTIRE highest ADF05 source retain all validated 8d+51 mechanisms. Add u32word exponent attention lookahead with optional ranked actual-weight admission and rawescape plane skips; ordered compact MTP fold/BF16MoE/BF16residualAdd fusion with originalRMS plus private byte-admission. Select f102 graph-replay admission timing only; retain4%threshold/no diagnosticstalls. Add FI API fallback. Whole new combination unverified; remote execution only. MLX e61b0d79-f106-4070-a755-62ffe3013782 idea credit."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_attn_packed.py",
+      "why": "Selectonlygraph-replayadmissiontiming helper frompublicpendingf102bbdb-ebe5-48e5-a1c8-313774419059;24callscycle6real-layerweights,7replaymedian, nohostlaunchbias. Keep4%MIN_GAIN andrankedall-layerexactadmission; paired eagerbaseline/candidatefallback ifreferencegraphunavailable. DoNOTimportdiagnosticstalls,_sleep,stagecodes orMIN_GAIN10. ADFcombined8d/51notealreadycoverednonewmethod; wholecombo remainsunverified,remoteonly."
+    },
+    {
+      "file": "model_executor/layers/fused_moe/experts/{fused_humming_moe,humming_zskip}.py; v1/attention/backends/flashinfer.py; v1/worker/{prefill_graph,gpu_model_runner}.py",
+      "why": "Select useful pending1b5c5ed3-d003-4dc3-a84d-e06545496d9a J side-stream pzskip re-alignment, graph-refresh fieldcache/emptycopy elision and unneeded draft-prefetch guard, preserving all wholeADF paths/debugchecks. New compose I nativefresh plan structural cache with savedbufferidentity/planinfo/dtype/stride/device checks and original specprefillH retained. Add topkids.record_stream(side) and avoid lazy stream creation during capture. No prompt/result cache; allruntimevalues copied. Whole combination unverified; official remote execution only."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_packed.py;model_executor/models/nemotron_h_mtp_kernels.py",
+      "why": "Extend the u32 exponent-word read idea to native MTP qkv/hidden-half GEMV, smallGEMM and routed/shared expertup. Keep exact Gluon layouts, per-lane FP32 update/reduction and PDL/gate/rawescape paths. Exhaustive actualweight bit-check for everypacked tensor plus private real-prefix byte-comparisons of old/new GEMV/small/up at3scales in official remote startup; sticky device fallback onordinaryfailure. No numericformat/weightbits/newprecision, no localruntime. Word-read idea from51a375c2-22e1-4668-909e-5d1bd601e0b3 nextsteps and nativecodec from3d51cab6-7079-4fb2-98e4-f2a238077897 via D53/wholeADF. Wholecombination unverified."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_packed.py;model_executor/layers/attention/attention.py",
+      "why": "Select useful32b83ad4-0049-4109-9f95-b8b31ea5dd50 nativeMTP o_proj losslesspacking idea/condition and nativepackedplaneL2prefetch, not its entirelower2.29563679513432bundle/alternate targetkernel/routerprefetch. Originalnativecodec exhaustivebits and originalGluon layouts retained; MTPwordadmission probes separatelyperK2688/4096. New nativeprefetchcomposed into existingtarget_apk helper withsamebytebudget/window/join; no value moved. WholeA3winner remainsbase; new combination unverified,all executionremoteonly."
     }
   ]
 }

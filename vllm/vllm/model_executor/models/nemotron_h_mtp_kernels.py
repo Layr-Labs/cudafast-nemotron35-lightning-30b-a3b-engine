@@ -639,7 +639,7 @@ def relu2_prepare(w2, sd, inter, n_shared):
     return _RELU2_PACKED[key]
 
 
-def relu2_down(h, w2, sd, ids, tw, y, routed_scale, mode=None, bn=None, warps=None):
+def relu2_down(h, w2, sd, ids, tw, y, routed_scale, mode=None, bn=None, warps=None, residual=None):
     mode = _RELU2_MODE if mode is None else mode
     bn = _RELU2_BN if bn is None else bn
     warps = _RELU2_WARPS if warps is None else warps
@@ -659,9 +659,9 @@ def relu2_down(h, w2, sd, ids, tw, y, routed_scale, mode=None, bn=None, warps=No
                 num_stages=_MOE_DN_STAGES,
                 launch_pdl=mtp_pdl(),
             )
-            return
+            return False
         wp, sp = packed
-        from .nemotron_h_mtp_compact import maybe_down
+        from .nemotron_h_mtp_compact import maybe_down, can_add_residual
 
         # LOCAL PATCH (cudafast-nemotron35): the down projection over the
         # transposed weights (compact or zero-load) is latency-bound; prefetch
@@ -674,10 +674,11 @@ def relu2_down(h, w2, sd, ids, tw, y, routed_scale, mode=None, bn=None, warps=No
             and bool(_l2pf.DRAFT_SCREEN)
             and _l2pf.prefetch(_l2pf.DRAFT_SCREEN[0], max_bytes=_l2pf.DRAFT_BYTES)
         )
-        if maybe_down(h, packed, ids, tw, y, routed_scale):
+        add = can_add_residual(residual, y, routed_scale, ids.numel())
+        if maybe_down(h, packed, ids, tw, y, routed_scale, residual=residual if add else None):
             if pf:
                 _l2pf.join(y.device)
-            return
+            return add
         strides = (wp.stride(0), 1, 1, H, H, inter * H)
     else:
         wp, sp = w2, sd
@@ -692,6 +693,7 @@ def relu2_down(h, w2, sd, ids, tw, y, routed_scale, mode=None, bn=None, warps=No
     if pf:
         _l2pf.join(y.device)
 
+    return False
 
 _MOE_LAYERS: dict[str, torch.nn.Module] = {}
 
@@ -750,6 +752,11 @@ def prepare_mtp_relu2(module: torch.nn.Module) -> None:
         layer._fast_moe_weights = weights
         _, w2, _, sd, inter, n_shared = weights
         packed = relu2_prepare(w2, sd, inter, n_shared)
+        layer._mtp_fold_residual_ok = False
+        if packed is not False and _RELU2_MODE == 2:
+            from .nemotron_h_mtp_compact import prepare_residual_add
+            layer._mtp_fold_residual_ok = prepare_residual_add(
+                w2.device, float(layer.mixer.routed_scaling_factor))
         logger.info_once(
             "MTP exact-zero down: %s",
             "BF16 transpose ready" if packed is not False else "l2 fallback (nonfinite weights)",
@@ -767,13 +774,14 @@ def mtp_moe_row(
     n_shared: int,
     routed_scale: float,
     M: int,
+    residual: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """routed_scale * sum_j tw[j] * W2[ids[j]] relu2(W13[ids[j]] x)
     + SD relu2(SU x) for one row x [1, H], written to M output rows."""
     topk = ids.numel()
     E, inter, H = w13.shape
     h = torch.empty((topk + n_shared, inter), dtype=x.dtype, device=x.device)
-    from .nemotron_h_mtp_packed import PackedBF16, packed_moe_up
+    from .nemotron_h_mtp_packed import PackedBF16, packed_moe_up, word_load_enabled
 
     gate, gated = _gate_args(x)
     if isinstance(w13, PackedBF16):
@@ -782,6 +790,7 @@ def mtp_moe_row(
             inter * H, H, H, gate, TOPK=topk, BN=_PK_UP_BN, BK=_MOE_UP_BK,
             EVICT=_EVICT_W, GATED=gated, num_warps=4 * _PK_UP_WN,
             num_stages=_MOE_UP_STAGES, launch_pdl=mtp_pdl(), WN=_PK_UP_WN,
+            WORD=word_load_enabled(x.device),
         )
     else:
         _mtp_moe_up_kernel[(triton.cdiv(inter, _MOE_UP_BN), topk + n_shared)](
@@ -807,8 +816,8 @@ def mtp_moe_row(
         )
     y = torch.empty((M, H), dtype=x.dtype, device=x.device)
     if _RELU2_MODE:
-        relu2_down(h, w2, sd, ids, tw, y, routed_scale)
-        return y
+        added = relu2_down(h, w2, sd, ids, tw, y, routed_scale, residual=residual)
+        return y if residual is None or added else y + residual
     _mtp_moe_down_kernel[(triton.cdiv(H, _MOE_DN_BN),)](
         h,
         w2,
@@ -835,7 +844,7 @@ def mtp_moe_row(
         num_stages=_MOE_DN_STAGES,
         launch_pdl=mtp_pdl(),
     )
-    return y
+    return y if residual is None else y + residual
 
 
 # LOCAL PATCH (cudafast-nemotron35): routed experts the MTP draft evaluates per
@@ -875,8 +884,9 @@ def _topk_keep_kernel(
 
 
 
-def mtp_moe_single_row_impl(
-    hidden_states: torch.Tensor, row_src: torch.Tensor, layer_name: str
+def _mtp_moe_single_row_dispatch(
+    hidden_states: torch.Tensor, row_src: torch.Tensor, layer_name: str,
+    residual: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """MoE of the MTP layer for the single row hidden_states[row_src[0]],
     written to every one of the hidden_states.shape[0] output rows."""
@@ -889,7 +899,8 @@ def mtp_moe_single_row_impl(
             "on" if layer._fast_moe_weights else "off (unsupported weight layout)",
         )
     if not layer._fast_moe_weights:
-        return mixer(hidden_states.index_select(0, row_src))
+        out = mixer(hidden_states.index_select(0, row_src))
+        return out if residual is None else out + residual
     w13, w2, su, sd, inter, n_shared = layer._fast_moe_weights
     M, H = hidden_states.shape
     x = hidden_states if M == 1 else hidden_states.index_select(0, row_src[:1])  # [1, H]
@@ -926,7 +937,30 @@ def mtp_moe_single_row_impl(
         n_shared,
         float(mixer.routed_scaling_factor),
         M,
+        residual=residual,
     )
+
+
+
+def mtp_moe_single_row_impl(hidden_states: torch.Tensor, row_src: torch.Tensor,
+                            layer_name: str) -> torch.Tensor:
+    return _mtp_moe_single_row_dispatch(hidden_states, row_src, layer_name)
+
+
+def _mtp_moe_single_row_add_impl(hidden_states: torch.Tensor, row_src: torch.Tensor,
+                                 residual: torch.Tensor, layer_name: str) -> torch.Tensor:
+    return _mtp_moe_single_row_dispatch(hidden_states, row_src, layer_name, residual)
+
+
+def _mtp_moe_single_row_add_fake(hidden_states: torch.Tensor, row_src: torch.Tensor,
+                                 residual: torch.Tensor, layer_name: str) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+direct_register_custom_op(
+    op_name="mtp_moe_single_row_add_residual", op_func=_mtp_moe_single_row_add_impl,
+    fake_impl=_mtp_moe_single_row_add_fake,
+)
 
 
 def _mtp_moe_single_row_fake(

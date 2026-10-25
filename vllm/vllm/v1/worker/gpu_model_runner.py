@@ -4891,8 +4891,7 @@ class GPUModelRunner(
         # LOCAL PATCH (cudafast-nemotron35): the verify forward is queued; let
         # the bookkeeping that follows it overlap an L2 prefetch of the
         # drafter's first weight (harness/kernels/l2pf, moves no value).
-        if self._drafts_can_be_verified():
-            self._l2pf_prefetch("draft")
+        self._l2pf_prefetch("draft")
         # Unpack ephemeral state.
         (
             scheduler_output,

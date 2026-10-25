@@ -246,6 +246,10 @@
     {
       "file": "model_executor/kernels/linear/nvfp4/marlin.py; model_executor/models/nemotron_h.py; model_executor/layers/fused_moe/runner/shared_experts.py; model_executor/layers/fused_moe/experts/humming_tuned_moe.py",
       "why": "shco: the shared expert of the 496-token prefill runs on shx (harness/kernels/shco), a small-footprint (1 CTA/SM) NVFP4 W4A16 GEMM bit-identical to Marlin up -> relu^2 -> Marlin down (Marlin's stripe segments, k-warp chains and fp32 fold order), queued on the shared-expert aux stream beside the routed experts; humming's prefill w13 keeps its accumulation chain on a 4 x 36 persistent grid (3 resident CTAs per SM) to leave each SM room for it. Tables built at load; SHCO=0 restores stock."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_attn_packed.py (new); model_executor/models/nemotron_h.py; entrypoints/serve/instrumentator/static/swagger-ui-bundle.js (removed)",
+      "why": "the 5-row verify decodes the six attention layers' QKV and output projections from the drafter's lossless 12-bit BF16 codec in registers (one tl.dot chain over K tiles of 128 into fp32, rounded once to BF16) instead of cuBLAS reading 25% more bytes; every packed layer is compared bit for bit with F.linear and the cold-cache time must beat it at load, else the stock projection runs (ATTN_PACK12=0 disables). Prefill and M=1 keep F.linear. The unused API-docs swagger bundle is dropped to stay inside the editable byte cap"
     }
   ]
 }

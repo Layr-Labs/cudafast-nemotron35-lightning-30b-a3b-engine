@@ -822,6 +822,17 @@ direct_register_custom_op(
 
 @eager_break_during_capture
 @maybe_transfer_kv_layer
+def _prefetch_ahead(ahead, rows: int) -> bool:
+    """Queue the L2 prefetch of the projection that follows the attention kernel: the
+    packed planes the 5-row verify reads (nemotron_h_attn_packed.py) when the
+    projection has them, else its weight."""
+    sm = getattr(ahead, "_apk_sm", None)
+    if sm is None or rows != 5:
+        return _l2pf.prefetch(ahead.weight, max_bytes=_l2pf.ATTN_BYTES)
+    queued = _l2pf.prefetch(sm, max_bytes=_l2pf.ATTN_BYTES * 2 // 3)
+    return _l2pf.prefetch(ahead._apk_ex, max_bytes=_l2pf.ATTN_BYTES // 3) or queued
+
+
 def unified_attention_with_output(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -847,7 +858,7 @@ def unified_attention_with_output(
         ahead is not None
         and query.shape[0] <= 8
         and _l2pf.ATTN_BYTES > 0
-        and _l2pf.prefetch(ahead.weight, max_bytes=_l2pf.ATTN_BYTES)
+        and _prefetch_ahead(ahead, query.shape[0])
     )
     self.impl.forward(
         self,

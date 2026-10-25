@@ -48,6 +48,19 @@ def _l2pf_next_layer(layer, num_tokens: int) -> bool:
     nxt = _l2pf.AHEAD_MOE.get(str(getattr(layer, "layer_name", "")))
     if nxt is None:
         return False
+    planes = getattr(nxt, "_apk_planes", None)
+    if planes is not None:
+        # New attention mapping is registered only for admitted QKV shapes.
+        # Other M still consumes BF16, so do not prefetch packed planes for it.
+        if num_tokens != 5:
+            return False
+        budget = _l2pf.MOE_BYTES
+        if budget < 48:
+            return False
+        sm_bytes = (budget * 2 // 3) & ~15
+        ex_bytes = (budget - sm_bytes) & ~15
+        queued = _l2pf.prefetch(planes[0], max_bytes=sm_bytes)
+        return _l2pf.prefetch(planes[1], max_bytes=ex_bytes) or queued
     w = getattr(nxt, "_fp8small_weight", None)
     if w is None:
         w = getattr(nxt, "weight", None)

@@ -29,6 +29,7 @@ if RING not in (0, 3, 4, 6):
     RING = 0
 _RING_DEFAULT = {(10304, 2688): 3, (2688, 4096): 4}
 _PDL_ENABLED = os.environ.get("FP8C_PDL", "1") != "0"
+_L2KEEP = os.environ.get("FP8C_L2KEEP", "1") != "0"
 _lib = None
 _load_failed = False
 _ready_devices = set()
@@ -47,7 +48,7 @@ def _load():
         lib.fp8c_has_pdl.argtypes = []
         lib.fp8c_has_pdl.restype = ctypes.c_int
         lib.fp8c_run.argtypes = (
-            [ctypes.c_void_p] * 5 + [ctypes.c_int] * 6 + [ctypes.c_void_p]
+            [ctypes.c_void_p] * 5 + [ctypes.c_int] * 6 + [ctypes.c_void_p] + [ctypes.c_int]
         )
         lib.fp8c_run.restype = ctypes.c_int
         lib.fp8c_decode.argtypes = [
@@ -234,6 +235,7 @@ def gemm(
         a.data_ptr(), buf.data_ptr(), sa.data_ptr(), sb.data_ptr(), out.data_ptr(),
         m, n, k, buf.shape[1], int(use_pdl), ring,
         torch.cuda.current_stream(a.device).cuda_stream,
+        int(_L2KEEP),
     ]
     rc = _lib.fp8c_run(*args)
     if rc and use_pdl and not torch.cuda.is_current_stream_capturing():

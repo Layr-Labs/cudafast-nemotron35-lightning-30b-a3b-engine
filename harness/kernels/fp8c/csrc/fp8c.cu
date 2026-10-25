@@ -31,20 +31,34 @@ template<int K> struct Shape {
 struct P {const uint8_t *a,*w;const float *sa,*sb;__nv_bfloat16 *c;int m;int tile_bytes;};
 struct Slot {uint32_t c[7];uint32_t x;uint32_t q0;};
 
+template<bool KEEP>
 __device__ __forceinline__ uint4 ld4(const uint8_t* p) {
  uint4 v;
- asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];\n"
-  : "=r"(v.x),"=r"(v.y),"=r"(v.z),"=r"(v.w) : "l"(p));
+ if constexpr (KEEP)
+  asm volatile("ld.global.nc.L1::no_allocate.L2::evict_first.v4.u32 {%0,%1,%2,%3}, [%4];\n"
+   : "=r"(v.x),"=r"(v.y),"=r"(v.z),"=r"(v.w) : "l"(p));
+ else
+  asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];\n"
+   : "=r"(v.x),"=r"(v.y),"=r"(v.z),"=r"(v.w) : "l"(p));
  return v;
 }
+template<bool KEEP>
 __device__ __forceinline__ uint2 ld2(const uint8_t* p) {
  uint2 v;
- asm volatile("ld.global.nc.L1::no_allocate.v2.u32 {%0,%1}, [%2];\n" : "=r"(v.x),"=r"(v.y) : "l"(p));
+ if constexpr (KEEP)
+  asm volatile("ld.global.nc.L1::no_allocate.L2::evict_first.v2.u32 {%0,%1}, [%2];\n"
+   : "=r"(v.x),"=r"(v.y) : "l"(p));
+ else
+  asm volatile("ld.global.nc.L1::no_allocate.v2.u32 {%0,%1}, [%2];\n" : "=r"(v.x),"=r"(v.y) : "l"(p));
  return v;
 }
+template<bool KEEP>
 __device__ __forceinline__ uint32_t ld1(const uint8_t* p) {
  uint32_t v;
- asm volatile("ld.global.nc.L1::no_allocate.u32 %0, [%1];\n" : "=r"(v) : "l"(p));
+ if constexpr (KEEP)
+  asm volatile("ld.global.nc.L1::no_allocate.L2::evict_first.u32 %0, [%1];\n" : "=r"(v) : "l"(p));
+ else
+  asm volatile("ld.global.nc.L1::no_allocate.u32 %0, [%1];\n" : "=r"(v) : "l"(p));
  return v;
 }
 __device__ __forceinline__ uint32_t bfi8(uint32_t b, uint32_t w, uint32_t pos) {
@@ -53,22 +67,22 @@ __device__ __forceinline__ uint32_t bfi8(uint32_t b, uint32_t w, uint32_t pos) {
  return d;
 }
 // Main planes of chunk c (no dependence on the header).
-template<int K>
+template<int K, bool KEEP>
 __device__ __forceinline__ void load_main(const uint8_t* tb,int warp,int lane,int c,Slot& s) {
  const uint8_t* mp=tb+Shape<K>::HDR+c*MAIN;
- uint4 A=ld4(mp+warp*512+lane*16);
- uint2 B=ld2(mp+2048+warp*256+lane*8);
- uint32_t D=ld1(mp+3072+warp*128+lane*4);
+ uint4 A=ld4<KEEP>(mp+warp*512+lane*16);
+ uint2 B=ld2<KEEP>(mp+2048+warp*256+lane*8);
+ uint32_t D=ld1<KEEP>(mp+3072+warp*128+lane*4);
  s.c[0]=A.x;s.c[1]=A.y;s.c[2]=A.z;s.c[3]=A.w;s.c[4]=B.x;s.c[5]=B.y;s.c[6]=D;
 }
 // Exception window of chunk c: lane l holds bytes [wb+4l, wb+4l+4) of the tile's
 // exception area, wb = off & ~3, for the words that hold this warp-chunk's bytes.
-template<int K>
+template<int K, bool KEEP>
 __device__ __forceinline__ void load_x(const uint8_t* tb,int lane,int c,uint32_t ts,uint32_t te,Slot& s) {
  uint32_t off=__shfl_sync(FULL,ts,c),end=__shfl_sync(FULL,te,c);
  uint32_t q0=off&3u;
  s.q0=q0;
- s.x=(4u*lane<q0+end-off)?ld1(tb+Shape<K>::EXC+(off-q0)+4*lane):0u;
+ s.x=(4u*lane<q0+end-off)?ld1<KEEP>(tb+Shape<K>::EXC+(off-q0)+4*lane):0u;
 }
 __device__ __forceinline__ uint32_t lanemask_lt() {
  uint32_t m;
@@ -146,20 +160,27 @@ __device__ __forceinline__ void decode(const Slot& s,uint32_t e0x,uint32_t esc4,
   }
  }
 }
-template<bool NC>
+template<bool KEEP, bool NC>
 __device__ __forceinline__ uint32_t lda(const uint8_t* q) {
- if constexpr (NC) return __ldg((const uint32_t*)q);
- else return *(const uint32_t*)q;
+ uint32_t v;
+ if constexpr (KEEP) {
+  asm volatile("ld.global.L2::evict_last.u32 %0, [%1];\n" : "=r"(v) : "l"(q));
+  return v;
+ } else if constexpr (NC) {
+  return __ldg((const uint32_t*)q);
+ } else {
+  return *(const uint32_t*)q;
+ }
 }
 // Activation words (rows 0..7) of the 4 steps of chunk c; rows 8..15 are zero for M<=8.
-template<int K,bool NC>
+template<int K, bool KEEP, bool NC>
 __device__ __forceinline__ void load_a(const P&p,int lane,int c,uint32_t (&a)[4][2]) {
  int row=lane>>2;
  #pragma unroll
  for(int s=0;s<4;++s){
   int kk=(c*4+s)*32+(lane&3)*4;
-  a[s][0]=row<p.m?lda<NC>(p.a+row*K+kk):0u;
-  a[s][1]=row<p.m?lda<NC>(p.a+row*K+kk+16):0u;
+  a[s][0]=row<p.m?lda<KEEP,NC>(p.a+row*K+kk):0u;
+  a[s][1]=row<p.m?lda<KEEP,NC>(p.a+row*K+kk+16):0u;
  }
 }
 #ifndef FP8C_NO_PDL
@@ -183,7 +204,7 @@ __device__ __forceinline__ void mma(uint32_t a0,uint32_t a2,uint32_t b0,uint32_t
 // RC chunks (4*RC K-steps) in flight per warp. PDL: header, main planes and
 // exception windows (load-time data, never written at run time) are issued
 // before griddepcontrol.wait; activations, scales and stores after it.
-template<int N,int K,int RC,bool PDL=false>
+template<int N,int K,int RC,bool PDL=false,bool KEEP=false>
 __global__ __launch_bounds__(128,2) void gemm(P p) {
  constexpr int C=Shape<K>::C;
  int lane=threadIdx.x%32,warp=threadIdx.x/32;
@@ -195,20 +216,20 @@ __global__ __launch_bounds__(128,2) void gemm(P p) {
  uint32_t e0x=((prm&0xffu)<<3)*0x01010101u,esc4=((prm>>8)&0xffu)*0x01010101u;
  Slot s[RC];uint32_t a[RC][4][2];float acc[4]={0.f,0.f,0.f,0.f};
  #pragma unroll
- for(int j=0;j<RC;++j)if(j<C)load_main<K>(tb,warp,lane,j,s[j]);
+ for(int j=0;j<RC;++j)if(j<C)load_main<K,KEEP>(tb,warp,lane,j,s[j]);
  #pragma unroll
- for(int j=0;j<RC;++j)if(j<C)load_x<K>(tb,lane,j,ts,te,s[j]);
+ for(int j=0;j<RC;++j)if(j<C)load_x<K,KEEP>(tb,lane,j,ts,te,s[j]);
 #ifndef FP8C_NO_PDL
  if constexpr (PDL) pdl_wait();
 #endif
  #pragma unroll
- for(int j=0;j<RC;++j)if(j<C)load_a<K,!PDL>(p,lane,j,a[j]);
+ for(int j=0;j<RC;++j)if(j<C)load_a<K,KEEP,!PDL>(p,lane,j,a[j]);
  // Software pipeline: wc holds chunk c decoded; the MMAs of chunk c are issued
  // before the decode of chunk c+1, so the two latency chains overlap. Slot
  // (c mod RC) of the ring is refilled with chunk c+RC right after its decode.
  uint32_t wc[8];
  decode(s[0],e0x,esc4,lane,wc);
- if(RC<C){load_main<K>(tb,warp,lane,RC,s[0]);load_x<K>(tb,lane,RC,ts,te,s[0]);}
+ if(RC<C){load_main<K,KEEP>(tb,warp,lane,RC,s[0]);load_x<K,KEEP>(tb,lane,RC,ts,te,s[0]);}
  for(int cb=0;cb<C;cb+=RC){
   #pragma unroll
   for(int j=0;j<RC;++j){
@@ -217,14 +238,14 @@ __global__ __launch_bounds__(128,2) void gemm(P p) {
     #pragma unroll
     for(int st=0;st<4;++st)mma(a[j][st][0],a[j][st][1],wc[2*st],wc[2*st+1],acc);
     if constexpr (K == 2688) {
-     if(c+RC<C)load_a<K,!PDL>(p,lane,c+RC,a[j]);
+     if(c+RC<C)load_a<K,KEEP,!PDL>(p,lane,c+RC,a[j]);
     }
     if(c+1<C){
      uint32_t wn[8];
      decode(s[(j+1)%RC],e0x,esc4,lane,wn);
      if(c+1+RC<C){
-      load_main<K>(tb,warp,lane,c+1+RC,s[(j+1)%RC]);
-      load_x<K>(tb,lane,c+1+RC,ts,te,s[(j+1)%RC]);
+      load_main<K,KEEP>(tb,warp,lane,c+1+RC,s[(j+1)%RC]);
+      load_x<K,KEEP>(tb,lane,c+1+RC,ts,te,s[(j+1)%RC]);
      }
      #pragma unroll
      for(int i=0;i<8;++i)wc[i]=wn[i];
@@ -232,7 +253,7 @@ __global__ __launch_bounds__(128,2) void gemm(P p) {
     // Output projection: decode/refill weights before issuing the next
     // independent activation refill. Keep the original input schedule.
     if constexpr (K == 4096) {
-     if(c+RC<C)load_a<K,!PDL>(p,lane,c+RC,a[j]);
+     if(c+RC<C)load_a<K,KEEP,!PDL>(p,lane,c+RC,a[j]);
     }
    }
   }
@@ -257,8 +278,8 @@ __global__ __launch_bounds__(128) void decode_kernel(const uint8_t* buf,int tile
  uint32_t e0x=((prm&0xffu)<<3)*0x01010101u,esc4=((prm>>8)&0xffu)*0x01010101u;
  for(int c=0;c<C;++c){
   Slot s;uint32_t w[8];
-  load_main<K>(tb,warp,lane,c,s);
-  load_x<K>(tb,lane,c,ts,te,s);
+  load_main<K,false>(tb,warp,lane,c,s);
+  load_x<K,false>(tb,lane,c,ts,te,s);
   decode(s,e0x,esc4,lane,w);
   #pragma unroll
   for(int st=0;st<4;++st){
@@ -267,7 +288,7 @@ __global__ __launch_bounds__(128) void decode_kernel(const uint8_t* buf,int tile
   }
  }
 }
-template<int N,int K,int RC,bool PDL>
+template<int N,int K,int RC,bool PDL,bool KEEP>
 cudaError_t launch(const P&p,cudaStream_t stream) {
 #ifndef FP8C_NO_PDL
  if constexpr (PDL) {
@@ -277,23 +298,23 @@ cudaError_t launch(const P&p,cudaStream_t stream) {
   attr[0].id=cudaLaunchAttributeProgrammaticStreamSerialization;
   attr[0].val.programmaticStreamSerializationAllowed=1;
   cfg.attrs=attr;cfg.numAttrs=1;
-  return cudaLaunchKernelEx(&cfg,gemm<N,K,RC,true>,p);
+  return cudaLaunchKernelEx(&cfg,gemm<N,K,RC,true,KEEP>,p);
  }
 #endif
- gemm<N,K,RC,false><<<N/32,128,0,stream>>>(p);
+ gemm<N,K,RC,false,KEEP><<<N/32,128,0,stream>>>(p);
  return cudaGetLastError();
 }
-template<int RC,bool PDL>
+template<int RC,bool PDL,bool KEEP>
 cudaError_t dispatch(const P&p,int n,int k,cudaStream_t stream) {
- if(n==10304&&k==2688)return launch<10304,2688,RC,PDL>(p,stream);
- if(n==2688&&k==4096)return launch<2688,4096,RC,PDL>(p,stream);
+ if(n==10304&&k==2688)return launch<10304,2688,RC,PDL,KEEP>(p,stream);
+ if(n==2688&&k==4096)return launch<2688,4096,RC,PDL,KEEP>(p,stream);
  return cudaErrorInvalidValue;
 }
 }  // namespace fp8c
 
 // Ring depth in chunks: 3 (in_proj default), 4 (out_proj default) or 6.
 extern "C" int fp8c_run(const void*a,const void*w,const void*sa,const void*sb,void*c,int m,int n,int k,
-                        int tile_bytes,int pdl,int ring,void*stream) {
+                        int tile_bytes,int pdl,int ring,void*stream,int keep) {
  using namespace fp8c;
  if(m<1||m>8)return (int)cudaErrorInvalidValue;
  P p{(const uint8_t*)a,(const uint8_t*)w,(const float*)sa,(const float*)sb,(__nv_bfloat16*)c,m,tile_bytes};
@@ -302,12 +323,15 @@ extern "C" int fp8c_run(const void*a,const void*w,const void*sa,const void*sb,vo
 #ifdef FP8C_NO_PDL
  if(pdl)return (int)cudaErrorNotSupported;
 #endif
+ #define FP8C_DISPATCH(RC,PDL_) \
+  (keep ? dispatch<RC,PDL_,true>(p,n,k,st) : dispatch<RC,PDL_,false>(p,n,k,st))
  switch(ring){
-  case 3: rc=pdl?dispatch<3,true>(p,n,k,st):dispatch<3,false>(p,n,k,st);break;
-  case 4: rc=pdl?dispatch<4,true>(p,n,k,st):dispatch<4,false>(p,n,k,st);break;
-  case 6: rc=pdl?dispatch<6,true>(p,n,k,st):dispatch<6,false>(p,n,k,st);break;
+  case 3: rc=pdl?FP8C_DISPATCH(3,true):FP8C_DISPATCH(3,false);break;
+  case 4: rc=pdl?FP8C_DISPATCH(4,true):FP8C_DISPATCH(4,false);break;
+  case 6: rc=pdl?FP8C_DISPATCH(6,true):FP8C_DISPATCH(6,false);break;
   default: return (int)cudaErrorInvalidValue;
  }
+#undef FP8C_DISPATCH
  if(rc!=cudaSuccess){cudaGetLastError();return (int)rc;}  // cleared: the caller may retry without PDL
  return (int)cudaGetLastError();
 }
@@ -327,11 +351,15 @@ extern "C" int fp8c_header_bytes(int k) {
 extern "C" int fp8c_init() {
  cudaFuncAttributes attr;cudaError_t rc;
  // the default rings: 3 for in_proj, 4 for out_proj
- rc=cudaFuncGetAttributes(&attr,fp8c::gemm<10304,2688,3,false>);if(rc!=cudaSuccess)return (int)rc;
- rc=cudaFuncGetAttributes(&attr,fp8c::gemm<2688,4096,4,false>);if(rc!=cudaSuccess)return (int)rc;
+ rc=cudaFuncGetAttributes(&attr,fp8c::gemm<10304,2688,3,false,false>);if(rc!=cudaSuccess)return (int)rc;
+ rc=cudaFuncGetAttributes(&attr,fp8c::gemm<2688,4096,4,false,false>);if(rc!=cudaSuccess)return (int)rc;
+ rc=cudaFuncGetAttributes(&attr,fp8c::gemm<10304,2688,3,false,true>);if(rc!=cudaSuccess)return (int)rc;
+ rc=cudaFuncGetAttributes(&attr,fp8c::gemm<2688,4096,4,false,true>);if(rc!=cudaSuccess)return (int)rc;
 #ifndef FP8C_NO_PDL
- rc=cudaFuncGetAttributes(&attr,fp8c::gemm<10304,2688,3,true>);if(rc!=cudaSuccess)return (int)rc;
- rc=cudaFuncGetAttributes(&attr,fp8c::gemm<2688,4096,4,true>);if(rc!=cudaSuccess)return (int)rc;
+ rc=cudaFuncGetAttributes(&attr,fp8c::gemm<10304,2688,3,true,false>);if(rc!=cudaSuccess)return (int)rc;
+ rc=cudaFuncGetAttributes(&attr,fp8c::gemm<2688,4096,4,true,false>);if(rc!=cudaSuccess)return (int)rc;
+ rc=cudaFuncGetAttributes(&attr,fp8c::gemm<10304,2688,3,true,true>);if(rc!=cudaSuccess)return (int)rc;
+ rc=cudaFuncGetAttributes(&attr,fp8c::gemm<2688,4096,4,true,true>);if(rc!=cudaSuccess)return (int)rc;
 #endif
  rc=cudaFuncGetAttributes(&attr,fp8c::decode_kernel<2688>);if(rc!=cudaSuccess)return (int)rc;
  return (int)cudaFuncGetAttributes(&attr,fp8c::decode_kernel<4096>);

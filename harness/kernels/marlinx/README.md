@@ -5,7 +5,8 @@
 layers when a call has 1 to 8 rows: the 23 target shared experts (up 2688->3712,
 down 3712->2688) and `lm_head` (2688->131072). Every bf16 output element is
 bit-identical to stock Marlin. It reads the same Marlin-format tensors the layer
-already holds (no repack, no extra memory). `MARLINX=0` disables it. Calls outside
+already holds, except the shared down projection's tile-major copy (see below;
+`MARLINX_TILED=0` keeps Marlin's layout). `MARLINX=0` disables it. Calls outside
 the guard in `py/__init__.py` (shape allowlist, 1 <= M <= 8, bf16, 16-byte aligned
 rows, no bias, not under `torch.compile` tracing) run stock Marlin, so prefill
 (M ~ 496) is untouched.
@@ -134,6 +135,35 @@ k16 block from the activations (bit `kr` set when column `16*kb+kr` is nonzero
 in some row < M); a row whose bit is clear is not read and its nibbles are
 zero. Those weights only multiply activations that are zero in every row.
 Scales, dequant, MMA operands, segments and every fp32 add are unchanged.
-`MARLINX_ZS=0` disables it. `tests/marlinx_zs_exact.py` compares against stock
+`MARLINX_ZS=0` disables it, and so does the tile-major repack below, which is
+the default for this shape. `tests/marlinx_zs_exact.py` compares against stock
 Marlin and marlinx on all 23 layers (M = 1..8, synthetic and real dumped
 activations, signed zeros, CUDA graph replay with in-place inputs).
+
+## Tile-major repack for the shared expert down projection
+
+The skip above reads 32-byte gathers: one lane takes four u32 per k16 block,
+strided `N/64*8` words apart, and the eight lane groups of a warp cover only
+contiguous 32-byte runs inside each of those four rows. A dense read of Marlin's
+own layout is also awkward - a CTA's 512-byte half column sits every `N/2` int4
+(29.7 KB here) apart - so `prepare()` builds `tile_repack()`: each 128-feature
+column's whole K becomes one contiguous run, `[N/128][K/16][256]` int32 weights
+and `[N/128][K/16][128]` scales. `marlinx_gemm_tiled` is the same kernel with
+only the column base and the k16 stride changed (`col*(K/16)*64` and `+kb*64`
+uint4 instead of `64*col` and `+kb*N/2`), so every value, MMA operand, chain
+order, segment fold and fp32 add is identical, and a k row the skip would have
+dropped contributes exact zeros either way - the same argument the skip relies
+on. Scales are repacked the same way (`[N/128][K/16][16]` uint2 per k16 row).
+
+Cold measurement over 23 distinct 4.99 MB tensors (512 MB flush per sweep, CUDA
+graphs, ~50%-zero ReLU^2 activations, M = 5): **42.0 us dense tile-major vs
+50.4 us zero-row skip**, and 42.1 us for the same dense read over Marlin's
+layout - the win is the read shape, not the skipping. `MARLINX_TILED=0`
+restores the skip. The same repack on the shared up projection (3712 -> 2688) is
+neutral (36.9 vs 36.0 us cold), so the shared up keeps Marlin's layout; its
+`marlinx_gemm_relu2_tiled` entry point is verified but not enabled.
+
+Bit-exactness of the repacked down is checked by `tests/marlinx_exact.py` (which
+now covers both layouts) and separately on all 23 layers, M = 1..8, three input
+families and CUDA graph replay: 1748 cases, 0 word differences against stock
+Marlin, the dense kernel and the skip.

@@ -43,6 +43,7 @@ struct Params {
   const uint32_t* Z;       // zero-row skip: k-row-major copy of B, [K/16][16][N/64][8] u32 (or null)
   int part1_cols;          // columns reduced by a single Marlin block
   int iters;               // Marlin stripe length (k-tiles per block) in part 2
+  int tiled;               // B/S repacked [col][k16][...]: 1, Marlin's [k16][N/2] tile: 0
 };
 
 __device__ __forceinline__ uint4 ld_stream_v4(const uint4* p) {
@@ -301,10 +302,18 @@ __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
   // First internal segment cut of this column (k-tiles), k_tiles if none.
   const int first_cut = column_first_cut(p, col);
 
-  const long long nB = p.N >> 1;  // int4 per k16 row
-  const long long nS = p.N >> 3;  // uint2 per k16 row
-  const uint4* Bp = p.B + 64 * col + 32 * h + lane;
-  const uint2* Sp = p.S + 16 * col + 8 * h + (lane >> 2);
+  // Marlin stores one k16 row of the [K/16][N/2] int4 weights contiguously, so a
+  // CTA reads a 512-byte half column every N/2 int4 (29.7 KB here). Tiled reads
+  // the load-time repack [col][k16][64 uint4] / [col][k16][16 uint2] instead: the
+  // same values and the same order, but each CTA streams its own contiguous
+  // column. Only the strides and the base of the column differ.
+  const long long k16 = p.K >> 4;
+  const long long nB = p.tiled ? 64 : (p.N >> 1);  // int4 per k16 row
+  const long long nS = p.tiled ? 16 : (p.N >> 3);  // uint2 per k16 row
+  const uint4* Bp = p.B + (p.tiled ? (long long)col * (k16 * 64) : (long long)(64 * col)) +
+                    32 * h + lane;
+  const uint2* Sp = p.S + (p.tiled ? (long long)col * (k16 * 16) : (long long)(16 * col)) +
+                    8 * h + (lane >> 2);
   const int tok = lane >> 2;
   const bool arow = tok < p.M;
   const uint32_t* Ap =
@@ -522,11 +531,13 @@ int marlinx_regs(int depth) {
 // a negative code for unsupported arguments.
 static int marlinx_gemm_impl(const void* A, long long lda, int M, const void* B, const void* S,
                  const void* GS, void* C, long long ldc, int N, int K, int sms, int depth,
-                 void* stream, bool relu2, const void* Z = nullptr, bool pdl = false) {
+                 void* stream, bool relu2, const void* Z = nullptr, bool pdl = false,
+                 bool tiled = false) {
   if (M < 1 || M > 8) return -1;
   if (N <= 0 || K <= 0 || N % 128 || K % 128) return -2;
   if (sms <= 0) return -3;
   if (lda % 8 || (reinterpret_cast<uintptr_t>(A) & 15)) return -4;
+  if (tiled && Z) return -9;  // the repack carries weights and scales, not Z
   marlinx::Params p;
   p.A = static_cast<const __nv_bfloat16*>(A);
   p.lda = lda;
@@ -549,6 +560,7 @@ static int marlinx_gemm_impl(const void* A, long long lda, int M, const void* B,
   }
   p.part1_cols = p.n_tiles - part2;
   p.iters = (p.k_tiles * part2 + sms - 1) / sms;
+  p.tiled = tiled ? 1 : 0;
   cudaStream_t st = static_cast<cudaStream_t>(stream);
   if (relu2) {
     if (N != 3712 || K != 2688) return -6;
@@ -612,6 +624,39 @@ int marlinx_gemm_zs_pdl(const void* A, long long lda, int M, const void* B, cons
                  void* stream, const void* Z) {
   if (!Z) return -8;
   return marlinx_gemm_impl(A, lda, M, B, S, GS, C, ldc, N, K, sms, depth, stream, false, Z, true);
+}
+#endif
+
+// Same GEMM over the load-time tile-major repack of B and S made by
+// py/__init__.py tile_repack(): [col][k16][64 uint4] weights and
+// [col][k16][16 uint2] scales. Only the addressing changes; every value, MMA
+// operand, chain order and fp32 add is the dense kernel's.
+int marlinx_gemm_tiled(const void* A, long long lda, int M, const void* B, const void* S,
+                 const void* GS, void* C, long long ldc, int N, int K, int sms, int depth,
+                 void* stream) {
+  return marlinx_gemm_impl(A, lda, M, B, S, GS, C, ldc, N, K, sms, depth, stream, false, nullptr,
+                           false, true);
+}
+
+int marlinx_gemm_relu2_tiled(const void* A, long long lda, int M, const void* B, const void* S,
+                 const void* GS, void* C, long long ldc, int N, int K, int sms, int depth,
+                 void* stream) {
+  return marlinx_gemm_impl(A, lda, M, B, S, GS, C, ldc, N, K, sms, depth, stream, true, nullptr,
+                           false, true);
+}
+
+#ifndef MARLINX_NO_PDL
+int marlinx_gemm_tiled_pdl(const void* A, long long lda, int M, const void* B, const void* S,
+                 const void* GS, void* C, long long ldc, int N, int K, int sms, int depth,
+                 void* stream) {
+  return marlinx_gemm_impl(A, lda, M, B, S, GS, C, ldc, N, K, sms, depth, stream, false, nullptr,
+                           true, true);
+}
+int marlinx_gemm_relu2_tiled_pdl(const void* A, long long lda, int M, const void* B, const void* S,
+                 const void* GS, void* C, long long ldc, int N, int K, int sms, int depth,
+                 void* stream) {
+  return marlinx_gemm_impl(A, lda, M, B, S, GS, C, ldc, N, K, sms, depth, stream, true, nullptr,
+                           true, true);
 }
 #endif
 

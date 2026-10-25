@@ -17,7 +17,8 @@ import os
 
 import torch
 
-__all__ = ["LIB_PATH", "available", "prepare", "maybe_apply", "gemm", "hog", "regs", "SHAPES", "maybe_apply_relu2"]
+__all__ = ["LIB_PATH", "available", "prepare", "maybe_apply", "gemm", "hog", "regs", "SHAPES",
+           "maybe_apply_relu2", "tile_repack"]
 
 LIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "libmarlinx.so")
 
@@ -59,19 +60,19 @@ def _load():
             ctypes.c_void_p,  # stream
         ]
         lib.marlinx_gemm.restype = ctypes.c_int
-        if hasattr(lib, "marlinx_gemm_zs"):
-            lib.marlinx_gemm_zs.argtypes = lib.marlinx_gemm.argtypes + [ctypes.c_void_p]
-            lib.marlinx_gemm_zs.restype = ctypes.c_int
-        if hasattr(lib, "marlinx_gemm_relu2"):
-            lib.marlinx_gemm_relu2.argtypes = lib.marlinx_gemm.argtypes
-            lib.marlinx_gemm_relu2.restype = ctypes.c_int
         lib.marlinx_hog.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
                                     ctypes.c_longlong, ctypes.c_void_p, ctypes.c_void_p]
         lib.marlinx_hog.restype = ctypes.c_int
+        # Every entry point takes the same 13 arguments, except marlinx_gemm_zs,
+        # which appends Z. Each MUST have argtypes: without them ctypes passes
+        # the 64-bit pointer values as C int and truncates them.
         _ops = {"gemm": lib.marlinx_gemm}
-        for mode in ("relu2", "zs"):
+        for mode in ("relu2", "zs", "tiled", "relu2_tiled"):
             op = getattr(lib, "marlinx_gemm_" + mode, None)
             if op is not None:
+                op.argtypes = list(lib.marlinx_gemm.argtypes) + (
+                    [ctypes.c_void_p] if mode == "zs" else [])
+                op.restype = ctypes.c_int
                 _ops[mode] = op
         if _PDL_ENABLED:
             try:
@@ -81,6 +82,10 @@ def _load():
                     "relu2": lib.marlinx_gemm_relu2_pdl,
                     "zs": lib.marlinx_gemm_zs_pdl,
                 }
+                for mode in ("tiled", "relu2_tiled"):
+                    op = getattr(lib, "marlinx_gemm_" + mode + "_pdl", None)
+                    if op is not None:
+                        ops_pdl[mode] = op
             except AttributeError:  # old library or MARLINX_NO_PDL build
                 init_pdl = None
             if init_pdl is not None:
@@ -158,7 +163,22 @@ def prepare(layer) -> bool:
         ok = _init()
     layer._marlinx_ok = ok
     layer._marlinx_zs = None
-    if ok and ZS_ENABLED and (n, k) == ZS_SHAPE and hasattr(_lib, "marlinx_gemm_zs"):
+    layer._marlinx_bt = None
+    layer._marlinx_st = None
+    if (
+        ok
+        and TILED_ENABLED
+        and (n, k) in TILED_SHAPES
+        and hasattr(_lib, "marlinx_gemm_tiled")
+    ):
+        layer._marlinx_bt, layer._marlinx_st = tile_repack(w, s, n, k)
+    if (
+        ok
+        and layer._marlinx_bt is None
+        and ZS_ENABLED
+        and (n, k) == ZS_SHAPE
+        and hasattr(_lib, "marlinx_gemm_zs")
+    ):
         layer._marlinx_zs = zs_repack(w, n, k)
     return ok
 
@@ -189,17 +209,52 @@ def zs_repack(w: torch.Tensor, n: int, k: int) -> torch.Tensor:
     return out.to(torch.int32).contiguous()
 
 
+# Tile-major repack for the shared expert's projections. Marlin keeps one k16 row
+# of the [K/16][N/2] int4 weights contiguous, so a CTA of the dense kernel reads
+# a 512-byte half column every N/2 int4 (29.7 KB): one scattered segment per k16
+# block of a 4.99 MB tensor. tile_repack lays each 128-feature column's whole K
+# out as one contiguous run of (K/16)*64 uint4 weights and (K/16)*16 uint2
+# scales, so each CTA streams its column sequentially. Same bytes, same values,
+# same reduction order; csrc/marlinx.cu only changes the column base and the k16
+# stride.
+TILED_ENABLED = os.environ.get("MARLINX_TILED", "1") != "0"
+# Repacked shapes. The shared down (2688x3712) replaces its zero-row-skip copy:
+# a skipped k row contributes exact zeros either way (the same argument the skip
+# relies on), and a dense 512-byte read of the tile streams better than the
+# skip's 32-byte gathers (42.0 vs 50.4 us cold). The shared up (3712x2688) keeps
+# Marlin's layout: the same repack measured neutral there (36.9 vs 36.0 us), and
+# its relu2-fused entry point is verified but not enabled.
+TILED_SHAPES = frozenset({(2688, 3712)})
+
+
+@torch.no_grad()
+def tile_repack(w: torch.Tensor, s: torch.Tensor, n: int, k: int):
+    """([N/128][K/16][256] int32 weights, [N/128][K/16][128] scales) for gemm(tiled=True)."""
+    k16 = k // 16
+    bt = w.view(k16, n // 128, 256).permute(1, 0, 2).contiguous()
+    st = s.view(k16, n // 128, 128).permute(1, 0, 2).contiguous()
+    return bt, st
+
+
 def gemm(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
          global_scale: torch.Tensor, n: int, k: int, depth: int = DEPTH,
-         relu2: bool = False, zs: torch.Tensor | None = None) -> torch.Tensor:
+         relu2: bool = False, zs: torch.Tensor | None = None,
+         tiled: bool = False) -> torch.Tensor:
     """out[M, n] for a 2-D bf16 x[M, k] (1 <= M <= 8); no guard beyond the C side's."""
     global _pdl_active
     lib = _load()
     assert lib is not None, _load_error
     m = x.shape[0]
     out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
-    mode = "zs" if zs is not None else "relu2" if relu2 else "gemm"
-    use_pdl = _pdl_active
+    if tiled:
+        mode = "relu2_tiled" if relu2 else "tiled"
+    elif zs is not None:
+        mode = "zs"
+    elif relu2:
+        mode = "relu2"
+    else:
+        mode = "gemm"
+    use_pdl = _pdl_active and mode in _ops_pdl
     op = _ops_pdl[mode] if use_pdl else _ops[mode]
     args = (
         x.data_ptr(), x.stride(0), m,
@@ -240,8 +295,12 @@ def maybe_apply(layer, x: torch.Tensor) -> torch.Tensor | None:
     if not _ready and not _init():
         return None
     n = layer.output_size_per_partition
-    out = gemm(x2, layer.weight, layer.weight_scale, layer.weight_global_scale, n, k,
-               zs=getattr(layer, "_marlinx_zs", None))
+    bt = getattr(layer, "_marlinx_bt", None)
+    if bt is not None:
+        out = gemm(x2, bt, layer._marlinx_st, layer.weight_global_scale, n, k, tiled=True)
+    else:
+        out = gemm(x2, layer.weight, layer.weight_scale, layer.weight_global_scale, n, k,
+                   zs=getattr(layer, "_marlinx_zs", None))
     return out.reshape(*x.shape[:-1], n)
 
 
@@ -255,8 +314,12 @@ def hog(src: torch.Tensor, blocks: int, threads: int, smem: int, sink: torch.Ten
         raise RuntimeError(f"marlinx_hog failed: {rc}")
 
 
-def maybe_apply_relu2(x, weight, weight_scale, global_scale, n, k):
-    """Opaque-op runtime path for a prepared single-device shared up projection."""
+def maybe_apply_relu2(x, weight, weight_scale, global_scale, n, k, bt=None, st=None):
+    """Opaque-op runtime path for a prepared single-device shared up projection.
+
+    bt/st are the layer's tile-major repack when prepare() made one (see
+    tile_repack); otherwise the Marlin tensors are streamed as is.
+    """
     if not ENABLED or not _ready or _load() is None:
         return None
     if not hasattr(_lib, "marlinx_gemm_relu2") or (n, k) != (3712, 2688):
@@ -270,18 +333,36 @@ def maybe_apply_relu2(x, weight, weight_scale, global_scale, n, k):
         or x2.stride(-1) != 1
         or x2.stride(0) % 8
         or x2.data_ptr() % 16
-        or weight.dtype != torch.int32
+        or global_scale.dtype != torch.float32
+        or global_scale.numel() != 1
+        or not global_scale.is_contiguous()
+        or global_scale.device != x.device
+    ):
+        return None
+    if (
+        bt is not None
+        and st is not None
+        and "relu2_tiled" in _ops
+        and bt.dtype == torch.int32
+        and tuple(bt.shape) == (n // 128, k // 16, 256)
+        and bt.is_contiguous()
+        and st.dtype == torch.float8_e4m3fn
+        and tuple(st.shape) == (n // 128, k // 16, 128)
+        and st.is_contiguous()
+        and bt.device == x.device
+        and st.device == x.device
+    ):
+        out = gemm(x2, bt, st, global_scale, n, k, relu2=True, tiled=True)
+        return out.reshape(*x.shape[:-1], n)
+    if (
+        weight.dtype != torch.int32
         or weight.shape != (k // 16, 2 * n)
         or not weight.is_contiguous()
         or weight_scale.dtype != torch.float8_e4m3fn
         or weight_scale.shape != (k // 16, n)
         or not weight_scale.is_contiguous()
-        or global_scale.dtype != torch.float32
-        or global_scale.numel() != 1
-        or not global_scale.is_contiguous()
         or weight.device != x.device
         or weight_scale.device != x.device
-        or global_scale.device != x.device
     ):
         return None
     out = gemm(x2, weight, weight_scale, global_scale, n, k, relu2=True)

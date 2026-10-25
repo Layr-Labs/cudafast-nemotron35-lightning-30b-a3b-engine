@@ -19,6 +19,23 @@ OPS = ROOT / "vllm/vllm/model_executor/layers/mamba/ops"
 FUSED = OPS / "ssd_prefill_fused.py"
 
 
+def module_constants(path, prefix):
+    """Evaluate the module-level numeric constants `fused_prefill` reads."""
+    scope = {"os": os, "int": int}
+    out = {}
+    for node in ast.parse(path.read_text()).body:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id.startswith(prefix)
+        ):
+            out[node.targets[0].id] = eval(
+                compile(ast.Expression(node.value), str(path), "eval"), scope
+            )
+    return out
+
+
 def function(path, name, namespace):
     node = copy.deepcopy(
         next(
@@ -411,6 +428,11 @@ def fused_result(q, tl):
         LAST=q.last,
         INIT=q.initial,
         OUT=state,
+        FINAL_CACHE=state,
+        FINAL_INDEX=Tensor(np.array([0], dtype=np.int32)),
+        WRITE_FINAL=False,
+        FS=(q.heads * q.h * q.n, q.h * q.n, q.n, 1),
+        CACHE_SLOTS=1,
         H=q.h,
         N=q.n,
         RATIO=q.heads // q.groups,
@@ -600,13 +622,21 @@ class DispatchTests(unittest.TestCase):
             for n in new.body
             if isinstance(n, ast.FunctionDef) and n.name == "_cb_scan_kernel"
         )
-        head_loop = next(
-            n
-            for n in scan.body
-            if isinstance(n, ast.For)
-            and isinstance(n.target, ast.Name)
-            and n.target.id == "local_head"
-        )
+        def head_loop_of(node):
+            if not isinstance(node, ast.For):
+                return False
+            if isinstance(node.target, ast.Name) and node.target.id == "local_head":
+                return True
+            return any(
+                isinstance(statement, ast.Assign)
+                and any(
+                    isinstance(t, ast.Name) and t.id == "local_head"
+                    for t in statement.targets
+                )
+                for statement in node.body
+            )
+
+        head_loop = next(n for n in ast.walk(scan) if head_loop_of(n))
         self.assertFalse(
             any(
                 isinstance(n, ast.AugAssign)
@@ -664,7 +694,12 @@ class DispatchTests(unittest.TestCase):
         torch = torch_double()
         torch.empty = lambda shape, dtype, device: Tensor(np.empty(shape, np.float32))
         torch.accelerator = NS(device_index=lambda index: nullcontext())
-        ns.update(torch=torch, triton=NS(cdiv=lambda a, b: (a + b - 1) // b))
+        ns.update(
+            torch=torch,
+            triton=NS(cdiv=lambda a, b: (a + b - 1) // b),
+            os=os,
+            **module_constants(FUSED, "_SSD_"),
+        )
         function(FUSED, "fused_prefill", ns)(
             q.x,
             q.b,
@@ -679,11 +714,19 @@ class DispatchTests(unittest.TestCase):
             z=q.z,
             initial=q.initial,
         )
+        # The CB scan splits the head range over its part axis, so its grid is
+        # groups * hsplit, with the same hsplit rule the wrapper applies.
+        constants = module_constants(FUSED, "_SSD_")
+        state_split = constants["_SSD_STATE_NSPLIT"]
+        state_parts = state_split if self.q.n % (16 * state_split) == 0 else 1
+        scan_split = constants["_SSD_SCAN_HSPLIT"]
+        heads_per_group = self.q.heads // self.q.groups
+        scan_parts = scan_split if heads_per_group % scan_split == 0 else 1
         self.assertEqual(
             [x[:4] for x in calls],
             [
-                ("_state_pass_kernel", (1, 64), 4, 4),
-                ("_cb_scan_kernel", (2, 1, 8), 8, 1),
+                ("_state_pass_kernel", (1, 64, state_parts), 4, 4),
+                ("_cb_scan_kernel", (2, 1, self.q.groups * scan_parts), 8, 1),
             ],
         )
         self.assertEqual(

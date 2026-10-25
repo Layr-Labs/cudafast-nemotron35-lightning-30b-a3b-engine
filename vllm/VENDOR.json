@@ -278,6 +278,10 @@
     {
       "file": "harness/kernels/pzskip/csrc/pzskip.cu (+ build.sh)",
       "why": "PZ333 M496/top-6 only: HUMMING_EVICT_PZ defaults on and gives immutable packed B/BS cp.async loads L2 evict-first priority. Loader addresses, bytes, masks, K16 MMA order, negative-zero repair and formats are unchanged. HUMMING_EVICT_PZ=0 restores stock. Separate native template specialization; compile/load failure retains stock PZ333. Stacks independently with the routed-up evf policy; no decode change."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_packed.py; harness/tests/packed_gemv_group8_exact.py; harness/vllm_resident/test_ssd_prefill_fused.py",
+      "why": "Add an opt-in GROUP8 native M=1 packed decoder: flatten the existing GEMV tile into eight-value register groups, load RI/BASE and one uint32 EX word per group, then restore the original layout with assert_trivial=True. Preserve every BF16 bit, raw escape, gate, PDL launch, tile, FP32 accumulation and reduction. All 14 real QKV/output projections passed 84 comparisons over three magnitudes with 17,661 natural raw-escape blocks. Direct production timing favored GROUP8 over WORD on both shapes in every round. Native dispatch is enabled only after full-shape load-time BYTE equality at three magnitudes; failure retains the published path. MTP_PACK12_GROUP8=0 disables it. Test-only SSD fixture corrections have no model arithmetic changes."
     }
   ]
 }

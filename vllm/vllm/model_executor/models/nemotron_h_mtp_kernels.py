@@ -781,7 +781,7 @@ def mtp_moe_row(
     topk = ids.numel()
     E, inter, H = w13.shape
     h = torch.empty((topk + n_shared, inter), dtype=x.dtype, device=x.device)
-    from .nemotron_h_mtp_packed import PackedBF16, packed_moe_up, word_load_enabled
+    from .nemotron_h_mtp_packed import PackedBF16, packed_moe_up
 
     gate, gated = _gate_args(x)
     if isinstance(w13, PackedBF16):
@@ -790,7 +790,6 @@ def mtp_moe_row(
             inter * H, H, H, gate, TOPK=topk, BN=_PK_UP_BN, BK=_MOE_UP_BK,
             EVICT=_EVICT_W, GATED=gated, num_warps=4 * _PK_UP_WN,
             num_stages=_MOE_UP_STAGES, launch_pdl=mtp_pdl(), WN=_PK_UP_WN,
-            WORD=word_load_enabled(x.device),
         )
     else:
         _mtp_moe_up_kernel[(triton.cdiv(inter, _MOE_UP_BN), topk + n_shared)](

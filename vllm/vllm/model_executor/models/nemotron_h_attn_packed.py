@@ -33,7 +33,6 @@ import sys
 
 import torch
 import torch.nn.functional as F
-from vllm.triton_utils import triton, tl
 
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -51,12 +50,8 @@ ENABLED = os.environ.get("ATTN_PACK12", "1") != "0"
 SHAPES = frozenset({(4608, 2688), (2688, 4096)})
 MIN_GAIN = 0.96
 KERNEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nemotron_h_attn_packed_kernel.py")
-CUDA = ("apk12",)
-CUDA_PDL = ("apk12_pdl",)
-CUDA_PDL8 = ("apk12_pdl8",)
-_cuda_ok = False
-_cuda_pdl_ok = False
-_cuda_pdl8_ok = False
+CUDA = ("apk12", 4)
+CUDA_R2 = ("apk12", 2)
 
 _chosen: dict[tuple[int, int], tuple] = {}
 _word_ok = False
@@ -95,9 +90,7 @@ spec = importlib.util.spec_from_file_location("apk12", sys.argv[1])
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 dev = torch.device("cuda")
-pdl = sys.argv[2] in ("apk12_pdl", "apk12_pdl8")
-ring = 8 if sys.argv[2] == "apk12_pdl8" else 4
-assert (m.ready_pdl(dev) if pdl else m.ready(dev))
+assert m.ready(dev)
 for n, k in ((4608, 2688), (2688, 4096)):
     nb = n * k // 128
     sm = torch.randint(0, 256, (n * k,), dtype=torch.uint8, device=dev)
@@ -115,25 +108,22 @@ for n, k in ((4608, 2688), (2688, 4096)):
     w = torch.where(esc, raw.int().view(-1, 128)[ri.clamp(min=0)].view(-1), w).short()
     cp = m.pack((sm, ex, base, ri, raw), n, k)
     assert m.check(cp, w, n, k) == 0
-    x = torch.randn(5, k, device=dev, dtype=torch.bfloat16)
-    reference = m.gemm(x, cp, n, k)
-    y = m.gemm(x, cp, n, k, pdl=pdl, ring=ring)
+    y = m.gemm(torch.randn(5, k, device=dev, dtype=torch.bfloat16), cp, n, k)
     torch.cuda.synchronize()
     assert y.shape == (5, n)
-    assert torch.equal(y.view(torch.uint8), reference.view(torch.uint8))
 print("probe-ok")
 """
 
 
 def _run(x: torch.Tensor, planes, n: int, k: int, cfg: tuple) -> torch.Tensor:
-    if cfg in (CUDA, CUDA_PDL, CUDA_PDL8):
-        return _apk12.gemm(x, planes, n, k, pdl=cfg != CUDA, ring=8 if cfg == CUDA_PDL8 else 4)
+    if cfg in (CUDA, CUDA_R2):
+        return _apk12.gemm(x, planes, n, k, ring=cfg[1])
     return run(x, *planes, n, k, cfg)
 
 
 def _planes(item, cfg: tuple):
     """An item is (proj, codec planes, apk12's copy of them or None)."""
-    return item[2] if cfg in (CUDA, CUDA_PDL, CUDA_PDL8) else item[1]
+    return item[2] if cfg in (CUDA, CUDA_R2) else item[1]
 
 
 def _linear_impl(x: torch.Tensor, w: torch.Tensor, n: int, k: int, pid: int) -> torch.Tensor:
@@ -196,23 +186,8 @@ def _probe() -> bool:
 
 
 def _probe_cuda(dev: torch.device) -> bool:
-    global _cuda_ok, _cuda_pdl_ok, _cuda_pdl8_ok
-    ordinary = (_apk12 is not None
-                and _probe_group(CUDA[0], _PROBE_CUDA, _apk12.__file__)
-                and _apk12.ready(dev))
-    _cuda_pdl_ok = bool(
-        ordinary and hasattr(_apk12, "ready_pdl")
-        and _probe_group(CUDA_PDL[0], _PROBE_CUDA, _apk12.__file__)
-        and _apk12.ready_pdl(dev)
-    )
-    _cuda_pdl8_ok = bool(
-        _cuda_pdl_ok and _probe_group(CUDA_PDL8[0], _PROBE_CUDA, _apk12.__file__)
-        and _apk12.ready_pdl(dev)
-    )
-    # ENTIRE fc043 carries the ordinary CUDA path. Retain that qualified
-    # baseline choice while independently admitting the new PDL variants.
-    _cuda_ok = bool(ordinary)
-    return _cuda_ok or _cuda_pdl_ok or _cuda_pdl8_ok
+    return (_apk12 is not None and _probe_group(CUDA[0], _PROBE_CUDA, _apk12.__file__)
+            and _apk12.ready(dev))
 
 
 def _cuda_planes(planes, w: torch.Tensor, n: int, k: int):
@@ -229,61 +204,6 @@ def _cuda_planes(planes, w: torch.Tensor, n: int, k: int):
     return cp
 
 
-@triton.jit
-def _probe_producer(src, dst, N: tl.constexpr, B: tl.constexpr,
-                    launch_pdl: tl.constexpr = False):
-    if launch_pdl:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
-    ix = tl.program_id(0) * B + tl.arange(0, B)
-    value = tl.load(src + ix, mask=ix < N, other=0.0)
-    tl.store(dst + ix, value, mask=ix < N)
-
-
-@torch.no_grad()
-def _exact_cuda_graph(items, n: int, k: int, cfg: tuple) -> bool:
-    """Private remote replay, including an early-signaling mutable producer.
-
-    All temporary inputs and captured outputs are synthetic and released. This
-    checks fresh input visibility after PDL wait, beyond immutable weight bits.
-    """
-    device = items[0][0].weight.device
-    gen = torch.Generator(device=device).manual_seed(643821)
-    probes = [(torch.randn((ROWS, k), device=device, generator=gen) * scale)
-              .to(torch.bfloat16) for scale in (0.001, 1., 30.)]
-    edge = torch.zeros((ROWS, k), dtype=torch.bfloat16, device=device)
-    edge.view(torch.int16)[:, :8] = torch.tensor(
-        [0, -32768, 1, -32767, 128, -32640, 16256, -16512],
-        dtype=torch.int16, device=device).view(1, 8)
-    sparse = probes[1].clone()
-    sparse[:, ::2] = 0.
-    sparse[:, 2::4] = -0.
-    probes.extend((edge, sparse, torch.zeros_like(edge)))
-    for item in items:
-        proj, planes = item[0], _planes(item, cfg)
-        src = probes[1].clone()
-        xbuf = torch.empty_like(src)
-        # Compile and warm the exact producer/consumer before capture.
-        _probe_producer[(triton.cdiv(src.numel(), 1024),)](
-            src, xbuf, N=src.numel(), B=1024, launch_pdl=True)
-        _run(xbuf, planes, n, k, cfg)
-        torch.cuda.synchronize(device)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=torch.cuda.graph_pool_handle()):
-            _probe_producer[(triton.cdiv(src.numel(), 1024),)](
-                src, xbuf, N=src.numel(), B=1024, launch_pdl=True)
-            output = _run(xbuf, planes, n, k, cfg)
-        torch.cuda.synchronize(device)
-        # Repeat changing generations in different order; pointers stay fixed.
-        for probe in (*probes, *reversed(probes)):
-            src.copy_(probe)
-            graph.replay()
-            expected = F.linear(probe, proj.weight)
-            if not torch.equal(output.view(torch.uint8), expected.view(torch.uint8)):
-                return False
-    return True
-
-
 def _exact(items, n: int, k: int, cfg: tuple[int, int]) -> bool:
     dev = items[0][0].weight.device
     gen = torch.Generator(device=dev)
@@ -294,14 +214,8 @@ def _exact(items, n: int, k: int, cfg: tuple[int, int]) -> bool:
             for _ in range(8):
                 x = torch.randn(ROWS, k, device=dev, dtype=torch.float32, generator=gen)
                 x = (x * scale).to(torch.bfloat16)
-                actual, expected = _run(x, planes, n, k, cfg), F.linear(x, proj.weight)
-                if cfg in (CUDA, CUDA_PDL, CUDA_PDL8):
-                    if not torch.equal(actual.view(torch.uint8), expected.view(torch.uint8)):
-                        return False
-                elif not torch.equal(actual, expected):
+                if not torch.equal(_run(x, planes, n, k, cfg), F.linear(x, proj.weight)):
                     return False
-    if cfg in (CUDA, CUDA_PDL, CUDA_PDL8):
-        return _exact_cuda_graph(items, n, k, cfg)
     return True
 
 
@@ -359,13 +273,13 @@ def _choose(items, n: int, k: int, flush: torch.Tensor):
         use_graph = False
         linear_us = _op_us(lambda: F.linear(x, proj.weight), flush)
     choices = []
-    cuda = (([CUDA] if _cuda_ok else [])
-            + ([CUDA_PDL] if _cuda_pdl_ok else [])
-            + ([CUDA_PDL8] if _cuda_pdl8_ok else [])) if all(it[2] is not None for it in items) else []
+    cuda = (
+        [CUDA_R2, CUDA] if _apk12._RING == 2 else [CUDA]
+    ) if all(it[2] is not None for it in items) else []
     for cfg in cuda + (list(CONFIGS) if _triton_ok else []):
         if len(cfg) == 4 and not _word_ok:
             continue
-        if cfg not in (CUDA, CUDA_PDL, CUDA_PDL8) and n % cfg[0]:
+        if cfg not in (CUDA, CUDA_R2) and n % cfg[0]:
             continue
         try:
             if use_graph:

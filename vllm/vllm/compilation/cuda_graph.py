@@ -26,6 +26,11 @@ from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import current_stream, weak_ref_tensors
 
+try:
+    import l2pf as _l2pf
+except ImportError:
+    _l2pf = None
+
 logger = init_logger(__name__)
 
 
@@ -322,6 +327,8 @@ class CUDAGraphWrapper:
                     # forks copy_stream, but wait_prefetch only happens in
                     # the next forward pass.
                     get_offloader().join_after_forward()
+                    if _l2pf is not None:
+                        _l2pf.join_capture(current_stream().device)
                     if self.cudagraph_options.weak_ref_output:
                         # by converting it to weak ref,
                         # the original `output` will immediately be released

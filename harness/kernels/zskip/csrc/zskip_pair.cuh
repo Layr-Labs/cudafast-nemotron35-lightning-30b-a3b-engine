@@ -19,10 +19,9 @@ __device__ __forceinline__ uint4 ldg_u128(const void* p) {
 // HalfSkip (configs 114, 119): an 8-row half of a group (k 0..7 or 8..15) whose mask byte is zero
 // has keep01 or keep23 zero on every lane, so its A fragments are +0 whatever the weights; they
 // are not dequantised and the same MMAs take literal +0 there. m is the same on every lane.
-template <bool Fused, bool HalfSkip, int R = 3>
+template <bool Fused, bool HalfSkip>
 __global__ void __launch_bounds__(32) down_pair_kernel(const Params p) {
-  constexpr int TPW = 2, WPC = 1, NB = 1;
-  static_assert(R == 2 || R == 3, "paired loader ring");
+  constexpr int TPW = 2, WPC = 1, R = 3, NB = 1;
   constexpr bool HALF = false;
   static_assert(TPW == 1 || TPW == 2, "tiles per warp");
   static_assert(NB >= 1 && NB <= 4, "n-blocks per warp");

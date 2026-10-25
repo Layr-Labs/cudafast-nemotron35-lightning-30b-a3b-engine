@@ -16,13 +16,14 @@ import os
 import torch
 
 __all__ = [
-    "LIB_PATH", "ENABLED", "MAMBA_BYTES", "ATTN_BYTES", "MOE_BYTES", "DRAFT_BYTES",
+    "LIB_PATH", "ENABLED", "LATE_JOIN", "MAMBA_BYTES", "ATTN_BYTES", "MOE_BYTES", "DRAFT_BYTES",
     "AHEAD", "AHEAD_MOE", "DRAFT_SCREEN",
-    "prefetch", "join",
+    "prefetch", "join", "join_after_out_proj", "join_capture",
 ]
 
 LIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "libl2pf.so")
 ENABLED = os.environ.get("L2PF", "1") != "0"
+LATE_JOIN = os.environ.get("L2PF_LATE_JOIN", "1") != "0"
 CHUNK = 1 << 16
 # Bytes prefetched per window: what DRAM can deliver while the latency-bound
 # kernels of that window run (more stalls the rejoin).
@@ -69,13 +70,25 @@ def _load():
     return lib
 
 
+_capture_pending: set[int] = set()
+
+
+def _device_index(device: torch.device) -> int:
+    return device.index if device.index is not None else torch.cuda.current_device()
+
+
 def _side_stream(device: torch.device) -> torch.cuda.Stream:
-    idx = device.index if device.index is not None else torch.cuda.current_device()
+    idx = _device_index(device)
     s = _side.get(idx)
     if s is None:
         s = torch.cuda.Stream(device=idx)
         _side[idx] = s
     return s
+
+
+def _mark_capture(device: torch.device) -> None:
+    if torch.cuda.is_current_stream_capturing():
+        _capture_pending.add(_device_index(device))
 
 
 def prefetch(t: torch.Tensor | None, max_bytes: int = 0) -> bool:
@@ -93,12 +106,29 @@ def prefetch(t: torch.Tensor | None, max_bytes: int = 0) -> bool:
     rc = _lib.l2pf_prefetch(st.data_ptr(), nbytes, CHUNK, side.cuda_stream)
     if rc != 0:
         raise RuntimeError(f"l2pf_prefetch failed: {rc}")
+    _mark_capture(t.device)
     return True
 
 
 def join(device: torch.device) -> None:
     """Make the current stream wait for the side stream's prefetches."""
     torch.cuda.current_stream(device).wait_stream(_side_stream(device))
+    _capture_pending.discard(_device_index(device))
+
+
+def join_after_out_proj(x: torch.Tensor, n: int, k: int) -> None:
+    if (LATE_JOIN and ENABLED and _lib is not None and MAMBA_BYTES > 0
+            and (n, k) == (2688, 4096) and 1 <= x.shape[0] <= 8
+            and not torch.cuda.is_current_stream_capturing()):
+        join(x.device)
+
+
+def join_capture(device: torch.device) -> None:
+    idx = _device_index(device)
+    if LATE_JOIN and idx in _capture_pending:
+        join(device)
+    else:
+        _capture_pending.discard(idx)
 
 
 def gate_weight(layer_name: str, budget: int) -> tuple[torch.Tensor | None, int]:
@@ -157,6 +187,7 @@ def prefetch_many(ranges) -> bool:
     rc = fused(*args, CHUNK, side.cuda_stream)
     if rc != 0:
         raise RuntimeError(f"l2pf_prefetch3 failed: {rc}")
+    _mark_capture(device)
     return True
 
 

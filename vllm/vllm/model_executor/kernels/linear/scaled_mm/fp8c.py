@@ -17,6 +17,11 @@ from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
 
+try:
+    import l2pf as _l2pf
+except ImportError:
+    _l2pf = None
+
 logger = init_logger(__name__)
 SHAPES = {(10304, 2688), (2688, 4096)}
 _logged = False
@@ -83,7 +88,10 @@ def _scaled_mm(
         import fp8c
 
         _log_once(fp8c)
-        return fp8c.gemm(a, comp, sa, sb, n, k)
+        out = fp8c.gemm(a, comp, sa, sb, n, k)
+        if _l2pf is not None:
+            _l2pf.join_after_out_proj(a, n, k)
+        return out
     return ops.cutlass_scaled_mm(a, b, scale_a=sa, scale_b=sb, out_dtype=torch.bfloat16)
 
 

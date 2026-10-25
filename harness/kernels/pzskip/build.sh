@@ -19,7 +19,7 @@ rm -f "$out/libpzskip.so"
   -gencode "arch=compute_${sm},code=sm_${sm}" \
   -o "$out/libpzskip.so" "$here/csrc/pzskip.cu" 2>&1 | grep -v '^$' || true
 if ! test -f "$out/libpzskip.so"; then
-  echo "pzskip: L2 cache policy compile unavailable; rebuilding stock PZ333/PZ356" >&2
+  echo "pzskip: L2 cache policy compile unavailable; rebuilding stock PZ333" >&2
   "$nvcc" -O3 -std=c++17 -shared -Xcompiler -fPIC -DPZSKIP_NO_CACHE_POLICY \
     -gencode "arch=compute_${sm},code=sm_${sm}" \
     -o "$out/libpzskip.so" "$here/csrc/pzskip.cu" 2>&1 | grep -v '^$' || true

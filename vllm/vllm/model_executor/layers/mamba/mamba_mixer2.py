@@ -1288,10 +1288,9 @@ def mamba_mixer2(
     # LOCAL PATCH (cudafast-nemotron35): small batches only (decode / verify):
     # prefetch the first 5 MB (L2PF_MAMBA_MB) of the weight out_proj will read (its fp8c or fp8small
     # pack when present) into L2 on a side stream while the conv and SSM
-    # kernels below (latency-bound, DRAM mostly idle) run, then rejoin, so
-    # out_proj reads that part from L2. Moves no value. More than the window can
-    # fetch stalls the rejoin (the whole 11 MB measured -0.7% decode, 5 MB
-    # +0.8%). harness/kernels/l2pf; L2PF=0 disables.
+    # kernels below (latency-bound, DRAM mostly idle) run. The forward joins
+    # after out_proj, not before it: both streams only read immutable weights.
+    # Moves no value. harness/kernels/l2pf; L2PF=0 disables.
     pf = False
     if (_l2pf is not None and projected_states.shape[0] <= 8
             and _l2pf.MAMBA_BYTES > 0):
@@ -1299,7 +1298,7 @@ def mamba_mixer2(
         pf = _l2pf.prefetch_many(((gate, reserved),
                                  (_out_proj_weight(self), _l2pf.MAMBA_BYTES - reserved)))
     self.conv_ssm_forward(projected_states=projected_states, output=output)
-    if pf:
+    if pf and (not _l2pf.LATE_JOIN or _out_proj_weight(self) is self.out_proj.weight):
         _l2pf.join(projected_states.device)
 
 

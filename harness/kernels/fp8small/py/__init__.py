@@ -8,6 +8,11 @@ from pathlib import Path
 import torch
 from vllm.triton_utils import tl, triton
 
+try:
+    import l2pf as _l2pf
+except ImportError:
+    _l2pf = None
+
 SHAPES = {(10304, 2688), (2688, 4096)}
 _lib = None
 _load_failed = False
@@ -119,4 +124,6 @@ def gemm(
         rc = _run(*args)
     if rc:
         raise RuntimeError(f"fp8small launch failed: {rc}, M={m}, N={n}, K={k}")
+    if _l2pf is not None:
+        _l2pf.join_after_out_proj(a, n, k)
     return out

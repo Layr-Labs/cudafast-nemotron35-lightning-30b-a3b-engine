@@ -254,7 +254,7 @@ def packed_moe_up(x_ptr, SM, EX, BASE, RI, RAW, SSM, SEX, SBASE, SRI, SRAW,
                    ids_ptr,h_ptr,I,K,stride_we,stride_wn,stride_wsn,gate_ptr,
                    TOPK:tl.constexpr,BN:tl.constexpr,BK:tl.constexpr,EVICT:tl.constexpr,
                    GATED:tl.constexpr=False, launch_pdl:tl.constexpr=False,
-                   WN:tl.constexpr=2, WORD:tl.constexpr=False, GROUP8:tl.constexpr=True):
+                   WN:tl.constexpr=2, WORD:tl.constexpr=False):
     if launch_pdl:
         pdl_prologue()
     # WN warps along N, 4 along K: the K layout (8 x 32 x 4), and with it every
@@ -264,12 +264,6 @@ def packed_moe_up(x_ptr, SM, EX, BASE, RI, RAW, SSM, SEX, SBASE, SRI, SRAW,
     j=tl.program_id(1)
     offs_n=pid_n*BN+tl.arange(0,BN,layout=SliceLayout(1,layout))
     offs_k=tl.arange(0,BK,layout=SliceLayout(0,layout))
-    if GROUP8:
-        group_layout:tl.constexpr=BlockedLayout([1,8],[32,1],[WN*4,1],[1,0])
-        group=tl.arange(0,BN*(BK//8),layout=SliceLayout(1,group_layout))
-        lane=tl.arange(0,8,layout=SliceLayout(0,group_layout))
-        group_n=pid_n*BN+group//(BK//8)
-        group_k=(group%(BK//8))*8
     nmask=offs_n<I
     if GATED:
         if tl.load(gate_ptr)!=0:
@@ -287,24 +281,10 @@ def packed_moe_up(x_ptr, SM, EX, BASE, RI, RAW, SSM, SEX, SBASE, SRI, SRAW,
     for k0 in range(0,K,BK):
         kk=k0+offs_k
         kmask=kk<K
-        if GROUP8:
-            gk=k0+group_k
-            if j<TOPK:
-                index=tl.load(ids_ptr+j).to(tl.int64)*stride_we+group_n.to(tl.int64)*stride_wn+gk
-            else:
-                index=((j-TOPK)*I+group_n).to(tl.int64)*stride_wsn+gk
-            mask=(group_n<I)&(gk<K)
-            value_mask=mask[:,None]&(gk[:,None]+lane[None,:]<K)
-            if j<TOPK:
-                w8=load_packed_group8(SM,EX,BASE,RI,RAW,index,lane,mask,value_mask,EVICT=EVICT)
-            else:
-                w8=load_packed_group8(SSM,SEX,SBASE,SRI,SRAW,index,lane,mask,value_mask,EVICT=EVICT)
-            w=tl.convert_layout(tl.reshape(w8,(BN,BK)),layout)
+        if j<TOPK:
+            w=load_packed(SM,EX,BASE,RI,RAW,wbase+kk[None,:],wn[:,None]&kmask[None,:],EVICT=EVICT,WORD=WORD)
         else:
-            if j<TOPK:
-                w=load_packed(SM,EX,BASE,RI,RAW,wbase+kk[None,:],wn[:,None]&kmask[None,:],EVICT=EVICT,WORD=WORD)
-            else:
-                w=load_packed(SSM,SEX,SBASE,SRI,SRAW,wbase+kk[None,:],wn[:,None]&kmask[None,:],EVICT=EVICT,WORD=WORD)
+            w=load_packed(SSM,SEX,SBASE,SRI,SRAW,wbase+kk[None,:],wn[:,None]&kmask[None,:],EVICT=EVICT,WORD=WORD)
         x=tl.load(x_ptr+kk,mask=kmask,other=0.0)
         acc+=w.to(tl.float32)*x[None,:].to(tl.float32)
     h=tl.maximum(tl.sum(acc,axis=1),0.0)

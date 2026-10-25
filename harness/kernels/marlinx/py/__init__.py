@@ -27,7 +27,6 @@ MAX_M = 8
 # Register-ring depth in k16 blocks (csrc/marlinx.cu supports 4 and 8; same bits).
 DEPTH = int(os.environ.get("MARLINX_DEPTH", "8"))
 ENABLED = os.environ.get("MARLINX", "1") != "0"
-_RDS_RING4 = os.environ.get("RDS_SHARED_RING4", "1") != "0"
 
 _lib = None
 _load_error: str | None = None
@@ -66,10 +65,6 @@ def _load():
         if hasattr(lib, "marlinx_gemm_relu2"):
             lib.marlinx_gemm_relu2.argtypes = lib.marlinx_gemm.argtypes
             lib.marlinx_gemm_relu2.restype = ctypes.c_int
-        if hasattr(lib, "marlinx_gemm_su"):
-            lib.marlinx_gemm_su.argtypes = lib.marlinx_gemm.argtypes + [
-                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]  # Z SU relu2 pdl
-            lib.marlinx_gemm_su.restype = ctypes.c_int
         lib.marlinx_hog.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
                                     ctypes.c_longlong, ctypes.c_void_p, ctypes.c_void_p]
         lib.marlinx_hog.restype = ctypes.c_int
@@ -163,32 +158,9 @@ def prepare(layer) -> bool:
         ok = _init()
     layer._marlinx_ok = ok
     layer._marlinx_zs = None
-    layer._marlinx_su = None
     if ok and ZS_ENABLED and (n, k) == ZS_SHAPE and hasattr(_lib, "marlinx_gemm_zs"):
         layer._marlinx_zs = zs_repack(w, n, k)
-    if ok and SU_SHAPES.get((n, k)) in SU_LAYERS and hasattr(_lib, "marlinx_gemm_su"):
-        layer._marlinx_su = su_repack(s, n, k)
-        # the shared up runs through an opaque op that receives the tensors, not the layer
-        _su_by_scale[s.data_ptr()] = (s, layer._marlinx_su)
     return ok
-
-
-# Unit-major scale copy (MARLINX_SU, comma list of "lm" = lm_head, "down" = shared
-# expert down; "0" or "" = none). Marlin's scale tensor is [K/16][N] bytes, so a
-# 64-feature half column reads 64 bytes per k16 block at an N-byte stride: for
-# lm_head 22 MB of 64-byte requests that run far below the weight stream's rate.
-# su_repack stores the same bytes as [N/64][K/16][64]; the kernel stages its half
-# column's scales in shared memory with coalesced reads. Values and arithmetic
-# are unchanged (a byte permutation of a weight tensor).
-SU_SHAPES = {(131072, 2688): "lm", (2688, 3712): "down", (3712, 2688): "up"}
-_su_by_scale: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-SU_LAYERS = frozenset(v for v in os.environ.get("MARLINX_SU", "lm").split(",") if v and v != "0")
-
-
-@torch.no_grad()
-def su_repack(s: torch.Tensor, n: int, k: int) -> torch.Tensor:
-    """[N/64][K/16][64] bytes from Marlin's [K/16][N] scale bytes (byte permutation)."""
-    return s.view(torch.uint8).view(k // 16, n // 64, 64).transpose(0, 1).contiguous()
 
 
 # Zero-row skip for the shared expert down projection (its input is ReLU^2,
@@ -219,16 +191,12 @@ def zs_repack(w: torch.Tensor, n: int, k: int) -> torch.Tensor:
 
 def gemm(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
          global_scale: torch.Tensor, n: int, k: int, depth: int = DEPTH,
-         relu2: bool = False, zs: torch.Tensor | None = None,
-         su: torch.Tensor | None = None) -> torch.Tensor:
+         relu2: bool = False, zs: torch.Tensor | None = None) -> torch.Tensor:
     """out[M, n] for a 2-D bf16 x[M, k] (1 <= M <= 8); no guard beyond the C side's."""
     global _pdl_active
     lib = _load()
     assert lib is not None, _load_error
     m = x.shape[0]
-    # Loader lookahead only: both variants keep the same Cursor/MMA/fold order.
-    if _RDS_RING4 and zs is not None and (m, n, k, depth) == (5, 2688, 3712, 8):
-        depth = 4
     out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
     mode = "zs" if zs is not None else "relu2" if relu2 else "gemm"
     use_pdl = _pdl_active
@@ -239,15 +207,6 @@ def gemm(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
         out.data_ptr(), n, n, k, _sm_count(x.device), depth,
         torch.cuda.current_stream(x.device).cuda_stream,
     )
-    if su is not None:
-        su_args = args + (zs.data_ptr() if zs is not None else None, su.data_ptr(), int(relu2))
-        rc = lib.marlinx_gemm_su(*su_args, int(use_pdl))
-        if rc and use_pdl and not torch.cuda.is_current_stream_capturing():
-            _pdl_active = False
-            rc = lib.marlinx_gemm_su(*su_args, 0)
-        if rc != 0:
-            raise RuntimeError(f"marlinx_gemm_su failed: {rc} (M={m} N={n} K={k} depth={depth})")
-        return out
     if zs is not None:
         args += (zs.data_ptr(),)
     rc = op(*args)
@@ -282,7 +241,7 @@ def maybe_apply(layer, x: torch.Tensor) -> torch.Tensor | None:
         return None
     n = layer.output_size_per_partition
     out = gemm(x2, layer.weight, layer.weight_scale, layer.weight_global_scale, n, k,
-               zs=getattr(layer, "_marlinx_zs", None), su=getattr(layer, "_marlinx_su", None))
+               zs=getattr(layer, "_marlinx_zs", None))
     return out.reshape(*x.shape[:-1], n)
 
 
@@ -325,7 +284,5 @@ def maybe_apply_relu2(x, weight, weight_scale, global_scale, n, k):
         or global_scale.device != x.device
     ):
         return None
-    hit = _su_by_scale.get(weight_scale.data_ptr())
-    su = hit[1] if hit is not None and hit[0].shape == weight_scale.shape else None
-    out = gemm(x2, weight, weight_scale, global_scale, n, k, relu2=True, su=su)
+    out = gemm(x2, weight, weight_scale, global_scale, n, k, relu2=True)
     return out.reshape(*x.shape[:-1], n)

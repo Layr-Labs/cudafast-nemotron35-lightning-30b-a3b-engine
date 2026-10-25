@@ -31,39 +31,15 @@ __device__ __forceinline__ void load_w(const P& p, int tile, int warp, int lane,
                : "=r"(x.x), "=r"(x.y) : "l"(p.ex + i));
   b = __ldg(p.meta + ((size_t)tile * (K / 128) + G / 2) * 32 + warp * 8 + lane / 4);
 }
-// Reuse the record's Marlinx PDL contract: immutable planes may preload, but
-// every activation read follows a memory-clobbering wait and uses coherent loads.
-#ifndef APK12_NO_PDL
-__device__ __forceinline__ void pdl_wait() {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-  asm volatile("griddepcontrol.wait;" ::: "memory");
-#endif
-}
-__device__ __forceinline__ void pdl_launch_dependents() {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-#endif
-}
-#endif
-
-template<bool PDL>
-__device__ __forceinline__ uint32_t load_activation(const uint32_t* p) {
-  if constexpr (!PDL) return __ldg(p);
-  uint32_t value;
-  asm volatile("ld.global.u32 %0, [%1];" : "=r"(value) : "l"(p) : "memory");
-  return value;
-}
-
 // Activation half: A registers 0 and 2 of the group's four k16 steps (row lane/4, zero
 // at and past m; K = 16j + 2t and 16j + 8 + 2t). Registers 1 and 3 are rows 8-15: zero.
-template<bool PDL>
 __device__ __forceinline__ void load_a(const P& p, int lane, int G, uint32_t (&a)[8]) {
   int row = lane / 4;
   const __nv_bfloat16* q = p.x + (size_t)row * p.ldx + G * 64 + (lane % 4) * 2;
 #pragma unroll
   for (int j = 0; j < 4; ++j) {
-    a[2 * j] = row < p.m ? load_activation<PDL>((const unsigned int*)(q + 16 * j)) : 0u;
-    a[2 * j + 1] = row < p.m ? load_activation<PDL>((const unsigned int*)(q + 16 * j + 8)) : 0u;
+    a[2 * j] = row < p.m ? __ldg((const unsigned int*)(q + 16 * j)) : 0u;
+    a[2 * j + 1] = row < p.m ? __ldg((const unsigned int*)(q + 16 * j + 8)) : 0u;
   }
 }
 template<int K>
@@ -86,8 +62,8 @@ __device__ __forceinline__ void mma(uint32_t a0, uint32_t a2, uint32_t b0, uint3
                : "r"(a0), "r"(0u), "r"(a2), "r"(0u), "r"(b0), "r"(b1));
 }
 // One warp per 8 columns, four per CTA, R groups (64 K each) in flight per lane.
-template<int N, int K, int R, bool PDL = false>
-__global__ __launch_bounds__(128, (R > 4 ? 2 : 3)) void gemm(P p) {
+template<int N, int K, int R>
+__global__ __launch_bounds__(128, 3) void gemm(P p) {
   static_assert(N % 32 == 0 && K % 128 == 0 && R <= K / 64, "shape");
   constexpr int GN = K / 64;
   int lane = threadIdx.x % 32, warp = threadIdx.x / 32, tile = blockIdx.x;
@@ -95,22 +71,10 @@ __global__ __launch_bounds__(128, (R > 4 ? 2 : 3)) void gemm(P p) {
   uint2 x[R];
   uint32_t b[R], a[R][8];
   float c[4] = {0.f, 0.f, 0.f, 0.f};
-#ifndef APK12_NO_PDL
-  if constexpr (PDL) {
 #pragma unroll
-    for (int r = 0; r < R; ++r)
-      load_w<K>(p, tile, warp, lane, r, s[r], x[r], b[r]);
-    pdl_wait();
-#pragma unroll
-    for (int r = 0; r < R; ++r) load_a<PDL>(p, lane, r, a[r]);
-  } else
-#endif
-  {
-#pragma unroll
-    for (int r = 0; r < R; ++r) {
-      load_w<K>(p, tile, warp, lane, r, s[r], x[r], b[r]);
-      load_a<PDL>(p, lane, r, a[r]);
-    }
+  for (int r = 0; r < R; ++r) {
+    load_w<K>(p, tile, warp, lane, r, s[r], x[r], b[r]);
+    load_a(p, lane, r, a[r]);
   }
   for (int g0 = 0; g0 < GN; g0 += R) {
 #pragma unroll
@@ -123,15 +87,11 @@ __global__ __launch_bounds__(128, (R > 4 ? 2 : 3)) void gemm(P p) {
         for (int j = 0; j < 4; ++j) mma(a[r][2 * j], a[r][2 * j + 1], w[2 * j], w[2 * j + 1], c);
         if (G + R < GN) {
           load_w<K>(p, tile, warp, lane, G + R, s[r], x[r], b[r]);
-          load_a<PDL>(p, lane, G + R, a[r]);
+          load_a(p, lane, G + R, a[r]);
         }
       }
     }
   }
-#ifndef APK12_NO_PDL
-  // Same MMA chain is complete. A dependent still must wait before reading y.
-  if constexpr (PDL) pdl_launch_dependents();
-#endif
   int row = lane / 4, col = tile * 32 + warp * 8 + (lane % 4) * 2;
   if (row < p.m) {
     __nv_bfloat162 v;
@@ -163,43 +123,44 @@ __global__ void check(P p, const uint16_t* w, unsigned int* bad) {
     }
   if (n) atomicAdd(bad, n);
 }
-#ifndef APK12_NO_PDL
-template<int N, int K, int R = 4>
-static int launch_pdl(const P& p, cudaStream_t stream) {
-  cudaLaunchConfig_t cfg = {};
-  cfg.gridDim = dim3(N / 32);
-  cfg.blockDim = dim3(128);
-  cfg.dynamicSmemBytes = 0;
-  cfg.stream = stream;
-  cudaLaunchAttribute attr[1];
-  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attr[0].val.programmaticStreamSerializationAllowed = 1;
-  cfg.attrs = attr;
-  cfg.numAttrs = 1;
-  cudaError_t rc = cudaLaunchKernelEx(&cfg, gemm<N, K, R, true>, p);
-  if (rc != cudaSuccess) { cudaGetLastError(); return (int)rc; }
-  return (int)cudaGetLastError();
+template<int N, int K>
+void launch(const P& p, int ring, cudaStream_t st) {
+  switch (ring) {
+    case 1: gemm<N, K, 1><<<N / 32, 128, 0, st>>>(p); break;
+    case 2: gemm<N, K, 2><<<N / 32, 128, 0, st>>>(p); break;
+    case 4: gemm<N, K, 4><<<N / 32, 128, 0, st>>>(p); break;
+    case 8: gemm<N, K, 8><<<N / 32, 128, 0, st>>>(p); break;
+  }
 }
-#endif
+template<int N, int K>
+cudaError_t init_shape() {
+  cudaFuncAttributes attr;
+  cudaError_t rc = cudaFuncGetAttributes(&attr, gemm<N, K, 1>);
+  if (rc == cudaSuccess) rc = cudaFuncGetAttributes(&attr, gemm<N, K, 2>);
+  if (rc == cudaSuccess) rc = cudaFuncGetAttributes(&attr, gemm<N, K, 4>);
+  if (rc == cudaSuccess) rc = cudaFuncGetAttributes(&attr, gemm<N, K, 8>);
+  return rc;
+}
 }  // namespace apk12
 using apk12::P;
 extern "C" int apk12_init() {
   cudaFuncAttributes attr;
-  cudaError_t rc = cudaFuncGetAttributes(&attr, apk12::gemm<4608, 2688, 4>);
-  if (rc == cudaSuccess) rc = cudaFuncGetAttributes(&attr, apk12::gemm<2688, 4096, 4>);
+  cudaError_t rc = apk12::init_shape<4608, 2688>();
+  if (rc == cudaSuccess) rc = apk12::init_shape<2688, 4096>();
   if (rc == cudaSuccess) rc = cudaFuncGetAttributes(&attr, apk12::check<4608, 2688>);
   if (rc == cudaSuccess) rc = cudaFuncGetAttributes(&attr, apk12::check<2688, 4096>);
   return (int)rc;
 }
 extern "C" int apk12_run(const void* x, const void* sm, const void* ex, const void* meta,
                          const void* ri, const void* raw, void* y, int m, int n, int k,
-                         int ldx, void* stream) {
-  if (m < 1 || m > 8) return (int)cudaErrorInvalidValue;
+                         int ldx, int ring, void* stream) {
+  if (m < 1 || m > 8 || (ring != 1 && ring != 2 && ring != 4 && ring != 8))
+    return (int)cudaErrorInvalidValue;
   P p{(const __nv_bfloat16*)x, (const uint4*)sm, (const uint2*)ex, (const uint8_t*)meta,
       (const int32_t*)ri, (const uint16_t*)raw, (__nv_bfloat16*)y, m, ldx};
   cudaStream_t st = (cudaStream_t)stream;
-  if (n == 4608 && k == 2688) apk12::gemm<4608, 2688, 4><<<4608 / 32, 128, 0, st>>>(p);
-  else if (n == 2688 && k == 4096) apk12::gemm<2688, 4096, 4><<<2688 / 32, 128, 0, st>>>(p);
+  if (n == 4608 && k == 2688) apk12::launch<4608, 2688>(p, ring, st);
+  else if (n == 2688 && k == 4096) apk12::launch<2688, 4096>(p, ring, st);
   else return (int)cudaErrorInvalidValue;
   return (int)cudaGetLastError();
 }
@@ -217,30 +178,3 @@ extern "C" int apk12_check(const void* sm, const void* ex, const void* meta, con
   else return (int)cudaErrorInvalidValue;
   return (int)cudaGetLastError();
 }
-
-#ifndef APK12_NO_PDL
-extern "C" int apk12_init_pdl() {
-  cudaFuncAttributes attr;
-  cudaError_t rc = cudaFuncGetAttributes(&attr, apk12::gemm<4608, 2688, 4, true>);
-  if (rc == cudaSuccess) rc = cudaFuncGetAttributes(&attr, apk12::gemm<2688, 4096, 4, true>);
-  if (rc == cudaSuccess) rc = cudaFuncGetAttributes(&attr, apk12::gemm<4608, 2688, 8, true>);
-  if (rc == cudaSuccess) rc = cudaFuncGetAttributes(&attr, apk12::gemm<2688, 4096, 8, true>);
-  return (int)rc;
-}
-extern "C" int apk12_run_pdl(const void* x, const void* sm, const void* ex, const void* meta,
-                             const void* ri, const void* raw, void* y, int m, int n, int k,
-                             int ldx, int ring, void* stream) {
-  if (m < 1 || m > 8) return (int)cudaErrorInvalidValue;
-  P p{(const __nv_bfloat16*)x, (const uint4*)sm, (const uint2*)ex, (const uint8_t*)meta,
-      (const int32_t*)ri, (const uint16_t*)raw, (__nv_bfloat16*)y, m, ldx};
-  cudaStream_t st = (cudaStream_t)stream;
-  if (ring == 4) {
-    if (n == 4608 && k == 2688) return apk12::launch_pdl<4608, 2688, 4>(p, st);
-    if (n == 2688 && k == 4096) return apk12::launch_pdl<2688, 4096, 4>(p, st);
-  } else if (ring == 8) {
-    if (n == 4608 && k == 2688) return apk12::launch_pdl<4608, 2688, 8>(p, st);
-    if (n == 2688 && k == 4096) return apk12::launch_pdl<2688, 4096, 8>(p, st);
-  }
-  return (int)cudaErrorInvalidValue;
-}
-#endif

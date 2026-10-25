@@ -317,6 +317,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         vocab_size: int,
         routed_experts: RoutedExpertsTensors | None = None,
         check_ep_fault: bool = False,
+        copy_ready_event: torch.cuda.Event | None = None,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
@@ -338,7 +339,10 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         # Initiate the copy on a separate stream, but do not synchronize it.
         default_stream = torch.cuda.current_stream()
         with torch.cuda.stream(async_output_copy_stream):
-            async_output_copy_stream.wait_stream(default_stream)
+            if copy_ready_event is None:
+                async_output_copy_stream.wait_stream(default_stream)
+            else:
+                async_output_copy_stream.wait_event(copy_ready_event)
             self.sampled_token_ids_cpu = self._sampled_token_ids.to(
                 "cpu", non_blocking=True
             )
@@ -353,6 +357,8 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
                 else None
             )
             if check_ep_fault:
+                if copy_ready_event is not None:
+                    async_output_copy_stream.wait_stream(default_stream)
                 has_fault = get_ep_all2all_manager().query_fault()
                 self._has_fault = has_fault.to("cpu", non_blocking=True)
             self.async_copy_ready_event.record()
@@ -4758,6 +4764,21 @@ class GPUModelRunner(
                 self._pp_broadcast_prev_sampled_token_ids(
                     sampler_output.sampled_token_ids
                 )
+            routed_experts_snapshot = None
+            if self.routed_experts_initialized:
+                buf = self.routed_experts_capturer.get_device_buffer()
+                total = scheduler_output.total_num_scheduled_tokens
+                routed_experts_snapshot = RoutedExpertsTensors(
+                    routing_data=buf[:total].clone(),
+                    slot_mapping=self.routed_experts_slot_mapping_device[
+                        :total
+                    ].clone(),
+                )
+            copy_ready_event = torch.cuda.Event(enable_timing=False)
+            copy_ready_event.record()
+        else:
+            routed_experts_snapshot = None
+            copy_ready_event = None
 
         self._draft_token_ids = None
         self._draft_probs = None
@@ -4952,9 +4973,6 @@ class GPUModelRunner(
         with record_function_or_nullcontext(
             "gpu_model_runner: AsyncGPUModelRunnerOutput"
         ):
-            # Async path: produce a device-side snapshot that the async
-            # copy stream can D2H later. Both tensors must be private
-            # clones because:
             #   - ``routing_data`` source is the shared capturer buffer,
             #     which is ``clear_buffer()``-ed at the start of the
             #     next step on the default stream.
@@ -4964,17 +4982,6 @@ class GPUModelRunner(
             #     stream while the D2H is still pending on the copy
             #     stream.
             # Without clones, the copy stream would read torn data.
-            routed_experts_snapshot = None
-            if self.routed_experts_initialized:
-                buf = self.routed_experts_capturer.get_device_buffer()
-                total = scheduler_output.total_num_scheduled_tokens
-                routed_experts_snapshot = RoutedExpertsTensors(
-                    routing_data=buf[:total].clone(),
-                    slot_mapping=self.routed_experts_slot_mapping_device[
-                        :total
-                    ].clone(),
-                )
-
             async_output = AsyncGPUModelRunnerOutput(
                 model_runner_output=output,
                 sampled_token_ids=sampler_output.sampled_token_ids,
@@ -4984,6 +4991,7 @@ class GPUModelRunner(
                 vocab_size=self.input_batch.vocab_size,
                 routed_experts=routed_experts_snapshot,
                 check_ep_fault=self.check_ep_fault,
+                copy_ready_event=copy_ready_event,
             )
         with record_function_or_nullcontext(
             "gpu_model_runner: set_async_sampled_token_ids"

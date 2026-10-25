@@ -210,6 +210,18 @@
     {
       "file": "harness/kernels/l2pf/py/__init__.py",
       "why": "Carry useful04706ad7-c4e8-44b9-b8ba-77f14d8b8adf MoE-window immutable prefetch default6to12MB. Its complete official2.19195352041462 is within0.1% of fulla484, but only budget mechanism is combined here on higherfulla484. Prefix pair/SSM combination unverified."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_kernels.py, harness/kernels/pzskip/csrc/pzskip.cu, vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
+      "why": "Tuning only. MTP_DEPTH_THETA default 0.4 -> 0.5 (the confidence gate stops drafting at a higher top-1 probability; drafts only, the target decides every token). pzskip config 333 (32-row blocks, 384 columns, 2 k16 groups per stage, 3 stages) replaces 322 as the prefill default: same arithmetic, load-time bitwise check per layer with fallback."
+    },
+    {
+      "file": "vllm/vllm/model_executor/models/nemotron_h_mtp_screen.py; vllm/v1/worker/gpu_model_runner.py",
+      "why": "Experimental8/32/64/fullK native draft cascade,512/256/32survivors; NEWthree-level integer candidate/column gather folding with every-stage remote bit admission. Select only f126screen source, ownB821early-cascade scaffold, public0b3earlysample-ready D2H; coarse16-only2900officialnegative not retained. Entire51aa retained; no shared chain, stage-top2, lazy anchor, norm producer or macro geometry in this reserve."
+    },
+    {
+      "file": "harness/kernels/screen_radix/*; vllm/model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "Select ONLY publicdaf0 CUB radix selector/build/FFI and extend WIDTH512/9IDbits plus KEEP512, init/hostguards and remote admission pairs2048to512,512to256. New3stagehead usesnative local IDs or fusedchunkoffset, replaces10topk sites while preserving Torch fallback. Source orderedkeyorigin3e519ff4-4664-434d-b412-fc3c96227f25 acknowledged. No sharedsegments,pack12,model or kernel hooks copied."
     }
   ]
 }

@@ -60,6 +60,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.models.nemotron_shared_up import maybe_shared_up_relu2
+from vllm.model_executor.models import nemotron_h_packed_attn as _packed_attn
 from vllm.model_executor.models.interfaces import (
     EagleModelMixin,
     HasInnerState,
@@ -566,10 +567,19 @@ class NemotronHAttention(nn.Module):
         hidden_states: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        # LOCAL PATCH (cudafast-nemotron35): target projections prepared by
+        # nemotron_h_packed_attn.py read their lossless 12-bit copy at verify size
+        # (same BF16 values as cuBLAS); other shapes run the original linear.
+        if _packed_attn.packed(self.qkv_proj):
+            qkv = _packed_attn.packed_linear(self.qkv_proj, hidden_states)
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         attn_output = self.attn(q, k, v)
-        output, _ = self.o_proj(attn_output)
+        if _packed_attn.packed(self.o_proj):
+            output = _packed_attn.packed_linear(self.o_proj, attn_output)
+        else:
+            output, _ = self.o_proj(attn_output)
         return output
 
 
@@ -698,6 +708,24 @@ class NemotronHModel(nn.Module, EagleModelMixin):
                     if name is None:
                         name = f"{prefix}.layers.{i}.mixer.experts"
                     _l2pf.AHEAD_MOE[str(name)] = nxt.mixer.in_proj
+            # The router weight of an MoE layer is read first and by a latency-bound
+            # GEMM: let the layer before it (Mamba or attention, both with an l2pf
+            # window) prefetch it as well. Keyed by that layer's op name.
+            ahead_gate = getattr(_l2pf, "AHEAD_GATE", None)
+            if ahead_gate is None:
+                ahead_gate = {}
+                _l2pf.AHEAD_GATE = ahead_gate
+            for i in range(self.start_layer, self.end_layer - 1):
+                cur, nxt = self.layers[i], self.layers[i + 1]
+                gate = getattr(getattr(nxt, "mixer", None), "gate", None)
+                if not isinstance(nxt, NemotronHMoEDecoderLayer) or gate is None:
+                    continue
+                if isinstance(cur, NemotronHMambaDecoderLayer):
+                    ahead_gate[str(cur.mixer.prefix)] = gate
+                elif isinstance(cur, NemotronHAttentionDecoderLayer):
+                    attn_name = getattr(getattr(cur.mixer, "attn", None), "layer_name", None)
+                    if attn_name is not None:
+                        ahead_gate[str(attn_name)] = gate
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
@@ -1031,6 +1059,11 @@ class NemotronHForCausalLM(
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
+
+    def process_weights_after_loading(self) -> None:
+        # LOCAL PATCH (cudafast-nemotron35): lossless 12-bit copies of the BF16
+        # attention projections for verify-size calls (nemotron_h_packed_attn.py).
+        _packed_attn.prepare_attention_packed(self.model)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self, skip_prefixes=["mtp"])

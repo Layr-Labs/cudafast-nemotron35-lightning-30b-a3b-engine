@@ -245,6 +245,17 @@ def _packed_linear_impl(
         if x.stride(1) != 1:
             x = x.contiguous()
         y = x.new_empty((x.shape[0], n))
+        from .nemotron_h_packed_attn import _CONFIGS, packed_mm
+
+        cfg = _CONFIGS.get((n, k))
+        if cfg is not None:
+            # the same ascending MMA chain as packed_small, on more programs
+            bn, wn, bk = cfg
+            packed_mm[(triton.cdiv(n, bn),)](
+                x, *p.planes, y, x.shape[0], n, k, x.stride(0), y.stride(0),
+                BM=16, BN=bn, BK=bk, WN=wn, num_warps=wn, launch_pdl=mtp_pdl(),
+                gate_ptr=gate, GATED=gated)
+            return y
         packed_small[(triton.cdiv(n, 64),)](
             x, *p.planes, y, x.shape[0], n, k, x.stride(0), y.stride(0), gate,
             GATED=gated, num_warps=4, num_stages=4, launch_pdl=mtp_pdl())
@@ -305,6 +316,11 @@ def prepare_eh_hidden_packed(layer):
         layer.register_buffer("_mtp_eh_pk_" + suffix, tensor, persistent=False)
 
 
+# o_proj as well (its packed GEMV / small GEMM keep the BF16 kernels' layouts like
+# qkv_proj's do). MTP_PACK12_OPROJ=0 keeps it in BF16.
+_PACK_OPROJ = os.environ.get("MTP_PACK12_OPROJ", "1") != "0"
+
+
 @torch.no_grad()
 def prepare_mtp_packed(module):
     """Pack only the screened shapes after original pinned weights are loaded."""
@@ -318,7 +334,8 @@ def prepare_mtp_packed(module):
     for name, layer in module.named_modules():
         w = getattr(layer, "weight", None)
         if (w is not None
-                and name.endswith("qkv_proj") and tuple(w.shape) == (4608, 2688)
+                and ((name.endswith("qkv_proj") and tuple(w.shape) == (4608, 2688))
+                     or (_PACK_OPROJ and name.endswith("o_proj") and tuple(w.shape) == (2688, 4096)))
                 and type(getattr(layer, "quant_method", None)).__name__ == "MTPSmallLinearMethod"):
             p = pack_bf16(w)
             if p is None:

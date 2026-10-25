@@ -19,6 +19,7 @@
 //
 // Weight layout: zskip's "swap" repack (layer.zskip_w2), read as down4 reads it.
 
+#include <type_traits>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
@@ -898,104 +899,110 @@ __global__ void __launch_bounds__(192, MINB) smem5_kernel(const Params p) {
   const unsigned xoff = (tid >= 24 && tid - 24 < 2 * nrows)
                             ? static_cast<unsigned>((long long)L.rows[(tid - 24) >> 1] * p.lda * 2 + 16 * ((tid - 24) & 1))
                             : 0u;
-  float acc[4][4][4];
-  bool dense = p.dense == 1;
-  const bool loadonly = p.dense == 2;
-  const bool computeonly = p.dense == 3;
-  for (int pass = 0; pass < 2; ++pass) {
-    const int nsteps = dense ? G : nag;
-    const int nst = (nsteps + KG - 1) / KG;
-    auto issue = [&](int st) {
-      if (computeonly) return;
-      Stage& S = stg[st % NS];
-#pragma unroll
-      for (int gi = 0; gi < KG; ++gi) {
-        const int j = st * KG + gi;
-        if (j < nsteps) {
-          const int grp = dense ? j : L.gact[j];
-          const uint32_t m = dense ? 0xFFFFu : L.gmask[grp];
-          const int wr = tid / 12, wpc = tid - 12 * wr;
-          if ((m >> wr) & 1u)
-            cp16_weight<POLICY>(&S.w[gi][wr][16 * wpc], wexp + (woff + grp * (unsigned)(16 * p.w_k)));
-          if (tid < 24)
-            cp16_weight<POLICY>(&S.s[gi][16 * tid], sexp + (unsigned)(grp * p.s_g + 16 * tid));
-          else if (tid - 24 < 2 * nrows)
-            cp16(&S.x[gi][(tid - 24) >> 1][16 * ((tid - 24) & 1)], reinterpret_cast<const uint8_t*>(p.A) + (xoff + 32u * grp));
+  // The row count is invariant for this CTA. Specialize once, rather than
+  // re-dispatching the same token-tile count for every active reduction group.
+  auto run_nt = [&](auto tag) {
+    constexpr int NT = decltype(tag)::value;
+    float acc[4][4][4];
+    bool dense = p.dense == 1;
+    const bool loadonly = p.dense == 2;
+    const bool computeonly = p.dense == 3;
+    for (int pass = 0; pass < 2; ++pass) {
+      const int nsteps = dense ? G : nag;
+      const int nst = (nsteps + KG - 1) / KG;
+      auto issue = [&](int st) {
+        if (computeonly) return;
+        Stage& S = stg[st % NS];
+  #pragma unroll
+        for (int gi = 0; gi < KG; ++gi) {
+          const int j = st * KG + gi;
+          if (j < nsteps) {
+            const int grp = dense ? j : L.gact[j];
+            const uint32_t m = dense ? 0xFFFFu : L.gmask[grp];
+            const int wr = tid / 12, wpc = tid - 12 * wr;
+            if ((m >> wr) & 1u)
+              cp16_weight<POLICY>(&S.w[gi][wr][16 * wpc], wexp + (woff + grp * (unsigned)(16 * p.w_k)));
+            if (tid < 24)
+              cp16_weight<POLICY>(&S.s[gi][16 * tid], sexp + (unsigned)(grp * p.s_g + 16 * tid));
+            else if (tid - 24 < 2 * nrows)
+              cp16(&S.x[gi][(tid - 24) >> 1][16 * ((tid - 24) & 1)], reinterpret_cast<const uint8_t*>(p.A) + (xoff + 32u * grp));
+          }
+        }
+      };
+  #pragma unroll
+      for (int tt = 0; tt < NT; ++tt)
+  #pragma unroll
+        for (int c = 0; c < 4; ++c)
+  #pragma unroll
+          for (int i = 0; i < 4; ++i) acc[tt][c][i] = 0.0f;
+      if constexpr (POLICY != 0) {
+        // Not unrolled with the L2 hint: ptxas (CUDA 13.0, sm_121a) folds the unrolled stages'
+        // constant shared-memory offsets into a uniform-register address on some hinted LDGSTS
+        // and emits it with an unset descriptor register (illegal instruction at run time).
+        // Same copies in the same order; the stock stream (POLICY 0) is unchanged.
+  #pragma unroll 1
+        for (int st = 0; st < NS - 1; ++st) {
+          if (st < nst) issue(st);
+          cp_commit();
+        }
+      } else {
+  #pragma unroll
+        for (int st = 0; st < NS - 1; ++st) {
+          if (st < nst) issue(st);
+          cp_commit();
         }
       }
-    };
-#pragma unroll
-    for (int tt = 0; tt < 4; ++tt)
-#pragma unroll
-      for (int c = 0; c < 4; ++c)
-#pragma unroll
-        for (int i = 0; i < 4; ++i) acc[tt][c][i] = 0.0f;
-    if constexpr (POLICY != 0) {
-      // Not unrolled with the L2 hint: ptxas (CUDA 13.0, sm_121a) folds the unrolled stages'
-      // constant shared-memory offsets into a uniform-register address on some hinted LDGSTS
-      // and emits it with an unset descriptor register (illegal instruction at run time).
-      // Same copies in the same order; the stock stream (POLICY 0) is unchanged.
-#pragma unroll 1
-      for (int st = 0; st < NS - 1; ++st) {
-        if (st < nst) issue(st);
+      bool neg0 = false;
+      for (int st = 0; st < nst; ++st) {
+        cp_wait<NS - 2>();
+        __syncthreads();
+        if (st + NS - 1 < nst) issue(st + NS - 1);
         cp_commit();
+        const Stage& S = stg[st % NS];
+        if (loadonly) continue;
+  #pragma unroll 1
+        for (int gi = 0; gi < KG; ++gi) {
+          if (st * KG + gi >= nsteps) continue;
+          s5_group<NT>(acc, S.w[gi], S.s[gi], S.x[gi], lane, warp);
+        }
       }
-    } else {
-#pragma unroll
-      for (int st = 0; st < NS - 1; ++st) {
-        if (st < nst) issue(st);
-        cp_commit();
+      if (!dense) {
+  #pragma unroll
+        for (int tt = 0; tt < NT; ++tt)
+  #pragma unroll
+          for (int ci = 0; ci < 4; ++ci)
+  #pragma unroll
+            for (int q = 0; q < 4; ++q) neg0 |= __float_as_uint(acc[tt][ci][q]) == 0x80000000u;
       }
+      cp_wait<0>();
+      const bool redo = __syncthreads_or(neg0 ? 1 : 0) != 0;
+      if (!redo || dense) break;
+      if (tid == 0 && p.stats) atomicAdd(p.stats + 0, 1);
+      dense = true;
     }
-    bool neg0 = false;
-    for (int st = 0; st < nst; ++st) {
-      cp_wait<NS - 2>();
-      __syncthreads();
-      if (st + NS - 1 < nst) issue(st + NS - 1);
-      cp_commit();
-      const Stage& S = stg[st % NS];
-      if (loadonly) continue;
-#pragma unroll 1
-      for (int gi = 0; gi < KG; ++gi) {
-        if (st * KG + gi >= nsteps) continue;
-        switch (ntt) {
-          case 1: s5_group<1>(acc, S.w[gi], S.s[gi], S.x[gi], lane, warp); break;
-          case 2: s5_group<2>(acc, S.w[gi], S.s[gi], S.x[gi], lane, warp); break;
-          case 3: s5_group<3>(acc, S.w[gi], S.s[gi], S.x[gi], lane, warp); break;
-          default: s5_group<4>(acc, S.w[gi], S.s[gi], S.x[gi], lane, warp); break;
+    const float gs4 = mul_ftz(p.GS[e], 4.0f);
+  #pragma unroll
+    for (int tt = 0; tt < NT; ++tt) {
+  #pragma unroll
+      for (int ci = 0; ci < 4; ++ci) {
+        const int col = (NTL * P + warp) * 64 + 16 * ci + g8;
+  #pragma unroll
+        for (int q = 0; q < 4; ++q) {
+          const int r = 8 * tt + 2 * t + (q & 1);
+          const int cc = col + ((q >> 1) ? 8 : 0);
+          if (r < nrows) {
+            const uint32_t v = to_bf16x2(mul_ftz(acc[tt][ci][q], gs4), 0.0f);
+            reinterpret_cast<uint16_t*>(p.C)[(long long)L.rows[r] * p.ldc + cc] = static_cast<uint16_t>(v);
+          }
         }
       }
     }
-    if (!dense) {
-#pragma unroll
-      for (int tt = 0; tt < 4; ++tt)
-#pragma unroll
-        for (int ci = 0; ci < 4; ++ci)
-#pragma unroll
-          for (int q = 0; q < 4; ++q) neg0 |= __float_as_uint(acc[tt][ci][q]) == 0x80000000u;
-    }
-    cp_wait<0>();
-    const bool redo = __syncthreads_or(neg0 ? 1 : 0) != 0;
-    if (!redo || dense) break;
-    if (tid == 0 && p.stats) atomicAdd(p.stats + 0, 1);
-    dense = true;
-  }
-  const float gs4 = mul_ftz(p.GS[e], 4.0f);
-#pragma unroll
-  for (int tt = 0; tt < 4; ++tt) {
-#pragma unroll
-    for (int ci = 0; ci < 4; ++ci) {
-      const int col = (NTL * P + warp) * 64 + 16 * ci + g8;
-#pragma unroll
-      for (int q = 0; q < 4; ++q) {
-        const int r = 8 * tt + 2 * t + (q & 1);
-        const int cc = col + ((q >> 1) ? 8 : 0);
-        if (r < nrows) {
-          const uint32_t v = to_bf16x2(mul_ftz(acc[tt][ci][q], gs4), 0.0f);
-          reinterpret_cast<uint16_t*>(p.C)[(long long)L.rows[r] * p.ldc + cc] = static_cast<uint16_t>(v);
-        }
-      }
-    }
+  };
+  switch (ntt) {
+    case 1: run_nt(std::integral_constant<int, 1>{}); break;
+    case 2: run_nt(std::integral_constant<int, 2>{}); break;
+    case 3: run_nt(std::integral_constant<int, 3>{}); break;
+    default: run_nt(std::integral_constant<int, 4>{}); break;
   }
 }
 

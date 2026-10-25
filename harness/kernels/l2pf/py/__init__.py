@@ -73,6 +73,14 @@ def _load():
         lib.l2pf_prefetch_slots2.restype = ctypes.c_int
     except AttributeError:
         pass  # Older library: no slot-range prefetch.
+    try:
+        lib.l2pf_prefetch_anchor.argtypes = [ctypes.c_void_p, ctypes.c_longlong, ctypes.c_void_p,
+                                             ctypes.c_longlong, ctypes.c_void_p, ctypes.c_void_p,
+                                             ctypes.c_longlong, ctypes.c_int, ctypes.c_size_t,
+                                             ctypes.c_int, ctypes.c_void_p]
+        lib.l2pf_prefetch_anchor.restype = ctypes.c_int
+    except AttributeError:
+        pass  # Older library: no anchor prefetch.
     _lib = lib
     return lib
 
@@ -129,6 +137,30 @@ def prefetch_slots2(t: torch.Tensor, slot0: torch.Tensor, off0: int, bytes0: int
             CHUNK, side.cuda_stream)
     if rc != 0:
         raise RuntimeError(f"l2pf_prefetch_slots2 failed: {rc}")
+    return True
+
+
+SSM_ANCHOR = os.environ.get("L2PF_SSM_ANCHOR", "1") != "0"
+
+
+def prefetch_anchor(t: torch.Tensor, slots_row: torch.Tensor, seq_lens: torch.Tensor,
+                    qsl: torch.Tensor, tag_off: int, period: int, nbytes: int) -> bool:
+    """Queue an L2 prefetch of the lazy SSM anchor the next verify loads (slot 0 or 2 of
+    slots_row, chosen on the device from the prompt-length word and the positions)."""
+    fn = getattr(_lib, "l2pf_prefetch_anchor", None) if _lib is not None else None
+    if (not ENABLED or fn is None or t is None or not t.is_cuda or slots_row.dtype != torch.int32
+            or seq_lens.dtype != torch.int32 or qsl.dtype != torch.int32 or slots_row.numel() < 3):
+        return False
+    stride = t.stride(0) * t.element_size()
+    if t.data_ptr() % 16 or stride % 16:
+        return False
+    main = torch.cuda.current_stream(t.device)
+    side = _side_stream(t.device)
+    side.wait_stream(main)
+    rc = fn(t.data_ptr(), stride, slots_row.data_ptr(), slots_row.stride(0), seq_lens.data_ptr(),
+            qsl.data_ptr(), tag_off, period, nbytes, CHUNK, side.cuda_stream)
+    if rc != 0:
+        raise RuntimeError(f"l2pf_prefetch_anchor failed: {rc}")
     return True
 
 

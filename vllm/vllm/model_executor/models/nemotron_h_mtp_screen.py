@@ -131,10 +131,13 @@ def _nvfp4_rows_dot(
     pid = tl.program_id(0)
     r = pid * BR + tl.arange(0, BR)
     rmask = r < R
-    # weight/scale-load mask: off once the depth gate stopped the draft loop (zeros out)
-    wr = rmask
     if GATED:
-        wr = rmask & (tl.load(gate_ptr) == 0)
+        if tl.load(gate_ptr) != 0:
+            # Stopped draft pass: the +0 sums its masked weight and scale loads
+            # would give, without reading rows, weights or h.
+            tl.store(out_ptr + r, tl.zeros((BR,), dtype=tl.float32) * gscale, mask=rmask)
+            return
+    wr = rmask
     if RMODE == 1:
         rows = tl.load(rows_ptr + r, mask=rmask, other=0) + (r // CPER) * CHUNK
         if INDEX32:
@@ -236,6 +239,8 @@ def _chunk_topk(
     K: tl.constexpr,
     GATHER: tl.constexpr,
     launch_pdl: tl.constexpr = False,
+    gate_ptr=None,
+    GATED: tl.constexpr = False,
 ):
     """The indices torch.topk(scores.view(C, N), K, dim=-1, sorted=False) returns,
     in its order (CUDA sbtopk::gatherTopK: every key above the K-th largest in
@@ -246,6 +251,17 @@ def _chunk_topk(
         tl.extra.cuda.gdc_wait()
         tl.extra.cuda.gdc_launch_dependents()
     c = tl.program_id(0)
+    if GATED:
+        if tl.load(gate_ptr) != 0:
+            # Stopped draft pass: its scores are all +0 (the gated rows_dot), so
+            # every key ties and the first K ids in ascending index order are taken.
+            j = tl.arange(0, K)
+            if GATHER:
+                first = tl.load(src_ptr + c * N + j)
+            else:
+                first = c.to(tl.int64) * N + j
+            tl.store(out_ptr + c * K + j, first)
+            return
     i = tl.arange(0, N)
     key = _topk_key(tl.load(scores_ptr + c * N + i))
     # The K-th largest key: the largest t with count(key >= t) >= K, bit by bit.
@@ -517,10 +533,12 @@ class DraftHeadScreen:
                 self.gscale, self.scores, False, gated,
             )
             nchunk = self.n // SCREEN_CHUNK
+            tgate, tok = _gate_args(self.scores)
+            tgated = gated and tok
             _chunk_topk[(nchunk,)](
                 self.scores, self.scores, self._coarse_cand,
                 N=SCREEN_CHUNK, K=CASCADE_PER, GATHER=False,
-                num_warps=8, launch_pdl=mtp_pdl(),
+                num_warps=8, launch_pdl=mtp_pdl(), gate_ptr=tgate, GATED=tgated,
             )
             _rows_dot(
                 self._hs, self.w_scr, self.s_scr, self._coarse_cand,
@@ -529,7 +547,7 @@ class DraftHeadScreen:
             _chunk_topk[(nchunk,)](
                 self.refine_scores, self._coarse_cand, self._cand,
                 N=CASCADE_PER, K=SCREEN_PER, GATHER=True,
-                num_warps=4, launch_pdl=mtp_pdl(),
+                num_warps=4, launch_pdl=mtp_pdl(), gate_ptr=tgate, GATED=tgated,
             )
             cand = self._cand
         elif self.cascade and self.fold:

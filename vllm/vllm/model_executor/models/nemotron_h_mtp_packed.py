@@ -48,6 +48,12 @@ def pdl_prologue():
 
 
 @gluon.jit
+def stopped_zero(ptrs, mask, lay:tl.constexpr, BN:tl.constexpr):
+    """+0 at ptrs: what a stopped (depth-gated) pass's masked weight loads sum to."""
+    tl.store(ptrs, tl.full((BN,), 0.0, tl.float32, lay).to(ptrs.dtype.element_ty), mask=mask)
+
+
+@gluon.jit
 def packed_gemv(x_ptr, SM, EX, BASE, RI, RAW, y_ptr, N, K, stride_wn,
                 gate_ptr, BN:tl.constexpr, BK:tl.constexpr, EVICT:tl.constexpr,
                 GATED:tl.constexpr=False, launch_pdl:tl.constexpr=False):
@@ -58,9 +64,12 @@ def packed_gemv(x_ptr, SM, EX, BASE, RI, RAW, y_ptr, N, K, stride_wn,
     offs_n=pid*BN+tl.arange(0,BN,layout=SliceLayout(1,layout))
     offs_k=tl.arange(0,BK,layout=SliceLayout(0,layout))
     nmask=offs_n<N
-    wn=nmask
     if GATED:
-        wn=nmask & (tl.load(gate_ptr)==0)
+        if tl.load(gate_ptr)!=0:
+            # Stopped pass: store the zeros the masked loads would sum to, stream nothing.
+            stopped_zero(y_ptr+offs_n,nmask,SliceLayout(1,layout),BN)
+            return
+    wn=nmask
     acc=tl.full((BN,BK),0,tl.float32,layout)
     for k0 in range(0,K,BK):
         kk=k0+offs_k
@@ -76,18 +85,24 @@ def packed_gemv(x_ptr, SM, EX, BASE, RI, RAW, y_ptr, N, K, stride_wn,
 def packed_moe_up(x_ptr, SM, EX, BASE, RI, RAW, SSM, SEX, SBASE, SRI, SRAW,
                    ids_ptr,h_ptr,I,K,stride_we,stride_wn,stride_wsn,gate_ptr,
                    TOPK:tl.constexpr,BN:tl.constexpr,BK:tl.constexpr,EVICT:tl.constexpr,
-                   GATED:tl.constexpr=False, launch_pdl:tl.constexpr=False):
+                   GATED:tl.constexpr=False, launch_pdl:tl.constexpr=False,
+                   WN:tl.constexpr=2):
     if launch_pdl:
         pdl_prologue()
-    layout:tl.constexpr=BlockedLayout([1,8],[1,32],[2,4],[1,0])
+    # WN warps along N, 4 along K: the K layout (8 x 32 x 4), and with it every
+    # row's accumulation and reduction order, does not depend on WN or BN.
+    layout:tl.constexpr=BlockedLayout([1,8],[1,32],[WN,4],[1,0])
     pid_n=tl.program_id(0)
     j=tl.program_id(1)
     offs_n=pid_n*BN+tl.arange(0,BN,layout=SliceLayout(1,layout))
     offs_k=tl.arange(0,BK,layout=SliceLayout(0,layout))
     nmask=offs_n<I
-    wn=nmask
     if GATED:
-        wn=nmask & (tl.load(gate_ptr)==0)
+        if tl.load(gate_ptr)!=0:
+            # Stopped pass: store the zeros the masked loads would give, stream nothing.
+            stopped_zero(h_ptr+j*I+offs_n,nmask,SliceLayout(1,layout),BN)
+            return
+    wn=nmask
     if j<TOPK:
         e=tl.load(ids_ptr+j).to(tl.int64)
         wbase=e*stride_we+offs_n[:,None].to(tl.int64)*stride_wn

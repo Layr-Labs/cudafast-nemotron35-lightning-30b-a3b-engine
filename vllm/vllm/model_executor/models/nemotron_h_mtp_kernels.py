@@ -419,6 +419,9 @@ def install_mtp_small_linear(module: torch.nn.Module) -> int:
 # Measured on GB10: 8 rows x 1024 columns per step, 8 warps -> ~240 GB/s
 # for both kernels (the device's streaming read rate).
 _MOE_UP_BN, _MOE_UP_BK, _MOE_UP_WARPS, _MOE_UP_STAGES = 8, 1024, 8, 3
+# Packed (12-bit) up projection: 2 rows per program, 2 warps along N and the same
+# 4 along K (nemotron_h_mtp_packed.packed_moe_up); each row's arithmetic is unchanged.
+_PK_UP_BN, _PK_UP_WN = 2, 2
 _MOE_DN_BN, _MOE_DN_BK, _MOE_DN_WARPS, _MOE_DN_STAGES = 8, 1024, 8, 3
 
 
@@ -774,11 +777,11 @@ def mtp_moe_row(
 
     gate, gated = _gate_args(x)
     if isinstance(w13, PackedBF16):
-        packed_moe_up[(triton.cdiv(inter, _MOE_UP_BN), topk + n_shared)](
+        packed_moe_up[(triton.cdiv(inter, _PK_UP_BN), topk + n_shared)](
             x, *w13.planes, *su.planes, ids, h, inter, H,
-            inter * H, H, H, gate, TOPK=topk, BN=_MOE_UP_BN, BK=_MOE_UP_BK,
-            EVICT=_EVICT_W, GATED=gated, num_warps=_MOE_UP_WARPS,
-            num_stages=_MOE_UP_STAGES, launch_pdl=mtp_pdl(),
+            inter * H, H, H, gate, TOPK=topk, BN=_PK_UP_BN, BK=_MOE_UP_BK,
+            EVICT=_EVICT_W, GATED=gated, num_warps=4 * _PK_UP_WN,
+            num_stages=_MOE_UP_STAGES, launch_pdl=mtp_pdl(), WN=_PK_UP_WN,
         )
     else:
         _mtp_moe_up_kernel[(triton.cdiv(inter, _MOE_UP_BN), topk + n_shared)](

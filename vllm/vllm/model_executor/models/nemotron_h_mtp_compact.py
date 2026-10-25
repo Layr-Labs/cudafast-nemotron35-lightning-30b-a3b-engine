@@ -87,6 +87,67 @@ def _down(
         tl.store(y + row * H + n, out, mask=n < H)
 
 
+@triton.jit
+def _down_slots(
+    indices, values, counts, w2, sd, ids, part,
+    H: tl.constexpr, I: tl.constexpr, TOPK: tl.constexpr,
+    BN: tl.constexpr, BK: tl.constexpr,
+    launch_pdl: tl.constexpr = False,
+):
+    """_down's per-slot sums, one program per (column block, slot): part[slot, n] =
+    tl.sum(acc, axis=0) with the same tile, chunk order and reduction as _down."""
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    n = tl.program_id(0) * BN + tl.arange(0, BN)
+    slot = tl.program_id(1)
+    lane = tl.arange(0, BK)
+    count = tl.load(counts + slot)
+    if slot < TOPK:
+        base = w2 + tl.load(ids + slot).to(tl.int64) * I * H
+    else:
+        base = sd + (slot - TOPK).to(tl.int64) * I * H
+    acc = tl.zeros((BK, BN), tl.float32)
+    for start in range(0, count, BK):
+        pos = start + lane
+        k = tl.load(indices + slot * I + pos, mask=pos < count, other=0)
+        value = tl.load(values + slot * I + pos, mask=pos < count, other=0.0)
+        weight = tl.load(
+            base + k[:, None].to(tl.int64) * H + n[None, :],
+            mask=(pos[:, None] < count) & (n[None, :] < H),
+            other=0.0, eviction_policy="evict_first",
+        )
+        acc += weight.to(tl.float32) * value[:, None].to(tl.float32)
+    tl.store(part + slot * H + n, tl.sum(acc, axis=0), mask=n < H)
+
+
+@triton.jit
+def _down_combine(
+    part, weights, y,
+    M: tl.constexpr, H: tl.constexpr, ROUTED_SCALE: tl.constexpr,
+    TOPK: tl.constexpr, S: tl.constexpr, BN: tl.constexpr,
+    launch_pdl: tl.constexpr = False,
+):
+    """_down's epilogue over the per-slot sums, in _down's order."""
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    n = tl.program_id(0) * BN + tl.arange(0, BN)
+    routed = tl.zeros((BN,), tl.float32)
+    for j in range(TOPK):
+        routed += tl.load(weights + j).to(tl.float32) * tl.load(part + j * H + n, mask=n < H, other=0.0)
+    shared = tl.zeros((BN,), tl.float32)
+    for s in range(S):
+        shared += tl.load(part + (TOPK + s) * H + n, mask=n < H, other=0.0)
+    out = (routed * ROUTED_SCALE + shared).to(y.dtype.element_ty)
+    for row in range(M):
+        tl.store(y + row * H + n, out, mask=n < H)
+
+
+# MTP_DOWN_SLOTS=0 runs _down (one program per column block, slots in a loop).
+_SLOTS = os.environ.get("MTP_DOWN_SLOTS", "1") != "0"
+
+
 def maybe_down(h, packed, ids, weights, y, routed_scale):
     """Reuse the existing finite, exact BF16 transpose prepared before capture."""
     if not _ENABLED:
@@ -115,6 +176,20 @@ def maybe_down(h, packed, ids, weights, y, routed_scale):
         h, indices, values, counts, I=1856, BLOCK=2048, num_warps=4,
         launch_pdl=mtp_pdl(),
     )
+    if _SLOTS:
+        # The slots' sums in parallel programs, then _down's epilogue: the same
+        # values, with five times the programs streaming the gathered rows.
+        part = torch.empty((slots, 2688), dtype=torch.float32, device=h.device)
+        _down_slots[(triton.cdiv(2688, 32), slots)](
+            indices, values, counts, w2, sd, ids, part,
+            H=2688, I=1856, TOPK=topk, BN=32, BK=64, num_warps=4, num_stages=3,
+            launch_pdl=mtp_pdl(),
+        )
+        _down_combine[(triton.cdiv(2688, 256),)](
+            part, weights, y, M=y.shape[0], H=2688, ROUTED_SCALE=routed_scale,
+            TOPK=topk, S=2, BN=256, num_warps=4, launch_pdl=mtp_pdl(),
+        )
+        return True
     _down[(triton.cdiv(2688, 32),)](
         indices, values, counts, w2, sd, ids, weights, y,
         M=y.shape[0], H=2688, I=1856, ROUTED_SCALE=routed_scale,

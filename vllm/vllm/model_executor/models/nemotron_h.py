@@ -328,10 +328,9 @@ class NemotronHMoE(nn.Module):
             hidden_states = sequence_parallel_chunk(hidden_states)
 
         if self._smallk_early_router:
-            # the runner applies self.gate to this fp32 copy after the side-stream fork
             final_hidden_states = self.experts(
                 hidden_states=hidden_states,
-                router_logits=hidden_states.to(self.gate.weight.dtype),
+                router_logits=hidden_states,
             )
             return final_hidden_states.view(num_tokens, hidden_dim)
 

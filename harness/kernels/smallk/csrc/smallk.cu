@@ -62,10 +62,19 @@ __device__ __forceinline__ float ldw(const void* __restrict__ w, long i) {
   }
 }
 
+template <bool X16>
+__device__ __forceinline__ float ldxv(const void* __restrict__ x, long i) {
+  if constexpr (X16) {
+    return __uint_as_float(static_cast<unsigned int>(__ldg(static_cast<const unsigned short*>(x) + i)) << 16);
+  } else {
+    return __ldg(static_cast<const float*>(x) + i);
+  }
+}
+
 // MODE 0: chain = fmaf(w, x, acc) from acc = 0. MODE 1: chain = acc + (w * x) (separate rounding).
-template <int R, int M, int MODE, bool W16 = false>
+template <int R, int M, int MODE, bool W16 = false, bool X16 = false>
 __global__ void __launch_bounds__(kLanes * kMaxTiles)
-    router_gemm_kernel(const float* __restrict__ x, long ldx, const void* __restrict__ w, int K,
+    router_gemm_kernel(const void* __restrict__ x, long ldx, const void* __restrict__ w, int K,
                        float* __restrict__ y, long ldy, int N, const int* __restrict__ vrows) {
   const int t = threadIdx.x;
   const int r = t & (kLanes - 1);
@@ -75,8 +84,27 @@ __global__ void __launch_bounds__(kLanes * kMaxTiles)
   __shared__ float part[R * M][kMaxTiles][kLanes];
   __shared__ float lane_sum[R * M][kLanes];
 
+  float wv_pref[kLanes][R];
+  if constexpr (X16) {
+    if (j < J) {
+      const int len_pref = min(kLanes, (K - j * kTile) / kLanes);
+      if (len_pref == kLanes) {
+        const int base_pref = j * kTile + r;
+        long wrow_pref[R];
+  #pragma unroll
+        for (int a = 0; a < R; ++a) {
+          const int n = min(n0 + a, N - 1);
+          wrow_pref[a] = static_cast<long>(n) * K + base_pref;
+        }
+  #pragma unroll
+        for (int i = 0; i < kLanes; ++i)
+  #pragma unroll
+          for (int a = 0; a < R; ++a) wv_pref[i][a] = ldw<W16>(w, wrow_pref[a] + i * kLanes);
+      }
+    }
+  }
   pdl_wait();
-  // verify-row count (nullptr: every row), loaded early so its latency hides under the main loop
+  // Mutable verify rows and activation reads remain after producer readiness.
   const int vr = vrows == nullptr ? M : *vrows;
   if (j < J) {
     const int len = min(kLanes, (K - j * kTile) / kLanes);
@@ -93,24 +121,27 @@ __global__ void __launch_bounds__(kLanes * kMaxTiles)
       wrow[a] = static_cast<long>(n) * K + base;
     }
     if (len == kLanes) {
-      float wv[kLanes][R];
+      if constexpr (!X16) {
+        // Preserve the original FP32 path's post-wait weight loads.
 #pragma unroll
-      for (int i = 0; i < kLanes; ++i)
+        for (int i = 0; i < kLanes; ++i)
 #pragma unroll
-        for (int a = 0; a < R; ++a) wv[i][a] = ldw<W16>(w, wrow[a] + i * kLanes);
+          for (int a = 0; a < R; ++a)
+            wv_pref[i][a] = ldw<W16>(w, wrow[a] + i * kLanes);
+      }
 #pragma unroll
       for (int i = 0; i < kLanes; ++i) {
         float xv[M];
 #pragma unroll
-        for (int m = 0; m < M; ++m) xv[m] = __ldg(x + m * ldx + base + i * kLanes);
+        for (int m = 0; m < M; ++m) xv[m] = ldxv<X16>(x, m * ldx + base + i * kLanes);
 #pragma unroll
         for (int a = 0; a < R; ++a)
 #pragma unroll
           for (int m = 0; m < M; ++m) {
             if (MODE == 0) {
-              acc[a][m] = __fmaf_rn(wv[i][a], xv[m], acc[a][m]);
+              acc[a][m] = __fmaf_rn(wv_pref[i][a], xv[m], acc[a][m]);
             } else {
-              acc[a][m] = __fadd_rn(acc[a][m], __fmul_rn(wv[i][a], xv[m]));
+              acc[a][m] = __fadd_rn(acc[a][m], __fmul_rn(wv_pref[i][a], xv[m]));
             }
           }
       }
@@ -118,7 +149,7 @@ __global__ void __launch_bounds__(kLanes * kMaxTiles)
       for (int i = 0; i < len; ++i) {
         float xv[M];
 #pragma unroll
-        for (int m = 0; m < M; ++m) xv[m] = __ldg(x + m * ldx + base + i * kLanes);
+        for (int m = 0; m < M; ++m) xv[m] = ldxv<X16>(x, m * ldx + base + i * kLanes);
 #pragma unroll
         for (int a = 0; a < R; ++a) {
           const float wa = ldw<W16>(w, wrow[a] + i * kLanes);
@@ -380,18 +411,18 @@ int launch(Kern kernel, dim3 grid, dim3 block, int pdl, cudaStream_t stream, Arg
   return err == cudaSuccess ? 0 : 1000 + static_cast<int>(err);
 }
 
-template <int R, int MODE, bool W16 = false>
-int router_launch(const float* x, long ldx, int M, const void* w, int N, int K, float* y, long ldy, int pdl,
+template <int R, int MODE, bool W16 = false, bool X16 = false>
+int router_launch(const void* x, long ldx, int M, const void* w, int N, int K, float* y, long ldy, int pdl,
                   const int* vrows, cudaStream_t stream) {
   dim3 grid((N + R - 1) / R);
   dim3 block(kLanes * ((K + kTile - 1) / kTile));
   switch (M) {
     case 4:
-      return launch(router_gemm_kernel<R, 4, MODE, W16>, grid, block, pdl, stream, x, ldx, w, K, y, ldy, N, vrows);
+      return launch(router_gemm_kernel<R, 4, MODE, W16, X16>, grid, block, pdl, stream, x, ldx, w, K, y, ldy, N, vrows);
     case 5:
       // Follow-on M5 specialization: reuse each independent M4 arithmetic
       // chain; equivalence to the M5 cuBLAS choice requires remote validation.
-      return launch(router_gemm_kernel<R, 5, MODE, W16>, grid, block, pdl, stream, x, ldx, w, K, y, ldy, N, vrows);
+      return launch(router_gemm_kernel<R, 5, MODE, W16, X16>, grid, block, pdl, stream, x, ldx, w, K, y, ldy, N, vrows);
     default:
       return 2;
   }
@@ -432,6 +463,24 @@ int sk_init() {
   rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<2, 5, 0, true>) != cudaSuccess;
   rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<4, 5, 0, true>) != cudaSuccess;
   rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<8, 5, 0, true>) != cudaSuccess;
+#endif
+  rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<1, 4, 0, false, true>) != cudaSuccess;
+  rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<2, 4, 0, false, true>) != cudaSuccess;
+  rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<4, 4, 0, false, true>) != cudaSuccess;
+  rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<8, 4, 0, false, true>) != cudaSuccess;
+  rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<1, 5, 0, false, true>) != cudaSuccess;
+  rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<2, 5, 0, false, true>) != cudaSuccess;
+  rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<4, 5, 0, false, true>) != cudaSuccess;
+  rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<8, 5, 0, false, true>) != cudaSuccess;
+#ifndef SMALLK_NO_W16
+  rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<1, 4, 0, true, true>) != cudaSuccess;
+  rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<2, 4, 0, true, true>) != cudaSuccess;
+  rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<4, 4, 0, true, true>) != cudaSuccess;
+  rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<8, 4, 0, true, true>) != cudaSuccess;
+  rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<1, 5, 0, true, true>) != cudaSuccess;
+  rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<2, 5, 0, true, true>) != cudaSuccess;
+  rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<4, 5, 0, true, true>) != cudaSuccess;
+  rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<8, 5, 0, true, true>) != cudaSuccess;
 #endif
   rc |= cudaFuncGetAttributes(&a, topk_sigmoid_kernel<128>) != cudaSuccess;
   rc |= cudaFuncGetAttributes(&a, align_kernel) != cudaSuccess;
@@ -484,6 +533,32 @@ int sk_router_gemm_w16(const float* x, long ldx, int M, const void* w16, int N, 
   return 3;
 }
 #endif  // SMALLK_NO_W16: without it the Python side keeps the fp32 read (no sk_router_gemm_w16 symbol)
+
+int sk_router_gemm_x16(const void* x, long ldx, int M, const void* w, int N, int K, float* y, long ldy, int rows,
+                       int pdl, const int* vrows, int w16_flag, void* stream) {
+  if (K % kLanes != 0 || K > kTile * kMaxTiles || K <= 0 || N <= 0) return 1;
+  cudaStream_t s = static_cast<cudaStream_t>(stream);
+  if (w16_flag) {
+#ifndef SMALLK_NO_W16
+    switch (rows) {
+      case 1: return router_launch<1, 0, true, true>(x, ldx, M, w, N, K, y, ldy, pdl, vrows, s);
+      case 2: return router_launch<2, 0, true, true>(x, ldx, M, w, N, K, y, ldy, pdl, vrows, s);
+      case 4: return router_launch<4, 0, true, true>(x, ldx, M, w, N, K, y, ldy, pdl, vrows, s);
+      case 8: return router_launch<8, 0, true, true>(x, ldx, M, w, N, K, y, ldy, pdl, vrows, s);
+    }
+#else
+    return 4;
+#endif
+  } else {
+    switch (rows) {
+      case 1: return router_launch<1, 0, false, true>(x, ldx, M, w, N, K, y, ldy, pdl, vrows, s);
+      case 2: return router_launch<2, 0, false, true>(x, ldx, M, w, N, K, y, ldy, pdl, vrows, s);
+      case 4: return router_launch<4, 0, false, true>(x, ldx, M, w, N, K, y, ldy, pdl, vrows, s);
+      case 8: return router_launch<8, 0, false, true>(x, ldx, M, w, N, K, y, ldy, pdl, vrows, s);
+    }
+  }
+  return 3;
+}
 
 // logits [M][E] fp32 contiguous, bias [E] fp32; values [M][topk] fp32, indices [M][topk] int32.
 int sk_topk_sigmoid(const float* logits, const float* bias, int M, int E, int topk, int renormalize, float scale,

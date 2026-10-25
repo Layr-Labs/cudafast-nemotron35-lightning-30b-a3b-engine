@@ -89,10 +89,13 @@ _vrows_missed = False
 _has_vrows_entry = False
 _w16: dict = {}  # gate weight data_ptr -> (weight, bf16 shadow or None when not bf16-exact)
 _has_w16_entry = False
+_has_x16_entry = False
+_X16_ON = os.environ.get("SMALLK_ROUTER_X16", "1") != "0"
+_x16_checked: dict = {}
 
 
 def _load():
-    global _lib, _load_error, _has_vrows_entry, _has_w16_entry
+    global _lib, _load_error, _has_vrows_entry, _has_w16_entry, _has_x16_entry
     if _lib is not None or _load_error is not None:
         return _lib
     try:
@@ -118,6 +121,12 @@ def _load():
             _has_w16_entry = current
         except AttributeError:
             _has_w16_entry = False
+        try:
+            lib.sk_router_gemm_x16.argtypes = [vp, cl, ci, vp, ci, ci, vp, cl, ci, ci, vp, ci, vp]
+            lib.sk_router_gemm_x16.restype = ci
+            _has_x16_entry = True
+        except AttributeError:
+            _has_x16_entry = False
         lib.sk_topk_sigmoid.argtypes = [vp, vp, ci, ci, ci, ci, cf, vp, vp, ci, ci, vp]
         lib.sk_topk_sigmoid.restype = ci
         lib.sk_align.argtypes = [vp, ci, ci, ci, vp, ci, vp, ci, vp, ci, vp]
@@ -178,7 +187,19 @@ def router_gemm(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor | None = Non
     rows = ROUTER_ROWS if rows is None else rows
     if vrows is not None:
         assert _has_vrows_entry and vrows.dtype == torch.int32 and vrows.device == x.device
-    if w16 is not None:
+    if x.dtype == torch.bfloat16:
+        assert _has_x16_entry and mode == 0 and x.stride(1) == 1
+        wptr = w.data_ptr()
+        w16_flag = 0
+        if w16 is not None:
+            assert _has_w16_entry and w16.dtype == torch.bfloat16 and w16.shape == w.shape
+            assert w16.is_contiguous() and w16.device == w.device
+            wptr = w16.data_ptr()
+            w16_flag = 1
+        rc = lib.sk_router_gemm_x16(x.data_ptr(), x.stride(0), m, wptr, n, k, out.data_ptr(),
+                                    out.stride(0), rows, _pdl(pdl),
+                                    None if vrows is None else vrows.data_ptr(), w16_flag, _stream(x))
+    elif w16 is not None:
         assert _has_w16_entry and mode == 0 and w16.dtype == torch.bfloat16 and w16.shape == w.shape
         assert w16.is_contiguous() and w16.device == w.device
         rc = lib.sk_router_gemm_w16(x.data_ptr(), x.stride(0), m, w16.data_ptr(), n, k, out.data_ptr(),
@@ -303,6 +324,53 @@ def reset_verify_rows() -> None:
         buf.fill_(VROWS_ALL)
 
 
+def _admit_x16(w: torch.Tensor) -> bool:
+    """Remote startup: compare the new path on every immutable actual gate.
+
+    A cache miss during capture uses the original FP32 path. No request data
+    enters this check or cache, and cache entries hold the weight alive.
+    """
+    if not _X16_ON or not _has_x16_entry:
+        return False
+    key = (w.data_ptr(), tuple(w.shape), tuple(w.stride()), w.dtype, w.device)
+    hit = _x16_checked.get(key)
+    if hit is not None:
+        return hit[1]
+    if torch.cuda.is_current_stream_capturing():
+        return False
+    try:
+        n, k = w.shape
+        gen = torch.Generator(device=w.device).manual_seed(81563)
+        shadow = gate_w16(w)
+        for m in (4, 5):
+            for case in range(4):
+                if case < 3:
+                    scale = (0.001, 1.0, 32.0)[case]
+                    x = (torch.randn((m, k), dtype=torch.float32, generator=gen,
+                                     device=w.device) * scale).to(torch.bfloat16)
+                else:
+                    bits = torch.tensor([0, -32768, 1, -32767, 0x3f80, -16512,
+                                         0x7f7f, -129, 0x7f80, -128,
+                                         0x7fc1, 0x7f81, -1],
+                                        dtype=torch.int16, device=w.device)
+                    x = bits.repeat((m * k + bits.numel() - 1) // bits.numel())
+                    x = x[:m * k].reshape(m, k).view(torch.bfloat16).contiguous()
+                wide = x.to(torch.float32)
+                for count in ((None, 0, 1, 3, 5) if m == 5 else (None,)):
+                    vr = None if count is None else torch.tensor(
+                        [count], dtype=torch.int32, device=w.device)
+                    reference = router_gemm(wide, w, pdl=0, vrows=vr, w16=shadow)
+                    actual = router_gemm(x, w, pdl=0, vrows=vr, w16=shadow)
+                    if not torch.equal(actual.view(torch.int32), reference.view(torch.int32)):
+                        raise RuntimeError("BF16 router differs from original FP32-input kernel")
+        _x16_checked[key] = (w, True)
+        return True
+    except Exception as exc:
+        _x16_checked[key] = (w, False)
+        print(f"SMALLK_ROUTER_X16 rejected; original FP32 path retained: {exc!r}", flush=True)
+        return False
+
+
 def maybe_router_gemm(x: torch.Tensor, w: torch.Tensor, row_mask: bool = False) -> torch.Tensor | None:
     """M4 router or follow-on M5 experiment; None for unsupported metadata. row_mask (target-model
     gates only): honour verify_rows."""
@@ -314,7 +382,7 @@ def maybe_router_gemm(x: torch.Tensor, w: torch.Tensor, row_mask: bool = False) 
         return None
     if (
         (m, n, k) not in ROUTER_SHAPES
-        or x.dtype != torch.float32
+        or x.dtype not in (torch.float32, torch.bfloat16)
         or w.dtype != torch.float32
         or w.shape[1] != k
         or x.stride(1) != 1
@@ -323,6 +391,8 @@ def maybe_router_gemm(x: torch.Tensor, w: torch.Tensor, row_mask: bool = False) 
     ):
         return None
     if not _usable():
+        return None
+    if x.dtype == torch.bfloat16 and not _admit_x16(w):
         return None
     vrows = None
     if row_mask:

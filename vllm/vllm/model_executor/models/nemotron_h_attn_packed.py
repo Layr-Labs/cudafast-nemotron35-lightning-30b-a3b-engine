@@ -44,6 +44,8 @@ KERNEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nemotron
 _chosen: dict[tuple[int, int], tuple] = {}
 _word_ok = False
 _WORD = os.environ.get("ATTN_PACK12_WORDLOAD", "1") != "0"
+_GLUON = os.environ.get("ATTN_PACK12_GLUON", "1") != "0"
+_gluon_ok = False
 _registry: dict[int, tuple[torch.Tensor, ...]] = {}
 
 _PROBE = """
@@ -62,7 +64,7 @@ for n, k in ((4608, 2688), (2688, 4096)):
     raw = torch.randint(-32768, 32767, (128,), dtype=torch.int16, device=dev)
     x = torch.randn(m.ROWS, k, device=dev, dtype=torch.bfloat16)
     for cfg in m.CONFIGS:
-        group = "word" if len(cfg) == 4 else "base"
+        group = "gluon" if len(cfg) == 3 else ("word" if len(cfg) == 4 else "base")
         if group != sys.argv[2]:
             continue
         y = m.run(x, sm, ex, base, ri, raw, n, k, cfg)
@@ -124,10 +126,11 @@ def _probe_group(group: str) -> bool:
 
 
 def _probe() -> bool:
-    global _word_ok
+    global _word_ok, _gluon_ok
     if not _probe_group("base"):
         return False
     _word_ok = _WORD and _probe_group("word")
+    _gluon_ok = _GLUON and _probe_group("gluon")
     return True
 
 
@@ -201,6 +204,8 @@ def _choose(items, n: int, k: int, flush: torch.Tensor):
     choices = []
     for cfg in CONFIGS:
         if len(cfg) == 4 and not _word_ok:
+            continue
+        if len(cfg) == 3 and not _gluon_ok:
             continue
         if n % cfg[0]:
             continue

@@ -266,6 +266,22 @@
     {
       "file": "model_executor/models/nemotron_h_attn_packed.py",
       "why": "Selectonlygraph-replayadmissiontiming helper frompublicpendingf102bbdb-ebe5-48e5-a1c8-313774419059;24callscycle6real-layerweights,7replaymedian, nohostlaunchbias. Keep4%MIN_GAIN andrankedall-layerexactadmission; paired eagerbaseline/candidatefallback ifreferencegraphunavailable. DoNOTimportdiagnosticstalls,_sleep,stagecodes orMIN_GAIN10. ADFcombined8d/51notealreadycoverednonewmethod; wholecombo remainsunverified,remoteonly."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_packed.py, nemotron_h_mtp_kernels.py, vllm/v1/attention/backends/flashinfer.py, layers/attention/attention.py, vllm/v1/worker/gpu_model_runner.py",
+      "why": "jacklightChen 36efef0d (decode pieces only): native MTP word reads, packed drafter output projection, structural plan reuse. Its prefill-alignment hunks (humming_zskip.py, fused_humming_moe.py, prefill_graph.py) are not carried: the equivalent pieces measured -0.23% on this tree."
+    },
+    {
+      "file": "harness/kernels/smallk/{csrc/smallk.cu,py/__init__.py};model_executor/layers/fused_moe/router/gate_linear.py;model_executor/models/nemotron_h.py",
+      "why": "Select4ef72848-19b4-492e-a948-e9d44a94bef0 BF16routeractivation/immutableweightpre-waitfetch idea/source only; whole4ef failed remote decode token mismatch/no score, cause notisolated. NEW mutablevrows staysafterpdl_wait; onlyX16weightprefetchahead, oldFP32postwaitweights retained; peractualgate remoteprivatebyteadmissionM4/5,3scales+BF16edgepatterns+prefixcounts,stickyfallback. Castfallback retriesoriginalFP32smallk preservingrowmask. NoPyc/MTP/otherunreportedhunks copied; wholecombo unverified,all runtime officialremote."
+    },
+    {
+      "file": "v1/spec_decode/nemotron_full_step.py",
+      "why": "Select only explicitcurrentplan_ready_event waitbeforewholegraph fromown0e8bb4ee-f97f-4e33-bd26-75270404bf78. Whole0e8measured2.33406905591559 negativevs7c/41 andNOTbaseline; no isolatedcauseclaim. Wholehighest41fullnativegraph retained, no0e8halfskip/extraHostPlanInfo/workspaceguard imported. FullreplaybypassesnativeFI Pythonwait, sohonoractualeventwithoutrelyingonQKVduration. Nextrelaypoolresearch aimswaitinsidegraph toretainoverlap,unimplementedhere."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_attn_packed{,_kernel}.py",
+      "why": "Select publishedfde6623d-b819-4e16-99a0-0a01acb6b3f0 nativeGluonpacked_small targetM5backend idea/codegeometry (64,4,BK128,4stages), notentirelowerB86-basedFDE. Addonlyseventhoptionalconfigwithindependentgluonchildprobe tofull41 sixoldconfigs andrankedgraph-us/4percent/perreallayer24input3scale exactadmission. NEW nozero dummyGPUgate allocation: GATED=False/WORD=False andunusedxpointer. OriginalTritonbase/wordkernelbodies andfallback unchanged; no source tests/fixturehunks copied. WholeFDEAPIcorrect2.30573759940767 loweritsB86parent, notbaseline/noisolatedgainclaim. Newcomposition unverified/allruntimeofficialremote."
     }
   ]
 }

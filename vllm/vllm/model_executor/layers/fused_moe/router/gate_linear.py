@@ -302,6 +302,13 @@ def smallk_router_gemm_impl(
         out = _smallk.maybe_router_gemm(x, weight, row_mask=row_mask)
         if out is not None:
             return out
+    if x.dtype != weight.dtype:
+        x = x.to(weight.dtype)
+        # Keep the original fast FP32 router and its verify-row semantics.
+        if _smallk is not None:
+            out = _smallk.maybe_router_gemm(x, weight, row_mask=row_mask)
+            if out is not None:
+                return out
     if _routerbig is not None:
         out = _routerbig.maybe_router_gemm(x, weight)
         if out is not None:

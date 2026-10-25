@@ -1,6 +1,6 @@
 """Triton GEMM for the lossless 12-bit attention projections (see nemotron_h_attn_packed.py).
 
-Imports only torch and triton so a child process can compile and run it in isolation.
+Base imports only torch/triton; optional Gluon adapter imports the existing native MTP helper lazily.
 """
 
 import torch
@@ -10,7 +10,8 @@ import triton.language as tl
 ROWS = 5
 # (columns per program, warps), tried in this order; BN is a multiple of 16.
 CONFIGS = ((32, 4), (64, 4), (16, 4),
-           (32, 4, True, True), (64, 4, True, True), (16, 4, True, True))
+           (32, 4, True, True), (64, 4, True, True), (16, 4, True, True),
+           (64, 4, "gluon"))
 
 
 @triton.jit
@@ -111,6 +112,19 @@ def _packed_gemm_wordlookahead(
 def run(x, sm, ex, base, ri, raw, n: int, k: int, cfg: tuple) -> torch.Tensor:
     """y = x @ W.T for W stored in the planes (raw is the int16 view of the uint16 plane)."""
     bn, warps = cfg[:2]
+    if len(cfg) == 3 and cfg[2] == "gluon":
+        from vllm.model_executor.models.nemotron_h_mtp_packed import packed_small
+
+        y = x.new_empty((x.shape[0], n))
+        # GATED=False removes every gate read. Reuse x as the unused pointer;
+        # unlike the source adapter, allocate/fill no dummy device gate tensor.
+        packed_small[(triton.cdiv(n, bn),)](
+            x, sm, ex, base, ri, raw, y,
+            x.shape[0], n, k, x.stride(0), y.stride(0), x,
+            BM=16, BN=bn, BK=128, GATED=False, WORD=False,
+            num_warps=warps, num_stages=4, launch_pdl=False,
+        )
+        return y
     kernel = _packed_gemm_wordlookahead if len(cfg) == 4 else _packed_gemm
     y = x.new_empty((x.shape[0], n))
     kernel[(n // bn,)](

@@ -4752,7 +4752,8 @@ class GPUModelRunner(
             fresh_logits = None
             if use_fresh_graph:
                 model_output, fresh_logits = fresh_graph.replay(
-                    attn_metadata, slot_mappings, input_ids, positions)
+                    attn_metadata, slot_mappings, input_ids, positions,
+                    lite=not self._drafts_can_be_verified())
             else:
                 model_output = self._model_forward(
                     input_ids=input_ids,

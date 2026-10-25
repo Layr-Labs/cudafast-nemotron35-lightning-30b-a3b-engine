@@ -302,6 +302,34 @@
     {
       "file": "model_executor/layers/fused_moe/experts/humming_nvsc.py (+ humming_relu2_epilogue.py forward_relu2, quantization/utils/humming_utils.py)",
       "why": "nvsc, default on: at load, a routed w13 layer whose FP8 E4M3 block scales take <= 64 distinct bytes keeps a 64-entry table plus a tile-major 6-bit index stream (load check decodes every byte back; otherwise the layer stays stock). For <= 8 tokens a derived ReLU2 humming kernel replaces only the two B-scale loaders (cp.async of 96 instead of 128 bytes per stage; shared->register decode to the identical uint32 of original E4M3 bytes), so dequantization, the K16 MMA chain and the epilogue are stock and the output is bit-identical. Prefill keeps the stock kernel and scale tensor (re-pointed into the same allocation). NVSC=0 restores current behaviour; compile/load failure logs once and uses stock."
+    },
+    {
+      "file": "harness/kernels/marlinx/py/__init__.py",
+      "why": "ArthurOstapenko 57e48c1a's exact loader-ring change for the target's 5-row shared-expert down projection, carried byte for byte onto dadon's fc04335b record (which does not include it). Measured by e-man07 on GB10 against fc04335b: +2.01% composite (decode +2.43%), identical token streams on all nine prompts."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_packed.py (packed_moe_up GROUP8)",
+      "why": "newjordan 59b3dbb4's grouped eight-value packed weight loads for the native MTP drafter's routed and shared up projections, carried byte for byte (official decode 2.79668 vs the record's 2.78821). Same decoder as ivanfioravanti's GROUP8 GEMV; the BF16 values, fp32 accumulation and reduction order are unchanged. Stacked with ArthurOstapenko's shared-down ring (a different file). Official measurement #5 of this stack (same code)."
+    },
+    {
+      "file": "models/nemotron_h_mtp_down_pipeline.py; nemotron_h_mtp_compact.py; nemotron_h_mtp_kernels.py",
+      "why": "NEW grouped metadata/exponent broadcast across eight contiguous output columns in original compacted transposed-down planes plus optional one/two-chunk indirect-read lookahead. Single original BK64 FP32lane accumulation/reduction, sorted K/expert/combine order; private actual all128routed+2shared part-byte checks, changing compact/slots/foldAdd CUDA graphs and cold whole-path>=4pct vs currently admitted packed/BF16 path. Reuses only original immutable admitted pack, original fallback retained. Material7c65206e-ebb9-48c0-8757-7e591281116c packed-down/guards, c0ce642d-0f7b-4c1f-a168-f8edb153aa4e/d33b9c7d-dc8e-4098-9171-96b32402d684 grouped decoder idea, 526d6e53-7b8b-4ce8-b4a1-b3c7a53be9d9 slots order, 3d51cab6-7079-4fb2-98e4-f2a238077897 lossless codec and a33bc79f-84b0-4244-8ab9-e3c43f45f935 changed-input byte-admission construction. No local candidate execution; implementation remains an unvalidated experiment."
+    },
+    {
+      "file": "v1/worker/prefill_graph.py; v1/worker/gpu_model_runner.py; model_executor/models/nemotron_h.py; model_executor/layers/fused_moe/runner/moe_runner.py; harness/kernels/shco/py/__init__.py",
+      "why": "One-row last MoE layer for the one-token prefill: FreshPrefillGraph also captures graph_lite (own pool), replayed when every request has max_tokens == 1 (_drafts_can_be_verified() False). In it the last MoE runner (keep_m_lite) runs the routed experts on the logits row alone (humming's up chain and zskip's/pzskip's down chains are block-size independent, so that row's routed output is the full call's) and shx runs only the units of Marlin's last launch (rows 448..495, shco.TAIL_ONLY), each with its full-call rows and k-segments. The seed prefill of a decode keeps the ordinary graph. PREFILL_LITE=0 disables."
+    },
+    {
+      "file": "prefill_graph/gpu_runner/nemotron_h/moe_runner/shco",
+      "why": "Useful pendingc22bfb12-d172-4059-98e7-ce3d4eb0909b actualfdd7db5c00c35caa71296b7e2e289531cde68ef5 exact5files. Onlywhen everyactualrequestmax_tokens1: additionalfreshprefillgraph lastMoE routedrowonly andoriginalsharedMarlinlast-launchunits, ordinaryseed/decodegraph retained. Layerislast, finalnormperrow; all capturedrequestinputsrefreshed; flagsfinallycleared. No owncorrectness/performanceclaimbeforeofficialremotevalidation."
+    },
+    {
+      "file": "harness/kernels/fp8d6/{build.sh,csrc/fp8d6.cu,py/__init__.py}; kernels/linear/scaled_mm/fp8c.py",
+      "why": "NEWoptional exact6-bit top63 per-column raw-FP8-byte dictionary+escape on ENTIREhighestb91cd8e6-5d46-4cc9-95b6-47e5d2e3b6bd (complete36ce+compactpipeline+C22 retained). Materialfc04335b-c894-41f9-b73b-aa9b5aac1fb5 original fp8c encoder/decoder/window/MMA/ring/PDL scaffold; same original FP8MMA/scales/BF16RN, newshared2KiB dictionary,6word planes andtwo128-byte raw windows. CoherentPDLactivation/scale loads pattern927589d0-dd7f-4257-9bef-30129a89b7ae. Isolatedsyntheticchild/fullactualdecode/allM1,4,5,8rawbytes/changinggraph andcold4pctcurrent7bitqualification. Mustbeatactual7bitbufferbytesby0.5pct, otherwise original retained. Strongbufferprovenanceowners; unknownencoding falls back originalFP8 CUTLASS. All candidate execution official remote only; no gain/fidelity/engagement claim."
+    },
+    {
+      "file": "vllm/vllm/v1/spec_decode/nemotron_tail_cycle.py; vllm/vllm/v1/spec_decode/llm_base_proposer.py; harness/vllm_resident/test_nemotron_tail_cycle.py",
+      "why": "NEMO_MTP_TAIL_CYCLE: startup-admitted single-request depth-four native MTP graph for the three tail steps, after the original first-tail native plan and input update. Only exact current-cycle same-page FA2 plans, buffer/input/gate signatures and freshly proven CPU sequence lengths qualify. The next two plans are invariant for unchanged page counts; current positions, slots, last-page occupancy, hidden inputs and three distinct token outputs are computed inside the graph. Native reference admission compares outputs and mutable/KV state, with restored private startup fixtures; page transitions and unsupported cases retain the original loop. No local GPU performance claim."
     }
   ]
 }

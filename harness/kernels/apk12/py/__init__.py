@@ -7,6 +7,7 @@ from pathlib import Path
 import torch
 
 SHAPES = {(4608, 2688), (2688, 4096)}
+PIPE_GROUPS = (1, 2, 4)
 _lib = None
 _load_failed = False
 _ready_devices = set()
@@ -23,7 +24,7 @@ def _load():
         lib = ctypes.CDLL(str(Path(__file__).with_name("libapk12.so")))
         lib.apk12_init.argtypes = []
         lib.apk12_init.restype = ctypes.c_int
-        lib.apk12_run.argtypes = [ctypes.c_void_p] * 7 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
+        lib.apk12_run.argtypes = [ctypes.c_void_p] * 7 + [ctypes.c_int] * 5 + [ctypes.c_void_p]
         lib.apk12_run.restype = ctypes.c_int
         lib.apk12_check.argtypes = [ctypes.c_void_p] * 7 + [ctypes.c_int] * 2 + [ctypes.c_void_p]
         lib.apk12_check.restype = ctypes.c_int
@@ -73,13 +74,15 @@ def check(cp, w: torch.Tensor, n: int, k: int) -> int:
     return int(bad.item())
 
 
-def gemm(x: torch.Tensor, cp, n: int, k: int) -> torch.Tensor:
+def gemm(x: torch.Tensor, cp, n: int, k: int, pipe_groups: int = 4) -> torch.Tensor:
     """x @ W.T for the W that pack() laid out in cp; x is [1..8, k] BF16 with unit K stride."""
+    if pipe_groups not in PIPE_GROUPS:
+        raise ValueError(f"unsupported apk12 pipeline width: {pipe_groups}")
     if x.stride(0) % 2 or x.data_ptr() % 4:
         x = x.clone(memory_format=torch.contiguous_format)
     y = torch.empty((x.shape[0], n), device=x.device, dtype=torch.bfloat16)
     rc = _lib.apk12_run(x.data_ptr(), *(t.data_ptr() for t in cp), y.data_ptr(),
-                        x.shape[0], n, k, x.stride(0), _stream(x))
+                        x.shape[0], n, k, x.stride(0), pipe_groups, _stream(x))
     if rc:
         raise RuntimeError(f"apk12 launch failed: {rc}, M={x.shape[0]}, N={n}, K={k}")
     return y

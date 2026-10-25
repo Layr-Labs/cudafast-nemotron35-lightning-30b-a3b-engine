@@ -256,16 +256,16 @@
       "why": "the 5-row verify decodes the six attention layers' QKV and output projections from the drafter's lossless 12-bit BF16 codec in registers (one tl.dot chain over K tiles of 128 into fp32, rounded once to BF16) instead of cuBLAS reading 25% more bytes; a child process first compiles and runs the kernel on synthetic planes, every packed layer is compared bit for bit with F.linear and the cold-cache time must beat it at load, else the stock projection runs (ATTN_PACK12=0 disables). Prefill and M=1 keep F.linear. The unused API-docs swagger bundle is dropped to stay inside the editable byte cap"
     },
     {
-      "file": "vllm/v1/spec_decode/nemotron_full_step.py, vllm/v1/spec_decode/llm_base_proposer.py",
-      "why": "jacklightChen 495313b7-...: native MTP whole draft-step CUDA graph (captured at startup only, with input/metadata/KV/private-pool guards; the original model call runs whenever a guard does not match). Carried file for file; its packed-attention L2 prefetch hunk is not used here because this tree's attention storage is jungjipdo's."
-    },
-    {
       "file": "models/nemotron_h_attn_packed*.py; models/nemotron_h_mtp*.py; layers/mamba/ops/ssd_prefill_fused.py; v1/attention/backends/{flashinfer,mamba2_attn}.py; v1/spec_decode/llm_base_proposer.py; v1/worker/{prefill_graph,block_table,gpu_model_runner}.py",
       "why": "On ENTIRE highest ADF05 source retain all validated 8d+51 mechanisms. Add u32word exponent attention lookahead with optional ranked actual-weight admission and rawescape plane skips; ordered compact MTP fold/BF16MoE/BF16residualAdd fusion with originalRMS plus private byte-admission. Select f102 graph-replay admission timing only; retain4%threshold/no diagnosticstalls. Add FI API fallback. Whole new combination unverified; remote execution only. MLX e61b0d79-f106-4070-a755-62ffe3013782 idea credit."
     },
     {
       "file": "model_executor/models/nemotron_h_attn_packed.py",
       "why": "Selectonlygraph-replayadmissiontiming helper frompublicpendingf102bbdb-ebe5-48e5-a1c8-313774419059;24callscycle6real-layerweights,7replaymedian, nohostlaunchbias. Keep4%MIN_GAIN andrankedall-layerexactadmission; paired eagerbaseline/candidatefallback ifreferencegraphunavailable. DoNOTimportdiagnosticstalls,_sleep,stagecodes orMIN_GAIN10. ADFcombined8d/51notealreadycoverednonewmethod; wholecombo remainsunverified,remoteonly."
+    },
+    {
+      "file": "model_executor/layers/fused_moe/moe_fused_mul_sum.py; model_executor/layers/fused_moe/experts/fused_humming_moe.py; model_executor/layers/fused_moe/runner/shared_experts.py; model_executor/layers/fused_moe/runner/moe_runner.py",
+      "why": "Decode MoE combine: the 23 shared-expert adds (bf16 opmath sum after the routed mul-sum) are stored by moe_fused_mul_sum itself when the deferred shared down has finished, routed_scaling_factor is 1, and there is no latent output transform. The runner then does not add again. TP>1 and a refused shape put the buffer back and keep the separate add. Parent dc661d0."
     }
   ]
 }

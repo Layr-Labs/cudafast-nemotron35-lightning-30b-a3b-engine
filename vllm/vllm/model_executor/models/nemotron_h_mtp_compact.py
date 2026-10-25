@@ -148,8 +148,6 @@ def _down_combine(
         value = out
         if ADD_RES:
             residual = tl.load(residual_ptr + row * H + n, mask=n < H, other=0.0)
-            # Retain the original MoE BF16 rounding before the separate Add's
-            # FP32 sum and BF16 result. The following RMS is still original.
             value = (out.to(tl.float32) + residual.to(tl.float32)).to(y.dtype.element_ty)
         tl.store(y + row * H + n, value, mask=n < H)
 
@@ -196,7 +194,7 @@ def prepare_residual_add(device, routed_scale):
                         return False
         _ADD_OK[key] = True
         logger.info("MTP ordered fold plus BF16 residual Add admitted")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("MTP folded residual unavailable (%r); original Add retained", exc)
     return _ADD_OK[key]
 

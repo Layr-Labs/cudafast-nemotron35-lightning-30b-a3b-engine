@@ -839,14 +839,7 @@ class SpecDecodeBaseProposer:
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 slot_mapping=self._get_slot_mapping(input_batch_size),
             ):
-                ret_hidden_states = None
-                if getattr(self, "_nemo_full", None) is not None:
-                    from vllm.v1.spec_decode.nemotron_full_step import maybe_run
-                    ret_hidden_states = maybe_run(
-                        self, model_kwargs, per_layer_attn_metadata,
-                        input_batch_size, batch_size)
-                if ret_hidden_states is None:
-                    ret_hidden_states = self.model(**model_kwargs)
+                ret_hidden_states = self.model(**model_kwargs)
                 if not self.model_returns_tuple():
                     last_hidden_states = ret_hidden_states
                     hidden_states = ret_hidden_states
@@ -1962,11 +1955,6 @@ class SpecDecodeBaseProposer:
                 if self.pass_hidden_states_to_model:
                     kwargs["hidden_states"] = self.hidden_states[:num_input_tokens]
                 self.model(**kwargs)
-
-        # Native MTP full attention/model graph: only startup capture, no request capture.
-        if is_graph_capturing and not torch.cuda.is_current_stream_capturing():
-            from vllm.v1.spec_decode.nemotron_full_step import prepare
-            prepare(self)
 
     def _get_eagle3_use_aux_hidden_state_from_config(self) -> bool:
         """

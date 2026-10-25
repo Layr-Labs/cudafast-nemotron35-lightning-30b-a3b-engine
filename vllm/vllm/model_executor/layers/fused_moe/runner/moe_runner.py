@@ -283,6 +283,11 @@ class MoERunner(MoERunnerInterface):
                 enable_dbo=enable_dbo,
                 mk_can_overlap_shared_experts=can_overlap,
             )
+            self._shared_experts.fold_add = (
+                routed_scaling_factor == 1.0
+                and routed_output_transform is None
+                and shared_expert_gate is None
+            )
 
         # Needed for string -> MoERunner layer lookup in custom ops.
         self.layer_name = layer_name
@@ -843,11 +848,9 @@ class MoERunner(MoERunnerInterface):
         ):
             hidden_states = get_pcp_group().reduce_scatter(hidden_states, dim=0)
 
-        if self.shared_experts is not None:
-            assert shared_output is not None
+        if self.shared_experts is not None and shared_output is not None:
             return shared_output, hidden_states
-        else:
-            return hidden_states
+        return hidden_states
 
     def _forward_impl(
         self,

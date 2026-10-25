@@ -849,13 +849,24 @@ class HummingIndexedExperts(HummingExpertsBase):
         if l2pf_pending:
             _l2pf.join(down_output.device)
 
+        shared = None
+        if expert_map is None and topk_ids.size(0) <= 8:
+            from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+                consume_deferred_shared,
+                restore_deferred_shared,
+            )
+
+            shared = consume_deferred_shared()
         moe_fused_mul_sum(
             inputs=buffers["down_output"].view(*topk_ids.shape, -1),
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             expert_map=expert_map,
             outputs=output,
+            shared=shared,
         )
+        if shared is not None and not moe_fused_mul_sum.folded:
+            restore_deferred_shared(shared)
 
 
 class HummingGroupedExperts(HummingExpertsBase):

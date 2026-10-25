@@ -66,10 +66,45 @@ def launch_pending_shared_down() -> None:
         se._launch_down()
 
 
+def consume_deferred_shared() -> torch.Tensor | None:
+    """Join the deferred shared-expert down and hand its buffer to the routed
+    combine. None leaves the runner's separate add in place."""
+    se = SharedExperts._defer_live
+    if se is None or not getattr(se, "fold_add", False):
+        return None
+    from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
+
+    if get_tensor_model_parallel_world_size() != 1:
+        return None
+    se._join_aux()
+    idx = se._output_idx
+    out = se._output[idx]
+    if out is None:
+        SharedExperts._defer_live = None
+        return None
+    se._output[idx] = None
+    se._folded = True
+    SharedExperts._defer_restore = se
+    SharedExperts._defer_live = None
+    return out
+
+
+def restore_deferred_shared(tensor: torch.Tensor) -> None:
+    """Put a refused epilogue buffer back so the runner add still runs."""
+    se = SharedExperts._defer_restore
+    if se is None:
+        return
+    se._output[se._output_idx] = tensor
+    se._folded = False
+    SharedExperts._defer_restore = None
+
+
 class SharedExperts(torch.nn.Module):
     _early_logged = False
     _pending: "SharedExperts | None" = None
     _pending_h: torch.Tensor | None = None
+    _defer_live: "SharedExperts | None" = None
+    _defer_restore: "SharedExperts | None" = None
 
     def __init__(
         self,
@@ -91,6 +126,8 @@ class SharedExperts(torch.nn.Module):
 
         self._mk_can_overlap_shared_experts = mk_can_overlap_shared_experts
         self._aux_open = False
+        self.fold_add = False
+        self._folded = False
 
         # Allow disabling of the separate shared experts stream for
         # debug purposes.
@@ -192,6 +229,7 @@ class SharedExperts(torch.nn.Module):
             with torch.cuda.stream(self._stream):
                 self._pending_h = self._layer.forward_up(shared_experts_input)
             SharedExperts._pending = self
+            SharedExperts._defer_live = self
         else:
             with torch.cuda.stream(self._stream):
                 self._output[idx] = self._layer(shared_experts_input)
@@ -246,7 +284,12 @@ class SharedExperts(torch.nn.Module):
         return dbo_current_ubatch_id() if self.enable_dbo else 0
 
     @property
-    def output(self) -> torch.Tensor:
+    def output(self) -> torch.Tensor | None:
+        if self._folded:
+            self._folded = False
+            return None
+        if SharedExperts._defer_live is self:
+            SharedExperts._defer_live = None
         self._join_aux()
         assert self._output[self._output_idx] is not None
         output = self._output[self._output_idx]
@@ -258,6 +301,9 @@ class SharedExperts(torch.nn.Module):
         shared_experts_input: torch.Tensor,
         order: SharedExpertsOrder,
     ):
+        if self._folded:
+            return None
+
         experts_order = self._determine_shared_experts_order(shared_experts_input)
 
         if order != experts_order:

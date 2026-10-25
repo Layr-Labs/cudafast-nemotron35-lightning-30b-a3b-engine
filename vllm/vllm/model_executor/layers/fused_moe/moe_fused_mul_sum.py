@@ -32,12 +32,14 @@ def moe_fused_mul_sum_kernel(
     expert_map_ptr,
     num_tokens,
     stride_m,
+    shared_ptr,
     has_expert_map: tl.constexpr,
     top_k: tl.constexpr,
     size: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     launch_pdl: tl.constexpr = False,
+    add_shared: tl.constexpr = False,
 ):
     # LOCAL PATCH (cudafast-nemotron35): programmatic dependent launch. Wait for the
     # producer grid before any load; signal dependents once every load is issued.
@@ -77,14 +79,22 @@ def moe_fused_mul_sum_kernel(
             ).to(tl.float32)
         acc += a_vec * b_val[:, None]
 
-    if launch_pdl:
-        tl.extra.cuda.gdc_launch_dependents()
+    rounded = acc.to(outputs_ptr.dtype.element_ty)
+    if add_shared:
+        s_ptrs = shared_ptr + (offs_m * size)[:, None] + offs_k[None, :]
+        shared = tl.load(s_ptrs, mask=mask, other=0.0)
+        rounded = (rounded.to(tl.float32) + shared.to(tl.float32)).to(
+            outputs_ptr.dtype.element_ty
+        )
     out_ptrs = outputs_ptr + (offs_m * size)[:, None] + offs_k[None, :]
-    tl.store(
-        out_ptrs,
-        acc.to(outputs_ptr.dtype.element_ty),
-        mask=mask,
-    )
+    if add_shared:
+        tl.store(out_ptrs, rounded, mask=mask)
+        if launch_pdl:
+            tl.extra.cuda.gdc_launch_dependents()
+    else:
+        if launch_pdl:
+            tl.extra.cuda.gdc_launch_dependents()
+        tl.store(out_ptrs, rounded, mask=mask)
 
 
 def _heuristic_config(
@@ -162,6 +172,7 @@ def moe_fused_mul_sum(
     outputs: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
     expert_map: torch.Tensor | None = None,
+    shared: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Fused kernel for MoE (Mixture of Experts) to perform weighted summation
@@ -198,6 +209,19 @@ def moe_fused_mul_sum(
     assert outputs.shape == output_shape
     assert topk_weights.shape == (num_tokens, top_k)
 
+    add_shared = (
+        shared is not None
+        and shared.dtype == inputs.dtype == outputs.dtype == torch.bfloat16
+        and shared.shape == output_shape
+        and shared.device == outputs.device
+        and shared.is_contiguous()
+        and outputs.is_contiguous()
+        and expert_map is None
+    )
+    if isinstance(inputs, FakeTensor):
+        add_shared = False
+    moe_fused_mul_sum.folded = add_shared
+
     if not isinstance(inputs, FakeTensor):
         BLOCK_M, BLOCK_K, num_warps, num_stages = _heuristic_config(
             num_tokens,
@@ -214,6 +238,7 @@ def moe_fused_mul_sum(
             expert_map,
             num_tokens,
             top_k * size,
+            shared if add_shared else outputs,
             expert_map is not None,
             top_k,
             size,
@@ -222,6 +247,7 @@ def moe_fused_mul_sum(
             num_warps=num_warps,
             num_stages=num_stages,
             launch_pdl=_pdl_enabled(),
+            add_shared=add_shared,
         )
 
     return outputs

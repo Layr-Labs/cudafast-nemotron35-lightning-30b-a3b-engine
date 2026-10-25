@@ -246,6 +246,10 @@
     {
       "file": "model_executor/kernels/linear/nvfp4/marlin.py; model_executor/models/nemotron_h.py; model_executor/layers/fused_moe/runner/shared_experts.py; model_executor/layers/fused_moe/experts/humming_tuned_moe.py",
       "why": "shco: the shared expert of the 496-token prefill runs on shx (harness/kernels/shco), a small-footprint (1 CTA/SM) NVFP4 W4A16 GEMM bit-identical to Marlin up -> relu^2 -> Marlin down (Marlin's stripe segments, k-warp chains and fp32 fold order), queued on the shared-expert aux stream beside the routed experts; humming's prefill w13 keeps its accumulation chain on a 4 x 36 persistent grid (3 resident CTAs per SM) to leave each SM room for it. Tables built at load; SHCO=0 restores stock."
+    },
+    {
+      "file": "harness/kernels/upskip; vllm/model_executor/layers/fused_moe/experts/humming_upskip.py; vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py; vllm/model_executor/layers/quantization/utils/humming_utils.py",
+      "why": "upskip: decode routed up (w13, NVFP4, N=1856, K=2688, 1..8 tokens) on zskip's swap-layout mma.m16n8k16 chain plus the fused relu^2 epilogue. Same bits as humming forward_relu2 or the layer stays on humming (load-time compare, and a timed replay that disables a kernel that is not faster). UPSKIP=0 restores humming. Prefill is untouched."
     }
   ]
 }

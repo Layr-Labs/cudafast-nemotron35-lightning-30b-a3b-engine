@@ -767,13 +767,24 @@ class HummingIndexedExperts(HummingExpertsBase):
             from vllm.model_executor.layers.fused_moe.experts.humming_relu2_epilogue import (  # noqa: E501
                 forward_relu2,
             )
-
-            forward_relu2(
-                layer=self.layer,
-                inputs=inputs,
-                outputs=buffers["activation_output"],
-                **moe_kwargs1,
+            from vllm.model_executor.layers.fused_moe.experts.humming_upskip import (
+                maybe_up,
             )
+
+            if not maybe_up(
+                self.layer,
+                inputs,
+                buffers["activation_output"],
+                topk_ids.size(0),
+                topk_ids.size(1),
+                moe_kwargs1,
+            ):
+                forward_relu2(
+                    layer=self.layer,
+                    inputs=inputs,
+                    outputs=buffers["activation_output"],
+                    **moe_kwargs1,
+                )
         else:
             HummingMethod.forward_layer(
                 layer=self.layer,

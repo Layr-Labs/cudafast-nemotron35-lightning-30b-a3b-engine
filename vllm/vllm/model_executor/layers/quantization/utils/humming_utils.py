@@ -1036,6 +1036,9 @@ def convert_to_humming_moe_kernel_format(
 
     if tuned:
         humming_zskip.prepare_raw(layer, _extract_sublayer_tensors(layer, "w2"))
+        from vllm.model_executor.layers.fused_moe.experts import humming_upskip
+
+        humming_upskip.prepare_raw(layer, _extract_sublayer_tensors(layer, "w13"))
 
     # Preserve only a byte permutation of the original NVFP4 down weights.
     # Humming's ordinary format remains available for prefill and fallbacks.
@@ -1079,3 +1082,6 @@ def convert_to_humming_moe_kernel_format(
 
     if tuned:
         humming_zskip.finalize(layer)
+        from vllm.model_executor.layers.fused_moe.experts import humming_upskip
+
+        humming_upskip.finalize(layer)

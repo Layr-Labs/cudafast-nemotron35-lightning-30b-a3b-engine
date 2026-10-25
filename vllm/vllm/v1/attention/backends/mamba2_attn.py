@@ -132,10 +132,21 @@ _SHARED_ACCEPTED: dict[tuple, torch.Tensor] = {}
 _STEP: dict[str, Any] = {"qsl": None, "sig": None, "acc_qsl": None}
 
 
+def begin_metadata_step() -> None:
+    """Scope group sharing to this runner build, even if qsl's object is reused.
+
+    Persistent decode objects remain reusable by their structural signature;
+    current CPU metadata and accepted-count copies must be reconsidered each step.
+    """
+    _STEP["qsl"] = None
+    _STEP["sig"] = None
+    _STEP["acc_qsl"] = None
+
+
 def _tensor_key(t: torch.Tensor | None) -> tuple | None:
     if t is None:
         return None
-    return (t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.dtype)
+    return (str(t.device), t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.dtype)
 
 
 def _step_signature(

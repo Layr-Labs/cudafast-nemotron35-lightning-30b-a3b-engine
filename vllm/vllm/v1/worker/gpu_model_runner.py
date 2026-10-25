@@ -2388,6 +2388,12 @@ class GPUModelRunner(
         Returns:
             tuple[attn_metadata, spec_decode_common_attn_metadata]
         """
+        # A persistent query_start_loc object is not a per-step generation.
+        # Reset only the group-common memo; structural decode caches remain hot.
+        mamba2_module = sys.modules.get("vllm.v1.attention.backends.mamba2_attn")
+        if mamba2_module is not None:
+            mamba2_module.begin_metadata_step()
+
         # Attention metadata is not needed for attention free models
         if len(self.kv_cache_config.kv_cache_groups) == 0:
             return {}, None
@@ -2422,6 +2428,10 @@ class GPUModelRunner(
             else:
                 blk_table = self.input_batch.block_table[kv_cache_gid]
                 blk_table_tensor = blk_table.get_device_tensor(num_reqs_padded)
+                if num_reqs_padded > num_reqs:
+                    # Padding below mutates device rows without a CPU table write.
+                    # A later larger batch must recommit those rows from the CPU.
+                    blk_table.invalidate_gpu_rows_from(num_reqs)
 
             # Fill unused block table entries with NULL_BLOCK_ID (null block)
             # for CUDAGraph padding. Block 0 is reserved for padding.

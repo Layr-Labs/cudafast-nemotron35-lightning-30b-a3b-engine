@@ -2167,6 +2167,9 @@ class FlashInferImpl(AttentionImpl):
                 assert isinstance(attn_metadata.decode, FIDecode)
                 decode_wrapper = attn_metadata.decode.wrapper
                 assert decode_wrapper is not None
+                ev = getattr(attn_metadata, "plan_ready_event", None)  # draft plan side stream
+                if ev is not None:
+                    torch.cuda.current_stream().wait_event(ev)
                 assert decode_wrapper._window_left == self.window_left
                 assert decode_wrapper._logits_soft_cap == (self.logits_soft_cap or 0.0)
                 assert decode_wrapper._sm_scale == self.scale

@@ -62,6 +62,11 @@ def _load():
         if hasattr(lib, "marlinx_gemm_zs"):
             lib.marlinx_gemm_zs.argtypes = lib.marlinx_gemm.argtypes + [ctypes.c_void_p]
             lib.marlinx_gemm_zs.restype = ctypes.c_int
+        if hasattr(lib, "marlinx_gemm_zs_segments"):
+            lib.marlinx_gemm_zs_segments.argtypes = lib.marlinx_gemm.argtypes + [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
+            ]
+            lib.marlinx_gemm_zs_segments.restype = ctypes.c_int
         if hasattr(lib, "marlinx_gemm_relu2"):
             lib.marlinx_gemm_relu2.argtypes = lib.marlinx_gemm.argtypes
             lib.marlinx_gemm_relu2.restype = ctypes.c_int
@@ -69,7 +74,7 @@ def _load():
                                     ctypes.c_longlong, ctypes.c_void_p, ctypes.c_void_p]
         lib.marlinx_hog.restype = ctypes.c_int
         _ops = {"gemm": lib.marlinx_gemm}
-        for mode in ("relu2", "zs"):
+        for mode in ("relu2", "zs", "zs_segments"):
             op = getattr(lib, "marlinx_gemm_" + mode, None)
             if op is not None:
                 _ops[mode] = op
@@ -83,6 +88,9 @@ def _load():
                 }
             except AttributeError:  # old library or MARLINX_NO_PDL build
                 init_pdl = None
+            seg_pdl = getattr(lib, "marlinx_gemm_zs_segments_pdl", None)
+            if init_pdl is not None and seg_pdl is not None and "zs_segments" in _ops:
+                ops_pdl["zs_segments"] = seg_pdl
             if init_pdl is not None:
                 init_pdl.argtypes = []
                 init_pdl.restype = ctypes.c_int
@@ -158,8 +166,12 @@ def prepare(layer) -> bool:
         ok = _init()
     layer._marlinx_ok = ok
     layer._marlinx_zs = None
+    layer._marlinx_segments_ok = False
     if ok and ZS_ENABLED and (n, k) == ZS_SHAPE and hasattr(_lib, "marlinx_gemm_zs"):
         layer._marlinx_zs = zs_repack(w, n, k)
+        if (_SEGMENTS_ENABLED and hasattr(_lib, "marlinx_gemm_zs_segments")
+                and torch.cuda.get_device_capability(w.device) == (12, 1)):
+            layer._marlinx_segments_ok = _segments_admit(layer, n, k)
     return ok
 
 
@@ -167,6 +179,7 @@ def prepare(layer) -> bool:
 # mostly exact zeros): a k-row-major copy of the Marlin weight lets the kernel
 # read only the k rows whose activation is nonzero in some row (see csrc).
 ZS_ENABLED = os.environ.get("MARLINX_ZS", "1") != "0"
+_SEGMENTS_ENABLED = os.environ.get("MARLINX_ZS_SEGMENTS", "1") != "0"
 ZS_SHAPE = (2688, 3712)
 # bit offsets inside Marlin's word for k = 2t, 2t+1, 2t+8, 2t+9: (feature g, feature g+8)
 _ZS_POS = ((0, 8), (16, 24), (4, 12), (20, 28))
@@ -191,15 +204,16 @@ def zs_repack(w: torch.Tensor, n: int, k: int) -> torch.Tensor:
 
 def gemm(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
          global_scale: torch.Tensor, n: int, k: int, depth: int = DEPTH,
-         relu2: bool = False, zs: torch.Tensor | None = None) -> torch.Tensor:
+         relu2: bool = False, zs: torch.Tensor | None = None,
+         segmented: bool = False, pdl: bool | None = None) -> torch.Tensor:
     """out[M, n] for a 2-D bf16 x[M, k] (1 <= M <= 8); no guard beyond the C side's."""
     global _pdl_active
     lib = _load()
     assert lib is not None, _load_error
     m = x.shape[0]
     out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
-    mode = "zs" if zs is not None else "relu2" if relu2 else "gemm"
-    use_pdl = _pdl_active
+    mode = "zs_segments" if segmented else "zs" if zs is not None else "relu2" if relu2 else "gemm"
+    use_pdl = (_pdl_active if pdl is None else pdl and _pdl_active) and mode in _ops_pdl
     op = _ops_pdl[mode] if use_pdl else _ops[mode]
     args = (
         x.data_ptr(), x.stride(0), m,
@@ -207,7 +221,20 @@ def gemm(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
         out.data_ptr(), n, n, k, _sm_count(x.device), depth,
         torch.cuda.current_stream(x.device).cuda_stream,
     )
-    if zs is not None:
+    if segmented:
+        assert zs is not None and not relu2 and (n, k) == ZS_SHAPE
+        sms = _sm_count(x.device)
+        part2 = n // 128
+        if part2 > sms:
+            part2 %= sms
+            if part2 * 3 <= sms:
+                part2 += sms
+        iters = ((k // 128) * part2 + sms - 1) // sms
+        slots = 1 + (k // 128 + iters - 2) // iters
+        partials = torch.empty((2 * (n // 128), slots, 512),
+                               dtype=torch.float32, device=x.device)
+        args += (zs.data_ptr(), partials.data_ptr(), slots)
+    elif zs is not None:
         args += (zs.data_ptr(),)
     rc = op(*args)
     if rc and use_pdl and not torch.cuda.is_current_stream_capturing():
@@ -217,6 +244,24 @@ def gemm(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
     if rc != 0:
         raise RuntimeError(f"marlinx_gemm failed: {rc} (M={m} N={n} K={k} depth={depth})")
     return out
+
+
+def _segments_admit(layer, n, k):
+    """Official remote load only: compare the original native path (in the active
+    launch mode) with the segmented path under PDL and under the ordinary launch."""
+    for m in (1, 4, 5, 8):
+        i = torch.arange(m * k, dtype=torch.int64, device=layer.weight.device)
+        value = (((i * 17 + 3) % 67).float() - 33) / 32
+        value = torch.where(i % 5 < 3, 0.0, value)
+        value = torch.where(i % 11 == 0, -torch.zeros_like(value), value)
+        x = value.to(torch.bfloat16).reshape(m, k).contiguous()
+        args = (x, layer.weight, layer.weight_scale, layer.weight_global_scale, n, k)
+        original = gemm(*args, zs=layer._marlinx_zs)
+        for pdl in (True, False):
+            candidate = gemm(*args, zs=layer._marlinx_zs, segmented=True, pdl=pdl)
+            if not torch.equal(original.view(torch.int16), candidate.view(torch.int16)):
+                return False
+    return True
 
 
 def maybe_apply(layer, x: torch.Tensor) -> torch.Tensor | None:
@@ -241,7 +286,8 @@ def maybe_apply(layer, x: torch.Tensor) -> torch.Tensor | None:
         return None
     n = layer.output_size_per_partition
     out = gemm(x2, layer.weight, layer.weight_scale, layer.weight_global_scale, n, k,
-               zs=getattr(layer, "_marlinx_zs", None))
+               zs=getattr(layer, "_marlinx_zs", None),
+               segmented=bool(getattr(layer, "_marlinx_segments_ok", False)))
     return out.reshape(*x.shape[:-1], n)
 
 

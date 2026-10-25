@@ -210,6 +210,18 @@
     {
       "file": "harness/kernels/l2pf/py/__init__.py",
       "why": "Carry useful04706ad7-c4e8-44b9-b8ba-77f14d8b8adf MoE-window immutable prefetch default6to12MB. Its complete official2.19195352041462 is within0.1% of fulla484, but only budget mechanism is combined here on higherfulla484. Prefix pair/SSM combination unverified."
+    },
+    {
+      "file": "harness/kernels/screen_radix/{csrc/screen_radix.cu,py/__init__.py,build.sh}, vllm/model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "Draft-head screen candidate selection: a native CUB BlockRadixSort per score row (256 threads; width 2048 or 256) on a 40/43-bit key, ordered FP32 score in the high bits and the inverted local id in the low bits, replaces torch.topk(sorted=False) plus the chunk-offset add at the coarse, refine and single-screen sites of the gated screen. Lower local id wins an equal score, NaN ranks above numbers. The partial-K scores, depth-gate masks, full-K rescore and lowest-id tie rule are unchanged. Load-time check (outside capture) against a stable descending torch sort on rows with NaN, inf, signed zeros and ties, and set equality with torch.topk(sorted=False) on boundary-tie rows (all +0, as a stopped draft loop scores, all equal, seven distinct values), for all three width/keep pairs; a mismatch or a missing library keeps torch.topk. MTP_SCREEN_RADIX=0 disables. Carried from jacklightChen f8766cda-e78f-4d5c-8abe-163f534af907."
+    },
+    {
+      "file": "harness/kernels/marlinx/{csrc/marlinx.cu,py/__init__.py}",
+      "why": "Shared-expert down projection (2688 x 3712, M <= 8) on the zero-row-skip path runs Marlin's original K segments in parallel CTAs: each CTA advances the original stripe cursor to its segment, runs the unchanged four-warp MMA chain and intra-segment reduction, and stores its FP32 partial; merge_segments then adds the partials in the original bottom-up order with plain RN FP32 adds and runs the original global-scale/BF16 epilogue. No atomics, no new K split, no reassociation. The segment grid keeps the PDL launch (scale preload, griddepcontrol.wait before any activation or mask read, coherent activation loads); merge_segments is an ordinary launch. Load-time bitwise check against the active zero-row-skip launch at M = 1, 4, 5, 8 with sparse BF16 inputs and signed zeros, for the PDL and the ordinary segment launch; a mismatch keeps the existing kernel. MARLINX_ZS_SEGMENTS=0 disables. Carried from jacklightChen f8766cda-e78f-4d5c-8abe-163f534af907."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_packed.py (+ nemotron_h_mtp.py, nemotron_h_mtp_kernels.py)",
+      "why": "MTP-only lossless load-time 12-bit BF16 encoding of original pinned routed/shared expert-up, QKV and eh_proj. Original GEMV/up reduction layouts and QKV MMA v2 products/accumulation retained. eh_proj uses packed GEMV only at M=1 and keeps its BF16 matrix for every other shape; QKV uses packed M=1 and 2..16, a temporary exact decode only for other nonempty shapes. The packed GEMV, expert-up and QKV kernels AND the depth gate's stop flag into their packed-weight load masks like the BF16 kernels, so a stopped draft loop reads no weights and masked codes decode to +0, the BF16 kernels' masked weight. Packed launches use ordinary stream serialization. Exhaustive boot bit assertion per packed tensor, then, before any original storage is released, a bitwise output check of the packed linear (M = 1 for eh_proj; 1, 2, 5, 16 for QKV) and of the drafter MoE row with packed expert-up against the BF16 drafter kernels; a mismatch keeps that layer in BF16. MTP_PACK12=0 keeps the original path. Carried from ArthurOstapenko 732c3711-b4f8-4d68-8d5f-158639bffb62."
     }
   ]
 }

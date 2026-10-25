@@ -212,6 +212,27 @@ def _select_token(
                 tl.store(gate_ptr, 1)
 
 
+try:
+    import screen_radix as _screen_radix
+except ImportError:
+    _screen_radix = None
+
+_NATIVE_TOPK = os.environ.get("MTP_SCREEN_RADIX", "1") != "0"
+
+
+def _screen_topk(scores, width, keep, offset=0):
+    if _NATIVE_TOPK and _screen_radix is not None:
+        selected = _screen_radix.maybe_topk(scores, width, keep, offset)
+        if selected is not None:
+            return selected
+    selected = scores.view(-1, width).topk(keep, dim=-1, sorted=False).indices
+    if offset:
+        rows = torch.arange(selected.shape[0], device=scores.device,
+                            dtype=selected.dtype).view(-1, 1)
+        selected = selected + rows * offset
+    return selected
+
+
 class DraftHeadScreen:
     """Load-time buffers plus the greedy screen for one shared NVFP4 head."""
 
@@ -291,6 +312,9 @@ class DraftHeadScreen:
         if _l2pf is not None and self.cascade:
             _l2pf.DRAFT_SCREEN[:] = [self.w_coarse]
         self.graph = None
+        # Initialize/admit native selection outside graph capture, remotely.
+        if device.type == "cuda" and _NATIVE_TOPK and _screen_radix is not None:
+            _screen_radix.available(device)
         self._h = torch.empty(k, dtype=torch.float32, device=device)
         self._out = torch.empty(1, dtype=torch.int32, device=device)
         if device.type == "cuda" and screen_graph_enabled():
@@ -332,9 +356,8 @@ class DraftHeadScreen:
             # Every consumer below is order-independent (index-aligned gathers,
             # then the max with the lowest-id tie rule), so the candidate sets
             # need not be sorted: sorted=False skips a segmented sort per stage.
-            coarse_cand = (
-                self.scores.view(-1, SCREEN_CHUNK)
-                .topk(CASCADE_PER, dim=-1, sorted=False).indices + self.chunk_off
+            coarse_cand = _screen_topk(
+                self.scores, SCREEN_CHUNK, CASCADE_PER, SCREEN_CHUNK
             )
             hs = h.index_select(0, self.cols)
             _rows_dot(
@@ -343,19 +366,17 @@ class DraftHeadScreen:
             )
             # Scores retain the [original chunk, coarse candidate] layout.
             # Gather global IDs; adding chunk_off here would offset twice.
-            refined = self.refine_scores.view(-1, CASCADE_PER).topk(
-                SCREEN_PER, dim=-1, sorted=False
-            ).indices
+            refined = _screen_topk(
+                self.refine_scores, CASCADE_PER, SCREEN_PER
+            )
             cand = coarse_cand.gather(1, refined).reshape(-1)
         else:
             hs = h.index_select(0, self.cols)
             _rows_dot(
                 hs, self.w_scr, self.s_scr, None, self.gscale, self.scores, False, gated
             )
-            cand = (
-                self.scores.view(-1, SCREEN_CHUNK)
-                .topk(SCREEN_PER, dim=-1, sorted=False).indices
-                + self.chunk_off
+            cand = _screen_topk(
+                self.scores, SCREEN_CHUNK, SCREEN_PER, SCREEN_CHUNK
             ).reshape(-1)
         _rows_dot(
             h, self.w_full, self.s_full, cand, self.gscale, self.cand_logits, True, gated

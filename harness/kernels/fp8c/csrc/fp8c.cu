@@ -216,7 +216,9 @@ __global__ __launch_bounds__(128,2) void gemm(P p) {
    if(c<C){
     #pragma unroll
     for(int st=0;st<4;++st)mma(a[j][st][0],a[j][st][1],wc[2*st],wc[2*st+1],acc);
-    if(c+RC<C)load_a<K,!PDL>(p,lane,c+RC,a[j]);
+    if constexpr (K == 2688) {
+     if(c+RC<C)load_a<K,!PDL>(p,lane,c+RC,a[j]);
+    }
     if(c+1<C){
      uint32_t wn[8];
      decode(s[(j+1)%RC],e0x,esc4,lane,wn);
@@ -226,6 +228,11 @@ __global__ __launch_bounds__(128,2) void gemm(P p) {
      }
      #pragma unroll
      for(int i=0;i<8;++i)wc[i]=wn[i];
+    }
+    // Output projection: decode/refill weights before issuing the next
+    // independent activation refill. Keep the original input schedule.
+    if constexpr (K == 4096) {
+     if(c+RC<C)load_a<K,!PDL>(p,lane,c+RC,a[j]);
     }
    }
   }

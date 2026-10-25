@@ -219,12 +219,29 @@ class DynEvictFirstRelu2HummingKernel(EvictFirstRelu2HummingKernel):
     dyn_scheduler = True
 
 
+def _w13_k128_enabled():
+    return os.environ.get("HUMMING_W13_K128", "1") != "0"
+
+
+def _w13_k128_params(lo, hi, params):
+    # Only the five-to-eight-token verify bucket. The K16 MMA chain stays
+    # serial and ascending; four adjacent K32 payloads share one pipeline wait.
+    if (_w13_k128_enabled() and (lo, hi) == (24, 48)
+            and params["block_shape"] == [16, 64, 32]
+            and params["warp_shape"] == [16, 32, 32]
+            and params["num_stages"] == 8):
+        return dict(params, block_shape=[16, 64, 128],
+                    warp_shape=[16, 32, 128], num_stages=2)
+    return params
+
+
 def _variant_key(dyn):
     """Cache-key part of the scheduler variant: the claim-when-free kernels'
     persistent grids come from the environment, so they are part of it."""
     if not dyn:
-        return (False,)
-    return (True, _dyn_num_sms(0, 1 << 30, 0), _dyn_num_sms(0, 1, 0))
+        return (False, _w13_k128_enabled())
+    return (True, _dyn_num_sms(0, 1 << 30, 0), _dyn_num_sms(0, 1, 0),
+            _w13_k128_enabled())
 
 
 def _prepare_stock(meta, compute_config, tuning_config, dyn):
@@ -246,7 +263,7 @@ def _prepare_stock(meta, compute_config, tuning_config, dyn):
         assert config["block_shape"][2] == config["warp_shape"][2] == 32
         assert not config.get("use_stream_k", False)
         assert not config.get("use_f16_accum", False)
-        params = lc | cc | config
+        params = _w13_k128_params(lo, hi, lc | cc | config)
         num_sms = params.pop("num_sms", 0)
         if dyn:
             num_sms = _dyn_num_sms(lo, hi, num_sms)

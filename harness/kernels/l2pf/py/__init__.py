@@ -26,7 +26,9 @@ ENABLED = os.environ.get("L2PF", "1") != "0"
 CHUNK = 1 << 16
 # Bytes prefetched per window: what DRAM can deliver while the latency-bound
 # kernels of that window run (more stalls the rejoin).
-MAMBA_BYTES = int(float(os.environ.get("L2PF_MAMBA_MB", "5")) * (1 << 20))
+# 8 MB (was 5): on the apk12 + GROUP8 tree 8 MB measured +0.34% / +0.23% composite on GB10 (decode
+# +0.37% / +0.32%); 3 MB measured -0.89%.
+MAMBA_BYTES = int(float(os.environ.get("L2PF_MAMBA_MB", "8")) * (1 << 20))
 ATTN_BYTES = int(float(os.environ.get("L2PF_ATTN_MB", "7")) * (1 << 20))
 # The routed down projection of a small call (zskip) is latency-bound and leaves
 # DRAM about half idle: prefetch the head of the next Mamba layer's in_proj then.

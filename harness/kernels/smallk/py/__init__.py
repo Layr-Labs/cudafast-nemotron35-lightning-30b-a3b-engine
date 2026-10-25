@@ -5,8 +5,10 @@ reproduces and README.md the evidence:
 
 - router_gemm(x, w): the fp32 MoE gate y = x . w^T for M = 4 rows, with the summation tree of the
   cuBLAS gemmSN_TN kernel torch picks for (M = 4, N = 128, K = 2688).
-  M = 5 is a new unvalidated specialization of the same independent chains;
-  equality to the actual M5 cuBLAS selection is not established yet.
+  M = 5 and M = 6 are unvalidated specializations of the same independent chains;
+  equality to the actual cuBLAS selection is not established yet. M = 6 is the
+  depth-5 verify width. SMALLK_ROUTER_ROWS above 4 does not launch it (shared
+  memory); that call falls back.
   maybe_router_gemm reads the gate weight from a bf16 shadow when every fp32 value of it is exactly
   a bf16 value (checked once per gate outside capture; the checkpoint stores the gate in bf16 and
   vLLM upcasts it on GB10): same fp32 operands, half the bytes. SMALLK_ROUTER_W16=0 turns it off.
@@ -66,7 +68,7 @@ ROUTER_ROWS = int(os.environ.get("SMALLK_ROUTER_ROWS", "1"))
 TOPK_WARPS = int(os.environ.get("SMALLK_TOPK_WARPS", "4"))
 
 # M4 is verified in the carrier; M5 is the new remote-only experiment.
-ROUTER_SHAPES = frozenset({(4, 128, 2688), (5, 128, 2688)})  # M5 unverified extension
+ROUTER_SHAPES = frozenset({(4, 128, 2688), (5, 128, 2688), (6, 128, 2688)})
 NUM_EXPERTS = 128
 MAX_TOPK = 8
 # Stock count_and_sort fills an expert's slots in lane order when all ids sit in one warp; with
@@ -304,13 +306,15 @@ def reset_verify_rows() -> None:
 
 
 def maybe_router_gemm(x: torch.Tensor, w: torch.Tensor, row_mask: bool = False) -> torch.Tensor | None:
-    """M4 router or follow-on M5 experiment; None for unsupported metadata. row_mask (target-model
+    """M4 router or follow-on M5/M6 experiment; None for unsupported metadata. row_mask (target-model
     gates only): honour verify_rows."""
-    if not ROUTER_ON or x.dim() != 2 or x.shape[0] not in (4, 5) or w.dim() != 2:
+    if not ROUTER_ON or x.dim() != 2 or x.shape[0] not in (4, 5, 6) or w.dim() != 2:
         return None
     m, k = x.shape
     n = w.shape[0]
-    if m == 5 and not ROUTER_M5_ON:
+    if m > 4 and not ROUTER_M5_ON:
+        return None
+    if m == 6 and ROUTER_ROWS > 4:
         return None
     if (
         (m, n, k) not in ROUTER_SHAPES

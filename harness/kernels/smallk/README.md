@@ -1,15 +1,15 @@
 # smallk: bit-exact small kernels of the MoE routing in the MTP verify
 
-Follow-on experiment: native MTP depth four verifies five rows. This source
-also instantiates the same independent FP32 chains for M5 and admits only
-the additional shape `(5, 128, 2688)`. The M4 evidence below does not prove
-equality to cuBLAS's M5 choice. No local execution was performed for this
-extension; the official remote token oracle and complete paired score decide
-correctness and usefulness. `SMALLK_ROUTER_M5=0` restores the M5 torch fallback.
-The matching configuration retains an exact five-row graph alongside the
-one- and two-row drafter graphs. The older depth-only experiment's negative
-whole result is not adopted; this evaluates a different router and sparse
-expert cost regime on the newest full verified engine.
+Follow-on experiment: native MTP depth five verifies six rows. This source
+instantiates the same independent FP32 chains for M5 and M6 and admits the
+shapes `(5, 128, 2688)` and `(6, 128, 2688)`. The M4 evidence below does not
+prove equality to cuBLAS at those widths. M6 is launched only for an output
+tile of 1, 2 or 4 rows of N; a tile of 8 does not fit the static shared
+memory and falls back. No local execution was performed for this extension;
+the official remote token oracle and complete paired score decide correctness
+and usefulness. `SMALLK_ROUTER_M5=0` restores the torch fallback for both
+widths. The capture list keeps the verify width beside the one- and two-row
+drafter graphs.
 
 `smallk` replaces the latency-bound routing kernels of each of the 23 target MoE layers in the
 depth-3 verify (4 rows, one FULL CUDA graph) with kernels that compute the same bits:

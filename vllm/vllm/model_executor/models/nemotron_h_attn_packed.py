@@ -1,11 +1,11 @@
-"""Lossless 12-bit storage of the target's BF16 attention projections for the 5-row verify.
+"""Lossless 12-bit storage of the target's BF16 attention projections for the 6-row verify.
 
 Each of the six attention layers streams its QKV (4608x2688) and output (2688x4096)
 projection from DRAM once per verify: 46.7 MB of BF16 per layer, about 1.25 ms of a
 17.8 ms cycle. The weights are repacked once at load with the drafter's exact codec
 (nemotron_h_mtp_packed.pack_bf16: sign+mantissa byte, 4-bit exponent code relative to a
 per-128-block base, raw side plane for blocks whose exponents do not fit) and the
-verify's M = 5 call decodes them in registers into the same BF16 MMA operands
+verify's M = 6 call decodes them in registers into the same BF16 MMA operands
 (nemotron_h_attn_packed_kernel.py).
 
 Exactness: the kernel is one tl.dot chain over K tiles of 128 into an fp32 accumulator,

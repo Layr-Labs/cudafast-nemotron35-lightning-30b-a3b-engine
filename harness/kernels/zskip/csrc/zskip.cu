@@ -81,14 +81,15 @@ struct Params {
   int* queue;               // work-item counter (reset by prep_kernel)
   int max_blocks;           // expert blocks covered (grid of prep_kernel)
   unsigned long long* trace;  // optional timing trace: 8 words per item (see down3_kernel)
-  const int* verify_rows;  // optional confidence prefix, paired M5 only
+  const int* verify_rows;
 };
 
 __device__ __forceinline__ int prefix_row_limit(const Params& p) {
   if (p.verify_rows == nullptr) return p.shape_m;
   const int rows = *p.verify_rows;
-  // Avoid multiplying the ALL_ROWS sentinel. Eligible calls have 5 tokens x6.
-  return rows >= 5 ? p.shape_m : (rows < 1 ? 1 : rows) * 6;
+  const int tokens = p.shape_m / 6;
+  if (tokens <= 0 || rows >= tokens) return p.shape_m;
+  return (rows < 1 ? 1 : rows) * 6;
 }
 
 __device__ __forceinline__ unsigned long long gtimer() {

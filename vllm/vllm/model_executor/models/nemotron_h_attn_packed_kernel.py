@@ -7,7 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
-ROWS = 5
+ROWS = 6
 # (columns per program, warps), tried in this order; BN is a multiple of 16.
 CONFIGS = ((32, 4), (64, 4), (16, 4),
            (32, 4, True, True), (64, 4, True, True), (16, 4, True, True))

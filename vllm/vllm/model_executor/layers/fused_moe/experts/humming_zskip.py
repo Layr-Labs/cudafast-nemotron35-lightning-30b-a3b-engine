@@ -158,6 +158,7 @@ def finalize(layer: torch.nn.Module) -> None:
     if PAIR_ENABLED:
         _prepare_pair(layer)
     layer.zskip_pair_prefix_ok = False
+    layer.zskip_pair_prefix_m6 = False
     if (getattr(layer, "zskip_pair_w2", None) is not None
         and os.environ.get("ZSKIP_VERIFY_PREFIX", "1") != "0"
         and _zskip.prefix_available()):
@@ -167,6 +168,16 @@ def finalize(layer: torch.nn.Module) -> None:
             )
         except Exception as exc:  # optional prefix; original checked pair remains
             logger.warning_once("zskip: prefix check unavailable (%r); full pair retained", exc)
+        if layer.zskip_pair_prefix_ok:
+            try:
+                layer.zskip_pair_prefix_m6 = _pair_check(
+                    layer, layer.zskip_pair_w2, layer.zskip_pair_config,
+                    prefix=True, prefix_ms=(6,),
+                )
+            except Exception as exc:
+                logger.warning_once(
+                    "zskip: six-row prefix check unavailable (%r); five-row prefix retained", exc
+                )
 
 
 def _prepare_pair(layer: torch.nn.Module) -> None:
@@ -200,14 +211,15 @@ def _prepare_pair(layer: torch.nn.Module) -> None:
                 logger.warning_once("zskip: empty-half skip unavailable (%r); config %d", exc, config)
         layer.zskip_pair_w2 = pair
         layer.zskip_pair_config = config
-        logger.info_once("zskip: dadon paired decode config %d enabled for M=5", config)
+        logger.info_once("zskip: dadon paired decode config %d enabled for M=5 and M=6", config)
     except Exception as exc:  # noqa: BLE001
         logger.warning_once("zskip: paired decode unavailable (%r); checked legacy config retained", exc)
 
 
 def _pair_check(layer: torch.nn.Module, packed: Any, config: int, prefix: bool = False,
-                ms: Any = (4, 5, 8), ref_config: int | None = None) -> bool:
-    """Load-time, bitwise against humming: M=4/5/8 (or ms), independent plus crowded routing.
+                ms: Any = (4, 5, 6, 8), ref_config: int | None = None,
+                prefix_ms: Any = (5,)) -> bool:
+    """Load-time, bitwise against humming: M=4/5/6/8 (or ms), independent plus crowded routing.
 
     Compare all slots, including exact negative-zero activations and all-zero groups.
     The new config never serves prefill. No random state is taken from a request.
@@ -232,7 +244,7 @@ def _pair_check(layer: torch.nn.Module, packed: Any, config: int, prefix: bool =
         "use_f16_accum": envs.VLLM_HUMMING_USE_F16_ACCUM,
         "gemm_type": GemmType.INDEXED.value,
     })
-    for m in ((5,) if prefix else ms):
+    for m in (prefix_ms if prefix else ms):
         for crowded in (False, True):
             ids = [[(29*i + (0 if crowded else 17*t)) % NUM_EXPERTS
                     for i in range(TOP_K)] for t in range(m)]
@@ -259,7 +271,7 @@ def _pair_check(layer: torch.nn.Module, packed: Any, config: int, prefix: bool =
                 tuning_config=json.dumps(configs[1]),
             )
             out = torch.empty_like(ref)
-            for count in ((1, 2, 3, 4, 5) if prefix else (None,)):
+            for count in (tuple(range(1, m + 1)) if prefix else (None,)):
                 vrows = (torch.tensor([count], dtype=torch.int32, device=dev)
                          if count is not None else None)
                 _zskip.down(act, sorted_ids, expert_ids, ntp, packed, out,
@@ -547,11 +559,13 @@ def maybe_down(
             max_blocks=sorted_ids.numel() // PREFILL_BM,
         )
         return True
-    # M=5 is depth-4 verify. Other shapes keep main's checked decode selection.
     pair = getattr(layer, "zskip_pair_w2", None)
-    use_pair = num_tokens == 5 and pair is not None
+    use_pair = num_tokens in (5, 6) and pair is not None
     vrows = None
-    if use_pair and getattr(layer, "zskip_pair_prefix_ok", False):
+    prefix_ok = getattr(layer, "zskip_pair_prefix_ok", False)
+    if num_tokens == 6:
+        prefix_ok = prefix_ok and getattr(layer, "zskip_pair_prefix_m6", False)
+    if use_pair and prefix_ok:
         smallk = sys.modules.get("smallk")
         if smallk is not None and hasattr(smallk, "live_verify_rows"):
             vrows = smallk.live_verify_rows(inputs.device)

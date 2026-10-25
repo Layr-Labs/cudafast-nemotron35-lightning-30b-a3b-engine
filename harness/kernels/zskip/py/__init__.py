@@ -287,7 +287,7 @@ def down(a: torch.Tensor, sorted_ids: torch.Tensor, expert_ids: torch.Tensor, nu
     )
     launch = lib.zskip_down
     if verify_rows is not None:
-        assert shape_m == 30 and config in PAIR_CONFIGS and mode == SKIP
+        assert shape_m in (30, 36) and config in PAIR_CONFIGS and mode == SKIP
         assert verify_rows.device == a.device and verify_rows.dtype == torch.int32
         assert verify_rows.numel() == 1 and verify_rows.is_contiguous()
         prefix_launch = getattr(lib, "zskip_down_prefix", None)

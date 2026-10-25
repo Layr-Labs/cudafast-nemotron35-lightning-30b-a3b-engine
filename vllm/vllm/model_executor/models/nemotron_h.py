@@ -116,7 +116,6 @@ try:
 except ImportError:
     _l2pf = None
 
-# Lossless 12-bit attention projections for the 5-row verify (nemotron_h_attn_packed.py);
 # unavailable or ATTN_PACK12=0: the stock projections run.
 try:
     from vllm.model_executor.models import nemotron_h_attn_packed as _attn_packed

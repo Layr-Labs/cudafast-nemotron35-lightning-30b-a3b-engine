@@ -113,6 +113,12 @@ def init() -> bool:
     rc = lib.zskip_init()
     if rc != 0:
         raise RuntimeError(f"zskip_init failed: {rc}")
+    setter = getattr(lib, "zskip_set_rds_ring2", None)
+    if setter is not None:
+        setter.argtypes = [ctypes.c_int]
+        setter.restype = ctypes.c_int
+        if setter(int(os.environ.get("RDS_ROUTED_RING2", "1") != "0")) != 0:
+            raise RuntimeError("zskip routed ring initialization failed")
     # Programmatic dependent launch for the v4 pair (prep, down4): both kernels
     # wait for the preceding grid before any memory access. ZSKIP_PDL=0 keeps
     # the ordinary launch; a library built with -DZSKIP_NO_PDL has no switch.

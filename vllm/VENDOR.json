@@ -302,6 +302,22 @@
     {
       "file": "model_executor/layers/fused_moe/experts/humming_nvsc.py (+ humming_relu2_epilogue.py forward_relu2, quantization/utils/humming_utils.py)",
       "why": "nvsc, default on: at load, a routed w13 layer whose FP8 E4M3 block scales take <= 64 distinct bytes keeps a 64-entry table plus a tile-major 6-bit index stream (load check decodes every byte back; otherwise the layer stays stock). For <= 8 tokens a derived ReLU2 humming kernel replaces only the two B-scale loaders (cp.async of 96 instead of 128 bytes per stage; shared->register decode to the identical uint32 of original E4M3 bytes), so dequantization, the K16 MMA chain and the epilogue are stock and the output is bit-identical. Prefill keeps the stock kernel and scale tensor (re-pointed into the same allocation). NVSC=0 restores current behaviour; compile/load failure logs once and uses stock."
+    },
+    {
+      "file": "v1/worker/prefill_graph.py; v1/worker/gpu_model_runner.py; model_executor/models/nemotron_h.py; model_executor/layers/fused_moe/runner/moe_runner.py; harness/kernels/shco/py/__init__.py",
+      "why": "ercumentyildirim b7f85098, carried unchanged: One-row last MoE layer for the one-token prefill: FreshPrefillGraph also captures graph_lite (own pool), replayed when every request has max_tokens == 1 (_drafts_can_be_verified() False). In it the last MoE runner (keep_m_lite) runs the routed experts on the logits row alone (humming's up chain and zskip's/pzskip's down chains are block-size independent, so that row's routed output is the full call's) and shx runs only the units of Marlin's last launch (rows 448..495, shco.TAIL_ONLY), each with its full-call rows and k-segments. The seed prefill of a decode keeps the ordinary graph. PREFILL_LITE=0 disables."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_packed.py",
+      "why": "newjordan 59b3dbb4, carried unchanged: grouped packed weight loads for the native MTP routed and shared up projection. Eight contiguous packed values share one exponent word load (ivanfioravanti's GROUP8 decoder, c0ce642d) and are rebuilt to the original BF16 bits before the unchanged multiply, accumulation and reduction; expert selection, activation, gate and output dtype unchanged."
+    },
+    {
+      "file": "harness/kernels/marlinx/py/__init__.py",
+      "why": "ArthurOstapenko 57e48c1a: for the 5-row verify shared-expert down call only (M5, 2688x3712, zero-skip), use the existing marlinx P=4 register loader ring in place of P=8, keeping every per-output Cursor, MMA operand, K order, segment fold, zero/NaN handling and format. RDS_SHARED_RING4=0 restores P=8. All other calls unchanged. Word probes on real decode inputs: 23 layers, 7,418,880 output words, 0 differences."
+    },
+    {
+      "file": "harness/kernels/zskip/csrc/{zskip.cu,zskip_pair.cuh}; harness/kernels/zskip/py/__init__.py",
+      "why": "ArthurOstapenko (ours, new here): the target verify's paired routed-down M5 call prefetches 2 groups ahead instead of 3 (config 119: 125 registers instead of 159, no spills). Only the number of prefetched groups changes; each output consumes the same ascending group sequence, dequantization, MMA operands, negative-zero detection and dense repair in the same order. RDS_ROUTED_RING2=0 selects the original depth 3; a missing setter ABI leaves stock. Word gate: 153,941,760 per-expert output words, 0 differences."
     }
   ]
 }

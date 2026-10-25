@@ -210,6 +210,14 @@
     {
       "file": "harness/kernels/l2pf/py/__init__.py",
       "why": "Carry useful04706ad7-c4e8-44b9-b8ba-77f14d8b8adf MoE-window immutable prefetch default6to12MB. Its complete official2.19195352041462 is within0.1% of fulla484, but only budget mechanism is combined here on higherfulla484. Prefix pair/SSM combination unverified."
+    },
+    {
+      "file": "vllm/model_executor/layers/fused_moe/experts/humming_zskip.py; harness/kernels/pzskip/csrc/pzskip.cu",
+      "why": "pzskip prefill config 333 (32-row expert blocks, 384 columns, two k16 groups per stage, three stages), taken from e-man07 51aa1545-b946-46da-bb0f-e0628924c7a1; same arithmetic as config 322."
+    },
+    {
+      "file": "vllm/v1/attention/backends/flashinfer.py; vllm/v1/spec_decode/llm_base_proposer.py",
+      "why": "dadon: ring the drafter's FlashInfer pinned staging per draft index so the CPU builds the next draft pass's plan without waiting for the GPU to consume the previous one (host-only, no value changes)."
     }
   ]
 }

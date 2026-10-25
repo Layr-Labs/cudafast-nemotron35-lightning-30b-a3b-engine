@@ -1643,7 +1643,11 @@ class GPUModelRunner(
         # Valid tokens are contiguous from position 0, so counting non-(-1)
         # tokens gives us the first -1 position (i.e., number of accepted).
         num_reqs = output_token_ids.size(0)
-        self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(dim=1)
+        counted, self._vsample_counted = self._vsample_counted, None
+        if counted is not output_token_ids or num_reqs != 1:
+            self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(
+                dim=1
+            )
 
         if self.cache_config.mamba_cache_mode == "align":
             # Fused GPU postprocess: state copies + per-request accepted-token
@@ -1666,9 +1670,18 @@ class GPUModelRunner(
             assert self.num_accepted_tokens_event is not None
             self.num_accepted_tokens_event.record()
         else:
-            self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
-                self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
-            )
+            # LOCAL PATCH (cudafast-nemotron35): under async scheduling with
+            # mamba_cache_mode "none" nothing reads num_accepted_tokens_cpu (the
+            # _prepare_inputs re-sync is skipped for exactly that case, and
+            # preprocess_mamba runs in "align" mode only), so its D2H copy is
+            # skipped: it sat on the stream between the sampler and the drafter.
+            if not (
+                self.use_async_scheduling
+                and self.cache_config.mamba_cache_mode == "none"
+            ):
+                self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
+                    self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
+                )
             assert self.num_accepted_tokens_event is not None
             self.num_accepted_tokens_event.record()
 
@@ -3813,6 +3826,17 @@ class GPUModelRunner(
         # which the greedy kernel rejects, emitting row count - 1's own argmax.
         # Then every row is valid again. See nemotron_h_mtp_kernels.py.
         vrows = _verify_rows_buffer(logits)
+        # LOCAL PATCH (cudafast-nemotron35): vsample (harness/kernels/vsample). For a
+        # one-request greedy verify, the depth-gate masking above, the rejection
+        # sampler's greedy-argmax path, the verify-row reset below and the accepted
+        # count of _update_states_after_model_execute run as one kernel with the same
+        # integer results (argmax under torch's NaN/tie order); the stock path runs
+        # whenever its guard refuses. VSAMPLE=0 disables it.
+        fused = self._vsample_greedy(
+            logits, spec_decode_metadata, sampling_metadata, vrows
+        )
+        if fused is not None:
+            return fused
         if vrows is not None:
             spec_decode_metadata = _reject_unverified_drafts(
                 spec_decode_metadata, vrows
@@ -3826,6 +3850,47 @@ class GPUModelRunner(
         if vrows is not None:
             vrows.fill_(_smallk_module().VROWS_ALL)
         return sampler_output
+
+    # LOCAL PATCH (cudafast-nemotron35): vsample (see _sample). The output tensor whose
+    # accepted count the fused kernel already wrote to num_accepted_tokens.gpu[0].
+    _vsample_counted: torch.Tensor | None = None
+
+    def _vsample_greedy(
+        self,
+        logits: torch.Tensor | None,
+        spec_decode_metadata: SpecDecodeMetadata,
+        sampling_metadata,
+        vrows: torch.Tensor | None,
+    ) -> SamplerOutput | None:
+        self._vsample_counted = None
+        vsample = sys.modules.get("vsample")
+        if vsample is None:
+            try:
+                import vsample  # harness/kernels/vsample
+            except ImportError:
+                return None
+        rs = self.rejection_sampler
+        if (
+            logits is None
+            or not vsample.ENABLED
+            or type(rs) is not RejectionSampler
+            or self.input_batch.num_reqs != 1
+            or logits.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+            or not rs._can_use_greedy_argmax(sampling_metadata)
+        ):
+            return None
+        count = (
+            self.num_accepted_tokens.gpu[:1]
+            if self.speculative_config and self.model_config.is_hybrid
+            else None
+        )
+        out = vsample.maybe_greedy_verify(logits, spec_decode_metadata, vrows, count)
+        if out is None:
+            return None
+        if count is not None:
+            self._vsample_counted = out
+        logger.info_once("vsample: fused greedy verify sampler active")
+        return SamplerOutput(sampled_token_ids=out, logprobs_tensors=None)
 
     def _bookkeeping_sync(
         self,

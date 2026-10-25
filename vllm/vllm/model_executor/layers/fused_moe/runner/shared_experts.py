@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Callable
 from enum import IntEnum
 
@@ -36,8 +37,25 @@ class SharedExpertsOrder(IntEnum):
     MULTI_STREAM_OVERLAPPED = (3,)
 
 
+# LOCAL PATCH (cudafast-nemotron35): deferred shared-expert down projection for
+# small calls (see SharedExperts._launch_aux). VLLM_SHARED_DOWN_DEFER=0 disables.
+_DEFER_DOWN = os.environ.get("VLLM_SHARED_DOWN_DEFER", "1") != "0"
+_DEFER_MAX_TOKENS = 8
+
+
+def launch_pending_shared_down() -> None:
+    """Queue the pending deferred shared-expert down projection, if any, behind
+    the main stream's work queued so far (called by the routed path after its
+    up GEMM)."""
+    se = SharedExperts._pending
+    if se is not None:
+        se._launch_down()
+
+
 class SharedExperts(torch.nn.Module):
     _early_logged = False
+    _pending: "SharedExperts | None" = None
+    _pending_h: torch.Tensor | None = None
 
     def __init__(
         self,
@@ -137,17 +155,58 @@ class SharedExperts(torch.nn.Module):
         assert self._stream is not None
         idx = self._output_idx
         assert self._output[idx] is None
-        with torch.cuda.stream(self._stream):
-            self._output[idx] = self._layer(shared_experts_input)
+        # LOCAL PATCH (cudafast-nemotron35): for a small call, queue only the
+        # up projection (+ ReLU^2) now; the down projection is queued on the same
+        # aux stream once the routed experts' up GEMM has been queued
+        # (launch_pending_shared_down, called by the routed path), so the aux
+        # stream's down runs beside the latency-bound routed down projection
+        # instead of streaming against the routed up GEMM. Same modules, same
+        # inputs, same stream; only when the down starts changes.
+        defer = (
+            _DEFER_DOWN
+            and not self.enable_dbo
+            and shared_experts_input.shape[0] <= _DEFER_MAX_TOKENS
+            and callable(getattr(self._layer, "forward_up", None))
+            and callable(getattr(self._layer, "forward_down", None))
+        )
+        if defer:
+            if SharedExperts._pending is not None:
+                SharedExperts._pending._launch_down()
+            with torch.cuda.stream(self._stream):
+                self._pending_h = self._layer.forward_up(shared_experts_input)
+            SharedExperts._pending = self
+        else:
+            with torch.cuda.stream(self._stream):
+                self._output[idx] = self._layer(shared_experts_input)
         self._aux_open = True
         if not SharedExperts._early_logged:
             SharedExperts._early_logged = True
-            logger.info("shared experts: early aux-stream launch active (M=%d)", shared_experts_input.shape[0])
+            logger.info(
+                "shared experts: early aux-stream launch active (M=%d, deferred down=%s)",
+                shared_experts_input.shape[0], defer,
+            )
+
+    def _launch_down(self) -> None:
+        h = self._pending_h
+        if h is None:
+            return
+        self._pending_h = None
+        if SharedExperts._pending is self:
+            SharedExperts._pending = None
+        assert self._stream is not None
+        idx = self._output_idx
+        # The aux stream starts the down once the main stream's queued work
+        # (through the routed up GEMM) is done.
+        self._stream.wait_stream(current_stream())
+        with torch.cuda.stream(self._stream):
+            self._output[idx] = self._layer.forward_down(h)
 
     def _join_aux(self) -> None:
         if not self._aux_open:
             return
         assert self._stream is not None
+        if self._pending_h is not None:
+            self._launch_down()
         current_stream().wait_stream(self._stream)
         self._aux_open = False
 

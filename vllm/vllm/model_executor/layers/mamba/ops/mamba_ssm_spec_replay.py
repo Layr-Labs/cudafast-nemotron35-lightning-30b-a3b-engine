@@ -83,9 +83,58 @@ def _pdl_enabled() -> bool:
     return _PDL
 
 
+# Checkpoint period of the lazy anchor (see spec_replay_lazy).
+LAZY_PERIOD = 12
+
+
+def spec_replay_lazy() -> bool:
+    """Lazy anchor: the state is stored only at checkpoint positions
+    L - 1 + k * LAZY_PERIOD (L: prompt length; k = 0 is the prefill's final
+    state), alternately in slots 0 and 2, and a verify replays every token since
+    the last checkpoint from the ring, which then also holds token 0. The store
+    happens in the verify whose tokens include the next checkpoint position
+    (about two verifies in five) instead of in every verify; every state update
+    is the same per-token fp32 expression in the same order, so the states and
+    outputs are the reference's. The prefill writes L into the slot-0 page's
+    padding after the SSM state (write_prefill_tag). VLLM_MAMBA_REPLAY_LAZY=0
+    restores an anchor store in every verify."""
+    value = os.environ.get("VLLM_MAMBA_REPLAY_LAZY", "1").strip().lower()
+    return value not in ("0", "false", "off", "no")
+
+
 def spec_replay_ring_len(num_spec: int) -> int:
-    """Ring entries per request: any value >= 2 * num_spec + 1 is hazard-free."""
+    """Ring entries per request: any value >= 2 * num_spec + 1 is hazard-free;
+    the lazy anchor replays up to LAZY_PERIOD - 1 tokens before the num_spec + 1
+    it writes, so it needs >= LAZY_PERIOD + num_spec."""
+    if spec_replay_lazy():
+        return max(2 * (num_spec + 1), LAZY_PERIOD + num_spec + 1)
     return 2 * (num_spec + 1)
+
+
+def prefill_tag_view(state: torch.Tensor) -> torch.Tensor | None:
+    """int32 view of one word per slot just after the slot's SSM state (the
+    page padding), or None when the slot stride leaves no room for it."""
+    if state.dim() != 4 or state.dtype != torch.float32:
+        return None
+    slot_elems = state.shape[1] * state.shape[2] * state.shape[3]
+    if state.stride(0) < slot_elems + 1 or state.stride(1) != state.shape[2] * state.shape[3]:
+        return None
+    return torch.as_strided(
+        state.view(torch.int32), (state.shape[0],), (state.stride(0),),
+        state.storage_offset() + slot_elems,
+    )
+
+
+def write_prefill_tag(state: torch.Tensor, slots: torch.Tensor, seq_lens: torch.Tensor) -> bool:
+    """Record each prefilled request's length L next to its slot-0 state: the
+    lazy anchor's checkpoint k = 0 is that state (after position L - 1)."""
+    tag = prefill_tag_view(state)
+    if tag is None:
+        return False
+    if slots.dim() == 2:
+        slots = slots[:, 0]
+    tag.index_copy_(0, slots.to(torch.int64), seq_lens.to(torch.int32))
+    return True
 
 
 def spec_replay_ring_elems(nheads: int, dim: int, ngroups: int, dstate: int) -> int:
@@ -179,6 +228,11 @@ def _selective_scan_update_spec_replay_kernel(
     launch_pdl: tl.constexpr = False,
     verify_rows_ptr=None,
     PREFIX_LIMIT: tl.constexpr = False,
+    LAZY: tl.constexpr = False,
+    LAZY_P: tl.constexpr = 12,
+    SLOT_ELEMS: tl.constexpr = 0,
+    SCALAR_RING: tl.constexpr = False,
+    SCALAR_OFF: tl.constexpr = 0,
 ):
     # The dt/A of a head are scalars (stride-0 expansion over head_dim); that is
     # the only layout the Mamba2 decode path produces and the only one the
@@ -219,8 +273,6 @@ def _selective_scan_update_spec_replay_kernel(
     # The reference starts from slot init_token_idx = num_accepted - 1, i.e.
     # the state after token init_token_idx of the previous verify; the anchor
     # holds the state after token 0, so replay tokens 1..init_token_idx.
-    num_accepted = tl.load(num_accepted_tokens_ptr + pid_b).to(tl.int64)
-    num_replay = tl.maximum(num_accepted - 1, 0)
     # Absolute position of this verify's token 0.
     pos0 = tl.load(seq_lens_ptr + pid_b).to(tl.int64) - seq_len
 
@@ -229,7 +281,31 @@ def _selective_scan_update_spec_replay_kernel(
     ring_batch_idx = tl.load(state_batch_indices_ptr + stride_state_indices_T).to(
         tl.int64
     )
-    state_ptr += state_batch_idx * stride_state_batch + pid_h * stride_state_head
+    if LAZY:
+        # Checkpoint k sits at position L - 1 + k * LAZY_P (k = 0: the prefill's
+        # final state in slot 0); even k live in slot 0, odd k in slot 2. Start
+        # from the last checkpoint before token 0 and replay the tokens after it.
+        slot2_idx = tl.load(state_batch_indices_ptr + 2 * stride_state_indices_T).to(
+            tl.int64
+        )
+        tag_ptr = (
+            state_ptr + state_batch_idx * stride_state_batch + SLOT_ELEMS
+        ).to(tl.pointer_type(tl.int32))
+        prompt_len = tl.load(tag_ptr, mask=state_batch_idx != null_block_id, other=0).to(tl.int64)
+        k_last = tl.maximum(pos0 - prompt_len, 0) // LAZY_P
+        ckpt = prompt_len - 1 + k_last * LAZY_P
+        num_replay = tl.minimum(tl.maximum(pos0 - 1 - ckpt, 0), LAZY_P - 1)
+        anchor_idx = tl.where(k_last % 2 == 0, state_batch_idx, slot2_idx)
+        next_idx = tl.where(k_last % 2 == 0, slot2_idx, state_batch_idx)
+        # This verify's token that lands on the next checkpoint (none if > d).
+        next_t = ckpt + LAZY_P - pos0
+        state_ptr_next = state_ptr + next_idx * stride_state_batch + pid_h * stride_state_head
+        state_ptr += anchor_idx * stride_state_batch + pid_h * stride_state_head
+    else:
+        num_accepted = tl.load(num_accepted_tokens_ptr + pid_b).to(tl.int64)
+        num_replay = tl.maximum(num_accepted - 1, 0)
+        anchor_idx = state_batch_idx
+        state_ptr += state_batch_idx * stride_state_batch + pid_h * stride_state_head
     ring_ok = ring_batch_idx != null_block_id
     ring_base = ring_ptr + ring_batch_idx * stride_ring_batch
     ring_x_base = ring_base + pid_h * dim
@@ -239,6 +315,10 @@ def _selective_scan_update_spec_replay_kernel(
     ring_stride_x = nheads * dim
     ring_stride_B = ngroups * dstate
     ring_stride_dt = nheads
+    if SCALAR_RING:
+        # Append FP32 processed dt and decay after the unchanged raw ring.
+        # One past-step writer per head; all consumers read completed history.
+        scalar_base = (ring_base + SCALAR_OFF).to(tl.pointer_type(tl.float32))
     # One program per head writes dt, one per group writes B; every program
     # writes its own slice of x.
     is_dt_writer = pid_m == 0
@@ -262,7 +342,7 @@ def _selective_scan_update_spec_replay_kernel(
     )
 
     mask = (offs_m[:, None] < dim) & (offs_n[None, :] < dstate)
-    mask &= state_batch_idx != null_block_id
+    mask &= anchor_idx != null_block_id
     state = tl.load(state_ptrs, mask=mask, other=0.0).to(tl.float32)
 
     if HAS_DT_BIAS:
@@ -282,15 +362,23 @@ def _selective_scan_update_spec_replay_kernel(
             mask=(offs_m < dim) & ring_ok,
             other=0.0,
         ).to(tl.float32)
-        dt = tl.load(
-            ring_dt_base + ring_pos * ring_stride_dt, mask=ring_ok, other=0.0
-        ).to(tl.float32)
-        if HAS_DT_BIAS:
-            dt += tl.load(dt_bias_ptr).to(tl.float32)
-        if DT_SOFTPLUS:
-            dt = softplus(dt)
-        A = tl.load(A_ptr).to(tl.float32)
-        dA = fast_exp(A * dt)  # scalar, not a matrix
+        if SCALAR_RING and ring_ok:
+            # Exact FP32 values produced by the same current-step expression
+            # when these immutable raw inputs were first written. No new
+            # arithmetic or rounding, and no cross-CTA current-step wait.
+            dt = tl.load(scalar_base + ring_pos * nheads + pid_h)
+            dA = tl.load(scalar_base + rl * nheads + ring_pos * nheads + pid_h)
+        else:
+            # Preserve the original null/dummy-ring behavior as well.
+            dt = tl.load(
+                ring_dt_base + ring_pos * ring_stride_dt, mask=ring_ok, other=0.0
+            ).to(tl.float32)
+            if HAS_DT_BIAS:
+                dt += tl.load(dt_bias_ptr).to(tl.float32)
+            if DT_SOFTPLUS:
+                dt = softplus(dt)
+            A = tl.load(A_ptr).to(tl.float32)
+            dA = fast_exp(A * dt)  # scalar, not a matrix
 
         B = tl.load(
             ring_B_base + ring_pos * ring_stride_B + offs_n,
@@ -343,10 +431,24 @@ def _selective_scan_update_spec_replay_kernel(
         dB = B * dt
         state = state * dA + dB * x[:, None]
 
-        if i_t == 0:
+        if LAZY:
+            if i_t == next_t:
+                # The next checkpoint, in the other slot of the pair.
+                next_ptrs = state_ptr_next + (
+                    offs_m[:, None] * stride_state_dim
+                    + offs_n[None, :] * stride_state_dstate
+                )
+                tl.store(
+                    next_ptrs,
+                    state.to(state_ptrs.dtype.element_ty),
+                    mask=(offs_m[:, None] < dim)
+                    & (offs_n[None, :] < dstate)
+                    & (next_idx != null_block_id),
+                )
+        elif i_t == 0:
             # The new anchor: the state after token 0, as the reference's slot 0.
             tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=mask)
-        else:
+        if LAZY or i_t > 0:
             ring_pos = ((pos0 + i_t) % rl + rl) % rl
             tl.store(
                 ring_x_base + ring_pos * ring_stride_x + offs_m,
@@ -358,6 +460,11 @@ def _selective_scan_update_spec_replay_kernel(
                 dt_raw,
                 mask=ring_ok & is_dt_writer,
             )
+            if SCALAR_RING:
+                tl.store(scalar_base + ring_pos * nheads + pid_h, dt,
+                         mask=ring_ok & is_dt_writer)
+                tl.store(scalar_base + rl * nheads + ring_pos * nheads + pid_h, dA,
+                         mask=ring_ok & is_dt_writer)
             tl.store(
                 ring_B_base + ring_pos * ring_stride_B + offs_n,
                 B_raw,
@@ -477,6 +584,11 @@ def selective_state_update_spec_replay(
     ring_len=None,
     is_blackwell=False,
     replayed_out=None,
+    lazy=False,
+    _scalar_ring_offset=None,
+    _private_verify_rows=None,
+    _private_launch_pdl=None,
+    _private_no_prefix=False,
 ):
     """
     Spec-decode verify update with anchor + input-ring state handling.
@@ -486,9 +598,11 @@ def selective_state_update_spec_replay(
     cu_seqlens: (N + 1,)), plus
         seq_lens: (>= N,) total tokens per request including this verify's,
             so token 0 of request b sits at position seq_lens[b] - query_len[b].
-        ring_len: ring entries per request, >= 2 * d + 1.
+        ring_len: ring entries per request, >= 2 * d + 1 (lazy: >= LAZY_PERIOD + d).
         replayed_out: test hook; if given, an (N, nheads, dim, dstate) fp32
             tensor that receives the state each request starts the verify from.
+        lazy: checkpointed anchor (spec_replay_lazy); the caller's prefills
+            must have written the prompt length with write_prefill_tag.
 
     The caller must have checked `spec_replay_supported` for these layouts.
     """
@@ -516,6 +630,9 @@ def selective_state_update_spec_replay(
     assert state_batch_indices.shape[0] >= N
     assert state_batch_indices.shape[1] >= max_seqlen
     assert ring_len >= 2 * (max_seqlen - 1) + 1
+    if lazy:
+        assert max_seqlen >= 3 and ring_len >= LAZY_PERIOD + max_seqlen - 1
+        assert prefill_tag_view(state) is not None
     assert out.shape == x.shape
     assert num_accepted_tokens.shape == (N,)
     assert seq_lens.shape[0] >= N
@@ -525,6 +642,12 @@ def selective_state_update_spec_replay(
 
     # The ring is slot memory reinterpreted as the inputs' 16-bit type.
     ring = state.view(x.dtype)
+
+    # A fixed, per-layer boot decision made before compilation/capture or any
+    # request. Never activate partway through a raw-only history. The original
+    # raw ring is also maintained when this optional appended cache is enabled.
+    scalar_ring = _scalar_ring_offset is not None
+    scalar_off = 0 if _scalar_ring_offset is None else _scalar_ring_offset
 
     grid = lambda META: (triton.cdiv(dim, META["BLOCK_SIZE_M"]), N, nheads)
     z_strides = (z.stride(0), z.stride(1), z.stride(2)) if z is not None else (0, 0, 0)
@@ -538,6 +661,7 @@ def selective_state_update_spec_replay(
     if (
         N == 1 and max_seqlen == 5 and batch == 5
         and replayed_out is None
+        and _private_verify_rows is None and not _private_no_prefix
         and os.environ.get("VLLM_MAMBA_SPEC_PREFIX", "1") != "0"
     ):
         smallk = sys.modules.get("smallk")
@@ -545,6 +669,13 @@ def selective_state_update_spec_replay(
             # Never import/allocate/rebind the buffer here; its address must
             # already be the same one captured by every router and sampler.
             verify_rows = smallk.live_verify_rows(x.device)
+
+    if _private_verify_rows is not None:
+        # Only used by the boot qualification with entirely private buffers.
+        # In particular, never mutate the process's live confidence gate.
+        verify_rows = _private_verify_rows
+    if _private_no_prefix:
+        verify_rows = None
 
     with torch.accelerator.device_index(x.device.index):
         _selective_scan_update_spec_replay_kernel[grid](
@@ -611,7 +742,13 @@ def selective_state_update_spec_replay(
             HG_RATIO=nheads // ngroups,
             CONST_DIV=_const_div_enabled(),
             num_warps=num_warps,
-            launch_pdl=_pdl_enabled(),
+            launch_pdl=(_pdl_enabled() if _private_launch_pdl is None
+                        else _private_launch_pdl),
             verify_rows_ptr=verify_rows,
             PREFIX_LIMIT=verify_rows is not None,
+            LAZY=bool(lazy),
+            LAZY_P=LAZY_PERIOD,
+            SLOT_ELEMS=nheads * dim * dstate,
+            SCALAR_RING=scalar_ring,
+            SCALAR_OFF=scalar_off,
         )

@@ -8149,6 +8149,14 @@ class GPUModelRunner(
             kv_cache_config, kernel_block_sizes
         )
 
+        # Optional Mamba history-scalar admission uses only private buffers and
+        # loaded weights. Bind first, qualify before warmup/compile/capture;
+        # profiling and every cache rebind explicitly reset the layer decision.
+        for layer in self.compilation_config.static_forward_context.values():
+            prepare_scalar_ring = getattr(layer, "prepare_spec_scalar_ring", None)
+            if prepare_scalar_ring is not None:
+                prepare_scalar_ring(enabled=not is_profiling)
+
         if (
             self.speculative_config
             and self.speculative_config.uses_extract_hidden_states()

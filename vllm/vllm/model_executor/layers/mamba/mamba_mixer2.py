@@ -37,8 +37,11 @@ from vllm.model_executor.layers.mamba.ops.gated_norm_fp8 import maybe_gated_norm
 from vllm.model_executor.layers.mamba.ops.mamba_ssm_spec_replay import (
     selective_state_update_spec_replay,
     spec_replay_enabled,
+    prefill_tag_view,
+    spec_replay_lazy,
     spec_replay_ring_len,
     spec_replay_supported,
+    write_prefill_tag,
 )
 from vllm.model_executor.layers.mamba.ops.selective_state_update_replayssm_output_only import (  # noqa: E501
     selective_state_update_replayssm_output_only,
@@ -567,6 +570,9 @@ class MambaMixer2(MambaBase, PluggableLayer):
         )
         self.spec_replay_ring_len = spec_replay_ring_len(self.num_spec)
         self._spec_replay_ok: bool | None = None
+        self._spec_replay_lazy: bool | None = None
+        # Fixed before compile/capture and before any request writes history.
+        self._spec_scalar_ring_offset: int | None = None
         if self.use_spec_replay:
             logger.info_once(
                 "Mamba2 spec decode: anchor-state replay (ring of %d tokens).",
@@ -1053,6 +1059,15 @@ class MambaMixer2(MambaBase, PluggableLayer):
                         if fused_state_copy:
                             varlen_states = varlen_states[last_chunk_indices_p]
                         ssm_state[state_indices_tensor_p] = varlen_states
+                # LOCAL PATCH (cudafast-nemotron35): the lazy anchor's checkpoint 0
+                # is this state; record the prompt length next to it.
+                if self._lazy_anchor(ssm_state):
+                    num_p = attn_metadata.num_prefills
+                    write_prefill_tag(
+                        ssm_state,
+                        state_indices_tensor_p,
+                        attn_metadata.seq_lens[num_decodes : num_decodes + num_p],
+                    )
 
         # Process decode requests
         if has_decode:
@@ -1191,6 +1206,8 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     seq_lens=attn_metadata.seq_lens,
                     ring_len=self.spec_replay_ring_len,
                     is_blackwell=self.is_blackwell,
+                    lazy=self._lazy_anchor(ssm_state),
+                    _scalar_ring_offset=self._spec_scalar_ring_offset,
                 )
             else:
                 selective_state_update(
@@ -1210,6 +1227,43 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     cu_seqlens=query_start_loc_d,
                     is_blackwell=self.is_blackwell,
                 )
+
+    def prepare_spec_scalar_ring(self, enabled: bool = True) -> None:
+        """Boot/cache-bind hook; no calibration inside a compiled forward.
+
+        A and dt_bias are the loaded immutable model Parameters. Rebinding a
+        cache resets the decision before either new raw or scalar history is
+        written. Profiling caches and unsupported layouts stay original.
+        """
+        self._spec_scalar_ring_offset = None
+        if not enabled or not self.use_spec_replay or self.num_spec != 4:
+            return
+        state = self.kv_cache[1]
+        if not self._lazy_anchor(state):
+            return
+        from vllm.model_executor.layers.mamba.ops.mamba_scalar_ring import prepare
+
+        A = self.A[:, None, None].expand(-1, self.head_dim, self.ssm_state_size)
+        bias = self.dt_bias[:, None].expand(-1, self.head_dim)
+        D = self.D[:, None].expand(-1, self.head_dim)
+        self._spec_scalar_ring_offset = prepare(
+            state, self.model_config.dtype, A, bias, D,
+            self.spec_replay_ring_len, self.is_blackwell,
+        )
+
+    def _lazy_anchor(self, ssm_state: torch.Tensor) -> bool:
+        """Whether verifies keep the checkpointed anchor (and prefills write the
+        prompt length it needs): fixed by the cache layout, decided once."""
+        if self._spec_replay_lazy is None:
+            self._spec_replay_lazy = (
+                self.use_spec_replay
+                and spec_replay_lazy()
+                and self.num_spec + 1 >= 3
+                and prefill_tag_view(ssm_state) is not None
+            )
+            if self._spec_replay_lazy:
+                logger.info_once("Mamba2 spec decode: lazy checkpointed anchor.")
+        return self._spec_replay_lazy
 
     def _spec_replay_ready(
         self,

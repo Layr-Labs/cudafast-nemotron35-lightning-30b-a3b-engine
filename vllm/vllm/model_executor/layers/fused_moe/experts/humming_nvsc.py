@@ -57,7 +57,9 @@ NUM_CODES = 64
 
 _STATS = {"packed": [], "stock": {}}
 _CONFIGS: dict = {}
-_FAILED = False
+# Scheduler variants (humming_relu2_epilogue._variant_key) whose derived kernel
+# failed to build: those calls keep the same variant's stock kernel.
+_FAILED: set = set()
 
 _LOADERS = r"""
 #include <humming/utils/all.cuh>
@@ -174,7 +176,15 @@ class S2RMemoryLoaderBS {
 """
 
 
-def _kernel_class():
+def _kernel_classes():
+    """The derived kernel classes {False: stock schedule, True: dyn}. dyn adds the
+    claim-when-free w13 tile scheduler (humming_relu2_epilogue.py,
+    HUMMING_W13_DYN): Relu2HummingKernel.prepare inserts it, with the epilogue,
+    after these loaders. Each variant has its own
+    class name, since KernelRuntime interns kernels by class name + config. The
+    scheduler adds no static shared memory (its counters are __device__ globals
+    and the claim travels through the row-index staging slot), so the static
+    shared footprint stays nvsc_table's 128 bytes at 128-byte alignment."""
     from vllm.model_executor.layers.fused_moe.experts.humming_relu2_epilogue import (
         Relu2HummingKernel,
     )
@@ -187,10 +197,13 @@ def _kernel_class():
             self.code = self.code[:at] + _LOADERS + self.code[at:]
             super().prepare()
 
-    return NvscRelu2HummingKernel
+    class NvscDynRelu2HummingKernel(NvscRelu2HummingKernel):
+        dyn_scheduler = True
+
+    return {False: NvscRelu2HummingKernel, True: NvscDynRelu2HummingKernel}
 
 
-_KERNEL_CLASS = None
+_KERNEL_CLASSES: dict = {}
 
 
 # ---------------------------------------------------------------------------
@@ -302,13 +315,18 @@ def prepare_layer(layer: torch.nn.Module) -> bool:
 # dispatch
 
 
-def _configs(meta, compute_config: str, tuning_config: str) -> torch.Tensor:
-    global _KERNEL_CLASS
-    key = (meta.to_str(), compute_config, tuning_config)
+def _configs(meta, compute_config: str, tuning_config: str, dyn: bool = False) -> torch.Tensor:
+    from vllm.model_executor.layers.fused_moe.experts.humming_relu2_epilogue import (
+        _dyn_num_sms,
+        _variant_key,
+    )
+
+    key = (meta.to_str(), compute_config, tuning_config) + _variant_key(dyn)
     if key in _CONFIGS:
         return _CONFIGS[key]
-    if _KERNEL_CLASS is None:
-        _KERNEL_CLASS = _kernel_class()
+    if not _KERNEL_CLASSES:  # one class object per name
+        _KERNEL_CLASSES.update(_kernel_classes())
+    kernel_cls = _KERNEL_CLASSES[dyn]
     lc = json.loads(meta.to_str())
     lc.pop("sublayer_name", None)
     cc = json.loads(compute_config)
@@ -327,10 +345,13 @@ def _configs(meta, compute_config: str, tuning_config: str) -> torch.Tensor:
         assert not config.get("use_stream_k", False)
         params = lc | cc | config
         num_sms = params.pop("num_sms", 0)
-        kernel = _KERNEL_CLASS(**params)
+        if dyn:  # the claim-when-free decode grid, as for the stock dyn kernel
+            num_sms = _dyn_num_sms(lo, hi, num_sms)
+        kernel = kernel_cls(**params)
         kernel.load_cubin()
-        assert type(kernel) is _KERNEL_CLASS
+        assert type(kernel) is kernel_cls
         assert "nvsc_table" in kernel.code
+        assert ("hm_dyn_claim" in kernel.code) == dyn
         result.extend([lo, hi, kernel.kernel_id, num_sms])
         covered = hi
     assert covered == DECODE_MAX_VALID_M, covered
@@ -340,12 +361,21 @@ def _configs(meta, compute_config: str, tuning_config: str) -> torch.Tensor:
 
 
 def launch(layer, inputs, outputs, compute_config, tuning_config, sorted_ids,
-           expert_ids, num_tokens_padded, top_k, valid_shape_m) -> bool:
+           expert_ids, num_tokens_padded, top_k, valid_shape_m, dyn=None) -> bool:
     """Run the routed up GEMM (+ReLU^2) with compressed scales. False (and
-    nothing launched) when the layer or call shape is not covered."""
-    global _FAILED
+    nothing launched) when the layer or call shape is not covered. dyn: the
+    claim-when-free scheduler (None: HUMMING_W13_DYN, default on)."""
+    from vllm.model_executor.layers.fused_moe.experts.humming_relu2_epilogue import (
+        _dyn_enabled,
+        _variant_key,
+    )
+
     bs = getattr(layer, "nvsc_w13_bs", None)
-    if bs is None or _FAILED or not ENABLED:
+    if bs is None or not ENABLED:
+        return False
+    dyn = _dyn_enabled() if dyn is None else bool(dyn)
+    variant = _variant_key(dyn)
+    if variant in _FAILED:
         return False
     if not (0 < valid_shape_m <= DECODE_MAX_VALID_M) or inputs.shape[0] > 8:
         return False
@@ -353,10 +383,10 @@ def launch(layer, inputs, outputs, compute_config, tuning_config, sorted_ids,
 
     meta = layer.humming_metas["w13"]
     try:
-        configs = _configs(meta, compute_config, tuning_config)
+        configs = _configs(meta, compute_config, tuning_config, dyn)
     except Exception as exc:  # noqa: BLE001
-        _FAILED = True
-        logger.warning("nvsc: derived kernel unavailable; using stock: %s", exc)
+        _FAILED.add(variant)
+        logger.warning("nvsc: derived kernel unavailable (dyn=%s); using stock: %s", dyn, exc)
         return False
     logger.info_once(
         "nvsc: 6-bit w13 block scales at decode on %d routed layers; stock on %s",

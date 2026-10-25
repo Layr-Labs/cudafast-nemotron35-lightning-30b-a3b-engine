@@ -738,6 +738,284 @@ static int launch_smem(const Params& p, cudaStream_t st) {
   return (int)cudaGetLastError();
 }
 
+// ---------------------------------------------------------------------------
+// Configs 356/357: config 333's CTA and arithmetic (32-row block, 384 columns, 6 warps, warp =
+// 64-column tile x the block's rows; per output element the same MMA chain over the block's
+// active k16 groups and the same epilogue) with far fewer instructions per group. 333 is bound by
+// instruction issue (its loads alone run at ~90% of its time, its compute alone at ~75%):
+//  - each thread's cp.async roles are fixed per CTA (one weight piece; at most one scale or
+//    activation piece), with 32-bit offsets instead of a divide-heavy piece loop;
+//  - the token-tile count is a template parameter (no predicated MMAs / activation reads);
+//  - weight rows the block does not load are not zeroed in registers. Exact: such a row holds a
+//    stale but finite weight (the fp4 and fp8 bit decodes never yield Inf/NaN, the scales are
+//    always loaded) and every valid row of the block has a +-0 activation there, so its products
+//    are +-0 and leave the fp32 chain unchanged (the chain starts at +0 and is never -0 before its
+//    end; the -0 insurance recompute of 333 is kept).
+//  - prep2: prep's outputs, byte for byte, with the mask loads of 8 rows in flight per step.
+// The grid is 333's one-shot grid (column tile fastest): the resident CTAs walk the weights in
+// address order, a few consecutive experts at a time, all K-ascending in step.
+
+__global__ void __launch_bounds__(128) prep2_kernel(const Params p) {
+  constexpr int BMT = 32;
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int mb = blockIdx.x;
+  uint8_t* bi = p.ws + (long long)mb * BI_BYTES;
+  int* rows = reinterpret_cast<int*>(bi + BI_ROWS);
+  uint16_t* mask = reinterpret_cast<uint16_t*>(bi + BI_MASK);
+  uint16_t* actg = reinterpret_cast<uint16_t*>(bi + BI_ACTG);
+  __shared__ int s_rows[BMT];
+  __shared__ int s_n;
+  __shared__ uint16_t s_mask[128];
+  const bool live = mb * BMT < *p.num_tokens_padded;
+  if (tid < BMT) {
+    const unsigned id = live ? static_cast<unsigned>(p.sorted_ids[mb * BMT + tid]) : 0xFFFFFFFFu;
+    const bool valid = id < static_cast<unsigned>(p.shape_m);
+    rows[tid] = valid ? static_cast<int>(id) : -1;
+    s_rows[tid] = valid ? static_cast<int>(id) : -1;
+  }
+  __syncthreads();
+  if (tid == 0) {
+    int n = 0;
+    for (int r = 0; r < BMT; ++r) n += s_rows[r] >= 0 ? 1 : 0;
+    s_n = n;
+    *reinterpret_cast<int*>(bi + BI_NROWS) = n;
+    *reinterpret_cast<int*>(bi + BI_EXPERT) = live ? p.expert_ids[mb] : -1;
+  }
+  __syncthreads();
+  {
+    const int g = tid;  // one k16 group per thread (G = 116 < 128)
+    uint32_t m = 0;
+    if (g < G && s_n > 0) {
+      if (p.dense == 1) {
+        m = 0xFFFFu;
+      } else {
+        for (int r0 = 0; r0 < BMT; r0 += 8) {
+          uint4 v[8][2];
+#pragma unroll
+          for (int i = 0; i < 8; ++i) {
+            const int row = s_rows[r0 + i];
+            if (row >= 0) {
+              const uint4* q = reinterpret_cast<const uint4*>(p.A + (long long)row * p.lda + 16 * g);
+              v[i][0] = __ldg(q);
+              v[i][1] = __ldg(q + 1);
+            } else {
+              v[i][0] = v[i][1] = make_uint4(0u, 0u, 0u, 0u);
+            }
+          }
+#pragma unroll
+          for (int i = 0; i < 8; ++i) m |= nz_mask8(v[i][0]) | (nz_mask8(v[i][1]) << 8);
+        }
+      }
+    }
+    s_mask[g] = static_cast<uint16_t>(m);
+    mask[g] = static_cast<uint16_t>(m);
+  }
+  __syncthreads();
+  if (warp == 0) {  // ordered list of active groups
+    int base = 0;
+    for (int c = 0; c < 4; ++c) {
+      const int g = 32 * c + lane;
+      const bool a = g < G && s_mask[g] != 0;
+      const unsigned ball = __ballot_sync(0xFFFFFFFFu, a);
+      if (a) actg[base + __popc(ball & ((1u << lane) - 1u))] = static_cast<uint16_t>(g);
+      base += __popc(ball);
+    }
+    if (lane == 0) *reinterpret_cast<int*>(bi + BI_NAG) = base;
+  }
+}
+
+// one k16 group of a warp's 64-column tile for NT token tiles of 8 rows
+template <int NT>
+__device__ __forceinline__ void s5_group(float (&acc)[4][4][4], const uint8_t (*w)[192], const uint8_t* s,
+                                         const uint8_t (*x)[XS], int lane, int Tl) {
+  const int g8 = lane >> 2, t = lane & 3;
+  const uint32_t w0 = *reinterpret_cast<const uint32_t*>(&w[2 * t][Tl * 32 + g8 * 4]);
+  const uint32_t w1 = *reinterpret_cast<const uint32_t*>(&w[2 * t + 1][Tl * 32 + g8 * 4]);
+  const uint32_t w2 = *reinterpret_cast<const uint32_t*>(&w[2 * t + 8][Tl * 32 + g8 * 4]);
+  const uint32_t w3 = *reinterpret_cast<const uint32_t*>(&w[2 * t + 9][Tl * 32 + g8 * 4]);
+  const uint2 sc = *reinterpret_cast<const uint2*>(&s[Tl * 64 + g8 * 8]);
+  uint32_t xb[NT][2];
+#pragma unroll
+  for (int tt = 0; tt < NT; ++tt) {
+    const uint8_t* xr = &x[8 * tt + g8][0];
+    xb[tt][0] = *reinterpret_cast<const uint32_t*>(xr + 4 * t);
+    xb[tt][1] = *reinterpret_cast<const uint32_t*>(xr + 16 + 4 * t);
+  }
+#pragma unroll
+  for (int c = 0; c < 4; ++c) {
+    const uint32_t sx = (c < 2) ? sc.x : sc.y;
+    // the two scale bytes of column group c into the high bytes of the two halves (as 333)
+    const uint32_t sp = hmul2_u32(fp8_to_bf16x2(__byte_perm(sx, 0u, (c & 1) == 0 ? 0x1404 : 0x3424)), kExp120);
+    const uint32_t slo = __byte_perm(sp, 0, 0x1010);
+    const uint32_t shi = __byte_perm(sp, 0, 0x3232);
+    const uint32_t sel = c | (c << 4) | ((c + 4) << 8) | ((c + 4) << 12);
+    const uint32_t x01 = __byte_perm(w0, w1, sel);
+    const uint32_t x23 = __byte_perm(w2, w3, sel);
+    const uint32_t a0 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x01 << 12), kExp124), slo);
+    const uint32_t a1 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x01 << 8), kExp124), shi);
+    const uint32_t a2 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x23 << 12), kExp124), slo);
+    const uint32_t a3 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x23 << 8), kExp124), shi);
+#pragma unroll
+    for (int tt = 0; tt < NT; ++tt) mma_bf16(acc[tt][c], a0, a1, a2, a3, xb[tt][0], xb[tt][1]);
+  }
+}
+
+template <int KG, int NS, int MINB, int POLICY = 0>
+__global__ void __launch_bounds__(192, MINB) smem5_kernel(const Params p) {
+  constexpr int BMT = 32, NTL = 6;
+  extern __shared__ __align__(128) uint8_t s5_smem[];
+  using Stage = SmemStage<KG, NS, NTL, BMT>;
+  static_assert(sizeof(Stage) % 128 == 0, "stages stay 128-byte aligned");
+  Stage* stg = reinterpret_cast<Stage*>(s5_smem);
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int g8 = lane >> 2, t = lane & 3;
+  const int P = blockIdx.x;  // tile of 384 columns
+  const int mb = blockIdx.y;
+  if (mb * BMT >= *p.num_tokens_padded) return;
+  const uint8_t* bi = p.ws + (long long)mb * BI_BYTES;
+  const int nrows = *reinterpret_cast<const int*>(bi + BI_NROWS);
+  const int e = *reinterpret_cast<const int*>(bi + BI_EXPERT);
+  if (e < 0 || nrows == 0) return;
+  struct alignas(128) Lists {  // a multiple of 128 bytes: the dynamic stages start 128-byte aligned
+    int rows[BMT];
+    uint16_t gmask[128];
+    uint16_t gact[128];
+  };
+  __shared__ Lists L;
+  for (int q = tid; q < 128; q += 192) {
+    if (q < BMT) L.rows[q] = reinterpret_cast<const int*>(bi + BI_ROWS)[q];
+    L.gmask[q] = reinterpret_cast<const uint16_t*>(bi + BI_MASK)[q];
+    L.gact[q] = reinterpret_cast<const uint16_t*>(bi + BI_ACTG)[q];
+  }
+  const int nag = *reinterpret_cast<const int*>(bi + BI_NAG);
+  __syncthreads();
+  const int ntt = (nrows + 7) >> 3;
+  const uint8_t* wexp = p.W + e * p.w_expert + (long long)(NTL * P) * 32;
+  const uint8_t* sexp = p.S + e * p.s_expert + (long long)(NTL * P) * 64;
+  // fixed cp.async roles: weight piece (tid / 12, tid % 12) of each group; an extra piece: scales
+  // (tid < 24) or activation row (tid - 24) / 2, half (tid - 24) % 2 (tid - 24 < 2 nrows)
+  const unsigned woff = static_cast<unsigned>((tid / 12) * p.w_k + 16 * (tid % 12));
+  const unsigned xoff = (tid >= 24 && tid - 24 < 2 * nrows)
+                            ? static_cast<unsigned>((long long)L.rows[(tid - 24) >> 1] * p.lda * 2 + 16 * ((tid - 24) & 1))
+                            : 0u;
+  float acc[4][4][4];
+  bool dense = p.dense == 1;
+  const bool loadonly = p.dense == 2;
+  const bool computeonly = p.dense == 3;
+  for (int pass = 0; pass < 2; ++pass) {
+    const int nsteps = dense ? G : nag;
+    const int nst = (nsteps + KG - 1) / KG;
+    auto issue = [&](int st) {
+      if (computeonly) return;
+      Stage& S = stg[st % NS];
+#pragma unroll
+      for (int gi = 0; gi < KG; ++gi) {
+        const int j = st * KG + gi;
+        if (j < nsteps) {
+          const int grp = dense ? j : L.gact[j];
+          const uint32_t m = dense ? 0xFFFFu : L.gmask[grp];
+          const int wr = tid / 12, wpc = tid - 12 * wr;
+          if ((m >> wr) & 1u)
+            cp16_weight<POLICY>(&S.w[gi][wr][16 * wpc], wexp + (woff + grp * (unsigned)(16 * p.w_k)));
+          if (tid < 24)
+            cp16_weight<POLICY>(&S.s[gi][16 * tid], sexp + (unsigned)(grp * p.s_g + 16 * tid));
+          else if (tid - 24 < 2 * nrows)
+            cp16(&S.x[gi][(tid - 24) >> 1][16 * ((tid - 24) & 1)], reinterpret_cast<const uint8_t*>(p.A) + (xoff + 32u * grp));
+        }
+      }
+    };
+#pragma unroll
+    for (int tt = 0; tt < 4; ++tt)
+#pragma unroll
+      for (int c = 0; c < 4; ++c)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) acc[tt][c][i] = 0.0f;
+    if constexpr (POLICY != 0) {
+      // Not unrolled with the L2 hint: ptxas (CUDA 13.0, sm_121a) folds the unrolled stages'
+      // constant shared-memory offsets into a uniform-register address on some hinted LDGSTS
+      // and emits it with an unset descriptor register (illegal instruction at run time).
+      // Same copies in the same order; the stock stream (POLICY 0) is unchanged.
+#pragma unroll 1
+      for (int st = 0; st < NS - 1; ++st) {
+        if (st < nst) issue(st);
+        cp_commit();
+      }
+    } else {
+#pragma unroll
+      for (int st = 0; st < NS - 1; ++st) {
+        if (st < nst) issue(st);
+        cp_commit();
+      }
+    }
+    bool neg0 = false;
+    for (int st = 0; st < nst; ++st) {
+      cp_wait<NS - 2>();
+      __syncthreads();
+      if (st + NS - 1 < nst) issue(st + NS - 1);
+      cp_commit();
+      const Stage& S = stg[st % NS];
+      if (loadonly) continue;
+#pragma unroll 1
+      for (int gi = 0; gi < KG; ++gi) {
+        if (st * KG + gi >= nsteps) continue;
+        switch (ntt) {
+          case 1: s5_group<1>(acc, S.w[gi], S.s[gi], S.x[gi], lane, warp); break;
+          case 2: s5_group<2>(acc, S.w[gi], S.s[gi], S.x[gi], lane, warp); break;
+          case 3: s5_group<3>(acc, S.w[gi], S.s[gi], S.x[gi], lane, warp); break;
+          default: s5_group<4>(acc, S.w[gi], S.s[gi], S.x[gi], lane, warp); break;
+        }
+      }
+    }
+    if (!dense) {
+#pragma unroll
+      for (int tt = 0; tt < 4; ++tt)
+#pragma unroll
+        for (int ci = 0; ci < 4; ++ci)
+#pragma unroll
+          for (int q = 0; q < 4; ++q) neg0 |= __float_as_uint(acc[tt][ci][q]) == 0x80000000u;
+    }
+    cp_wait<0>();
+    const bool redo = __syncthreads_or(neg0 ? 1 : 0) != 0;
+    if (!redo || dense) break;
+    if (tid == 0 && p.stats) atomicAdd(p.stats + 0, 1);
+    dense = true;
+  }
+  const float gs4 = mul_ftz(p.GS[e], 4.0f);
+#pragma unroll
+  for (int tt = 0; tt < 4; ++tt) {
+#pragma unroll
+    for (int ci = 0; ci < 4; ++ci) {
+      const int col = (NTL * P + warp) * 64 + 16 * ci + g8;
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        const int r = 8 * tt + 2 * t + (q & 1);
+        const int cc = col + ((q >> 1) ? 8 : 0);
+        if (r < nrows) {
+          const uint32_t v = to_bf16x2(mul_ftz(acc[tt][ci][q], gs4), 0.0f);
+          reinterpret_cast<uint16_t*>(p.C)[(long long)L.rows[r] * p.ldc + cc] = static_cast<uint16_t>(v);
+        }
+      }
+    }
+  }
+}
+
+template <int KG, int NS, int MINB, int POLICY = 0>
+static int launch_smem5(const Params& p, cudaStream_t st) {
+  prep2_kernel<<<p.max_blocks, 128, 0, st>>>(p);
+  cudaError_t e0 = cudaGetLastError();
+  if (e0 != cudaSuccess) return (int)e0;
+  const int sm = (int)sizeof(SmemStage<KG, NS, 6, 32>) * NS;
+  static int attr = 0;
+  if (sm > attr) {
+    cudaError_t e = cudaFuncSetAttribute(smem5_kernel<KG, NS, MINB, POLICY>, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
+    if (e != cudaSuccess) return (int)e;
+    attr = sm;
+  }
+  dim3 grid(N / 384, p.max_blocks);
+  smem5_kernel<KG, NS, MINB, POLICY><<<grid, 192, sm, st>>>(p);
+  return (int)cudaGetLastError();
+}
+
 }  // namespace pzskip
 
 extern "C" {
@@ -769,6 +1047,7 @@ int pzskip_down(const void* A, long long lda, int shape_m, const int* sorted_ids
   p.stats = stats;
   cudaStream_t st = static_cast<cudaStream_t>(stream);
   // configs 300-399 launch their own prep (with their block size); 3BB: BB = block rows 16/32
+  // (except 356/357: 32-row blocks, see smem5_kernel)
   switch (wpc) {
     case 300: return pzskip::launch_smem4<1, 4, 2, 4>(p, st);
     case 301: return pzskip::launch_smem4<1, 4, 2, 3>(p, st);
@@ -811,6 +1090,34 @@ int pzskip_down(const void* A, long long lda, int shape_m, const int* sorted_ids
 #endif
       return pzskip::launch_smem4<2, 3, 6, 3, 32, 0>(p, st);
     }   // 384 columns, 2 k16 groups per stage, 3 stages
+    case 356: {
+#ifndef PZSKIP_NO_CACHE_POLICY
+      // As case 333: the M=496 top-6 prefill (2976 routed slots) gets L2 evict-first weight and
+      // scale loads unless HUMMING_EVICT_PZ=0; same kernel otherwise, stock 356 on any failure.
+      const char* enabled = std::getenv("HUMMING_EVICT_PZ");
+      if (p.shape_m == 2976 && (!enabled || enabled[0] != '0')) {
+        static int loaded = -1;
+        if (loaded < 0) {
+          cudaFuncAttributes attr;
+          cudaError_t e = cudaFuncGetAttributes(&attr, pzskip::smem5_kernel<1, 4, 3, 1>);
+          loaded = e == cudaSuccess;
+          if (!loaded) {
+            cudaGetLastError();
+            std::fprintf(stderr, "pzskip: L2 evict-first load unavailable; stock PZ356 retained\n");
+          }
+        }
+        if (loaded) {
+          int rc = pzskip::launch_smem5<1, 4, 3, 1>(p, st);
+          if (!rc) return 0;
+          loaded = 0;
+          cudaGetLastError();
+          std::fprintf(stderr, "pzskip: L2 evict-first launch unavailable; stock PZ356 retained\n");
+        }
+      }
+#endif
+      return pzskip::launch_smem5<1, 4, 3, 0>(p, st);
+    }  // 333's CTA, lean issue (see smem5_kernel)
+    case 357: return pzskip::launch_smem5<2, 2, 3>(p, st);
     // 16-row blocks: one warp per 64-column tile, 2 token tiles
     case 340: return pzskip::launch_smem4<1, 4, 2, 8, 16>(p, st);
     case 341: return pzskip::launch_smem4<1, 4, 3, 6, 16>(p, st);

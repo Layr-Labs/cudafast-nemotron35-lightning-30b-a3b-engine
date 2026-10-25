@@ -86,6 +86,9 @@ def _cfg(
 # <= 128-register build, so each SM keeps room for one shx CTA of the shared expert on the
 # aux stream. Only the persistent grid changes; the accumulation chain is the same (see the
 # module docstring). SHCO=0 or SHCO_HUMMING_SMS=48 restores 4 CTAs per SM.
+# With the claim-when-free w13 scheduler (humming_relu2_epilogue.py, HUMMING_W13_DYN, default
+# on) the fused w13 kernel ignores these num_sms and uses HUMMING_W13_DYN_PF_SMS (prefill,
+# default 48) / HUMMING_W13_DYN_DEC_SMS (other entries, default 44) instead.
 def _prefill_w13_sms() -> int:
     if os.environ.get("SHCO", "1") == "0":
         return 48

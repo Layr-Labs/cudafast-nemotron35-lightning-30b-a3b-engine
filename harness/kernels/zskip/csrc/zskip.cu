@@ -1679,6 +1679,7 @@ __global__ void epi_kernel(const uint32_t* x, int n, float gs, uint32_t* out_bf1
 using namespace zskip;
 
 static int g_sms = 0;
+static int g_rds_ring2 = 0;  // old Python/new library remains stock until explicit init
 static int g_pdl = 0;  // zskip_set_pdl: launch the v4 pair with programmatic dependent launch
 
 #ifndef ZSKIP_NO_PDL
@@ -1740,8 +1741,8 @@ static int launch4f(const Params& p, cudaStream_t stream) {
 #endif
 
 #ifndef ZSKIP_NO_PAIR
-template <bool Fused, bool HalfSkip = false>
-static int launch_pair(const Params& p, cudaStream_t stream) {
+template <bool Fused, bool HalfSkip, int R>
+static int launch_pair_impl(const Params& p, cudaStream_t stream) {
   constexpr int SM = Fused ? BI_BYTES : 0;
 #ifndef ZSKIP_NO_PDL
   if (g_pdl) {
@@ -1749,7 +1750,7 @@ static int launch_pair(const Params& p, cudaStream_t stream) {
     if constexpr (!Fused)
       e = launch_pdl(prep_kernel<16, 8>, dim3(p.max_blocks), dim3(128), stream, p);
     if (e == cudaSuccess)
-      e = launch_pdl(down_pair_kernel<Fused, HalfSkip>, dim3(21, p.max_blocks), dim3(32), stream, p, SM);
+      e = launch_pdl(down_pair_kernel<Fused, HalfSkip, R>, dim3(21, p.max_blocks), dim3(32), stream, p, SM);
     if (e != cudaSuccess) {
       cudaGetLastError();
       return (int)e;
@@ -1758,9 +1759,15 @@ static int launch_pair(const Params& p, cudaStream_t stream) {
   }
 #endif
   if constexpr (!Fused) prep_kernel<16, 8><<<p.max_blocks, 128, 0, stream>>>(p);
-  down_pair_kernel<Fused, HalfSkip><<<dim3(21, p.max_blocks), 32, SM, stream>>>(p);
+  down_pair_kernel<Fused, HalfSkip, R><<<dim3(21, p.max_blocks), 32, SM, stream>>>(p);
   return (int)cudaGetLastError();
 }
+template <bool Fused, bool HalfSkip = false>
+static int launch_pair(const Params& p, cudaStream_t stream) {
+  return g_rds_ring2 ? launch_pair_impl<Fused, HalfSkip, 2>(p, stream)
+                     : launch_pair_impl<Fused, HalfSkip, 3>(p, stream);
+}
+
 #endif
 
 // v4 config id, warps per CTA, ring depth (active groups in flight per warp), 8-row MMA halves per
@@ -1849,6 +1856,8 @@ static int launch3(const Params& p, cudaStream_t stream, int ctas_per_sm) {
 
 extern "C" {
 
+int zskip_set_rds_ring2(int on) { g_rds_ring2 = on ? 1 : 0; return 0; }
+
 #ifndef ZSKIP_NO_PDL
 int zskip_set_pdl(int on) {
   g_pdl = on ? 1 : 0;
@@ -1864,6 +1873,19 @@ int zskip_init(void) {
   ZSKIP4_CONFIGS(X4)
 #undef X4
   if ((e = cudaFuncGetAttributes(&attr, prep_kernel<16, 8>)) != cudaSuccess) return (int)e;
+
+#ifndef ZSKIP_NO_PAIR
+  if ((e = cudaFuncGetAttributes(&attr, down_pair_kernel<false, false, 2>)) != cudaSuccess) return (int)e;
+  if ((e = cudaFuncGetAttributes(&attr, down_pair_kernel<false, false, 3>)) != cudaSuccess) return (int)e;
+  if ((e = cudaFuncGetAttributes(&attr, down_pair_kernel<false, true, 2>)) != cudaSuccess) return (int)e;
+  if ((e = cudaFuncGetAttributes(&attr, down_pair_kernel<false, true, 3>)) != cudaSuccess) return (int)e;
+#ifndef ZSKIP_NO_FUSED
+  if ((e = cudaFuncGetAttributes(&attr, down_pair_kernel<true, false, 2>)) != cudaSuccess) return (int)e;
+  if ((e = cudaFuncGetAttributes(&attr, down_pair_kernel<true, false, 3>)) != cudaSuccess) return (int)e;
+  if ((e = cudaFuncGetAttributes(&attr, down_pair_kernel<true, true, 2>)) != cudaSuccess) return (int)e;
+  if ((e = cudaFuncGetAttributes(&attr, down_pair_kernel<true, true, 3>)) != cudaSuccess) return (int)e;
+#endif
+#endif
   return 0;
 }
 
@@ -1914,9 +1936,10 @@ int zskip_config(int id, int* info) {
 #define PAIR_INFO(ID, FUSED, HSKIP) \
   if (id == ID) { \
     constexpr int SM = FUSED ? BI_BYTES : 0; \
-    if (cudaFuncGetAttributes(&attr, down_pair_kernel<FUSED, HSKIP>) != cudaSuccess) return -1; \
+    auto kernel = g_rds_ring2 ? down_pair_kernel<FUSED, HSKIP, 2> : down_pair_kernel<FUSED, HSKIP, 3>; \
+    if (cudaFuncGetAttributes(&attr, kernel) != cudaSuccess) return -1; \
     info[0] = attr.numRegs; info[1] = SM; info[2] = 1; \
-    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&info[3], down_pair_kernel<FUSED, HSKIP>, 32, SM) != cudaSuccess) \
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&info[3], kernel, 32, SM) != cudaSuccess) \
       return -1; \
     return 0; \
   }

@@ -12,9 +12,6 @@ import os
 import torch
 
 from vllm.triton_utils import tl, triton
-from vllm.logger import init_logger
-
-logger = init_logger(__name__)
 
 from .nemotron_h_mtp_kernels import mtp_pdl
 
@@ -130,7 +127,6 @@ def _down_combine(
     M: tl.constexpr, H: tl.constexpr, ROUTED_SCALE: tl.constexpr,
     TOPK: tl.constexpr, S: tl.constexpr, BN: tl.constexpr,
     launch_pdl: tl.constexpr = False,
-    residual_ptr=None, ADD_RES: tl.constexpr = False,
 ):
     """_down's epilogue over the per-slot sums, in _down's order."""
     if launch_pdl:
@@ -145,79 +141,19 @@ def _down_combine(
         shared += tl.load(part + (TOPK + s) * H + n, mask=n < H, other=0.0)
     out = (routed * ROUTED_SCALE + shared).to(y.dtype.element_ty)
     for row in range(M):
-        value = out
-        if ADD_RES:
-            residual = tl.load(residual_ptr + row * H + n, mask=n < H, other=0.0)
-            # Retain the original MoE BF16 rounding before the separate Add's
-            # FP32 sum and BF16 result. The following RMS is still original.
-            value = (out.to(tl.float32) + residual.to(tl.float32)).to(y.dtype.element_ty)
-        tl.store(y + row * H + n, value, mask=n < H)
+        tl.store(y + row * H + n, out, mask=n < H)
 
 
 # MTP_DOWN_SLOTS=0 runs _down (one program per column block, slots in a loop).
 _SLOTS = os.environ.get("MTP_DOWN_SLOTS", "1") != "0"
 
 
-_ADD_RES = os.environ.get("MTP_DOWN_ADD_RESIDUAL", "1") != "0"
-_ADD_OK: dict[tuple[int, float], bool] = {}
-
-
-@torch.no_grad()
-def prepare_residual_add(device, routed_scale):
-    """Official remote startup only: compare the folded result with old+BF16 Add."""
-    if not (_ADD_RES and _SLOTS and _ENABLED):
-        return False
-    key = (device.index, float(routed_scale))
-    if key in _ADD_OK:
-        return _ADD_OK[key]
-    _ADD_OK[key] = False
-    try:
-        gen = torch.Generator(device=device)
-        gen.manual_seed(20261025)
-        for m in (1, 5, 8):
-            for topk in (3, 6):
-                for case, scale in enumerate((0.0, 1e-3, 1.0, 32.0)):
-                    part = torch.randn(topk + 2, 2688, device=device, generator=gen, dtype=torch.float32) * scale
-                    weights = torch.rand(topk, device=device, generator=gen, dtype=torch.float32)
-                    weights /= weights.sum()
-                    residual = (torch.randn(m, 2688, device=device, generator=gen, dtype=torch.float32) * scale).to(torch.bfloat16)
-                    if case == 0:
-                        residual[:, ::2] = -0.0
-                    old = torch.empty_like(residual)
-                    new = torch.empty_like(residual)
-                    args = dict(M=m, H=2688, ROUTED_SCALE=routed_scale,
-                                TOPK=topk, S=2, BN=256, num_warps=4, launch_pdl=mtp_pdl())
-                    _down_combine[(triton.cdiv(2688, 256),)](part, weights, old, **args)
-                    reference = old + residual
-                    _down_combine[(triton.cdiv(2688, 256),)](
-                        part, weights, new, **args, residual_ptr=residual, ADD_RES=True)
-                    if not torch.equal(reference.view(torch.uint8), new.view(torch.uint8)):
-                        logger.warning("MTP folded residual differs; original Add retained")
-                        return False
-        _ADD_OK[key] = True
-        logger.info("MTP ordered fold plus BF16 residual Add admitted")
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("MTP folded residual unavailable (%r); original Add retained", exc)
-    return _ADD_OK[key]
-
-
-def can_add_residual(residual, y, routed_scale, topk):
-    return (residual is not None and _ADD_OK.get((y.device.index, float(routed_scale)), False)
-            and _SLOTS and topk in (3, 6)
-            and y.ndim == 2 and y.shape[0] in (1, 5, 8) and y.shape[1] == 2688
-            and residual.dtype == y.dtype == torch.bfloat16
-            and residual.device == y.device and residual.shape == y.shape
-            and residual.is_contiguous() and y.is_contiguous())
-
-
-def maybe_down(h, packed, ids, weights, y, routed_scale, residual=None):
+def maybe_down(h, packed, ids, weights, y, routed_scale):
     """Reuse the existing finite, exact BF16 transpose prepared before capture."""
     if not _ENABLED:
         return False
     w2, sd = packed
     topk = ids.numel()
-    if residual is not None and not can_add_residual(residual, y, routed_scale, topk):
-        return False
     slots = topk + 2
     if (
         not 1 <= topk <= 6
@@ -252,7 +188,6 @@ def maybe_down(h, packed, ids, weights, y, routed_scale, residual=None):
         _down_combine[(triton.cdiv(2688, 256),)](
             part, weights, y, M=y.shape[0], H=2688, ROUTED_SCALE=routed_scale,
             TOPK=topk, S=2, BN=256, num_warps=4, launch_pdl=mtp_pdl(),
-            residual_ptr=residual, ADD_RES=residual is not None,
         )
         return True
     _down[(triton.cdiv(2688, 32),)](

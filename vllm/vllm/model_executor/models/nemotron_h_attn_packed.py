@@ -41,9 +41,7 @@ SHAPES = frozenset({(4608, 2688), (2688, 4096)})
 MIN_GAIN = 0.96
 KERNEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nemotron_h_attn_packed_kernel.py")
 
-_chosen: dict[tuple[int, int], tuple] = {}
-_word_ok = False
-_WORD = os.environ.get("ATTN_PACK12_WORDLOAD", "1") != "0"
+_chosen: dict[tuple[int, int], tuple[int, int]] = {}
 _registry: dict[int, tuple[torch.Tensor, ...]] = {}
 
 _PROBE = """
@@ -62,9 +60,6 @@ for n, k in ((4608, 2688), (2688, 4096)):
     raw = torch.randint(-32768, 32767, (128,), dtype=torch.int16, device=dev)
     x = torch.randn(m.ROWS, k, device=dev, dtype=torch.bfloat16)
     for cfg in m.CONFIGS:
-        group = "word" if len(cfg) == 4 else "base"
-        if group != sys.argv[2]:
-            continue
         y = m.run(x, sm, ex, base, ri, raw, n, k, cfg)
         torch.cuda.synchronize()
         assert y.shape == (m.ROWS, n)
@@ -106,10 +101,10 @@ def apply(proj: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
     return torch.ops.vllm.nemo_attn_pk_linear(x, proj.weight, nk[0], nk[1], proj._apk_id)
 
 
-def _probe_group(group: str) -> bool:
+def _probe() -> bool:
     try:
         out = subprocess.run(
-            [sys.executable, "-c", _PROBE, KERNEL_PATH, group],
+            [sys.executable, "-c", _PROBE, KERNEL_PATH],
             capture_output=True, text=True, timeout=240,
         )
     except Exception as exc:  # noqa: BLE001
@@ -120,14 +115,6 @@ def _probe_group(group: str) -> bool:
             "attention pack12: probe failed (rc %s): %s", out.returncode, out.stderr[-400:]
         )
         return False
-    return True
-
-
-def _probe() -> bool:
-    global _word_ok
-    if not _probe_group("base"):
-        return False
-    _word_ok = _WORD and _probe_group("word")
     return True
 
 
@@ -164,67 +151,25 @@ def _op_us(fn, flush: torch.Tensor, reps: int = 20) -> float:
     return ms[len(ms) // 2] * 1000.0
 
 
-def _graph_us(fns, reps: int = 24, rounds: int = 7) -> float:
-    """Median GPU time per call in microseconds: a CUDA graph of `reps` calls that cycle
-    through the per-layer callables, so every call reads weights the previous ones pushed
-    out of L2 (6 layers of 18-25 MB each) and no host launch time is in the measurement."""
-    for fn in fns:
-        fn()
-    torch.cuda.synchronize()
-    g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
-        for i in range(reps):
-            fns[i % len(fns)]()
-    g.replay()
-    torch.cuda.synchronize()
-    ms = []
-    for _ in range(rounds):
-        a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        a.record()
-        g.replay()
-        b.record()
-        b.synchronize()
-        ms.append(a.elapsed_time(b))
-    return sorted(ms)[rounds // 2] * 1000.0 / reps
-
-
 def _choose(items, n: int, k: int, flush: torch.Tensor):
     proj, planes = items[0]
     x = torch.randn(ROWS, k, device=proj.weight.device, dtype=torch.bfloat16)
-    use_graph = True
-    try:
-        linear_us = _graph_us([(lambda w=p.weight: F.linear(x, w)) for p, _ in items])
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("attention pack12 graph timing unavailable (%r); paired eager timing", exc)
-        use_graph = False
-        linear_us = _op_us(lambda: F.linear(x, proj.weight), flush)
-    choices = []
+    linear_us = _op_us(lambda: F.linear(x, proj.weight), flush)
+    best = None
     for cfg in CONFIGS:
-        if len(cfg) == 4 and not _word_ok:
-            continue
         if n % cfg[0]:
             continue
         try:
-            if use_graph:
-                us = _graph_us([(lambda pl=pp: run(x, *pl, n, k, cfg)) for _, pp in items])
-            else:
-                us = _op_us(lambda: run(x, *planes, n, k, cfg), flush)
+            us = _op_us(lambda: run(x, *planes, n, k, cfg), flush)
         except Exception as exc:  # noqa: BLE001  (a configuration this Triton cannot build)
             logger.warning("attention pack12 %dx%d: config %s failed (%r)", n, k, cfg, exc)
             continue
-        choices.append((us, cfg))
-    choices.sort(key=lambda item: item[0])
-    logger.info("attention pack12 %dx%d: linear %.1f us, packed %s", n, k, linear_us, choices)
-    for us, cfg in choices:
-        if us > MIN_GAIN * linear_us:
-            break
-        try:
-            if _exact(items, n, k, cfg):
-                return cfg
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("attention pack12 %dx%d: equality failed for %s (%r)", n, k, cfg, exc)
-        logger.warning("attention pack12 %dx%d: rejecting configuration %s", n, k, cfg)
-    return None
+        if best is None or us < best[0]:
+            best = (us, cfg)
+    logger.info("attention pack12 %dx%d: linear %.1f us, packed %s", n, k, linear_us, best)
+    if best is None or best[0] > MIN_GAIN * linear_us:
+        return None
+    return best[1]
 
 
 @torch.no_grad()
@@ -273,6 +218,9 @@ def prepare(model: torch.nn.Module) -> int:
         cfg = None
         try:
             cfg = _choose(items, n, k, flush)
+            if cfg is not None and not _exact(items, n, k, cfg):
+                logger.warning("attention pack12 %dx%d: output differs from F.linear; off", n, k)
+                cfg = None
         except Exception as exc:  # noqa: BLE001
             logger.warning("attention pack12 %dx%d: guard failed (%r); off", n, k, exc)
             cfg = None

@@ -245,7 +245,6 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
         # the same row (see above), so the MoE runs once on that row and the
         # result is written to every output row. Drafter-only numerics.
         self._fast_moe = False
-        self._mtp_fold_residual_ok = False
         self._fast_moe_weights = None
         self._fast_moe_name = prefix
         try:
@@ -278,17 +277,11 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
         else:
             hidden_states, residual = self.norm(hidden_states, residual)
         if self._fast_moe:
-            if self.has_end_norm and self._mtp_fold_residual_ok and residual is not None:
-                hidden_states = torch.ops.vllm.mtp_moe_single_row_add_residual(
-                    hidden_states, self.moe_row_src[: hidden_states.shape[0]],
-                    residual, self._fast_moe_name)
-                residual = None
-            else:
-                hidden_states = torch.ops.vllm.mtp_moe_single_row(
-                    hidden_states,
-                    self.moe_row_src[: hidden_states.shape[0]],
-                    self._fast_moe_name,
-                )
+            hidden_states = torch.ops.vllm.mtp_moe_single_row(
+                hidden_states,
+                self.moe_row_src[: hidden_states.shape[0]],
+                self._fast_moe_name,
+            )
         else:
             hidden_states = hidden_states.index_select(
                 0, self.moe_row_src[: hidden_states.shape[0]]

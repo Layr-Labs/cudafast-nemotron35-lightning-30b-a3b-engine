@@ -246,6 +246,10 @@
     {
       "file": "model_executor/kernels/linear/nvfp4/marlin.py; model_executor/models/nemotron_h.py; model_executor/layers/fused_moe/runner/shared_experts.py; model_executor/layers/fused_moe/experts/humming_tuned_moe.py",
       "why": "shco: the shared expert of the 496-token prefill runs on shx (harness/kernels/shco), a small-footprint (1 CTA/SM) NVFP4 W4A16 GEMM bit-identical to Marlin up -> relu^2 -> Marlin down (Marlin's stripe segments, k-warp chains and fp32 fold order), queued on the shared-expert aux stream beside the routed experts; humming's prefill w13 keeps its accumulation chain on a 4 x 36 persistent grid (3 resident CTAs per SM) to leave each SM room for it. Tables built at load; SHCO=0 restores stock."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_screen.py:_chunk_topk/DraftHeadScreen",
+      "why": "On ENTIRE promoted adab284a-bf1d-4ce2-8e90-6720fa0f5435, preserve original AD5 torch-order floatkey and survivor/tie scatter; replace32 serial threshold reductions with8 masked4bit histograms and4warp coarse geometry. Uniformkeys fastpath uses exactmin/max threshold and stillwritesallK ids, especiallygateddrafts. Originalbinaryselector retained; officialremote model-load pairedold/new admission beforecapture, fallback onmismatch/unavailable, VLLM_MTP_RADIX_TOPK=0. No targetor draftscore arithmetic, groupcounts, policy, formats or localexecution changed. Performance and wholecorrectnessunverified."
     }
   ]
 }

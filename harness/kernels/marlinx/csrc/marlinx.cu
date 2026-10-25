@@ -256,6 +256,21 @@ __device__ __forceinline__ __nv_bfloat16 round_output(float scaled) {
   return rounded;
 }
 
+__device__ __forceinline__ __nv_bfloat162 round_output2_relu2(float a, float b) {
+  union {
+    __nv_bfloat162 h;
+    uint32_t u;
+  } cvt;
+  cvt.h = __floats2bfloat162_rn(a, b);
+  uint32_t out;
+  asm("{ .reg .b32 x, z;\n"
+      "mov.b32 z, 0; max.NaN.bf16x2 x, %1, z;\n"
+      "mul.rn.bf16x2 %0, x, x; }\n"
+      : "=r"(out) : "r"(cvt.u));
+  cvt.u = out;
+  return cvt.h;
+}
+
 // Marlin write_result: bf16_rn(R * global_scale), rows < M only (warp 0).
 template <bool Relu2>
 __device__ __forceinline__ void write_out(const Params& p, int col, int h, int lane,
@@ -265,10 +280,20 @@ __device__ __forceinline__ void write_out(const Params& p, int col, int h, int l
 #pragma unroll
   for (int j = 0; j < 4; ++j) {
     const long long f = 128LL * col + 64 * h + 16 * j + (lane >> 2);
-    const __nv_bfloat16 v0 = round_output<Relu2>(R[j][0] * g);
-    const __nv_bfloat16 v1 = round_output<Relu2>(R[j][1] * g);
-    const __nv_bfloat16 v2 = round_output<Relu2>(R[j][2] * g);
-    const __nv_bfloat16 v3 = round_output<Relu2>(R[j][3] * g);
+    __nv_bfloat16 v0, v1, v2, v3;
+    if constexpr (Relu2) {
+      const __nv_bfloat162 v01 = round_output2_relu2(R[j][0] * g, R[j][1] * g);
+      const __nv_bfloat162 v23 = round_output2_relu2(R[j][2] * g, R[j][3] * g);
+      v0 = __low2bfloat16(v01);
+      v1 = __high2bfloat16(v01);
+      v2 = __low2bfloat16(v23);
+      v3 = __high2bfloat16(v23);
+    } else {
+      v0 = round_output<false>(R[j][0] * g);
+      v1 = round_output<false>(R[j][1] * g);
+      v2 = round_output<false>(R[j][2] * g);
+      v3 = round_output<false>(R[j][3] * g);
+    }
     if (t0 < p.M) {
       p.C[t0 * p.ldc + f] = v0;
       p.C[t0 * p.ldc + f + 8] = v2;

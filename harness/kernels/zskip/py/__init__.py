@@ -49,8 +49,6 @@ CONFIGS4.update({300: (2, 2, 4, 32), 301: (1, 2, 4, 32), 302: (2, 4, 4, 32), 303
 CONFIGS4.update({400: (2, 2, 4, 32), 401: (3, 2, 4, 32), 402: (6, 2, 4, 32), 403: (7, 2, 4, 32), 404: (14, 2, 4, 32), 405: (6, 4, 4, 32), 406: (7, 4, 4, 32), 407: (6, 3, 4, 32), 408: (14, 3, 4, 32), 409: (6, 2, 2, 16), 410: (7, 2, 2, 16), 411: (6, 2, 8, 64), 412: (3, 4, 4, 32), 413: (21, 2, 4, 32)})
 CONFIGS4.update({500: (2, 2, 4, 32), 501: (6, 2, 4, 32), 502: (6, 4, 4, 32), 503: (6, 3, 4, 32), 504: (3, 4, 4, 32), 505: (7, 2, 4, 32), 506: (2, 4, 4, 32), 507: (6, 2, 2, 16), 508: (3, 2, 4, 32), 509: (6, 6, 4, 32)})
 CONFIGS4[108] = (2, 4, 1, 16)
-# swap2 decode pairs: 113/118 (unfused/fused prep) and their empty-half dequant skips 114/119
-PAIR_CONFIGS = (113, 114, 118, 119)
 DEFAULT_CONFIG = int(os.environ.get("ZSKIP_CONFIG", "0"))
 
 _lib = None
@@ -138,7 +136,7 @@ def config_info(config: int) -> dict:
     if rc != 0:
         raise ValueError(f"zskip config {config}: {rc}")
     return {"regs": info[0], "smem": info[1], "warps": info[2], "ctas_per_sm": info[3],
-            "shape": (1, 3, 1, 16) if config in PAIR_CONFIGS else CONFIGS.get(config) or CONFIGS4.get(config)}
+            "shape": (1, 3, 1, 16) if config in (113, 118) else CONFIGS.get(config) or CONFIGS4.get(config)}
 
 
 BI_BYTES = 5120
@@ -267,8 +265,8 @@ def down(a: torch.Tensor, sorted_ids: torch.Tensor, expert_ids: torch.Tensor, nu
     assert lib is not None, _load_error
     if config is None:
         config = 100
-    if (config in PAIR_CONFIGS) != (packed.layout == "swap2"):
-        raise ValueError("configs 113/114/118/119 require swap2; legacy configs require their original layout")
+    if (config in (113, 118)) != (packed.layout == "swap2"):
+        raise ValueError("configs 113/118 require swap2; legacy configs require their original layout")
     shape_m = a.shape[0]
     assert a.dtype == torch.bfloat16 and a.shape[1] == K and a.stride(1) == 1
     assert out.dtype == torch.bfloat16 and out.shape[1] == N and out.stride(1) == 1 and out.shape[0] >= shape_m
@@ -287,7 +285,7 @@ def down(a: torch.Tensor, sorted_ids: torch.Tensor, expert_ids: torch.Tensor, nu
     )
     launch = lib.zskip_down
     if verify_rows is not None:
-        assert shape_m == 30 and config in PAIR_CONFIGS and mode == SKIP
+        assert shape_m == 30 and config in (113, 118) and mode == SKIP
         assert verify_rows.device == a.device and verify_rows.dtype == torch.int32
         assert verify_rows.numel() == 1 and verify_rows.is_contiguous()
         prefix_launch = getattr(lib, "zskip_down_prefix", None)

@@ -326,6 +326,10 @@
     {
       "file": "(composition)",
       "why": "e-man07 composition on dadon's record fc04335b-c894-41f9-b73b-aa9b5aac1fb5: ArthurOstapenko 0f958570-4fab-4ffd-8db5-c5a2c37a5439's tree byte for byte, plus jacklightChen b0d0b0b6's apk12 coherent-PDL attention files and i34-9 c3e16bbb's prefill files (pzskip, humming relu2 epilogue / nvsc / tuned_moe / zskip glue) and marlinx unit-major scales, each carried byte for byte from its author's tree. No new arithmetic by us."
+    },
+    {
+      "file": "harness/kernels/fp8d6/{README.md,build.sh,csrc/fp8d6.cu,py/__init__.py}; kernels/linear/scaled_mm/fp8c.py",
+      "why": "jacklightChen 422827d4-d094-4eb3-a0d6-cffb2b04b229's optional exact six-bit per-column FP8 byte dictionary for the 46 Mamba projections, carried byte for byte (its drafter down pipeline is not carried). Same FP8 MMA chain, scales and BF16 RN epilogue as fp8c; admitted per tensor only after a child-process probe, a full decode of every weight byte, raw-byte output equality at M = 1/4/5/8 with changing-input graph replay, at least 0.5% fewer bytes than the 7-bit buffer and a cold M=5 graph time at least 4% better; otherwise fp8c runs."
     }
   ]
 }

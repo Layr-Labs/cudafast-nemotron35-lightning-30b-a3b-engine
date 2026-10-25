@@ -711,6 +711,8 @@ class NemotronHModel(nn.Module, EagleModelMixin):
                     if name is None:
                         name = f"{prefix}.layers.{i}.mixer.experts"
                     _l2pf.AHEAD_MOE[str(name)] = nxt.mixer.in_proj
+                    if hasattr(_l2pf, "AHEAD_SSM"):
+                        _l2pf.AHEAD_SSM[str(name)] = nxt.mixer
             # Source idea: 297e3412-dc4a-45ae-a0f1-b6c3afd76c1b. The
             # prefetcher shares the existing window budget with this router.
             for i in range(self.start_layer, self.end_layer - 1):

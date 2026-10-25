@@ -27,6 +27,12 @@ extern "C" void decode(const uint32_t* s, const uint32_t* x, uint32_t b, uint32_
 extern "C" void raw(const uint16_t* blk, int half, int t, uint32_t* w) {
   apk_raw(blk, half, t, *reinterpret_cast<uint32_t(*)[8]>(w));
 }
+extern "C" int group_batches(int groups, int width) {
+  return apk_group_batches(groups, width);
+}
+extern "C" int group_index(int batch, int offset, int width) {
+  return apk_group_index(batch, offset, width);
+}
 """
 
 
@@ -37,6 +43,10 @@ def host_lib(tmp: Path):
     lib = ctypes.CDLL(str(tmp / "dec.so"))
     lib.decode.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p]
     lib.raw.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+    lib.group_batches.argtypes = [ctypes.c_int, ctypes.c_int]
+    lib.group_batches.restype = ctypes.c_int
+    lib.group_index.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
+    lib.group_index.restype = ctypes.c_int
     return lib
 
 
@@ -112,6 +122,15 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         lib = host_lib(Path(tmp))
         total = 0
+        for k in (2688, 4096):
+            groups = k // 64
+            for width in apk12.PIPE_GROUPS:
+                batches = lib.group_batches(groups, width)
+                order = [lib.group_index(batch, offset, width)
+                         for batch in range(batches) for offset in range(width)]
+                valid = [group for group in order if group < groups]
+                assert valid == list(range(groups)), (k, width, valid)
+                print(f"K={k} pipeline={width}: {len(valid)} groups in ascending order")
         for n, k, tiles, seed in ((96, 384, range(3), 1), (64, 256, range(2), 2),
                                   (4608, 2688, (0, 71, 143), 3), (2688, 4096, (0, 41, 83), 4)):
             regs, bad = run(lib, apk12, n, k, tiles, seed)

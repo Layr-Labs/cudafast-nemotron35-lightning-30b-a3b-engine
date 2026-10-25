@@ -793,6 +793,7 @@ def mtp_moe_row(
             EVICT=_EVICT_W, GATED=gated, num_warps=4 * _PK_UP_WN,
             num_stages=_MOE_UP_STAGES, launch_pdl=mtp_pdl(), WN=_PK_UP_WN,
             WORD=word_load_enabled(x.device),
+            K2=_PASS_TOPK[1] if gated else 0, K3=_PASS_TOPK[2], K4=_PASS_TOPK[3],
         )
     else:
         _mtp_moe_up_kernel[(triton.cdiv(inter, _MOE_UP_BN), topk + n_shared)](
@@ -850,8 +851,23 @@ def mtp_moe_row(
 
 
 # LOCAL PATCH (cudafast-nemotron35): routed experts the MTP draft evaluates per
-# token (the router's top 6 by weight, highest first); MTP_DRAFT_TOPK=0 keeps all.
-_DRAFT_TOPK = int(os.environ.get("MTP_DRAFT_TOPK", "3"))
+# token (the router's top 6 by weight, highest first), per draft pass of a cycle:
+# MTP_TOPK_SCHEDULE="k1,k2,k3,k4" gives the first pass the k1 highest-weight
+# experts and the second, third and fourth (and later) passes k2, k3 and k4 of
+# them (k1 >= k2, k3, k4; a short list repeats its last entry). The first draft
+# of a cycle decides whether any of the others count, so it gets one more
+# expert than the rest. MTP_TOPK_SCHEDULE=3 is the previous fixed top 3;
+# MTP_DRAFT_TOPK=0 keeps all six in every pass.
+_PASS_TOPK = [int(v) for v in os.environ.get("MTP_TOPK_SCHEDULE", "4,3,3,3").split(",")]
+_PASS_TOPK = (_PASS_TOPK + [_PASS_TOPK[-1]] * 4)[:4]
+assert all(0 < k <= _PASS_TOPK[0] for k in _PASS_TOPK), _PASS_TOPK
+_DRAFT_TOPK = int(os.environ.get("MTP_DRAFT_TOPK", str(_PASS_TOPK[0])))
+if not 0 < _DRAFT_TOPK < 6:
+    _PASS_TOPK = [0, 0, 0, 0]
+elif any(k != _DRAFT_TOPK for k in _PASS_TOPK[1:]):
+    _PASS_TOPK[0] = _DRAFT_TOPK
+else:
+    _PASS_TOPK = [_DRAFT_TOPK, 0, 0, 0]  # one count for every pass: no per-pass gating
 # MTP_TOPK_KEEP_KERNEL=0 keeps torch.sort + slice + index_select for the selection.
 _TOPK_KEEP_KERNEL = os.environ.get("MTP_TOPK_KEEP_KERNEL", "1") != "0"
 

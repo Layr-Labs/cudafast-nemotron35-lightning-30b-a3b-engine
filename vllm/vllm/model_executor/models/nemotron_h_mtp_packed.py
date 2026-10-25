@@ -254,7 +254,8 @@ def packed_moe_up(x_ptr, SM, EX, BASE, RI, RAW, SSM, SEX, SBASE, SRI, SRAW,
                    ids_ptr,h_ptr,I,K,stride_we,stride_wn,stride_wsn,gate_ptr,
                    TOPK:tl.constexpr,BN:tl.constexpr,BK:tl.constexpr,EVICT:tl.constexpr,
                    GATED:tl.constexpr=False, launch_pdl:tl.constexpr=False,
-                   WN:tl.constexpr=2, WORD:tl.constexpr=False, GROUP8:tl.constexpr=True):
+                   WN:tl.constexpr=2, WORD:tl.constexpr=False, GROUP8:tl.constexpr=True,
+                   K2:tl.constexpr=0, K3:tl.constexpr=0, K4:tl.constexpr=0):
     if launch_pdl:
         pdl_prologue()
     # WN warps along N, 4 along K: the K layout (8 x 32 x 4), and with it every
@@ -276,6 +277,18 @@ def packed_moe_up(x_ptr, SM, EX, BASE, RI, RAW, SSM, SEX, SBASE, SRI, SRAW,
             # Stopped pass: store the zeros the masked loads would give, stream nothing.
             stopped_zero(h_ptr+j*I+offs_n,nmask,SliceLayout(1,layout),BN)
             return
+        if K2 > 0:
+            # Per-pass routed expert count: the first pass of a cycle (the draft
+            # loop not yet active, gate word 2) uses all TOPK slots; the next
+            # passes (gate word 1 = drafts kept so far) use the K2, K3 and K4
+            # highest-weight ones. A skipped slot writes zeros, so the down
+            # projection streams none of its rows.
+            if tl.load(gate_ptr+2)!=0:
+                kept=tl.load(gate_ptr+1)
+                k_pass=tl.where(kept<=1,K2,tl.where(kept==2,K3,K4))
+                if (j<TOPK)&(j>=k_pass):
+                    stopped_zero(h_ptr+j*I+offs_n,nmask,SliceLayout(1,layout),BN)
+                    return
     wn=nmask
     if j<TOPK:
         e=tl.load(ids_ptr+j).to(tl.int64)

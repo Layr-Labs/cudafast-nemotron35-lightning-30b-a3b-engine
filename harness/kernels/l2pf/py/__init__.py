@@ -65,6 +65,14 @@ def _load():
         lib.l2pf_prefetch3.restype = ctypes.c_int
     except AttributeError:
         pass  # Older library: retain the original per-range launch ABI.
+    try:
+        lib.l2pf_prefetch_slots2.argtypes = [ctypes.c_void_p, ctypes.c_longlong,
+                                             ctypes.c_void_p, ctypes.c_longlong, ctypes.c_size_t,
+                                             ctypes.c_void_p, ctypes.c_longlong, ctypes.c_size_t,
+                                             ctypes.c_int, ctypes.c_void_p]
+        lib.l2pf_prefetch_slots2.restype = ctypes.c_int
+    except AttributeError:
+        pass  # Older library: no slot-range prefetch.
     _lib = lib
     return lib
 
@@ -93,6 +101,34 @@ def prefetch(t: torch.Tensor | None, max_bytes: int = 0) -> bool:
     rc = _lib.l2pf_prefetch(st.data_ptr(), nbytes, CHUNK, side.cuda_stream)
     if rc != 0:
         raise RuntimeError(f"l2pf_prefetch failed: {rc}")
+    return True
+
+
+# MoE layer name -> the following Mamba mixer, whose spec-decode ring and lazy-anchor
+# tag word the MoE window prefetches (filled by the model). L2PF_SSM_RING=0 disables.
+AHEAD_SSM: dict[str, torch.nn.Module] = {}
+SSM_RING = os.environ.get("L2PF_SSM_RING", "1") != "0"
+
+
+def prefetch_slots2(t: torch.Tensor, slot0: torch.Tensor, off0: int, bytes0: int,
+                    slot1: torch.Tensor, off1: int, bytes1: int) -> bool:
+    """Queue L2 prefetches of [off, off + bytes) inside slot slot0[0] and slot1[0] of t
+    (dim 0 = slot) on the side stream; the slot numbers are device int32 scalars read by
+    the kernel. Returns whether one was queued."""
+    fn = getattr(_lib, "l2pf_prefetch_slots2", None) if _lib is not None else None
+    if (not ENABLED or fn is None or t is None or not t.is_cuda or t.dim() < 1
+            or slot0.dtype != torch.int32 or slot1.dtype != torch.int32):
+        return False
+    stride = t.stride(0) * t.element_size()
+    if t.data_ptr() % 16 or stride % 16:
+        return False
+    main = torch.cuda.current_stream(t.device)
+    side = _side_stream(t.device)
+    side.wait_stream(main)
+    rc = fn(t.data_ptr(), stride, slot0.data_ptr(), off0, bytes0, slot1.data_ptr(), off1, bytes1,
+            CHUNK, side.cuda_stream)
+    if rc != 0:
+        raise RuntimeError(f"l2pf_prefetch_slots2 failed: {rc}")
     return True
 
 

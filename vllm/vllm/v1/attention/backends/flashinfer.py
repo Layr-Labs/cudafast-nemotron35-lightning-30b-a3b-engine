@@ -9,7 +9,11 @@ from typing import ClassVar
 
 import os
 
+import functools
+
 import numpy as np
+
+_FI_FAST_SPEC_PLAN = os.environ.get("VLLM_FI_FAST_SPEC_PLAN", "1") == "1"
 
 _FI_PAGE_TRIM = os.environ.get("VLLM_FI_PAGE_COPY_TRIM", "1") == "1"
 import torch
@@ -19,6 +23,11 @@ from flashinfer import (
     BatchPrefillWithRaggedKVCacheWrapper,
     MultiLevelCascadeAttentionWrapper,
 )
+try:
+    from flashinfer.page import get_seq_lens
+except ImportError:
+    get_seq_lens = None
+    _FI_FAST_SPEC_PLAN = False
 from flashinfer.decode import fast_decode_plan, trtllm_batch_decode_with_kv_cache
 from flashinfer.prefill import trtllm_batch_context_with_kv_cache
 from flashinfer.utils import FP4Tensor
@@ -1079,6 +1088,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 paged_kv_last_page_len_buf=self.paged_kv_last_page_len.gpu[:num_reqs],
                 backend="auto",
             )
+            wrapper._vllm_spec_cg = key != 496
             self._spec_prefill_wrappers_cudagraph[key] = wrapper
         return wrapper
 
@@ -1530,7 +1540,17 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     o_dtype = (
                         FP8_DTYPE if self.is_kvcache_nvfp4 else self.model_config.dtype
                     )
-                    prefill_wrapper.plan(
+                    _plan = prefill_wrapper.plan
+                    if (
+                        _FI_FAST_SPEC_PLAN
+                        and not fresh_496
+                        and prefill_start == 0
+                        and getattr(prefill_wrapper, "_vllm_spec_cg", False)
+                    ):
+                        _plan = functools.partial(
+                            _fast_plan_spec_prefill, prefill_wrapper, self
+                        )
+                    _plan(
                         qo_indptr=qo_indptr_prefill_cpu,
                         paged_kv_indptr=paged_kv_indptr_prefill_cpu,
                         paged_kv_indices=paged_kv_indices,
@@ -2167,6 +2187,11 @@ class FlashInferImpl(AttentionImpl):
                 assert isinstance(attn_metadata.decode, FIDecode)
                 decode_wrapper = attn_metadata.decode.wrapper
                 assert decode_wrapper is not None
+                # LOCAL PATCH (cudafast-nemotron35): a draft step's plan copies may
+                # run on the proposer's side stream; wait for them before the run.
+                plan_ready = getattr(attn_metadata, "plan_ready_event", None)
+                if plan_ready is not None:
+                    torch.cuda.current_stream().wait_event(plan_ready)
                 assert decode_wrapper._window_left == self.window_left
                 assert decode_wrapper._logits_soft_cap == (self.logits_soft_cap or 0.0)
                 assert decode_wrapper._sm_scale == self.scale
@@ -2393,6 +2418,97 @@ class FlashInferImpl(AttentionImpl):
                 layer._k_scale,
                 layer._v_scale,
             )
+
+
+def _fast_plan_spec_prefill(wrapper, builder, **kw) -> None:
+    try:
+        _fast_plan_spec_prefill_impl(wrapper, builder, **kw)
+    except (AttributeError, TypeError, KeyError, ValueError, RuntimeError):
+        wrapper._vllm_fast_const = None
+        wrapper.plan(**kw)
+
+
+def _fast_plan_spec_prefill_impl(wrapper, builder, **kw) -> None:
+    """plan() for a CUDA-graph spec prefill wrapper whose index buffers are
+    the builder's persistent ones (see module patch note in the header of
+    _FI_FAST_SPEC_PLAN). Falls back to the full plan when anything differs."""
+    qo = kw["qo_indptr"]
+    indptr = kw["paged_kv_indptr"]
+    indices = kw["paged_kv_indices"]
+    lpl = kw["paged_kv_last_page_len"]
+    const = tuple(
+        (k, str(v)) for k, v in sorted(kw.items())
+        if k not in ("qo_indptr", "paged_kv_indptr", "paged_kv_indices",
+                     "paged_kv_last_page_len")
+    )
+    n = indptr.shape[0]
+    ok = (
+        getattr(wrapper, "_vllm_fast_const", None) == const
+        and wrapper._backend == "fa2"
+        and wrapper._cached_module is not None
+        and wrapper._custom_mask_buf is None
+        and qo.device.type == "cpu"
+        and indptr.device.type == "cpu"
+        and lpl.device.type == "cpu"
+        and wrapper._vllm_fast_qo is not None
+        and torch.equal(wrapper._vllm_fast_qo, qo)
+        and wrapper._paged_kv_indptr_buf.data_ptr()
+        == builder.paged_kv_indptr.gpu.data_ptr()
+        and wrapper._paged_kv_indptr_buf.shape[0] == n
+        and wrapper._paged_kv_last_page_len_buf.data_ptr()
+        == builder.paged_kv_last_page_len.gpu.data_ptr()
+        and wrapper._paged_kv_last_page_len_buf.shape[0] == lpl.shape[0]
+        and wrapper._paged_kv_indices_buf.data_ptr() == indices.data_ptr()
+        and len(indices) <= len(wrapper._paged_kv_indices_buf)
+        and wrapper._fixed_batch_size == n - 1
+    )
+    if ok:
+        total_num_rows = int(qo[-1])
+        ok = (
+            wrapper._max_total_num_rows is not None
+            and total_num_rows <= wrapper._max_total_num_rows
+        )
+    if not ok:
+        wrapper.plan(**kw)
+        wrapper._vllm_fast_const = const
+        wrapper._vllm_fast_qo = qo.clone()
+        return
+    page_size = kw["page_size"]
+    wrapper._qo_indptr_last = total_num_rows
+    wrapper._max_q_len = max(qo[1:] - qo[:-1]).item()
+    kv_lens = get_seq_lens(indptr, lpl, page_size)
+    nk = len(kv_lens)
+    if nk > wrapper._kv_lens_buffer.shape[0]:
+        wrapper.plan(**kw)
+        return
+    wrapper._kv_lens_buffer[:nk].copy_(kv_lens, non_blocking=True)
+    wrapper._max_kv_len = max(kv_lens).item()
+    fixed_split_size = kw.get("fixed_split_size")
+    head_dim_qk = kw["head_dim_qk"]
+    head_dim_vo = kw.get("head_dim_vo") or head_dim_qk
+    with torch.cuda.device(wrapper.device):
+        wrapper._plan_info = wrapper._cached_module.plan(
+            wrapper._float_workspace_buffer,
+            wrapper._int_workspace_buffer,
+            wrapper._pin_memory_int_workspace_buffer,
+            qo,
+            indptr,
+            kv_lens,
+            wrapper._max_total_num_rows or total_num_rows,
+            n - 1,
+            kw["num_qo_heads"],
+            kw["num_kv_heads"],
+            page_size,
+            wrapper.is_cuda_graph_enabled,
+            head_dim_qk,
+            head_dim_vo,
+            kw["causal"],
+            kw["window_left"],
+            fixed_split_size or -1,
+            kw.get("disable_split_kv", False),
+            0,
+            0,
+        )
 
 
 def fast_plan_decode(

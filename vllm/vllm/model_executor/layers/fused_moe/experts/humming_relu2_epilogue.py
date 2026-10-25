@@ -221,6 +221,8 @@ def _w13_k128_enabled():
 
 
 def _w13_k128_params(lo, hi, params):
+    # Only the five-to-eight-token verify bucket. The K16 MMA chain stays
+    # serial and ascending; four adjacent K32 payloads share one pipeline wait.
     if (_w13_k128_enabled() and (lo, hi) == (24, 48)
             and params["block_shape"] == [16, 64, 32]
             and params["warp_shape"] == [16, 32, 32]

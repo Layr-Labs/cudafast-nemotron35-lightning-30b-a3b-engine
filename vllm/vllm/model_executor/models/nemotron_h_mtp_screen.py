@@ -44,9 +44,7 @@ except ImportError:
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 
-from .nemotron_h_mtp_kernels import (
-    DEPTH_CUMULATIVE, DEPTH_THETA, _gate_args, depth_gate_init, mtp_pdl,
-)
+from .nemotron_h_mtp_kernels import DEPTH_THETA, _gate_args, depth_gate_init, mtp_pdl
 
 logger = init_logger(__name__)
 
@@ -350,7 +348,6 @@ def _select_token(
     gate_ptr=None,
     GATED: tl.constexpr = False,
     THETA: tl.constexpr = 0.0,
-    CUM: tl.constexpr = False,
     launch_pdl: tl.constexpr = False,
     ref=None,
     TWO_LEVEL: tl.constexpr = False,
@@ -382,14 +379,11 @@ def _select_token(
     if GATED:
         # Depth gate (nemotron_h_mtp_kernels.py): while a draft loop is active and
         # not stopped, count this draft as kept, then stop the loop if its top-1
+        # probability over the candidate logits is below THETA (NaN never stops it).
         if (tl.load(gate_ptr + 2) != 0) & (tl.load(gate_ptr) == 0):
             tl.store(gate_ptr + 1, tl.load(gate_ptr + 1) + 1)
             denom = tl.sum(tl.where(i < N, tl.exp(v - best), 0.0), axis=0)
-            conf = 1.0 / denom
-            if CUM:
-                conf = tl.load(gate_ptr + 3).to(tl.float32, bitcast=True) * conf
-                tl.store(gate_ptr + 3, conf.to(tl.int32, bitcast=True))
-            if conf < THETA:
+            if 1.0 / denom < THETA:
                 tl.store(gate_ptr, 1)
 
 
@@ -694,7 +688,7 @@ class DraftHeadScreen:
                 self.cand_logits, coarse_idx, out, N=self.cand_logits.numel(),
                 BLOCK=triton.next_power_of_2(self.cand_logits.numel()),
                 gate_ptr=gate, GATED=gated and ok, THETA=DEPTH_THETA,
-                CUM=DEPTH_CUMULATIVE, launch_pdl=mtp_pdl(),
+                launch_pdl=mtp_pdl(),
                 ref=refined, TWO_LEVEL=True, CHUNK=SCREEN_CHUNK, CPER=CASCADE_PER,
                 SPER=SCREEN_PER,
             )
@@ -741,7 +735,7 @@ class DraftHeadScreen:
             self.cand_logits, cand, out, N=self.cand_logits.numel(),
             BLOCK=triton.next_power_of_2(self.cand_logits.numel()),
             gate_ptr=gate, GATED=gated and ok, THETA=DEPTH_THETA,
-            CUM=DEPTH_CUMULATIVE, launch_pdl=mtp_pdl(),
+            launch_pdl=mtp_pdl(),
         )
         return out
 

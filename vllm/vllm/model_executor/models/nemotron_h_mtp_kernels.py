@@ -68,12 +68,18 @@ def mtp_pdl() -> bool:
 # --------------------------------------------------------------------------- #
 # Confidence-gated draft depth
 # --------------------------------------------------------------------------- #
+# Once a draft's top-1 probability (the screen's token select, over its candidate
+# logits) falls below DEPTH_THETA, the cycle's remaining draft passes stream no
+# weights: the kernels below mask their weight loads with the gate's stop flag and
+# produce zeros. The kept drafts are counted on device; the proposer hands the count
+# to the verify (smallk verify rows: rows past the last kept draft reuse a kept row's
+# experts) and the sampler rejects every draft past it, so the emitted tokens are those
+# of a verify at the kept depth, i.e. the target's. The stop flag is only ever set
+# inside the proposer's draft loop. MTP_DEPTH_GATE=0 disables.
 DEPTH_GATE = os.environ.get("MTP_DEPTH_GATE", "1") != "0"
 DEPTH_THETA = float(os.environ.get("MTP_DEPTH_THETA", "0.5"))
-DEPTH_CUMULATIVE = os.environ.get("MTP_DEPTH_CUMULATIVE", "1") != "0"
-GATE_PROD_ONE = 0x3F800000
-_GATE: torch.Tensor | None = None
-_GATE_START: torch.Tensor | None = None
+_GATE: torch.Tensor | None = None  # int32 [stop, kept drafts, draft loop active]
+_GATE_START: torch.Tensor | None = None  # [0, 0, 1] on the gate's device (no H2D per cycle)
 
 
 def depth_gate_init(device: torch.device) -> torch.Tensor | None:
@@ -81,10 +87,8 @@ def depth_gate_init(device: torch.device) -> torch.Tensor | None:
     and asks smallk for its verify-row buffer."""
     global _GATE, _GATE_START
     if DEPTH_GATE and _GATE is None and device.type == "cuda":
-        _GATE = torch.zeros(4, dtype=torch.int32, device=device)
-        _GATE_START = torch.tensor(
-            [0, 0, 1, GATE_PROD_ONE], dtype=torch.int32, device=device
-        )
+        _GATE = torch.zeros(3, dtype=torch.int32, device=device)
+        _GATE_START = torch.tensor([0, 0, 1], dtype=torch.int32, device=device)
         try:
             import smallk
 
@@ -140,7 +144,7 @@ def depth_gate_end(gate: torch.Tensor) -> None:
     vrows = smallk.live_verify_rows(gate.device) if smallk is not None else None
     if (
         _GATE_END_FUSED and gate.is_cuda and gate.dtype == torch.int32
-        and gate.numel() == 4 and gate.is_contiguous()
+        and gate.numel() == 3 and gate.is_contiguous()
         and (vrows is None or (
             vrows.is_cuda and vrows.device == gate.device
             and vrows.dtype == torch.int32 and vrows.numel() == 1

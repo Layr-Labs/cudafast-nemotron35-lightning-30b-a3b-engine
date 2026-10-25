@@ -297,7 +297,7 @@ def prepare(p):
             p._slot_mapping_buffer[:padded].fill_(-1)
             slot = (((length - 1) // p.block_size) % 2) * p.block_size + (length - 1) % p.block_size
             p._slot_mapping_buffer[:1].fill_(slot)
-            gate.copy_(torch.tensor([1 if case == 2 else 0, 1, 1, kernels.GATE_PROD_ONE],
+            gate.copy_(torch.tensor([1 if case == 2 else 0, 1, 1],
                                     device=p.device, dtype=torch.int32))
             p.model.set_moe_row_src(padded, row_zero)
             common = common_for(length)

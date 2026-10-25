@@ -5797,17 +5797,6 @@ class GPUModelRunner(
                         self.drafter.set_eplb_state(self.eplb_state)
                         eplb_models += 1
 
-                # Transparent immutable-weight backing after target/draft
-                # packing, before engine compilation and graph capture.
-                try:
-                    import cmp2 as _cmp2
-                except ImportError:
-                    logger.info("CMP2 compressed=none reason=allocator_unavailable")
-                else:
-                    _cmp2.prepare(
-                        (self.model, getattr(getattr(self, "drafter", None), "model", None))
-                    )
-
                 self._setup_eagle3_aux_hidden_state_outputs()
 
                 # Resolve the MoE model, unwrapping VLM wrappers if needed.
@@ -8160,6 +8149,8 @@ class GPUModelRunner(
             kv_cache_config, kernel_block_sizes
         )
 
+        # Real cache binding precedes any optional private admission. Profiling
+        # and every rebind explicitly reset the decision before graph capture.
         for layer in self.compilation_config.static_forward_context.values():
             prepare_pipeline = getattr(layer, "prepare_spec_replay_pipeline", None)
             if prepare_pipeline is not None:

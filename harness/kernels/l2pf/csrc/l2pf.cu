@@ -57,6 +57,10 @@ __global__ void prefetch_slots2_kernel(const uint8_t* __restrict__ base, long lo
     if (n) asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" :: "l"(p + off), "r"(n));
   }
 }
+// The checkpointed SSM anchor a lazy spec-decode verify will load first (mamba_ssm_spec_replay
+// LAZY): checkpoint k = max(pos0 - L, 0) / period lives in slot 0 (even k) or slot 2 (odd k), where
+// L is the int32 prompt-length word at tag_off in slot 0 and pos0 = seq_lens[0] - (qsl[1] - qsl[0]).
+// Everything is read on the device, so a CUDA graph follows the request.
 __global__ void prefetch_anchor_kernel(const uint8_t* __restrict__ base, long long slot_stride,
                                        const int* __restrict__ slots, long long slot_col_stride,
                                        const int* __restrict__ seq_lens, const int* __restrict__ qsl,

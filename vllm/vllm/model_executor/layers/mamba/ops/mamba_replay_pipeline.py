@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Remote-boot qualification of a raw-input replay software pipeline.
 
 No additional cache is stored. Full guarded backing, both checkpoint slots,
@@ -64,6 +65,7 @@ def _timing(rp, states, x, dt, A, B, C, D, bias, table, accepted, cu, seq,
         graphs.append(graph)
     torch.cuda.synchronize(dev)
     ratios, totals = [], [[], []]
+    # seq_len=5 => pos0=seq-5; prompt37 => k_last=0 for these residues.
     for replay, prefix in ((0, 1), (1, 5), (4, 3), (9, 5), (14, 1), (19, 5)):
         seq.fill_(37 + replay + 5)
         rows.fill_(prefix)
@@ -112,6 +114,7 @@ def prepare(state, dtype, A, bias, D, ring_len, is_blackwell):
             return False
         from . import mamba_ssm_spec_replay as rp
         stride, dev = state.stride(0), state.device
+        # Entire private physical stride plus guards; no live state values read.
         length = 7 * stride + 16
         shape, strides = (7, 64, 64, 128), (stride, 8192, 128, 1)
         advances = (1, 1, 3, 0, 2, 5, 1, 4, 2, 0, 5, 3)
@@ -178,6 +181,7 @@ def prepare(state, dtype, A, bias, D, ring_len, is_blackwell):
                         advance = min(prefix, advances[cycle % len(advances)])
                         pos += advance
                         previous_advance = advance
+                    # Include no-work and NULL-slot behavior, comparing all bytes.
                     for empty in (True, False):
                         cu[1] = 0 if empty else 5
                         table.zero_()

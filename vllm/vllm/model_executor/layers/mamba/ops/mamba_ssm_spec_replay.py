@@ -120,6 +120,10 @@ def prefill_tag_view(state: torch.Tensor) -> torch.Tensor | None:
     slot_elems = state.shape[1] * state.shape[2] * state.shape[3]
     if state.stride(0) < slot_elems + 1 or state.stride(1) != state.shape[2] * state.shape[3]:
         return None
+    # The last slot's word must also lie inside the tensor's storage.
+    end = state.storage_offset() + (state.shape[0] - 1) * state.stride(0) + slot_elems + 1
+    if end * state.element_size() > state.untyped_storage().nbytes():
+        return None
     return torch.as_strided(
         state.view(torch.int32), (state.shape[0],), (state.stride(0),),
         state.storage_offset() + slot_elems,
@@ -348,11 +352,16 @@ def _selective_scan_update_spec_replay_kernel(
         D_ptrs = D_ptr + offs_m * stride_D_dim
 
     if PIPELINED:
+        # Loaded weights are immutable for the complete invocation. Hoist them
+        # without changing the update expression or the reduction layout.
         invariant_A = tl.load(A_ptr).to(tl.float32)
         if HAS_DT_BIAS:
             invariant_bias = tl.load(dt_bias_ptr).to(tl.float32)
         if HAS_D:
             invariant_D = tl.load(D_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
+        # Normalize the circular address once, then advance by add/select. The
+        # original modulo formula is retained for the first (possibly negative)
+        # absolute position. All subsequent positions stay in [0, rl).
         rpos = ((pos0 - num_replay) % rl + rl) % rl
         live = ring_ok & (num_replay > 0)
         current_x = tl.load(ring_x_base + rpos * ring_stride_x + offs_m,
@@ -364,6 +373,8 @@ def _selective_scan_update_spec_replay_kernel(
         for i_r in range(num_replay):
             next_pos = tl.where(rpos + 1 < rl, rpos + 1, 0)
             next_live = ring_ok & (i_r + 1 < num_replay)
+            # Issue the next raw input loads before this iteration's dependent
+            # scalar math and FP32 recurrence. No store occurs during replay.
             next_x = tl.load(ring_x_base + next_pos * ring_stride_x + offs_m,
                              mask=(offs_m < dim) & next_live, other=0.0).to(tl.float32)
             next_dt = tl.load(ring_dt_base + next_pos * ring_stride_dt,

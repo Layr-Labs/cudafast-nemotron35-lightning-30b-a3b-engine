@@ -864,6 +864,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         )  # Extra buffer for mutable paged_kv_indptr.cpu in cuda graph mode
         self.paged_kv_indices = self._make_buffer(max_num_pages)
         self.paged_kv_last_page_len = self._make_buffer(max_num_reqs)
+        # LOCAL PATCH (cudafast-nemotron35 gaps): pinned-staging ring, see
+        # gaps_enable_staging_ring. None: one staging set (stock).
+        self._gaps_ring: list[tuple] | None = None
+        self._gaps_slot = 0
+        # Set by the drafter: waits until the previous build's copies ran.
+        self._gaps_wait_prev = None
 
         # Uniform spec-decode verify batches under FULL CUDA graphs: one
         # CUDA-graph-mode native prefill wrapper per request count.
@@ -917,6 +923,77 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         if cache_dtype == "nvfp4":
             return FlashInferBackend.get_dtype_for_flashinfer("fp8_e4m3")
         return self.kv_cache_spec.dtype
+
+    # LOCAL PATCH (cudafast-nemotron35 gaps): pinned-staging ring for the
+    # drafter. Each build stages paged_kv_indptr / last_page_len and the
+    # wrapper's plan data in pinned host memory and copies them to the GPU
+    # asynchronously; the next build may only rewrite that memory once those
+    # copies have run, so the drafter waited for the GPU before planning its
+    # next step. With one staging set per draft index the next step writes
+    # other memory. The device buffers, the values and the copies are the
+    # same; only the host source addresses differ.
+    def gaps_enable_staging_ring(self, n: int) -> bool:
+        if self._gaps_ring is not None:
+            return len(self._gaps_ring) == n
+        if not self.pin_memory or n < 2:
+            return False
+        slots = [
+            (
+                self.paged_kv_indptr.cpu,
+                self.paged_kv_indptr.np,
+                self.paged_kv_indptr_cpu_buffer,
+                self.paged_kv_last_page_len.cpu,
+                self.paged_kv_last_page_len.np,
+            )
+        ]
+        for _ in range(n - 1):
+            ic = torch.zeros_like(self.paged_kv_indptr.cpu, pin_memory=True)
+            sb = torch.zeros_like(self.paged_kv_indptr_cpu_buffer, pin_memory=True)
+            lc = torch.zeros_like(self.paged_kv_last_page_len.cpu, pin_memory=True)
+            slots.append((ic, ic.numpy(), sb, lc, lc.numpy()))
+        self._gaps_ring = slots
+        self._gaps_slot = 0
+        return True
+
+    def gaps_select_slot(self, slot: int) -> None:
+        """Points the host staging at ring slot `slot`, carrying the current
+        contents over (the caller has waited until the slot's previous copies
+        ran)."""
+        ring = self._gaps_ring
+        assert ring is not None
+        if slot != self._gaps_slot:
+            cur, nxt = ring[self._gaps_slot], ring[slot]
+            nxt[0].copy_(cur[0])
+            nxt[2].copy_(cur[2])
+            nxt[3].copy_(cur[3])
+            self.paged_kv_indptr.cpu, self.paged_kv_indptr.np = nxt[0], nxt[1]
+            self.paged_kv_indptr_cpu_buffer = nxt[2]
+            self.paged_kv_last_page_len.cpu = nxt[3]
+            self.paged_kv_last_page_len.np = nxt[4]
+            self._gaps_slot = slot
+
+    def _gaps_wrapper(self, wrapper):
+        """The wrapper with its pinned plan workspace set to the ring slot's."""
+        if self._gaps_ring is None:
+            return wrapper
+        ring = getattr(wrapper, "_gaps_pin_ring", None)
+        if ring is None:
+            orig = getattr(wrapper, "_pin_memory_int_workspace_buffer", None)
+            if not isinstance(orig, torch.Tensor) or not orig.is_pinned():
+                # not ringable: order its staging writes as before
+                self._gaps_wait()
+                return wrapper
+            ring = [orig] + [
+                torch.zeros_like(orig, pin_memory=True).copy_(orig)
+                for _ in range(len(self._gaps_ring) - 1)
+            ]
+            wrapper._gaps_pin_ring = ring
+        wrapper._pin_memory_int_workspace_buffer = ring[self._gaps_slot]
+        return wrapper
+
+    def _gaps_wait(self) -> None:
+        if self._gaps_ring is not None and self._gaps_wait_prev is not None:
+            self._gaps_wait_prev()
 
     def _make_buffer(
         self, *size: int | torch.SymInt, dtype: torch.dtype = torch.int32
@@ -1385,6 +1462,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             paged_kv_last_page_len_cpu = self.paged_kv_last_page_len.cpu[:num_reqs]
 
             attn_metadata.cascade_wrapper = self._get_cascade_wrapper()
+            self._gaps_wait()
             # Cascade attention must use the same q dtype for prefill and decode
             # because it does not support FP8 kv-cache or FP8 query yet.
             assert self.q_data_type_prefill == self.q_data_type_decode
@@ -1467,7 +1545,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 if fresh_496:
                     # Use the original native plan: graph-mode planning adds
                     # merge kernels. Keep its buffer addresses stable below.
-                    prefill_wrapper = self._get_spec_prefill_wrapper(496)
+                    prefill_wrapper = self._gaps_wrapper(
+                        self._get_spec_prefill_wrapper(496)
+                    )
                 elif (
                     self._spec_prefill_cudagraph
                     and attn_metadata.causal
@@ -1476,11 +1556,14 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     and num_prefill_tokens == num_prefills * self._spec_q_len
                     and common_attn_metadata.max_query_len == self._spec_q_len
                 ):
-                    prefill_wrapper = self._get_spec_prefill_wrapper(num_prefills)
+                    prefill_wrapper = self._gaps_wrapper(
+                        self._get_spec_prefill_wrapper(num_prefills)
+                    )
                 else:
                     prefill_wrapper = self._get_prefill_wrapper(
                         causal=attn_metadata.causal
                     )
+                    prefill_wrapper = self._gaps_wrapper(prefill_wrapper)
                 # Slicing CPU buffers that are only needed for FI native prefills
                 paged_kv_last_page_len_prefill_cpu = self.paged_kv_last_page_len.cpu[
                     prefill_start:num_reqs
@@ -1576,8 +1659,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 )
                 num_input_tokens = num_decode_tokens
 
-                decode_wrapper = self._get_decode_wrapper(
-                    num_input_tokens, use_cudagraph
+                decode_wrapper = self._gaps_wrapper(
+                    self._get_decode_wrapper(num_input_tokens, use_cudagraph)
                 )
                 # Use the persistent buffer with padding length,
                 # instead of the same address but chunked version

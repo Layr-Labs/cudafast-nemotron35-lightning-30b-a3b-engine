@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+import os
 import sys
 from importlib.util import find_spec
 from typing import TYPE_CHECKING, Any, cast
@@ -765,7 +766,7 @@ class SpecDecodeBaseProposer:
             if not self.constant_draft_positions or token_index == 0:
                 # A plan rewrites pinned host buffers that the previous plan's
                 # H2D copies read; wait until those copies have run.
-                if order_draft_plans and token_index > 0:
+                if order_draft_plans and token_index > 0 and not self._gaps_ring_slots():
                     assert self._draft_plan_event is not None
                     self._draft_plan_event.synchronize()
                 _, per_layer_attn_metadata = (
@@ -1118,7 +1119,18 @@ class SpecDecodeBaseProposer:
     ) -> tuple[list[object], dict[str, object]]:
         # LOCAL PATCH (cudafast-nemotron35): hostfast staging guard.
         guard = self._hostfast_staging_guard()
-        if guard is not None:
+        # LOCAL PATCH (cudafast-nemotron35 gaps): with a staging ring each draft
+        # index writes its own pinned host memory, so the build waits only for
+        # that slot's previous copies (one cycle old) instead of the previous
+        # build's (one draft step old).
+        slots = self._gaps_ring_slots() if guard is not None else 0
+        if slots:
+            slot = draft_index % slots
+            slot_guard = self._gaps_slot_guards[slot]
+            slot_guard.before()
+            for attn_group in self.draft_attn_groups:
+                attn_group.get_metadata_builder().gaps_select_slot(slot)
+        elif guard is not None:
             guard.before()
         per_group_attn_metadata: list[object] = []
         per_layer_attn_metadata: dict[str, object] = {}
@@ -1131,7 +1143,39 @@ class SpecDecodeBaseProposer:
                 per_layer_attn_metadata[layer_name] = attn_metadata
         if guard is not None:
             guard.after()
+        if slots:
+            slot_guard.after()
         return per_group_attn_metadata, per_layer_attn_metadata
+
+    # LOCAL PATCH (cudafast-nemotron35 gaps): staging ring (see flashinfer.py
+    # gaps_enable_staging_ring). VLLM_GAPS_STAGING_RING=0 restores the waits.
+    _gaps_ring_n: int | None = None
+    _gaps_slot_guards: list = []
+
+    def _gaps_ring_slots(self) -> int:
+        if self._gaps_ring_n is None:
+            n = 0
+            want = self.num_speculative_tokens
+            builders = [g.get_metadata_builder() for g in self.draft_attn_groups]
+            if (
+                os.environ.get("VLLM_GAPS_STAGING_RING", "1") != "0"
+                and want >= 2
+                and not self.parallel_drafting
+                and builders
+                and all(hasattr(b, "gaps_enable_staging_ring") for b in builders)
+                and all(b.gaps_enable_staging_ring(want) for b in builders)
+            ):
+                n = want
+                self._gaps_slot_guards = [hostfast.StagingGuard() for _ in range(n)]
+                guard = self._hostfast_staging_guard()
+                for b in builders:
+                    # a wrapper the ring cannot cover waits for the last build
+                    b._gaps_wait_prev = guard.before if guard is not None else None
+                logger.info("drafter staging ring: %d slots", n)
+            self._gaps_ring_n = n
+        if torch.cuda.is_current_stream_capturing():
+            return 0
+        return self._gaps_ring_n
 
     # LOCAL PATCH (cudafast-nemotron35): hostfast S2 (v1/worker/hostfast.py).
     # Set by the model runner before propose(): per request, the rejected

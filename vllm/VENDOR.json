@@ -210,6 +210,18 @@
     {
       "file": "harness/kernels/l2pf/py/__init__.py",
       "why": "Carry useful04706ad7-c4e8-44b9-b8ba-77f14d8b8adf MoE-window immutable prefetch default6to12MB. Its complete official2.19195352041462 is within0.1% of fulla484, but only budget mechanism is combined here on higherfulla484. Prefix pair/SSM combination unverified."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp.py, nemotron_h_mtp_kernels.py, nemotron_h_mtp_packed.py",
+      "why": "ENTIRE highestcompleteAD5 plus selected DAF0/732 lossless12bit BF16 drafter storage for QKV/routedexpertup/sharedup only. Newshapeeligibility omits bypassed full eh_proj (originalprojectedembedding eh_w_hkeep route preserved). Exhaustivedecodebitcheck and actualweightkernel admission at officialremoteboot before releasingweights; PDLoffpackedkernels. No newheadpolicy/CUB/segments/hostpipeline and nogainclaim. All executionofficialremote."
+    },
+    {
+      "file": "vllm/v1/attention/backends/flashinfer.py, vllm/v1/spec_decode/llm_base_proposer.py",
+      "why": "Select useful pending9f969dcb-0755-4fa8-a97e-850fdaf50404 per-draft pinnedplan staging ring, exactpublic candidate972b53793637eded3e7004de9dc4f2df67158d1a twofiles. Explicit wrapperselection handles lazilycreated decode/specprefill/nativeprefill; fallback waits previousplan for nonringable workspace. No pending PZ333 carried; wholeAD5theta0.4/PZ322 remains. This newring+losslesspack compositionunverified; no localnumbers treatedofficial."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_packed.py:load_packed",
+      "why": "Select ONLY own d53d22ff-7e89-45da-8923-37dcced5dc56 metadata-first rawescape bypass; RI first, codeplanes maskedrawid<0, same RAWbits/decode/gates/math. No EHhalf/compactdown/PDL/screenfolds, whole d53negative excluded. New compositionuntested."
     }
   ]
 }

@@ -47,6 +47,8 @@ _GATE_PREFETCH = os.environ.get("L2PF_GATE", "1") != "0"
 
 _lib = None
 _side: dict[int, torch.cuda.Stream] = {}
+_TILE_PREFETCH = os.environ.get('L2PF_CODEC_TILES', '1') != '0'
+_TILE_LAYOUTS = {}  # immutable producer-verified weight owners, never activations
 
 
 def _load():
@@ -65,6 +67,13 @@ def _load():
         lib.l2pf_prefetch3.restype = ctypes.c_int
     except AttributeError:
         pass  # Older library: retain the original per-range launch ABI.
+    try:
+        lib.l2pf_prefetch_tiles_v2.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
+            ctypes.c_void_p] + [ctypes.c_int] * 7 + [ctypes.c_size_t,
+            ctypes.c_int, ctypes.c_void_p]
+        lib.l2pf_prefetch_tiles_v2.restype = ctypes.c_int
+    except AttributeError:
+        pass  # Optional ABI absent: the existing contiguous policy is retained.
     _lib = lib
     return lib
 
@@ -157,6 +166,81 @@ def prefetch_many(ranges) -> bool:
     rc = fused(*args, CHUNK, side.cuda_stream)
     if rc != 0:
         raise RuntimeError(f"l2pf_prefetch3 failed: {rc}")
+    return True
+
+
+def register_fp8_tiles(tensor, n: int, k: int, codec: int) -> None:
+    """Only called by the producer AFTER full native decode-byte admission.
+
+    Register the actual uniform six/seven-bit output buffer, not a reference
+    whose bytes the active projection does not consume. No request data exists.
+    """
+    if not _TILE_PREFETCH or (n, k) != (2688, 4096) or codec not in (6, 7):
+        return
+    if (not tensor.is_cuda or tensor.dtype != torch.uint8 or tensor.ndim != 2
+            or not tensor.is_contiguous() or tensor.shape[0] != 84
+            or tensor.storage_offset() != 0 or tensor.data_ptr() % 256):
+        return
+    c, main = k // 128, 3072 if codec == 6 else 3584
+    dictionary = 2048 if codec == 6 else 64
+    header = ((4*c+1)*2 + dictionary + 127) // 128 * 128
+    exc, stride = header + c*main, tensor.shape[1]
+    if (stride % 128 or stride < exc + 128 or stride >= 32*k
+            or tensor.untyped_storage().nbytes() != tensor.numel()):
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+    # Six chunks consume the first24 warp-chunks. Only load-time immutable
+    # header metadata is transferred to the host, never request values.
+    raw6 = (tensor[:, 48:50].contiguous().view(torch.int16).to(torch.int32) & 65535)
+    raw6_max = (int(raw6.max().item()) + 15) // 16 * 16
+    if raw6_max > stride - exc:
+        return
+    _TILE_LAYOUTS[(tensor.device.index, tensor.data_ptr())] = (
+        tensor, "fp8-uniform-v2", tuple(tensor.shape), tuple(tensor.stride()), codec,
+        header, main, exc, stride, raw6_max)
+
+
+def prefetch_output_tiles(weight, projection_budget: int, gate=None, reserved: int = 0) -> bool:
+    """Same budget, exact exception prefix per consumer; original fork/join.
+
+    Unknown layout, small budget, disabled policy or missing ABI selects the
+    old path before launching. A selected native launch failure is propagated.
+    """
+    fallback = ((gate, reserved), (weight, projection_budget))
+    if (not ENABLED or _lib is None or not _TILE_PREFETCH or weight is None
+            or not weight.is_cuda or projection_budget <= 0):
+        return prefetch_many(fallback)
+    fn = getattr(_lib, 'l2pf_prefetch_tiles_v2', None)
+    entry = _TILE_LAYOUTS.get((weight.device.index, weight.data_ptr()))
+    if (fn is None or entry is None or entry[1] != 'fp8-uniform-v2'
+            or tuple(weight.shape) != entry[2] or tuple(weight.stride()) != entry[3] or weight.dtype != torch.uint8
+            or weight.storage_offset() != 0 or not weight.is_contiguous()
+            or weight.untyped_storage().nbytes() != weight.numel()):
+        return prefetch_many(fallback)
+    _, _, _, _, codec, header, main_bytes, exc, stride, raw6_max = entry
+    tail = stride - exc
+    allowance = (int(projection_budget) // 84) // 128 * 128
+    if header + 6*main_bytes + raw6_max > allowance:
+        return prefetch_many(fallback)
+    gate_bytes, gate_ptr = 0, 0
+    if gate is not None and reserved > 0:
+        if not gate.is_cuda or gate.device != weight.device:
+            return prefetch_many(fallback)
+        storage = gate.untyped_storage()
+        gate_bytes = min(int(reserved), storage.nbytes()) // 16 * 16
+        gate_ptr = storage.data_ptr()
+    if (exc + tail != stride or tail % 128
+            or 84*allowance > projection_budget):
+        return prefetch_many(fallback)
+    main = torch.cuda.current_stream(weight.device)
+    side = _side_stream(weight.device)
+    side.wait_stream(main)
+    rc = fn(gate_ptr, gate_bytes, weight.data_ptr(), 84, stride, header, main_bytes,
+            exc, tail, allowance,
+            int(projection_budget) + max(int(reserved), 0), CHUNK, side.cuda_stream)
+    if rc:
+        raise RuntimeError(f'l2pf_prefetch_tiles failed: {rc}')
     return True
 
 

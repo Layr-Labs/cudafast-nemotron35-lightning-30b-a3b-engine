@@ -14,9 +14,16 @@ arch=${arch%%;*}
 arch=${arch// /}
 arch=${arch%+PTX}
 sm=${arch/./}
+rm -f "$out/libl2pf.so"
 "$nvcc" -O3 -std=c++17 -shared -Xcompiler -fPIC \
   -gencode "arch=compute_${sm},code=sm_${sm}" \
   -o "$out/libl2pf.so" "$here/csrc/l2pf.cu" 2>&1 | grep -v '^$' || true
+# Optional tile ABI may be omitted without dropping any original entry point.
+if ! test -f "$out/libl2pf.so"; then
+  "$nvcc" -O3 -std=c++17 -shared -Xcompiler -fPIC -DL2PF_NO_TILES \
+    -gencode "arch=compute_${sm},code=sm_${sm}" \
+    -o "$out/libl2pf.so" "$here/csrc/l2pf.cu" 2>&1 || true
+fi
 test -f "$out/libl2pf.so" || { echo "l2pf: build failed" >&2; exit 1; }
 cp "$here/py/__init__.py" "$out/__init__.py"
 echo "l2pf: built $out/libl2pf.so for sm_${sm}"

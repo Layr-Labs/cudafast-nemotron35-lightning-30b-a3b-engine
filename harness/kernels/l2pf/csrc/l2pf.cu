@@ -59,3 +59,56 @@ extern "C" int l2pf_prefetch3(const void* p0, size_t b0,
       (const uint8_t*)p2, b2, (uint32_t)chunk);
   return (int)cudaGetLastError();
 }
+
+#ifndef L2PF_NO_TILES
+namespace l2pf {
+__device__ __forceinline__ void hint_range(const uint8_t* p,size_t bytes,uint32_t chunk){
+ for(size_t off=0;off<bytes;off+=chunk){
+  uint32_t n=(uint32_t)((bytes-off<chunk?bytes-off:chunk)&~(size_t)15);
+  if(n)asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" :: "l"(p+off),"r"(n));
+ }
+}
+// One thread per consumer tile. Immutable verified u16 escape offsets identify
+// the exact raw prefix needed by each proposed number of whole main chunks.
+__global__ void prefetch_tiles_kernel(const uint8_t* gate,size_t gate_bytes,
+ const uint8_t* weight,int tiles,int stride,int header,int main_bytes,int exc,
+ int tail,int allowance,uint32_t chunk){
+ for(size_t off=(size_t)threadIdx.x*chunk;off<gate_bytes;off+=(size_t)blockDim.x*chunk){
+  uint32_t n=(uint32_t)((gate_bytes-off<chunk?gate_bytes-off:chunk)&~(size_t)15);
+  if(n)asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" :: "l"(gate+off),"r"(n));
+ }
+ int tile=threadIdx.x;
+ if(tile>=tiles)return;
+ const uint8_t* tb=weight+(size_t)tile*stride;
+ int chunks=(allowance-header)/main_bytes;
+ if(chunks>32)chunks=32;
+ for(;chunks>=6;--chunks){
+  int raw=((int)__ldg((const uint16_t*)tb+4*chunks)+15)&~15;
+  int prefix=header+chunks*main_bytes;
+  if(raw<=tail&&prefix<=exc&&prefix+raw<=allowance){
+   hint_range(tb,prefix,chunk);
+   hint_range(tb+exc,raw,chunk);
+   return;
+  }
+ }
+ // Producer admission establishes a fitting six-chunk prefix. If unexpected
+ // metadata does not fit, issue no weight hint rather than exceed its budget.
+}
+}
+extern "C" int l2pf_prefetch_tiles_v2(const void*gate,size_t gate_bytes,const void*weight,
+ int tiles,int stride,int header,int main_bytes,int exc,int tail,int allowance,
+ size_t total_budget,int chunk,void*stream){
+ bool layout=(header==384&&main_bytes==3584&&exc==115072)||
+             (header==2432&&main_bytes==3072&&exc==100736);
+ if(!layout||!weight||tiles!=84||stride<=exc||tail<0||tail>stride-exc||
+    header+6*main_bytes>allowance)return -1;
+ if(chunk<16||chunk>65536||chunk%16||stride%128||exc%128||tail%128||allowance%128||
+    reinterpret_cast<uintptr_t>(weight)%256||reinterpret_cast<uintptr_t>(gate)%16||
+    (gate_bytes&&!gate)||gate_bytes%16)return -1;
+ if(gate_bytes+(size_t)tiles*allowance>total_budget)return -1;
+ l2pf::prefetch_tiles_kernel<<<1,128,0,reinterpret_cast<cudaStream_t>(stream)>>>(
+  (const uint8_t*)gate,gate_bytes,(const uint8_t*)weight,tiles,stride,header,main_bytes,
+  exc,tail,allowance,(uint32_t)chunk);
+ return (int)cudaGetLastError();
+}
+#endif

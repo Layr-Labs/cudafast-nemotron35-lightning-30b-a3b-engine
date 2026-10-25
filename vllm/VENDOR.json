@@ -326,6 +326,14 @@
     {
       "file": "(composition)",
       "why": "e-man07 composition on dadon's record fc04335b-c894-41f9-b73b-aa9b5aac1fb5: ArthurOstapenko 0f958570-4fab-4ffd-8db5-c5a2c37a5439's tree byte for byte, plus jacklightChen b0d0b0b6's apk12 coherent-PDL attention files and i34-9 c3e16bbb's prefill files (pzskip, humming relu2 epilogue / nvsc / tuned_moe / zskip glue) and marlinx unit-major scales, each carried byte for byte from its author's tree. No new arithmetic by us."
+    },
+    {
+      "file": "harness/kernels/l2pf/{build.sh,csrc/l2pf.cu,py/__init__.py,README.md}; scaled_mm/fp8c.py; mamba_mixer2.py",
+      "why": "ENTIRE current highest bd384670-8de1-41eb-abbc-066d05ab3aee/6edbf54b049a287000bee9c930f3a4408d29a529 retained, including ring2/targetPDL/prefill/unitmajor methods. No D6 or olderwhole imported. NEW unsubmitted all-consumer header/main-prefix+whole-exception-tail cache prefetch for ACTUAL producer-verified uniform6/7-bit Mamba output pack. Material pending291505c5-5dce-4448-a2d9-3042e521c3c9 budgetdistribution idea, original0a731363-6416-4fb9-aa94-b6f5f6e8155e/04706ad7-c4e8-44b9-b8ba-77f14d8b8adf/da9a764c-a409-42fc-8bb1-45dd1afbb03e prefetch/routerwindow and422827d4-d094-4eb3-a0d6-cffb2b04b229/fc04335b-c894-41f9-b73b-aa9b5aac1fb5 codec layouts. Per-tile allowance reserves full exceptiontail then whole mainchunks; minimum6chunks, same totalrouter+projectionbudget, oneCTA128 samefork/join. Versioned strong producerowners and exact pointer/shape/stride/fullstorage guards; unknown/mixedbuffers originalcontiguous path. Nativealign/bounds/budget/request<=64KiB checks; optionaldisabledABIbuild fallback beforelaunch; productionerrorpropagates. No stores, MMA or numericalpath change. No local candidate execution; official validation required. Further new V2 improvement: load-time max actual raw offset after6mainchunks guaranteesminimumcoverage; each prefetchthread usesimmutableheader endingoffset to choose largest mainprefix+EXACTrequiredrawprefix withinperTileallowance. No full unused rawtailpadding/latertileexceptions fetched. V2 symbol/version preventoldABI mismatch. Atmost84allowance+originalgate bytes, no numerical store; remote-only execution."
+    },
+    {
+      "file": "harness/kernels/fp8c/csrc/fp8c.cu",
+      "why": "Material public pending4929b3f5-29ce-4a7c-93b5-f2f441fd4d29 idea independently implemented: forK4096outprojection only move future activation-slot refill after nextweight decode/refill. Same loadaddress/slot andc+RC consumption; original MMAs/ascendingK/scale/RN unchanged. K2688input keepsoldorder. No copied donor source, no author localtests represented as ours; whole combination officialremote unverified."
     }
   ]
 }

@@ -38,6 +38,15 @@ def prepare_weight(packed: torch.Tensor) -> torch.Tensor | None:
         return None
     if comp is None and fp8c.stats["rejected"] > rejected:
         logger.warning("fp8c: %s; this layer keeps fp8small", fp8c.stats["last_reason"])
+    if comp is not None:
+        # Existing native decoder already compared every actual encoded byte.
+        try:
+            import l2pf
+            register = getattr(l2pf, 'register_fp8_tiles', None)
+            if register is not None:
+                register(comp, *packed.shape, 7)
+        except Exception as exc:
+            logger.warning('optional FP8 prefetch layout unavailable (%r)', exc)
     return comp
 
 

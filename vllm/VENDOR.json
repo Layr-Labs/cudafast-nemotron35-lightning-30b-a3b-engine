@@ -302,6 +302,10 @@
     {
       "file": "model_executor/layers/fused_moe/experts/humming_nvsc.py (+ humming_relu2_epilogue.py forward_relu2, quantization/utils/humming_utils.py)",
       "why": "nvsc, default on: at load, a routed w13 layer whose FP8 E4M3 block scales take <= 64 distinct bytes keeps a 64-entry table plus a tile-major 6-bit index stream (load check decodes every byte back; otherwise the layer stays stock). For <= 8 tokens a derived ReLU2 humming kernel replaces only the two B-scale loaders (cp.async of 96 instead of 128 bytes per stage; shared->register decode to the identical uint32 of original E4M3 bytes), so dequantization, the K16 MMA chain and the epilogue are stock and the output is bit-identical. Prefill keeps the stock kernel and scale tensor (re-pointed into the same allocation). NVSC=0 restores current behaviour; compile/load failure logs once and uses stock."
+    },
+    {
+      "file": "harness/kernels/marlinx/py/__init__.py",
+      "why": "ArthurOstapenko 57e48c1a's exact loader-ring change for the target's 5-row shared-expert down projection, carried byte for byte onto dadon's fc04335b record (which does not include it). Measured by e-man07 on GB10 against fc04335b: +2.01% composite (decode +2.43%), identical token streams on all nine prompts. Official measurement #3 of this stack (same code)."
     }
   ]
 }

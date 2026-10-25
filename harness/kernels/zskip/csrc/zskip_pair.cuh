@@ -19,11 +19,13 @@ __device__ __forceinline__ uint4 ldg_u128(const void* p) {
 // HalfSkip (configs 114, 119): an 8-row half of a group (k 0..7 or 8..15) whose mask byte is zero
 // has keep01 or keep23 zero on every lane, so its A fragments are +0 whatever the weights; they
 // are not dequantised and the same MMAs take literal +0 there. m is the same on every lane.
-template <bool Fused, bool HalfSkip, int R = 3>
-__global__ void __launch_bounds__(32) down_pair_kernel(const Params p) {
-  constexpr int TPW = 2, WPC = 1, NB = 1;
-  static_assert(R == 2 || R == 3, "paired loader ring");
-  constexpr bool HALF = false;
+// Configs 160..165 change only the schedule: WPC warps per CTA share one fused prep (FastPrep: its
+// row loads issued together), TPW = 1 gives each warp one half of a "swap2" pair, R the ring depth.
+template <bool Fused, bool HalfSkip, int R = 3, int WPC = 1, int TPW = 2, bool FastPrep = false>
+__global__ void __launch_bounds__(WPC * 32) down_pair_kernel(const Params p) {
+  constexpr int NB = 1;
+  static_assert(R >= 2 && R <= 4, "paired loader ring");
+  constexpr bool HALF = TPW == 1;
   static_assert(TPW == 1 || TPW == 2, "tiles per warp");
   static_assert(NB >= 1 && NB <= 4, "n-blocks per warp");
   static_assert(!HALF || TPW == 1, "half pairs are single tiles");
@@ -40,7 +42,7 @@ __global__ void __launch_bounds__(32) down_pair_kernel(const Params p) {
 #ifndef ZSKIP_NO_FUSED
   extern __shared__ __align__(16) uint8_t smem_pair[];
   if constexpr (Fused) {
-    fused_prep<32, 16, 8>(p, mb, smem_pair);
+    fused_prep<WPC * 32, 16, 8, FastPrep>(p, mb, smem_pair);
     bi = smem_pair;
   }
 #endif

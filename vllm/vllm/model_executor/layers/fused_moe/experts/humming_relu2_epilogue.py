@@ -204,6 +204,10 @@ def forward_relu2(
         meta, compute_config, tuning_config,
         evict_first=(inputs.shape[0] == 496 and top_k == 6
                      and valid_shape_m == 2976
+                     and not (
+                         getattr(layer, "_prefill_repeated_expert_rows", False)
+                         and os.environ.get("HUMMING_PREFILL_REUSE_CACHE", "1") != "0"
+                     )
                      and os.environ.get("HUMMING_EVICT_FIRST", "1") != "0"),
     )
     return ops.launch_kernel(

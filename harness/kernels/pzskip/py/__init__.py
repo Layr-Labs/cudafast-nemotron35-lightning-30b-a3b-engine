@@ -12,7 +12,7 @@ import os
 
 import torch
 
-__all__ = ["LIB_PATH", "available", "down", "BM", "block_rows"]
+__all__ = ["LIB_PATH", "available", "down", "BM", "block_rows", "reuse_cache_config"]
 
 LIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "libpzskip.so")
 ENABLED = os.environ.get("PZSKIP", "1") != "0"
@@ -22,10 +22,11 @@ BM = 64
 _lib = None
 _load_error: str | None = None
 _scratch: dict = {}
+_reuse_cache_config = 0
 
 
 def _load():
-    global _lib, _load_error
+    global _lib, _load_error, _reuse_cache_config
     if _lib is not None or _load_error is not None:
         return _lib
     try:
@@ -35,6 +36,12 @@ def _load():
         lib.pzskip_down.restype = ctypes.c_int
         lib.pzskip_bi_bytes.argtypes = []
         lib.pzskip_bi_bytes.restype = ctypes.c_int
+        marker = getattr(lib, "pzskip_reuse_cache_config", None)
+        if marker is not None:
+            marker.argtypes = []
+            marker.restype = ctypes.c_int
+            if marker() == 334:
+                _reuse_cache_config = 334
         _lib = lib
     except OSError as exc:
         _load_error = str(exc)
@@ -43,6 +50,11 @@ def _load():
 
 def available() -> bool:
     return ENABLED and _load() is not None
+
+
+def reuse_cache_config() -> int:
+    """Stock PZ333 arithmetic with ordinary cache policy, or 0 for old libraries."""
+    return _reuse_cache_config if _load() is not None else 0
 
 
 def block_rows(wpc: int) -> int:

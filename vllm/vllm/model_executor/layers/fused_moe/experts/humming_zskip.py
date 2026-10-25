@@ -600,7 +600,21 @@ def _pz_down(
         or outputs.stride(0) % 2
     ):
         return False
-    bm = _pzskip.block_rows(PZ_CONFIG)
+    config = PZ_CONFIG
+    if (
+        config == 333
+        and num_tokens == 496
+        and top_k == TOP_K
+        and getattr(layer, "_prefill_repeated_expert_rows", False)
+        and os.environ.get("HUMMING_PREFILL_REUSE_CACHE", "1") != "0"
+    ):
+        # Rerouted prefill touches six experts repeatedly. Config 334 is
+        # exactly 333's existing stock specialization, without evict-first.
+        # No new configuration is sent to an older optional library.
+        supported = getattr(_pzskip, "reuse_cache_config", lambda: 0)()
+        if supported == 334:
+            config = supported
+    bm = _pzskip.block_rows(config)
     if bm == PZ_BLOCK_M:
         sorted_ids = moe_kwargs["sorted_ids"]
         expert_ids = moe_kwargs["expert_ids"]
@@ -609,5 +623,5 @@ def _pz_down(
         sorted_ids, expert_ids, ntp = _align(topk_ids, bm)
     else:
         return False
-    _pzskip.down(inputs, sorted_ids, expert_ids, ntp, layer.zskip_w2, outputs, wpc=PZ_CONFIG)
+    _pzskip.down(inputs, sorted_ids, expert_ids, ntp, layer.zskip_w2, outputs, wpc=config)
     return True

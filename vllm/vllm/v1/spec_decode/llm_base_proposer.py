@@ -620,7 +620,14 @@ class SpecDecodeBaseProposer:
                 slot_mapping_size, common_attn_metadata.slot_mapping
             ),
         ):
-            ret_hidden_states = self.model(**model_kwargs)
+            ret_hidden_states = None
+            if getattr(self, "_nemo_first", None) is not None:
+                from vllm.v1.spec_decode.nemotron_first_pass import maybe_run
+                ret_hidden_states = maybe_run(
+                    self, model_kwargs, per_layer_attn_metadata,
+                    num_input_tokens, batch_size)
+            if ret_hidden_states is None:
+                ret_hidden_states = self.model(**model_kwargs)
             if not self.model_returns_tuple():
                 last_hidden_states = ret_hidden_states
                 hidden_states = last_hidden_states
@@ -1967,6 +1974,8 @@ class SpecDecodeBaseProposer:
         if is_graph_capturing and not torch.cuda.is_current_stream_capturing():
             from vllm.v1.spec_decode.nemotron_full_step import prepare
             prepare(self)
+            from vllm.v1.spec_decode.nemotron_first_pass import prepare as prepare_first
+            prepare_first(self)
 
     def _get_eagle3_use_aux_hidden_state_from_config(self) -> bool:
         """

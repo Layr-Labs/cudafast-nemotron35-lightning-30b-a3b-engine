@@ -785,6 +785,9 @@ int pzskip_down(const void* A, long long lda, int shape_m, const int* sorted_ids
     case 323: return pzskip::launch_smem4<1, 4, 7, 2, 32>(p, st);   // 448 columns, 7 warps
     case 324: return pzskip::launch_smem4<1, 6, 3, 4, 32>(p, st);
     case 325: return pzskip::launch_smem4<2, 4, 3, 4, 32>(p, st);
+    // The same stock specialization as 333's fallback, selectable per call
+    // when captured prefill reuses only six experts across its row blocks.
+    case 334: return pzskip::launch_smem4<2, 3, 6, 3, 32, 0>(p, st);
     case 333: {
 #ifndef PZSKIP_NO_CACHE_POLICY
       const char* enabled = std::getenv("HUMMING_EVICT_PZ");
@@ -906,5 +909,8 @@ int pzskip_down(const void* A, long long lda, int shape_m, const int* sorted_ids
 }
 
 int pzskip_bi_bytes(void) { return pzskip::BI_BYTES; }
+
+// Optional feature marker: older libraries keep their original config 333.
+int pzskip_reuse_cache_config(void) { return 334; }
 
 }  // extern "C"

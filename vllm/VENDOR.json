@@ -278,6 +278,30 @@
     {
       "file": "harness/kernels/pzskip/csrc/pzskip.cu (+ build.sh)",
       "why": "PZ333 M496/top-6 only: HUMMING_EVICT_PZ defaults on and gives immutable packed B/BS cp.async loads L2 evict-first priority. Loader addresses, bytes, masks, K16 MMA order, negative-zero repair and formats are unchanged. HUMMING_EVICT_PZ=0 restores stock. Separate native template specialization; compile/load failure retains stock PZ333. Stacks independently with the routed-up evf policy; no decode change."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_pkmm.py, models/nemotron_h_mtp_packed.py; harness/kernels/l2pf; models/nemotron_h.py; layers/mamba/mamba_mixer2.py; layers/attention/attention.py",
+      "why": "jacklightChen da9a764c (from ercumentyildirim 297e3412), carried unchanged as in AvinashNayak27 2ff1c240: optional narrow packed MMA for the native MTP drafter's M=2..5 projections with an exact K128 tail, admitted per shape only after full-output bit equality with packed_small and a cold timing filter (MTP_PACK12_MM=0 disables); next-MoE-router L2 prefetch sharing the existing Mamba/attention prefetch window in one launch. Moves no value; original paths kept as fallback."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_attn_packed.py; harness/kernels/apk12",
+      "why": "kaankolcu 8d510eaa, carried unchanged: a CUDA mma.sync kernel over a fragment-order copy of the 12-bit attention planes for the 5-row verify QKV/output projections. Ranked with the Triton configurations under the record's graph-replay speed guard (0.96 of F.linear) and bitwise F.linear check on every layer, after a child-process probe and a load-time decode check of every weight. Same accumulation chain (ascending K from +0, one RN rounding). ATTN_PACK12=0 disables the packed path."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_packed.py; harness/tests/packed_gemv_group8_exact.py; harness/vllm_resident/test_ssd_prefill_fused.py",
+      "why": "ivanfioravanti c0ce642d, carried unchanged: opt-in GROUP8 decoder for the native MTP M=1 packed QKV/output GEMV (eight-value register groups, one uint32 EX word per group, original layout restored with assert_trivial=True). Same BF16 bits, raw escapes, gate, PDL launch, tile, FP32 accumulation and reduction. Enabled per shape only after load-time byte equality with the published packed_gemv at three magnitudes; failure keeps the published path. MTP_PACK12_GROUP8=0 disables it. Disjoint from the M=2..5 narrow packed MMA branch. Test-only SSD fixture corrections."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_down_packed.py, models/nemotron_h_mtp_compact.py, models/nemotron_h_mtp_kernels.py",
+      "why": "jacklightChen 7c65206e, carried unchanged: optional lossless 12-bit storage (the existing pack_bf16 codec) of the native MTP drafter's transposed routed/shared down weights, decoded on demand in the compact slot kernel at the original sorted nonzero indices; same FP32 products, slot order, combine and residual. Admitted per TOPK only after raw FP32 bit equality with _down_slots over all experts and a cold timing filter; original BF16 weights kept as fallback. MTP_DOWN_PACK12=0 disables it."
+    },
+    {
+      "file": "vllm/v1/spec_decode/nemotron_first_pass.py; vllm/v1/spec_decode/llm_base_proposer.py",
+      "why": "NEMO_MTP_FIRST_PASS: startup-admitted whole CUDA graphs for the native MTP initial five-row pass at depth four. Request input preparation and the native FlashInfer planner still run. Exact plan scalar, workspace/index/input/cache address and metadata guards select a private graph bank; unsupported/mismatched cases keep the original first pass. Startup compares all five output rows and touched KV bytes across changed synthetic inputs and selected rows, restores temporary state, and publishes only admitted graphs. Existing one-row tail graph is unchanged. CPU-only local verification; GPU admission and full-model scoring execute on the official runner."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h.py; vllm/model_executor/layers/fused_moe/experts/humming_relu2_epilogue.py; vllm/model_executor/layers/fused_moe/experts/humming_zskip.py; harness/kernels/pzskip/csrc/pzskip.cu; harness/kernels/pzskip/py/__init__.py",
+      "why": "HUMMING_PREFILL_REUSE_CACHE: captured rerouted M496/top-six prefill only retains ordinary L2 priority for the repeated-six-expert routed up and PZ333 down. Uses the existing stock up kernel and PZ config334 as an exact alias of 333 stock specialization; optional marker preserves older-library fallback. Existing routing-switch finally clears the flag; every other call retains frontier cache policy. No arithmetic, format, layout, or routing change. Working-set rationale only; local GPU performance unmeasured. Switch=0 restores frontier policy."
     }
   ]
 }

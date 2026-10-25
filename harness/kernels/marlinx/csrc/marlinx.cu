@@ -43,6 +43,7 @@ struct Params {
   const uint32_t* Z;       // zero-row skip: k-row-major copy of B, [K/16][16][N/64][8] u32 (or null)
   int part1_cols;          // columns reduced by a single Marlin block
   int iters;               // Marlin stripe length (k-tiles per block) in part 2
+  const uint2* SU;         // optional unit-major copy of S, [N/64][K/16][8] uint2 (or null)
 };
 
 __device__ __forceinline__ uint4 ld_stream_v4(const uint4* p) {
@@ -306,6 +307,21 @@ __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
   const uint4* Bp = p.B + 64 * col + 32 * h + lane;
   const uint2* Sp = p.S + 16 * col + 8 * h + (lane >> 2);
   const int tok = lane >> 2;
+  // Unit-major scales (MARLINX_SU): the same scale bytes, stored per 64-feature half
+  // column contiguously ([N/64][K/16][8] uint2, py/__init__.py su_repack), so the CTA
+  // stages its whole column of scales in shared memory with a few coalesced 2 KB reads
+  // instead of one 64-byte read per k16 block (row stride N bytes). Scales are weights,
+  // immutable at run time, so a PDL grid may stage them before griddepcontrol.wait.
+  extern __shared__ __align__(16) uint2 su_smem[];
+  if (p.SU) {
+    const uint4* src = reinterpret_cast<const uint4*>(p.SU + (long long)unit * (p.K >> 4) * 8);
+    uint4* dst = reinterpret_cast<uint4*>(su_smem);
+    for (int i = threadIdx.x; i < (p.K >> 4) * 4; i += 128) dst[i] = ld_stream_v4(src + i);
+    __syncthreads();
+  }
+  auto load_s = [&](int kb) -> uint2 {
+    return p.SU ? su_smem[kb * 8 + (lane >> 2)] : ld_nc_v2(Sp + kb * nS);
+  };
   const bool arow = tok < p.M;
   const uint32_t* Ap =
       reinterpret_cast<const uint32_t*>(p.A + (arow ? (long long)tok * p.lda : 0)) + (lane & 3);
@@ -329,7 +345,7 @@ __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
       if (s < total) {
         const int kb = 8 * pre.tau + 2 * w + pre.k;
         if constexpr (!ZS) rb[s] = ld_stream_v4(Bp + kb * nB);
-        rs[s] = ld_nc_v2(Sp + kb * nS);
+        rs[s] = load_s(kb);
         cursor_next(pre, p.iters);
       }
     }
@@ -377,7 +393,7 @@ __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
     if (s < total) {
       const int kb = 8 * ld.tau + 2 * w + ld.k;
       if constexpr (!PDL || ZS) rb[s] = load_b(kb);
-      if constexpr (!PDL) rs[s] = ld_nc_v2(Sp + kb * nS);
+      if constexpr (!PDL) rs[s] = load_s(kb);
       ra[s][0] = arow ? ld_activation_u32<PDL>(Ap + 8 * kb) : 0u;
       ra[s][1] = arow ? ld_activation_u32<PDL>(Ap + 8 * kb + 4) : 0u;
       cursor_next(ld, p.iters);
@@ -406,7 +422,7 @@ __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
         if (i + P < total) {
           const int kb = 8 * ld.tau + 2 * w + ld.k;
           rb[s] = load_b(kb);
-          rs[s] = ld_nc_v2(Sp + kb * nS);
+          rs[s] = load_s(kb);
           ra[s][0] = arow ? ld_activation_u32<PDL>(Ap + 8 * kb) : 0u;
           ra[s][1] = arow ? ld_activation_u32<PDL>(Ap + 8 * kb + 4) : 0u;
           cursor_next(ld, p.iters);
@@ -456,7 +472,7 @@ static int launch(const Params& p, cudaStream_t stream, bool pdl) {
     cudaLaunchConfig_t cfg = {};
     cfg.gridDim = dim3(2 * p.n_tiles);
     cfg.blockDim = dim3(128);
-    cfg.dynamicSmemBytes = 0;
+    cfg.dynamicSmemBytes = p.SU ? (size_t)(p.K >> 4) * 64 : 0;
     cfg.stream = stream;
     cudaLaunchAttribute attr[1];
     attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
@@ -468,7 +484,7 @@ static int launch(const Params& p, cudaStream_t stream, bool pdl) {
     return (int)cudaGetLastError();
   }
 #endif
-  gemm_kernel<P, Relu2, ZS><<<2 * p.n_tiles, 128, 0, stream>>>(p);
+  gemm_kernel<P, Relu2, ZS><<<2 * p.n_tiles, 128, p.SU ? (size_t)(p.K >> 4) * 64 : 0, stream>>>(p);
   return (int)cudaGetLastError();
 }
 
@@ -522,7 +538,8 @@ int marlinx_regs(int depth) {
 // a negative code for unsupported arguments.
 static int marlinx_gemm_impl(const void* A, long long lda, int M, const void* B, const void* S,
                  const void* GS, void* C, long long ldc, int N, int K, int sms, int depth,
-                 void* stream, bool relu2, const void* Z = nullptr, bool pdl = false) {
+                 void* stream, bool relu2, const void* Z = nullptr, bool pdl = false,
+                 const void* SU = nullptr) {
   if (M < 1 || M > 8) return -1;
   if (N <= 0 || K <= 0 || N % 128 || K % 128) return -2;
   if (sms <= 0) return -3;
@@ -541,6 +558,8 @@ static int marlinx_gemm_impl(const void* A, long long lda, int M, const void* B,
   p.n_tiles = N / 128;
   p.k_tiles = K / 128;
   p.Z = static_cast<const uint32_t*>(Z);
+  p.SU = static_cast<const uint2*>(SU);
+  if (SU && ((K >> 4) * 64 > 48 * 1024 || (reinterpret_cast<uintptr_t>(SU) & 15))) return -9;
   // Marlin's stripe partition with parallel = 1 and grid = sms.
   int part2 = p.n_tiles;
   if (p.n_tiles > sms) {
@@ -614,6 +633,18 @@ int marlinx_gemm_zs_pdl(const void* A, long long lda, int M, const void* B, cons
   return marlinx_gemm_impl(A, lda, M, B, S, GS, C, ldc, N, K, sms, depth, stream, false, Z, true);
 }
 #endif
+
+// Unit-major scale variant (any mode): SU = py su_repack(S). Same arithmetic.
+int marlinx_gemm_su(const void* A, long long lda, int M, const void* B, const void* S,
+                    const void* GS, void* C, long long ldc, int N, int K, int sms, int depth,
+                    void* stream, const void* Z, const void* SU, int relu2, int pdl) {
+  if (!SU) return -8;
+#ifdef MARLINX_NO_PDL
+  if (pdl) return -10;
+#endif
+  return marlinx_gemm_impl(A, lda, M, B, S, GS, C, ldc, N, K, sms, depth, stream, relu2 != 0, Z,
+                           pdl != 0, SU);
+}
 
 // Streams nbytes from src with blocks x threads, reserving smem bytes of
 // shared memory per CTA. Returns 0 or a cudaError_t value.

@@ -46,7 +46,10 @@ def available() -> bool:
 
 
 def block_rows(wpc: int) -> int:
-    """Expert block rows a config expects in its moe_align layout (320-339: 32, 340-359: 16)."""
+    """Expert block rows a config expects in its moe_align layout (320-339 and 356/357: 32,
+    other 340-359: 16)."""
+    if wpc in (356, 357):  # config 333's 32-row CTA with a lean instruction stream
+        return 32
     return 32 if 320 <= wpc < 340 else (16 if 340 <= wpc < 360 else BM)
 
 

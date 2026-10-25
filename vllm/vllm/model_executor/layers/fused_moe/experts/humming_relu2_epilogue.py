@@ -7,9 +7,16 @@ epilogue first, so the intermediate BF16 value is retained exactly.
 """
 
 import json
+import os
+from pathlib import Path
+
+import humming
 import torch
 from humming import dtypes, ops
 from humming.kernel.humming import HummingKernel
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 _EPILOGUE = r"""
 #include <cuda_bf16.h>
@@ -58,8 +65,53 @@ class Relu2HummingKernel(HummingKernel):
 
 _CACHE = {}
 
+# Separate class AND config cache: KernelRuntime interns by class/config.
+_EVICT_CACHE = {}
+_EVICT_FAILED = False
+_EVICT_PREFIX = r"""
+#include <humming/utils/all.cuh>
+template<bool C, typename T>
+CUDA_INLINE void evf_load(const T *g, T *s, bool pred = true) {
+  if constexpr (!C || sizeof(T) != 16) {
+    if (pred) legacy_load<C>(g, s);
+  } else {
+    uint32_t sm = cast_smem_ptr_to_uint(s);
+    uint64_t policy;
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;"
+                 : "=l"(policy));
+    asm volatile("{.reg .pred p; setp.ne.s32 p,%0,0; "
+                 "@p cp.async.cg.shared.global.L2::cache_hint [%1],[%2],16,%3;}"
+                 :: "r"((uint32_t)pred), "r"(sm), "l"(g), "l"(policy)
+                 : "memory");
+  }
+}
+"""
 
-def prepare(meta, compute_config, tuning_config):
+
+class EvictFirstRelu2HummingKernel(Relu2HummingKernel):
+    def prepare(self):
+        assert self.use_cp_async and not self.use_tma_b and not self.use_tma_bs
+        # Keep the pinned 2D loader's loop, addresses and predicates verbatim.
+        # Include only B/BS under the replacement; indexed A remains stock.
+        header = (Path(humming.__file__).parent / "include/humming/utils/ptx/legacy_load.cuh").read_text()
+        start = header.index("template <bool use_cp_async, uint32_t num_int4s, uint32_t threads, uint32_t gmem_stride")
+        end = header.index("CUDA_INLINE void cp_async_commit_group", start)
+        body = header[start:end].replace("legacy_load_2d", "evf_load_2d")
+        body = body.replace("legacy_load_pred<use_cp_async>", "evf_load<use_cp_async>")
+        body = body.replace("legacy_load<use_cp_async>", "evf_load<use_cp_async>")
+        assert "legacy_load<" not in body and "legacy_load_pred<" not in body
+        code = _EVICT_PREFIX + body + r"""
+#define legacy_load_2d evf_load_2d
+#include <humming/memory/g2s_loader/loader_b.cuh>
+#include <humming/memory/g2s_loader/loader_bs.cuh>
+#undef legacy_load_2d
+"""
+        at = self.code.index("#if ")
+        self.code = self.code[:at] + code + self.code[at:]
+        super().prepare()
+
+
+def _prepare_stock(meta, compute_config, tuning_config):
     key = (meta.to_str(), compute_config, tuning_config)
     if key in _CACHE:
         return _CACHE[key]
@@ -88,6 +140,50 @@ def prepare(meta, compute_config, tuning_config):
     return configs
 
 
+def prepare(meta, compute_config, tuning_config, evict_first=False):
+    global _EVICT_FAILED
+    stock = _prepare_stock(meta, compute_config, tuning_config)
+    if not evict_first or _EVICT_FAILED:
+        return stock
+    key = (meta.to_str(), compute_config, tuning_config)
+    if key in _EVICT_CACHE:
+        return _EVICT_CACHE[key]
+    try:
+        values = stock.tolist()
+        tc = json.loads(tuning_config)
+        if isinstance(tc, dict):
+            tc = [[0, 1 << 30, tc]]
+        lc = json.loads(meta.to_str())
+        lc.pop("sublayer_name", None)
+        changed = 0
+        for i, (lo, hi, config) in enumerate(tc):
+            if not lo < 2976 <= hi:
+                continue
+            original = HummingKernel._id2kernel[values[4 * i + 2]]
+            assert tuple(original.problem_shape[1:]) == (1856, 2688)
+            assert config["block_shape"] == [64, 64, 32]
+            params = lc | json.loads(compute_config) | config
+            params.pop("num_sms", None)
+            kernel = EvictFirstRelu2HummingKernel(**params)
+            kernel.load_cubin()
+            # Exclude the stock-cubin singleton no-op before admitting the hint.
+            assert type(kernel) is EvictFirstRelu2HummingKernel
+            assert "createpolicy.fractional.L2::evict_first" in kernel.code
+            assert "cp.async.cg.shared.global.L2::cache_hint" in kernel.code
+            assert kernel.kernel_filename != original.kernel_filename
+            assert kernel.kernel_id != original.kernel_id
+            values[4 * i + 2] = kernel.kernel_id
+            changed += 1
+        assert changed == 1
+        configs = torch.tensor(values, dtype=torch.int64, device="cpu")
+        _EVICT_CACHE[key] = configs
+        return configs
+    except Exception as exc:
+        _EVICT_FAILED = True
+        logger.warning_once("humming evict-first unavailable; using stock: %s", exc)
+        return stock
+
+
 def forward_relu2(
     layer,
     inputs,
@@ -104,7 +200,12 @@ def forward_relu2(
     meta = layer.humming_metas["w13"]
     assert inputs.dtype == outputs.dtype == torch.bfloat16 and input_scale is None
     assert getattr(layer, meta.bias_name, None) is None
-    configs = prepare(meta, compute_config, tuning_config)
+    configs = prepare(
+        meta, compute_config, tuning_config,
+        evict_first=(inputs.shape[0] == 496 and top_k == 6
+                     and valid_shape_m == 2976
+                     and os.environ.get("HUMMING_EVICT_FIRST", "1") != "0"),
+    )
     return ops.launch_kernel(
         configs=configs,
         inputs=inputs,

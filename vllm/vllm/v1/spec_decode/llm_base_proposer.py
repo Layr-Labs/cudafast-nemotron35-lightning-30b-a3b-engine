@@ -740,7 +740,11 @@ class SpecDecodeBaseProposer:
         if set_moe_row_src is not None:
             # Padded rows of the single-token steps copy row 0.
             set_moe_row_src(input_batch_size, self._moe_row_zero)
+        tail_consumed = 0
         for token_index in range(self.num_speculative_tokens - 1):
+            if tail_consumed:
+                tail_consumed -= 1
+                continue
             # Update the inputs.
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax() returns int64 by default.
@@ -830,6 +834,19 @@ class SpecDecodeBaseProposer:
                     self.draft_model_config,
                     batch_size,
                 )
+
+            if getattr(self, "_nemo_tail", None) is not None:
+                from vllm.v1.spec_decode.nemotron_tail_cycle import maybe_run
+                tail = maybe_run(
+                    self, common_attn_metadata, per_layer_attn_metadata,
+                    input_batch_size, batch_size, sampling_metadata, depth_gate,
+                    self.num_speculative_tokens - 1 - token_index)
+                if tail is not None:
+                    tail_tokens, tail_hidden = tail
+                    draft_token_ids_list.extend(tail_tokens)
+                    hidden_states = tail_hidden[:batch_size]
+                    tail_consumed = len(tail_tokens) - 1
+                    continue
 
             with set_forward_context(
                 per_layer_attn_metadata,
@@ -1967,6 +1984,10 @@ class SpecDecodeBaseProposer:
         if is_graph_capturing and not torch.cuda.is_current_stream_capturing():
             from vllm.v1.spec_decode.nemotron_full_step import prepare
             prepare(self)
+            from vllm.v1.spec_decode.nemotron_decode_plan import prepare as prepare_plan
+            prepare_plan(self)
+            from vllm.v1.spec_decode.nemotron_tail_cycle import prepare as prepare_tail
+            prepare_tail(self)
 
     def _get_eagle3_use_aux_hidden_state_from_config(self) -> bool:
         """

@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os
+
 import torch
 from torch import nn
 
@@ -64,6 +66,8 @@ from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
     _resolve_layer_name,
+    aux_stream,
+    current_stream,
     direct_register_custom_op,
 )
 from vllm.v1.attention.backend import AttentionMetadata
@@ -572,6 +576,10 @@ class MambaMixer2(MambaBase, PluggableLayer):
         self._spec_replay_ok: bool | None = None
         self._spec_replay_lazy: bool | None = None
         self._spec_replay_pipeline = False
+        self._replay_ahead = os.environ.get("SSM_REPLAY_AHEAD", "1") != "0"
+        self._replay_carry = None
+        self._replay_dummy = None
+        self._replay_ahead_on = False
         if self.use_spec_replay:
             logger.info_once(
                 "Mamba2 spec decode: anchor-state replay (ring of %d tokens).",
@@ -596,11 +604,89 @@ class MambaMixer2(MambaBase, PluggableLayer):
         # Check if running on Blackwell (SM100+) for kernel tuning
         self.is_blackwell = current_platform.is_device_capability_family(100)
 
+    def _launch_replay_carry(self, rows: int) -> None:
+        """Run the lazy anchor replay on the aux stream, overlapping in_proj.
+
+        The checkpoint slot is not written. The post-replay fp32 state lands in
+        ``_replay_carry``; the verify kernel loads it and skips the replay loop.
+        """
+        self._replay_ahead_on = False
+        if (
+            not self._replay_ahead
+            or not self.use_spec_replay
+            or self.use_replayssm
+            or rows != 5
+            or self.num_spec != 4
+        ):
+            return
+        forward_context = get_forward_context()
+        attn_metadata_raw = forward_context.attn_metadata
+        if not isinstance(attn_metadata_raw, dict):
+            return
+        attn_metadata = attn_metadata_raw.get(self.prefix)
+        if (
+            attn_metadata is None
+            or attn_metadata.num_prefills != 0
+            or attn_metadata.num_decodes != 1
+            or attn_metadata.num_decode_tokens != 5
+            or attn_metadata.num_accepted_tokens is None
+            or self.cache_config is None
+            or self.cache_config.mamba_cache_mode != "none"
+        ):
+            return
+        state = self.kv_cache[1]
+        if not self._lazy_anchor(state):
+            return
+        if self._replay_carry is None or self._replay_dummy is None:
+            if torch.cuda.is_current_stream_capturing():
+                return
+            self._alloc_replay_carry(state)
+        if self._replay_carry is None or self._replay_dummy is None:
+            return
+        side = aux_stream()
+        if side is None:
+            return
+        dim = self.head_dim
+        dstate = self.ssm_state_size
+        carry = self._replay_carry
+        x, dt, B, C, out = self._replay_dummy
+        A = self.A[:, None, None].expand(-1, dim, dstate)
+        bias = self.dt_bias[:, None].expand(-1, dim)
+        D = self.D[:, None].expand(-1, dim)
+        side.wait_stream(current_stream())
+        with torch.cuda.stream(side):
+            selective_state_update_spec_replay(
+                self.kv_cache[1],
+                x,
+                dt,
+                A,
+                B,
+                C,
+                D,
+                bias,
+                dt_softplus=True,
+                state_batch_indices=attn_metadata.state_indices_tensor_d,
+                out=out,
+                num_accepted_tokens=attn_metadata.num_accepted_tokens,
+                cu_seqlens=attn_metadata.query_start_loc_d,
+                seq_lens=attn_metadata.seq_lens,
+                ring_len=self.spec_replay_ring_len,
+                is_blackwell=self.is_blackwell,
+                lazy=True,
+                _pipeline=self._spec_replay_pipeline,
+                _private_no_prefix=True,
+                _private_launch_pdl=False,
+                _carry=carry,
+                _carry_mode=1,
+            )
+        self._replay_ahead_on = True
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         mup_vector: torch.Tensor | None = None,
     ):
+        self._launch_replay_carry(hidden_states.shape[0])
         # 1. Gated MLP's linear projection
         projected_states, _ = self.in_proj(hidden_states)
         if mup_vector is not None:
@@ -1188,6 +1274,11 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     state_indices_tensor_d,
                 )
             ):
+                carry_mode = 0
+                if self._replay_ahead_on:
+                    current_stream().wait_stream(aux_stream())
+                    carry_mode = 2
+                    self._replay_ahead_on = False
                 selective_state_update_spec_replay(
                     ssm_state,
                     hidden_states_d,
@@ -1207,6 +1298,8 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     is_blackwell=self.is_blackwell,
                     lazy=self._lazy_anchor(ssm_state),
                     _pipeline=self._spec_replay_pipeline,
+                    _carry=self._replay_carry,
+                    _carry_mode=carry_mode,
                 )
             else:
                 selective_state_update(
@@ -1243,6 +1336,31 @@ class MambaMixer2(MambaBase, PluggableLayer):
         self._spec_replay_pipeline = prepare(
             state, self.model_config.dtype, A, bias, D,
             self.spec_replay_ring_len, self.is_blackwell,
+        )
+        self._alloc_replay_carry(state)
+
+    def _alloc_replay_carry(self, state: torch.Tensor) -> None:
+        if (
+            not self._replay_ahead
+            or not self.use_spec_replay
+            or self.num_spec != 4
+            or state.dim() != 4
+            or not state.is_cuda
+        ):
+            return
+        nheads, dim, dstate = state.shape[1], state.shape[2], state.shape[3]
+        ngroups = self.n_groups // self.tp_size
+        dtype = self.model_config.dtype
+        device = state.device
+        self._replay_carry = torch.empty(
+            nheads, dim, dstate, dtype=torch.float32, device=device
+        )
+        self._replay_dummy = (
+            torch.empty(5, nheads, dim, dtype=dtype, device=device),
+            torch.empty(5, nheads, dim, dtype=dtype, device=device),
+            torch.empty(5, ngroups, dstate, dtype=dtype, device=device),
+            torch.empty(5, ngroups, dstate, dtype=dtype, device=device),
+            torch.empty(5, nheads, dim, dtype=dtype, device=device),
         )
 
     def _lazy_anchor(self, ssm_state: torch.Tensor) -> bool:

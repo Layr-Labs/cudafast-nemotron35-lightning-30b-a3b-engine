@@ -364,12 +364,12 @@
       "why": "newjordan 34d21409, carried: the routed-up epilogue's ReLU-square uses packed non-FTZ bf16x2 instructions (max.NaN.bf16x2 with +0, mul.rn.bf16x2) on the original BF16 output instead of widening to fp32; the square of a BF16 value is exact in fp32, so both forms round the same product once to BF16."
     },
     {
-      "file": "vllm/model_executor/models/nemotron_h_mtp_kernels.py, vllm/model_executor/models/nemotron_h_mtp_screen.py, vllm/v1/spec_decode/nemotron_decode_plan.py",
-      "why": "Cumulative draft stop. The depth gate's fourth int32 word holds the float32 bits of the running product of kept drafts' top-1 probabilities (1.0 at loop start). The screen's token select multiplies this draft's top-1 into that word and sets the existing stop flag when the product falls below MTP_DEPTH_THETA (0.5). MTP_DEPTH_CUMULATIVE=0 restores the per-draft compare. Same verify-row handoff and the same target rejection; no weight or logit change on a draft the gate still keeps."
-    },
-    {
-      "file": "harness/kernels/cmp2 (+ vllm/v1/worker/gpu_model_runner.py)",
-      "why": "CMP2=1 (default): transparent generic-compression VMM backing for immutable fp8c codes, apk12 planes, shared Marlin weights/scales and target lm_head including its unit-major scale copy. Full load-time storage byte checks precede pointer rebinding and engine capture. Original storages stay alive; unsupported or failed allocations leave ordinary tensors. CMP2=0 disables. Target and drafter formats and arithmetic are unchanged."
-    }
+  "file": "vllm/model_executor/models/nemotron_h_mtp_kernels.py, vllm/model_executor/models/nemotron_h_mtp_screen.py, vllm/v1/spec_decode/nemotron_decode_plan.py",
+  "why": "Cumulative draft stop. The depth gate's fourth int32 word holds the float32 bits of the running product of kept drafts' top-1 probabilities (1.0 at loop start). The screen's token select multiplies this draft's top-1 into that word and sets the existing stop flag when the product falls below MTP_DEPTH_THETA (0.5). MTP_DEPTH_CUMULATIVE=0 restores the per-draft compare. Same verify-row handoff and the same target rejection; no weight or logit change on a draft the gate still keeps."
+},
+{
+  "file": "vllm/model_executor/layers/mamba/ops/mamba_ssm_spec_replay.py, vllm/model_executor/layers/mamba/mamba_mixer2.py",
+  "why": "Aux-stream lazy SSM replay. On a depth-4 verify the replay loop (tokens since the last period-16 checkpoint, up to 15) runs on the shared-expert aux stream while in_proj streams, and writes the post-replay fp32 state to a side buffer. The verify kernel loads that buffer and skips the loop. The checkpoint slot and the ring appends stay on the verify kernel, so the next verify still starts from the same anchor. SSM_REPLAY_AHEAD=0 keeps the loop inside the verify kernel."
+}
   ]
 }

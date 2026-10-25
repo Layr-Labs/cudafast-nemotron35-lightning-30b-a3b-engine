@@ -233,6 +233,8 @@ def _selective_scan_update_spec_replay_kernel(
     LAZY_P: tl.constexpr = 16,
     SLOT_ELEMS: tl.constexpr = 0,
     PIPELINED: tl.constexpr = False,
+    carry_ptr=None,
+    CARRY: tl.constexpr = 0,
 ):
     # The dt/A of a head are scalars (stride-0 expansion over head_dim); that is
     # the only layout the Mamba2 decode path produces and the only one the
@@ -339,7 +341,16 @@ def _selective_scan_update_spec_replay_kernel(
 
     mask = (offs_m[:, None] < dim) & (offs_n[None, :] < dstate)
     mask &= anchor_idx != null_block_id
-    state = tl.load(state_ptrs, mask=mask, other=0.0).to(tl.float32)
+    if CARRY == 2:
+        c_ptrs = (
+            carry_ptr
+            + (pid_h * dim + offs_m[:, None]) * dstate
+            + offs_n[None, :]
+        )
+        state = tl.load(c_ptrs, mask=(offs_m[:, None] < dim) & (offs_n[None, :] < dstate), other=0.0).to(tl.float32)
+        num_replay = num_replay - num_replay
+    else:
+        state = tl.load(state_ptrs, mask=mask, other=0.0).to(tl.float32)
 
     if HAS_DT_BIAS:
         dt_bias_ptrs = dt_bias_ptr + offs_m * stride_dt_bias_dim
@@ -410,6 +421,18 @@ def _selective_scan_update_spec_replay_kernel(
 
             dB = B * dt
             state = state * dA + dB * x[:, None]
+    if CARRY == 1:
+        c_ptrs = (
+            carry_ptr
+            + (pid_h * dim + offs_m[:, None]) * dstate
+            + offs_n[None, :]
+        )
+        tl.store(
+            c_ptrs,
+            state,
+            mask=(offs_m[:, None] < dim) & (offs_n[None, :] < dstate),
+        )
+        return
     if STORE_REPLAYED:
         # Test hook: the state this verify starts from (the reference's slot
         # num_accepted - 1), as a contiguous (N, nheads, dim, dstate) tensor.
@@ -614,6 +637,8 @@ def selective_state_update_spec_replay(
     _private_verify_rows=None,
     _private_no_prefix=False,
     _private_launch_pdl=None,
+    _carry=None,
+    _carry_mode: int = 0,
 ):
     """
     Spec-decode verify update with anchor + input-ring state handling.
@@ -768,4 +793,6 @@ def selective_state_update_spec_replay(
             SLOT_ELEMS=nheads * dim * dstate,
             PIPELINED=bool(_pipeline and lazy and N == 1 and batch == 5
                            and max_seqlen == 5 and z is None and dt_softplus),
+            carry_ptr=_carry if _carry is not None else state,
+            CARRY=_carry_mode,
         )

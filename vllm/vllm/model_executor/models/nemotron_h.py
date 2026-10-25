@@ -18,6 +18,7 @@
 # limitations under the License.
 """Inference-only NemotronH model."""
 
+import os
 from collections.abc import Iterable, Mapping
 from itertools import islice
 
@@ -83,6 +84,15 @@ from vllm.model_executor.models.utils import (
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.nemotron_h import NemotronHConfig
 
+
+if os.environ.get("NEMO_INDUCTOR_PDL", "1") != "0":
+    try:
+        import torch._inductor.config as _inductor_config
+
+        if hasattr(_inductor_config.triton, "enable_pdl"):
+            _inductor_config.triton.enable_pdl = True
+    except Exception:
+        pass
 
 # smallk (harness/kernels/smallk): run the router GEMM inside the MoE custom op, after the shared
 # experts' side stream has forked, so the side stream's GEMMs overlap it. Same kernels on the same

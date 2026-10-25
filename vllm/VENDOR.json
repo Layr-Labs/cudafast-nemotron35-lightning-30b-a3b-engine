@@ -238,6 +238,10 @@
     {
       "file": "vllm/model_executor/layers/mamba/ops/gated_norm_fp8.py; mamba_mixer2.py",
       "why": "Select priorcompletecorrect823867a3-d280-429c-bd43-c177dc25470a native-order groupedgatednorm/staticFP8 producer only onfulla484; add originalPDL wait-beforeallreads andexistingconfidenceprefixM5 earlyzero withoutweight/gate/SSMreads. Retainstaticcheckpointscale, bothBF16rounds, consumerQuantizedActivationguard, targetformats/fallback. Entirecombinationunverified; no localexecution."
+    },
+    {
+      "file": "harness/kernels/vsample (new); vllm/v1/worker/gpu_model_runner.py; vllm/v1/worker/block_table.py; vllm/model_executor/models/nemotron_h.py",
+      "why": "Carry Meganpark980320 940367a7 pieces D-G onto the record: one-kernel greedy verify sampler (depth-gate masking, greedy argmax under torch NaN/tie order, rejection, verify-row reset and accepted count in one launch; stock path when its guard refuses), dead accepted-count D2H skipped under async scheduling with mamba_cache_mode none, inductor PDL for generated Triton kernels, and block-table H2D re-commit skipped when no row changed. Integer/ordering work only; no arithmetic, format or routing change."
     }
   ]
 }

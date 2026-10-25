@@ -56,6 +56,7 @@ class SharedExperts(torch.nn.Module):
     _early_logged = False
     _pending: "SharedExperts | None" = None
     _pending_h: torch.Tensor | None = None
+    _pending_mask: torch.Tensor | None = None
 
     def __init__(
         self,
@@ -172,8 +173,15 @@ class SharedExperts(torch.nn.Module):
         if defer:
             if SharedExperts._pending is not None:
                 SharedExperts._pending._launch_down()
+            from vllm.model_executor.models.nemotron_shared_chain import maybe_shared_up_mask
+
             with torch.cuda.stream(self._stream):
-                self._pending_h = self._layer.forward_up(shared_experts_input)
+                pair = maybe_shared_up_mask(self._layer, shared_experts_input)
+                if pair is None:
+                    self._pending_h = self._layer.forward_up(shared_experts_input)
+                    self._pending_mask = None
+                else:
+                    self._pending_h, self._pending_mask = pair
             SharedExperts._pending = self
         else:
             with torch.cuda.stream(self._stream):
@@ -190,6 +198,7 @@ class SharedExperts(torch.nn.Module):
         h = self._pending_h
         if h is None:
             return
+        masks, self._pending_mask = self._pending_mask, None
         self._pending_h = None
         if SharedExperts._pending is self:
             SharedExperts._pending = None
@@ -199,7 +208,12 @@ class SharedExperts(torch.nn.Module):
         # (through the routed up GEMM) is done.
         self._stream.wait_stream(current_stream())
         with torch.cuda.stream(self._stream):
-            self._output[idx] = self._layer.forward_down(h)
+            if masks is None:
+                self._output[idx] = self._layer.forward_down(h)
+            else:
+                from vllm.model_executor.models.nemotron_shared_chain import shared_down_from_mask
+
+                self._output[idx] = shared_down_from_mask(self._layer, h, masks)
 
     def _join_aux(self) -> None:
         if not self._aux_open:
@@ -244,6 +258,14 @@ class SharedExperts(torch.nn.Module):
         experts_order = self._determine_shared_experts_order(shared_experts_input)
 
         if order != experts_order:
+            return None
+
+        # If another routed backend has no midpoint hook, finish the one
+        # pending shared up/down exactly once instead of launching full MLP
+        # again. The same aux/main join remains the output visibility boundary.
+        if (order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
+                and self._pending_h is not None):
+            self._launch_down()
             return None
 
         if (

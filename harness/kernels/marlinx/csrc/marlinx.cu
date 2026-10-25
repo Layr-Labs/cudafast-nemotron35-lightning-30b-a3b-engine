@@ -43,6 +43,9 @@ struct Params {
   const uint32_t* Z;       // zero-row skip: k-row-major copy of B, [K/16][16][N/64][8] u32 (or null)
   int part1_cols;          // columns reduced by a single Marlin block
   int iters;               // Marlin stripe length (k-tiles per block) in part 2
+  uint32_t* mask_out;      // current-call up epilogue union, or null
+  const uint32_t* mask_in; // current-call down union, or null
+  const int* verify_rows;  // optional existing M5 prefix count, or null
 };
 
 __device__ __forceinline__ uint4 ld_stream_v4(const uint4* p) {
@@ -255,12 +258,23 @@ __device__ __forceinline__ __nv_bfloat16 round_output(float scaled) {
   return rounded;
 }
 
+// The count and prepared mask are current-call producer outputs, never weights.
+// Coherent volatile loads stay after the PDL wait, including on graph replay.
+__device__ __forceinline__ int mask_live_rows(const Params& p) {
+  if (!p.verify_rows || p.M != 5) return p.M;
+  const int v = static_cast<int>(ld_activation_u32<true>(
+      reinterpret_cast<const uint32_t*>(p.verify_rows)));
+  return v >= p.M ? p.M : (v > 0 ? v : 1);
+}
+
 // Marlin write_result: bf16_rn(R * global_scale), rows < M only (warp 0).
-template <bool Relu2>
+template <bool Relu2, bool MaskIO = false>
 __device__ __forceinline__ void write_out(const Params& p, int col, int h, int lane,
                                           const float (&R)[4][4]) {
   const float g = __ldg(p.GS);
   const int t0 = 2 * (lane & 3);
+  int live = p.M;
+  if constexpr (MaskIO) live = mask_live_rows(p);
 #pragma unroll
   for (int j = 0; j < 4; ++j) {
     const long long f = 128LL * col + 64 * h + 16 * j + (lane >> 2);
@@ -268,13 +282,33 @@ __device__ __forceinline__ void write_out(const Params& p, int col, int h, int l
     const __nv_bfloat16 v1 = round_output<Relu2>(R[j][1] * g);
     const __nv_bfloat16 v2 = round_output<Relu2>(R[j][2] * g);
     const __nv_bfloat16 v3 = round_output<Relu2>(R[j][3] * g);
+    if constexpr (MaskIO && Relu2) {
+      // A 4-lane group owns one feature over all eight possible token rows.
+      // Collapse its four token-pair bits into one feature bit; no atomics.
+      const bool lo = (t0 < live && __bfloat162float(v0) != 0.0f) ||
+                      (t0 + 1 < live && __bfloat162float(v1) != 0.0f);
+      const bool hi = (t0 < live && __bfloat162float(v2) != 0.0f) ||
+                      (t0 + 1 < live && __bfloat162float(v3) != 0.0f);
+      const uint32_t bl = __ballot_sync(0xffffffffu, lo);
+      const uint32_t bh = __ballot_sync(0xffffffffu, hi);
+      if (lane == 0) {
+        uint32_t mask = 0;
+#pragma unroll
+        for (int g = 0; g < 8; ++g) {
+          mask |= ((bl >> (4 * g)) & 15u ? 1u : 0u) << g;
+          mask |= ((bh >> (4 * g)) & 15u ? 1u : 0u) << (g + 8);
+        }
+        p.mask_out[8 * col + 4 * h + j] = mask;
+      }
+    }
+    const __nv_bfloat16 zero = __float2bfloat16_rn(0.0f);
     if (t0 < p.M) {
-      p.C[t0 * p.ldc + f] = v0;
-      p.C[t0 * p.ldc + f + 8] = v2;
+      p.C[t0 * p.ldc + f] = MaskIO && !Relu2 && t0 >= live ? zero : v0;
+      p.C[t0 * p.ldc + f + 8] = MaskIO && !Relu2 && t0 >= live ? zero : v2;
     }
     if (t0 + 1 < p.M) {
-      p.C[(t0 + 1) * p.ldc + f] = v1;
-      p.C[(t0 + 1) * p.ldc + f + 8] = v3;
+      p.C[(t0 + 1) * p.ldc + f] = MaskIO && !Relu2 && t0 + 1 >= live ? zero : v1;
+      p.C[(t0 + 1) * p.ldc + f + 8] = MaskIO && !Relu2 && t0 + 1 >= live ? zero : v3;
     }
   }
 }
@@ -288,7 +322,7 @@ __device__ __forceinline__ int column_first_cut(const Params& p, int col) {
 
 // One 64-feature half column (`unit`) per CTA of 4 warps; warp w runs Marlin's
 // warp-row chain w through a register ring of P k16 blocks.
-template <int P, bool Relu2 = false, bool ZS = false, bool PDL = false>
+template <int P, bool Relu2 = false, bool ZS = false, bool PDL = false, bool MaskIO = false>
 __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
   __shared__ float red[2][3][16][32];
   __shared__ uint16_t zmask[ZS ? 512 : 1];
@@ -340,10 +374,16 @@ __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
   // Zero-row skip: bit k of zmask[kb] is set when activation column 16*kb + k
   // is nonzero in some row m < M; only those weight rows are read.
   const int t4 = lane & 3;
+  int live = p.M;
+  if constexpr (MaskIO && ZS) live = mask_live_rows(p);
+  const bool active_arow = arow && tok < live;
   const long long zstride = (long long)(p.N >> 6) * 8;  // u32 per k row
   const uint32_t* Zp = ZS ? p.Z + (long long)(2 * col + h) * 8 + (lane >> 2) : nullptr;
   if constexpr (ZS) {
     for (int kb = threadIdx.x; kb < (p.K >> 4); kb += 128) {
+      if constexpr (MaskIO) {
+        zmask[kb] = static_cast<uint16_t>(ld_activation_u32<true>(p.mask_in + kb));
+      } else {
       uint32_t m = 0;
       for (int r = 0; r < p.M; ++r) {
         const uint4* ar = reinterpret_cast<const uint4*>(p.A + (long long)r * p.lda + 16 * kb);
@@ -354,6 +394,7 @@ __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
           m |= ((v[i] & 0x7fffu) ? 1u : 0u) << (2 * i) | ((v[i] & 0x7fff0000u) ? 1u : 0u) << (2 * i + 1);
       }
       zmask[kb] = (uint16_t)m;
+      }
     }
     __syncthreads();
   }
@@ -378,8 +419,8 @@ __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
       const int kb = 8 * ld.tau + 2 * w + ld.k;
       if constexpr (!PDL || ZS) rb[s] = load_b(kb);
       if constexpr (!PDL) rs[s] = ld_nc_v2(Sp + kb * nS);
-      ra[s][0] = arow ? ld_activation_u32<PDL>(Ap + 8 * kb) : 0u;
-      ra[s][1] = arow ? ld_activation_u32<PDL>(Ap + 8 * kb + 4) : 0u;
+      ra[s][0] = active_arow ? ld_activation_u32<PDL>(Ap + 8 * kb) : 0u;
+      ra[s][1] = active_arow ? ld_activation_u32<PDL>(Ap + 8 * kb + 4) : 0u;
       cursor_next(ld, p.iters);
     }
   }
@@ -407,8 +448,8 @@ __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
           const int kb = 8 * ld.tau + 2 * w + ld.k;
           rb[s] = load_b(kb);
           rs[s] = ld_nc_v2(Sp + kb * nS);
-          ra[s][0] = arow ? ld_activation_u32<PDL>(Ap + 8 * kb) : 0u;
-          ra[s][1] = arow ? ld_activation_u32<PDL>(Ap + 8 * kb + 4) : 0u;
+          ra[s][0] = active_arow ? ld_activation_u32<PDL>(Ap + 8 * kb) : 0u;
+          ra[s][1] = active_arow ? ld_activation_u32<PDL>(Ap + 8 * kb + 4) : 0u;
           cursor_next(ld, p.iters);
         }
         if (seg_end) {  // uniform across the CTA: every chain has the same length
@@ -424,7 +465,7 @@ __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
   // epilogue remains; a dependent must wait before reading any of C.
   if constexpr (PDL) pdl_launch_dependents();
 #endif
-  if (!w) write_out<Relu2>(p, col, h, lane, R);
+  if (!w) write_out<Relu2, MaskIO>(p, col, h, lane, R);
 }
 
 // Streaming-read kernel used by the tests as a bandwidth probe and as a
@@ -449,7 +490,7 @@ __global__ void hog_kernel(const uint4* __restrict__ src, long long n16, unsigne
   if (x == 0x9e3779b9u) sink[0] = x + (unsigned)(uintptr_t)hog_smem;
 }
 
-template <int P, bool Relu2 = false, bool ZS = false>
+template <int P, bool Relu2 = false, bool ZS = false, bool MaskIO = false>
 static int launch(const Params& p, cudaStream_t stream, bool pdl) {
 #ifndef MARLINX_NO_PDL
   if (pdl) {
@@ -463,12 +504,12 @@ static int launch(const Params& p, cudaStream_t stream, bool pdl) {
     attr[0].val.programmaticStreamSerializationAllowed = 1;
     cfg.attrs = attr;
     cfg.numAttrs = 1;
-    cudaError_t rc = cudaLaunchKernelEx(&cfg, gemm_kernel<P, Relu2, ZS, true>, p);
+    cudaError_t rc = cudaLaunchKernelEx(&cfg, gemm_kernel<P, Relu2, ZS, true, MaskIO>, p);
     if (rc != cudaSuccess) { cudaGetLastError(); return (int)rc; }
     return (int)cudaGetLastError();
   }
 #endif
-  gemm_kernel<P, Relu2, ZS><<<2 * p.n_tiles, 128, 0, stream>>>(p);
+  gemm_kernel<P, Relu2, ZS, false, MaskIO><<<2 * p.n_tiles, 128, 0, stream>>>(p);
   return (int)cudaGetLastError();
 }
 
@@ -522,7 +563,9 @@ int marlinx_regs(int depth) {
 // a negative code for unsupported arguments.
 static int marlinx_gemm_impl(const void* A, long long lda, int M, const void* B, const void* S,
                  const void* GS, void* C, long long ldc, int N, int K, int sms, int depth,
-                 void* stream, bool relu2, const void* Z = nullptr, bool pdl = false) {
+                 void* stream, bool relu2, const void* Z = nullptr, bool pdl = false,
+                 uint32_t* mask_out = nullptr, const uint32_t* mask_in = nullptr,
+                 const int* verify_rows = nullptr) {
   if (M < 1 || M > 8) return -1;
   if (N <= 0 || K <= 0 || N % 128 || K % 128) return -2;
   if (sms <= 0) return -3;
@@ -541,6 +584,9 @@ static int marlinx_gemm_impl(const void* A, long long lda, int M, const void* B,
   p.n_tiles = N / 128;
   p.k_tiles = K / 128;
   p.Z = static_cast<const uint32_t*>(Z);
+  p.mask_out = mask_out;
+  p.mask_in = mask_in;
+  p.verify_rows = verify_rows;
   // Marlin's stripe partition with parallel = 1 and grid = sms.
   int part2 = p.n_tiles;
   if (p.n_tiles > sms) {
@@ -552,6 +598,15 @@ static int marlinx_gemm_impl(const void* A, long long lda, int M, const void* B,
   cudaStream_t st = static_cast<cudaStream_t>(stream);
   if (relu2) {
     if (N != 3712 || K != 2688) return -6;
+#ifndef MARLINX_NO_MASKS
+    if (mask_out) {
+      switch (depth) {
+        case 4: return marlinx::launch<4, true, false, true>(p, st, pdl);
+        case 8: return marlinx::launch<8, true, false, true>(p, st, pdl);
+        default: return -5;
+      }
+    }
+#endif
     switch (depth) {
       case 4: return marlinx::launch<4, true>(p, st, pdl);
       case 8: return marlinx::launch<8, true>(p, st, pdl);
@@ -560,6 +615,15 @@ static int marlinx_gemm_impl(const void* A, long long lda, int M, const void* B,
   }
   if (Z) {
     if (N != 2688 || K != 3712 || (K >> 4) > 512) return -7;
+#ifndef MARLINX_NO_MASKS
+    if (mask_in) {
+      switch (depth) {
+        case 4: return marlinx::launch<4, false, true, true>(p, st, pdl);
+        case 8: return marlinx::launch<8, false, true, true>(p, st, pdl);
+        default: return -5;
+      }
+    }
+#endif
     switch (depth) {
       case 4: return marlinx::launch<4, false, true>(p, st, pdl);
       case 8: return marlinx::launch<8, false, true>(p, st, pdl);
@@ -612,6 +676,68 @@ int marlinx_gemm_zs_pdl(const void* A, long long lda, int M, const void* B, cons
                  void* stream, const void* Z) {
   if (!Z) return -8;
   return marlinx_gemm_impl(A, lda, M, B, S, GS, C, ldc, N, K, sms, depth, stream, false, Z, true);
+}
+#endif
+
+#ifndef MARLINX_NO_MASKS
+// Optional ABI: existing entries and every old numeric specialization stay intact.
+int marlinx_init_masks(int pdl) {
+  cudaFuncAttributes attr;
+  cudaError_t e;
+#define MASK_ATTR(P, R, Z, D) \
+  if ((e = cudaFuncGetAttributes(&attr, marlinx::gemm_kernel<P, R, Z, D, true>)) != cudaSuccess) return (int)e
+  MASK_ATTR(4, true, false, false);
+  MASK_ATTR(8, true, false, false);
+  MASK_ATTR(4, false, true, false);
+  MASK_ATTR(8, false, true, false);
+#ifndef MARLINX_NO_PDL
+  if (pdl) {
+    MASK_ATTR(4, true, false, true);
+    MASK_ATTR(8, true, false, true);
+    MASK_ATTR(4, false, true, true);
+    MASK_ATTR(8, false, true, true);
+  }
+#endif
+#undef MASK_ATTR
+  return 0;
+}
+
+// Split producer/consumer ABI: the caller keeps AD5's deferred-down stream
+// schedule while carrying the current-call mask between the two launches.
+int marlinx_shared_up_mask(const void* A, long long lda, int M,
+    const void* U, const void* US, const void* UGS,
+    void* activation, void* masks, const int* verify_rows,
+    int sms, int depth, void* stream, int pdl) {
+  if (!activation || !masks) return -11;
+  return marlinx_gemm_impl(A, lda, M, U, US, UGS, activation, 3712,
+      3712, 2688, sms, depth, stream, true, nullptr, pdl != 0,
+      static_cast<uint32_t*>(masks), nullptr, verify_rows);
+}
+
+int marlinx_shared_down_mask(const void* activation, long long lda, int M,
+    const void* D, const void* DS, const void* DGS, const void* Z,
+    void* output, const void* masks, const int* verify_rows,
+    int sms, int depth, void* stream, int pdl) {
+  if (!Z || !activation || !output || !masks) return -11;
+  return marlinx_gemm_impl(activation, lda, M, D, DS, DGS, output, 2688,
+      2688, 3712, sms, depth, stream, false, Z, pdl != 0,
+      nullptr, static_cast<const uint32_t*>(masks), verify_rows);
+}
+
+int marlinx_shared_chain(const void* A, long long lda, int M,
+    const void* U, const void* US, const void* UGS,
+    const void* D, const void* DS, const void* DGS, const void* Z,
+    void* activation, void* output, void* masks, const int* verify_rows,
+    int sms, int depth, void* stream, int pdl) {
+  if (!Z || !activation || !output || !masks) return -11;
+  int rc = marlinx_gemm_impl(A, lda, M, U, US, UGS, activation, 3712,
+      3712, 2688, sms, depth, stream, true, nullptr, pdl != 0,
+      static_cast<uint32_t*>(masks), nullptr, verify_rows);
+  if (rc) return rc;
+  // No retry after production: up may already have launched.
+  return marlinx_gemm_impl(activation, 3712, M, D, DS, DGS, output, 2688,
+      2688, 3712, sms, depth, stream, false, Z, pdl != 0,
+      nullptr, static_cast<const uint32_t*>(masks), verify_rows);
 }
 #endif
 

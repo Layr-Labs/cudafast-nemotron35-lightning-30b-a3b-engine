@@ -764,8 +764,11 @@ class SpecDecodeBaseProposer:
             # loop iterations so we build once and reuse.
             if not self.constant_draft_positions or token_index == 0:
                 # A plan rewrites pinned host buffers that the previous plan's
-                # H2D copies read; wait until those copies have run.
-                if order_draft_plans and token_index > 0:
+                # H2D copies read; wait until those copies have run. With
+                # per-step staging sets (hostfast) this step's plan writes its
+                # own buffers and the set's event orders the reuse instead.
+                order_this_plan = order_draft_plans and self._hostfast_draft_sets() is None
+                if order_this_plan and token_index > 0:
                     assert self._draft_plan_event is not None
                     self._draft_plan_event.synchronize()
                 _, per_layer_attn_metadata = (
@@ -773,7 +776,7 @@ class SpecDecodeBaseProposer:
                         common_attn_metadata, draft_index=token_index + 1
                     )
                 )
-                if order_draft_plans:
+                if order_this_plan:
                     assert self._draft_plan_event is not None
                     self._draft_plan_event.record()
 
@@ -1116,9 +1119,13 @@ class SpecDecodeBaseProposer:
     def build_per_group_and_layer_attn_metadata(
         self, common_attn_metadata: CommonAttentionMetadata, draft_index: int = 0
     ) -> tuple[list[object], dict[str, object]]:
-        # LOCAL PATCH (cudafast-nemotron35): hostfast staging guard.
-        guard = self._hostfast_staging_guard()
-        if guard is not None:
+        # LOCAL PATCH (cudafast-nemotron35): hostfast per-step staging sets, or
+        # the staging guard when they are off.
+        sets = self._hostfast_draft_sets()
+        guard = None if sets is not None else self._hostfast_staging_guard()
+        if sets is not None:
+            sets.before(draft_index)
+        elif guard is not None:
             guard.before()
         per_group_attn_metadata: list[object] = []
         per_layer_attn_metadata: dict[str, object] = {}
@@ -1129,7 +1136,9 @@ class SpecDecodeBaseProposer:
             per_group_attn_metadata.append(attn_metadata)
             for layer_name in attn_group.layer_names:
                 per_layer_attn_metadata[layer_name] = attn_metadata
-        if guard is not None:
+        if sets is not None:
+            sets.after()
+        elif guard is not None:
             guard.after()
         return per_group_attn_metadata, per_layer_attn_metadata
 
@@ -1138,6 +1147,26 @@ class SpecDecodeBaseProposer:
     # draft tokens of the step being drafted for, on the CPU.
     hostfast_num_rejected_cpu: Any = None
     _hostfast_guard: "hostfast.StagingGuard | None" = None
+    # None: not built yet; False: the drafter's builders do not support sets.
+    _hostfast_sets: "hostfast.DraftStagingSets | bool | None" = None
+
+    def _hostfast_draft_sets(self) -> "hostfast.DraftStagingSets | None":
+        """One pinned staging set per draft step for the drafter's FlashInfer
+        builders (hostfast DraftStagingSets), or None for one shared set."""
+        if not hostfast.SETS or torch.cuda.is_current_stream_capturing():
+            return None
+        sets = self._hostfast_sets
+        if sets is None:
+            builders = [g.get_metadata_builder() for g in self.draft_attn_groups]
+            if not builders:
+                return None
+            if all(hostfast.DraftStagingSets.supports(b) for b in builders):
+                num_sets = max(1, self.speculative_config.num_speculative_tokens)
+                sets = hostfast.DraftStagingSets(builders, num_sets)
+            else:
+                sets = False
+            self._hostfast_sets = sets
+        return sets or None
 
     def _hostfast_draft_seq_lens(
         self,

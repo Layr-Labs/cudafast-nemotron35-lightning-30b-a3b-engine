@@ -3,8 +3,20 @@
 import torch
 from torch._subclasses.fake_tensor import FakeTensor
 
+import os
+
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+
+_PDL = None  # PDL launch on sm_90+; VLLM_MOE_MUL_SUM_PDL=0 disables
+
+
+def _pdl_enabled() -> bool:
+    global _PDL
+    if _PDL is None:
+        _PDL = (os.environ.get("VLLM_MOE_MUL_SUM_PDL", "1") != "0"
+                and current_platform.is_arch_support_pdl())
+    return _PDL
 
 
 @triton.jit
@@ -21,7 +33,10 @@ def moe_fused_mul_sum_kernel(
     size: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    launch_pdl: tl.constexpr = False,
 ):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
     pid_k = tl.program_id(0)
     pid_m = tl.program_id(1)
 
@@ -55,6 +70,8 @@ def moe_fused_mul_sum_kernel(
             ).to(tl.float32)
         acc += a_vec * b_val[:, None]
 
+    if launch_pdl:
+        tl.extra.cuda.gdc_launch_dependents()
     out_ptrs = outputs_ptr + (offs_m * size)[:, None] + offs_k[None, :]
     tl.store(
         out_ptrs,
@@ -197,6 +214,7 @@ def moe_fused_mul_sum(
             BLOCK_K,
             num_warps=num_warps,
             num_stages=num_stages,
+            launch_pdl=_pdl_enabled(),
         )
 
     return outputs

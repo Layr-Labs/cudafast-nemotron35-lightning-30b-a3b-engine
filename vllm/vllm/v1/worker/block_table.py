@@ -218,13 +218,13 @@ class BlockTable:
             BLOCK_SIZE=1024,
         )
 
-    # LOCAL PATCH (cudafast-nemotron35, crypto-a6): every write to the CPU table goes
-    # through the row methods above, which mark it dirty, and the GPU table is written
-    # only here and by clear(). A commit of rows that are unchanged since the last
-    # commit (and already covered by it) re-sends the same bytes, so it is skipped.
-    # VLLM_BLOCK_TABLE_COMMIT_ALWAYS=1 restores the unconditional copy.
+    # Device-only graph padding truncates that coverage via invalidate_gpu_rows_from.
     _commit_dirty: bool = True
     _committed_rows: int = -1
+
+    def invalidate_gpu_rows_from(self, first_row: int) -> None:
+        """Device-only padding leaves the prefix valid, not later CPU rows."""
+        self._committed_rows = min(self._committed_rows, first_row)
 
     def commit_block_table(self, num_reqs: int) -> None:
         if _COMMIT_ALWAYS or self._commit_dirty or num_reqs > self._committed_rows:

@@ -12,6 +12,7 @@ import os
 import numpy as np
 
 _FI_PAGE_TRIM = os.environ.get("VLLM_FI_PAGE_COPY_TRIM", "1") == "1"
+_FI_FRESH_PLAN_REUSE = os.environ.get("VLLM_FI_FRESH_PLAN_REUSE", "1") != "0"
 import torch
 from flashinfer import (
     BatchDecodeWithPagedKVCacheWrapper,
@@ -1530,26 +1531,73 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     o_dtype = (
                         FP8_DTYPE if self.is_kvcache_nvfp4 else self.model_config.dtype
                     )
-                    prefill_wrapper.plan(
-                        qo_indptr=qo_indptr_prefill_cpu,
-                        paged_kv_indptr=paged_kv_indptr_prefill_cpu,
-                        paged_kv_indices=paged_kv_indices,
-                        paged_kv_last_page_len=paged_kv_last_page_len_prefill_cpu,
-                        num_qo_heads=self.num_qo_heads,
-                        num_kv_heads=self.num_kv_heads,
-                        head_dim_qk=self.head_dim,
-                        page_size=self.page_size,
-                        causal=attn_metadata.causal,
-                        sm_scale=self.sm_scale,
-                        window_left=self.window_left,
-                        logits_soft_cap=self.logits_soft_cap,
-                        q_data_type=self.q_data_type_prefill,
-                        kv_data_type=self.kv_cache_dtype,
-                        o_data_type=o_dtype,
-                        fixed_split_size=self.prefill_fixed_split_size,
-                        disable_split_kv=self.disable_split_kv,
+                    fresh_key = None
+                    if fresh_496 and _FI_FRESH_PLAN_REUSE:
+                        fresh_key = (
+                            tuple(qo_indptr_prefill_cpu.tolist()),
+                            tuple(paged_kv_indptr_prefill_cpu.tolist()),
+                            tuple(paged_kv_last_page_len_prefill_cpu.tolist()),
+                            self.num_qo_heads,
+                            self.num_kv_heads,
+                            self.head_dim,
+                            self.page_size,
+                            attn_metadata.causal,
+                            self.sm_scale,
+                            self.window_left,
+                            self.logits_soft_cap,
+                            self.q_data_type_prefill,
+                            self.kv_cache_dtype,
+                            o_dtype,
+                            self.prefill_fixed_split_size,
+                            self.disable_split_kv,
+                            paged_kv_indices.data_ptr(),
+                            tuple(paged_kv_indices.shape),
+                        )
+                    reuse_fresh = (
+                        fresh_key is not None
+                        and getattr(prefill_wrapper, "_vp_fresh_plan_key", None)
+                        == fresh_key
+                        and getattr(
+                            prefill_wrapper, "_fresh_prefill_native_buffers", None
+                        )
+                        is not None
                     )
-                if fresh_496:
+                    if reuse_fresh:
+                        saved = prefill_wrapper._fresh_prefill_native_buffers
+                        dst = saved["_paged_kv_indices_buf"]
+                        assert prefill_wrapper._paged_kv_indices_buf is dst
+                        assert (dst.shape, dst.dtype) == (
+                            paged_kv_indices.shape, paged_kv_indices.dtype
+                        )
+                        dst.copy_(paged_kv_indices, non_blocking=True)
+                    else:
+                        prefill_wrapper.plan(
+                            qo_indptr=qo_indptr_prefill_cpu,
+                            paged_kv_indptr=paged_kv_indptr_prefill_cpu,
+                            paged_kv_indices=paged_kv_indices,
+                            paged_kv_last_page_len=paged_kv_last_page_len_prefill_cpu,
+                            num_qo_heads=self.num_qo_heads,
+                            num_kv_heads=self.num_kv_heads,
+                            head_dim_qk=self.head_dim,
+                            page_size=self.page_size,
+                            causal=attn_metadata.causal,
+                            sm_scale=self.sm_scale,
+                            window_left=self.window_left,
+                            logits_soft_cap=self.logits_soft_cap,
+                            q_data_type=self.q_data_type_prefill,
+                            kv_data_type=self.kv_cache_dtype,
+                            o_data_type=o_dtype,
+                            fixed_split_size=self.prefill_fixed_split_size,
+                            disable_split_kv=self.disable_split_kv,
+                        )
+                        if fresh_496:
+                            from vllm.v1.worker.prefill_graph import (
+                                stabilize_native_plan,
+                            )
+
+                            stabilize_native_plan(prefill_wrapper)
+                            prefill_wrapper._vp_fresh_plan_key = fresh_key
+                if fresh_496 and self.use_dcp:
                     from vllm.v1.worker.prefill_graph import stabilize_native_plan
 
                     stabilize_native_plan(prefill_wrapper)
@@ -2167,6 +2215,9 @@ class FlashInferImpl(AttentionImpl):
                 assert isinstance(attn_metadata.decode, FIDecode)
                 decode_wrapper = attn_metadata.decode.wrapper
                 assert decode_wrapper is not None
+                ev = getattr(attn_metadata, "plan_ready_event", None)  # draft plan side stream
+                if ev is not None:
+                    torch.cuda.current_stream().wait_event(ev)
                 assert decode_wrapper._window_left == self.window_left
                 assert decode_wrapper._logits_soft_cap == (self.logits_soft_cap or 0.0)
                 assert decode_wrapper._sm_scale == self.scale

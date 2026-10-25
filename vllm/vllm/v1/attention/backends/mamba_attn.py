@@ -748,8 +748,6 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             and num_reqs <= self.decode_cudagraph_max_bs
             and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
         ):
-            # Direct path: _update_metadata_for_cudagraph_capture will use the
-            # persistent buffers; rows num_decodes..num_reqs are its zero pad.
             if self._wpf_event is not None:
                 self._wpf_event.synchronize()
             self._wpf_wp_np[:num_decodes] = write_pos

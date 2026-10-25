@@ -32,29 +32,61 @@ def _static(value, memo):
     return result
 
 
+_DC_FIELDS: dict = {}
+
+
+def _dc_fields(tp):
+    names = _DC_FIELDS.get(tp)
+    if names is None:
+        names = tuple(f.name for f in dataclasses.fields(tp))
+        _DC_FIELDS[tp] = names
+    return names
+
+
 def _refresh(dst, src, seen):
-    if isinstance(dst, (torch.Tensor, dict, list, tuple)) or dataclasses.is_dataclass(dst):
+    if isinstance(dst, torch.Tensor):
         if id(dst) in seen:
             return
         seen.add(id(dst))
-    if isinstance(dst, torch.Tensor):
         assert (dst.shape, dst.dtype, dst.stride()) == (
             src.shape, src.dtype, src.stride())
+        if dst.numel() == 0:
+            return
+        if getattr(src, "_vp_const", False):
+            if getattr(dst, "_vp_last_src", None) is src:
+                return
+            dst.copy_(src, non_blocking=True)
+            dst._vp_last_src = src
+            return
+        dst._vp_last_src = None
         dst.copy_(src, non_blocking=True)
-    elif dataclasses.is_dataclass(dst):
-        assert type(src) is type(dst)
-        for field in dataclasses.fields(dst):
-            _refresh(getattr(dst, field.name), getattr(src, field.name), seen)
-    elif isinstance(dst, dict):
+        return
+    if isinstance(dst, dict):
+        if id(dst) in seen:
+            return
+        seen.add(id(dst))
         assert dst.keys() == src.keys()
         for key in dst:
             _refresh(dst[key], src[key], seen)
-    elif isinstance(dst, (list, tuple)):
+        return
+    tp = type(dst)
+    if hasattr(tp, "__dataclass_fields__") and not isinstance(dst, type):
+        if id(dst) in seen:
+            return
+        seen.add(id(dst))
+        assert type(src) is tp
+        for name in _dc_fields(tp):
+            _refresh(getattr(dst, name), getattr(src, name), seen)
+        return
+    if isinstance(dst, (list, tuple)):
+        if id(dst) in seen:
+            return
+        seen.add(id(dst))
         assert len(dst) == len(src)
         for left, right in zip(dst, src):
             _refresh(left, right, seen)
-    else:
-        assert dst is src or dst == src, (type(dst), dst, src)
+        return
+    assert dst is src or dst == src, (type(dst), dst, src)
 
 
 def stabilize_native_plan(wrapper):

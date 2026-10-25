@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+import os
 import sys
 from importlib.util import find_spec
 from typing import TYPE_CHECKING, Any, cast
@@ -771,11 +772,20 @@ class SpecDecodeBaseProposer:
                 if order_this_plan and token_index > 0:
                     assert self._draft_plan_event is not None
                     self._draft_plan_event.synchronize()
-                _, per_layer_attn_metadata = (
-                    self.build_per_group_and_layer_attn_metadata(
-                        common_attn_metadata, draft_index=token_index + 1
+                side = None if order_this_plan else self._draft_plan_side_stream()
+                if side is not None:
+                    side.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(side):
+                    _, per_layer_attn_metadata = (
+                        self.build_per_group_and_layer_attn_metadata(
+                            common_attn_metadata, draft_index=token_index + 1
+                        )
                     )
-                )
+                if side is not None:  # plan copies ran on `side`; flashinfer waits
+                    ev = self._draft_plan_ready[token_index]
+                    ev.record(side)
+                    for md in per_layer_attn_metadata.values():
+                        md.plan_ready_event = ev
                 if order_this_plan:
                     assert self._draft_plan_event is not None
                     self._draft_plan_event.record()
@@ -1149,6 +1159,23 @@ class SpecDecodeBaseProposer:
     _hostfast_guard: "hostfast.StagingGuard | None" = None
     # None: not built yet; False: the drafter's builders do not support sets.
     _hostfast_sets: "hostfast.DraftStagingSets | bool | None" = None
+
+    _draft_plan_stream = None  # None: undecided, False: off
+
+    def _draft_plan_side_stream(self):
+        """Side stream for draft-step plan copies (VLLM_DRAFT_PLAN_SIDE_STREAM=0: off)."""
+        if torch.cuda.is_current_stream_capturing() or self._hostfast_draft_sets() is None:
+            return None
+        if self._draft_plan_stream is None:
+            from vllm.v1.attention.backends.flashinfer import FlashInferMetadataBuilder
+
+            ok = os.environ.get("VLLM_DRAFT_PLAN_SIDE_STREAM", "1") != "0" and all(
+                isinstance(g.get_metadata_builder(), FlashInferMetadataBuilder)
+                for g in self.draft_attn_groups) and bool(self.draft_attn_groups)
+            self._draft_plan_stream = torch.cuda.Stream() if ok else False
+            self._draft_plan_ready = [
+                torch.cuda.Event() for _ in range(max(1, self.num_speculative_tokens))]
+        return self._draft_plan_stream or None
 
     def _hostfast_draft_sets(self) -> "hostfast.DraftStagingSets | None":
         """One pinned staging set per draft step for the drafter's FlashInfer

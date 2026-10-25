@@ -120,6 +120,8 @@ def _nvfp4_rows_dot(
     CHUNK: tl.constexpr = 1,
     CPER: tl.constexpr = 1,
     SPER: tl.constexpr = 1,
+    base_ptr=None,
+    BASE: tl.constexpr = False,
 ):
     """RMODE 0: rows from GATHER as before. 1: rows = rows_ptr[r] + (r // CPER) * CHUNK
     (first-stage top-k indices within their chunk). 2: rows = rows_ptr[c * CPER + ref_ptr[r]]
@@ -187,11 +189,15 @@ def _nvfp4_rows_dot(
         part = lo * hl[None, :] + hi * hh[None, :]
         part = tl.reshape(part, (BR, BB // 8, 8))
         acc += tl.sum(tl.sum(part, axis=2) * sc, axis=1)
-    tl.store(out_ptr + r, acc * gscale, mask=rmask)
+    if BASE:  # base[row] (coarse score) + the dot over the remaining groups
+        acc = tl.load(base_ptr + rows, mask=wr, other=0.0) + acc * gscale
+    else:
+        acc = acc * gscale
+    tl.store(out_ptr + r, acc, mask=rmask)
 
 
 def _rows_dot(h, w, s, rows, gscale, out, gather, gated=False, hcols=None, ref=None,
-              rmode=0, cper=1, sper=1):
+              rmode=0, cper=1, sper=1, base=None):
     n_out = out.numel()
     nbytes = w.shape[1]
     gather = gather or rmode != 0
@@ -212,6 +218,7 @@ def _rows_dot(h, w, s, rows, gscale, out, gather, gated=False, hcols=None, ref=N
         launch_pdl=mtp_pdl(),
         hcols_ptr=hcols, HCOLS=hcols is not None,
         ref_ptr=ref, RMODE=rmode, CHUNK=SCREEN_CHUNK, CPER=cper, SPER=sper,
+        base_ptr=base, BASE=base is not None,
     )
 
 
@@ -439,6 +446,14 @@ class DraftHeadScreen:
                 self.coarse_cols.numel(), dtype=torch.float32, device=device
             )
             self._hs = torch.empty(cols.numel(), dtype=torch.float32, device=device)
+        g2 = ranked_groups[CASCADE_FRAC_GROUPS:SCREEN_FRAC_GROUPS].sort().values
+        self.reuse = (self.fused_topk and _pow2(g2.numel() * 16)
+                      and os.environ.get("VLLM_MTP_SCREEN_REUSE", "1") != "0")
+        if self.reuse:
+            self.w_rest = w.view(n, ng, 8)[:, g2, :].reshape(n, -1).to(device).contiguous()
+            self.s_rest = s[:, g2].to(device).contiguous()
+            self.rest_cols = (g2[:, None] * 16 + torch.arange(16)[None, :]).reshape(-1).to(device)
+            self._hr = torch.empty(self.rest_cols.numel(), dtype=torch.float32, device=device)
         self.chunk_off = (
             torch.arange(n // SCREEN_CHUNK, device=device) * SCREEN_CHUNK
         )[:, None]
@@ -523,9 +538,10 @@ class DraftHeadScreen:
             # torch.topk(sorted=False) returns, in torch's order (_chunk_topk).
             # Same candidate ids in the same order, so every rows_dot, the
             # selection and the depth gate see identical inputs.
+            hb, cb = (self._hr, self.rest_cols) if self.reuse else (self._hs, self.cols)
             _gather_two[(1,)](
-                h, self.coarse_cols, self._hc, self.cols, self._hs,
-                NA=self.coarse_cols.numel(), NB=self.cols.numel(),
+                h, self.coarse_cols, self._hc, cb, hb,
+                NA=self.coarse_cols.numel(), NB=cb.numel(),
                 launch_pdl=mtp_pdl(),
             )
             _rows_dot(
@@ -541,8 +557,10 @@ class DraftHeadScreen:
                 num_warps=8, launch_pdl=mtp_pdl(), gate_ptr=tgate, GATED=tgated,
             )
             _rows_dot(
-                self._hs, self.w_scr, self.s_scr, self._coarse_cand,
+                hb, self.w_rest if self.reuse else self.w_scr,
+                self.s_rest if self.reuse else self.s_scr, self._coarse_cand,
                 self.gscale, self.refine_scores, True, gated,
+                base=self.scores if self.reuse else None,
             )
             _chunk_topk[(nchunk,)](
                 self.refine_scores, self._coarse_cand, self._cand,

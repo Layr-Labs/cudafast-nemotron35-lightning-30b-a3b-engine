@@ -112,30 +112,27 @@ class Mamba2AttentionMetadata(BaseMambaAttentionMetadata):
     seq_idx_p: torch.Tensor | None = None
 
 
-# LOCAL PATCH (cudafast-nemotron35): decode metadata reuse. In a spec-decode verify of a
-# pure-decode batch (no prefilling row, mamba_cache_mode "none", no ReplaySSM, full CUDA
-# graphs), every Mamba2 KV-cache group rebuilt the same metadata each step: the same ints and
-# views of the same persistent buffers (query_start_loc, seq_lens, the builder's state-index
-# and accepted-count buffers). The only per-step device work is copying this group's state
-# indices from its block table and the accepted counts into the buffers the verify graph reads.
-# So a builder whose inputs match its last decode build (same ints, same query_start_loc_cpu
-# values, same tensor storages and shapes) returns that metadata object after those copies,
-# and the Mamba2 groups share one accepted-count buffer that is copied once per step.
-# VLLM_MAMBA2_META_REUSE=0 restores the full build every step; VLLM_MAMBA2_META_REUSE_CHECK=1
-# also runs the full build and compares the two structurally.
 _META_REUSE = os.environ.get("VLLM_MAMBA2_META_REUSE", "1") != "0"
-_META_REUSE_CHECK = os.environ.get("VLLM_MAMBA2_META_REUSE_CHECK", "0") == "1"
-# (device, shape, dtype) -> the accepted-count buffer every Mamba2 group's verify graph reads
+_PREFILL_META_CACHE = os.environ.get("VLLM_MAMBA2_PREFILL_META_CACHE", "1") != "0"
 _SHARED_ACCEPTED: dict[tuple, torch.Tensor] = {}
-# Per-step state shared by the groups of one step (keyed by the step's query_start_loc
-# tensor object, which every group's shallow-copied CommonAttentionMetadata shares).
 _STEP: dict[str, Any] = {"qsl": None, "sig": None, "acc_qsl": None}
+
+
+def begin_metadata_step() -> None:
+    """Scope group sharing to this runner build, even if qsl's object is reused.
+
+    Persistent decode objects remain reusable by their structural signature;
+    current CPU metadata and accepted-count copies must be reconsidered each step.
+    """
+    _STEP["qsl"] = None
+    _STEP["sig"] = None
+    _STEP["acc_qsl"] = None
 
 
 def _tensor_key(t: torch.Tensor | None) -> tuple | None:
     if t is None:
         return None
-    return (t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.dtype)
+    return (str(t.device), t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.dtype)
 
 
 def _step_signature(
@@ -172,25 +169,58 @@ def _step_signature(
     return sig
 
 
-def _structure_diff(a: Any, b: Any, path: str, out: list[str]) -> None:
-    if isinstance(a, torch.Tensor) or isinstance(b, torch.Tensor):
-        if not (
-            isinstance(a, torch.Tensor)
-            and isinstance(b, torch.Tensor)
-            and _tensor_key(a) == _tensor_key(b)
-            and a.device == b.device
-        ):
-            out.append(path)
-        return
-    if type(a) is not type(b):
-        out.append(path)
-        return
-    if hasattr(a, "__dataclass_fields__"):
-        for f in fields(a):
-            _structure_diff(getattr(a, f.name), getattr(b, f.name), f"{path}.{f.name}", out)
-        return
-    if a != b:
-        out.append(path)
+def _prefill_signature(
+    common_attn_metadata: CommonAttentionMetadata, kwargs: dict[str, Any]
+) -> tuple | None:
+    """Inputs that decide a pure-prefill build (every row prefilling), or None."""
+    m = common_attn_metadata
+    isp = m.is_prefilling
+    if (
+        isp is None
+        or isp.is_cuda
+        or m.query_start_loc_cpu is None
+        or m.seq_lens_cpu_upper_bound is None
+        or m.seq_lens_cpu_upper_bound.is_cuda
+        or kwargs.get("prev_last_scheduled_idx") is not None
+    ):
+        return None
+    n = m.num_reqs
+    if n <= 0 or not bool(isp.numpy()[:n].all()):
+        return None
+    return (
+        n,
+        m.num_actual_tokens,
+        m.max_query_len,
+        tuple(m.query_start_loc_cpu.tolist()),
+        tuple(m.seq_lens_cpu_upper_bound.tolist()),
+        tuple(isp.tolist()),
+        _tensor_key(m.query_start_loc),
+        _tensor_key(m.seq_lens),
+        _tensor_key(kwargs.get("num_accepted_tokens")),
+    )
+
+
+_PREFILL_CONST_FIELDS = (
+    "query_start_loc_p",
+    "has_initial_states_p",
+    "num_computed_tokens_p",
+    "cu_chunk_seqlen_p",
+    "seq_idx_p",
+    "last_chunk_indices_p",
+    "batch_ptr",
+    "token_chunk_offset_ptr",
+)
+
+
+def _mark_const(value: Any) -> None:
+    if isinstance(value, torch.Tensor):
+        value._vp_const = True
+    elif isinstance(value, dict):
+        for v in value.values():
+            _mark_const(v)
+    elif isinstance(value, (list, tuple)):
+        for v in value:
+            _mark_const(v)
 
 
 class Mamba2AttentionMetadataBuilder(
@@ -211,7 +241,6 @@ class Mamba2AttentionMetadataBuilder(
             "chunk_size needs to be set in the model config for Mamba2 models"
         )
         self.chunk_size: int = chunk_size
-        # LOCAL PATCH (cudafast-nemotron35): decode metadata reuse (see _META_REUSE).
         self._meta_reuse = (
             _META_REUSE
             and self.use_spec_decode
@@ -221,6 +250,12 @@ class Mamba2AttentionMetadataBuilder(
         )
         self._decode_cache: tuple | None = None
         self._capture_build = False
+        self._prefill_cache_on = (
+            _PREFILL_META_CACHE
+            and vllm_config.cache_config.mamba_cache_mode == "none"
+            and not self.use_replayssm
+        )
+        self._prefill_cache: tuple | None = None
         if self._meta_reuse:
             buf = self.decode_num_accepted_tokens
             key = (str(buf.device), tuple(buf.shape), buf.dtype)
@@ -231,6 +266,7 @@ class Mamba2AttentionMetadataBuilder(
         self, common_attn_metadata: CommonAttentionMetadata
     ) -> Mamba2AttentionMetadata:
         self._decode_cache = None
+        self._prefill_cache = None
         self._capture_build = True
         try:
             return super().build_for_cudagraph_capture(common_attn_metadata)
@@ -244,6 +280,12 @@ class Mamba2AttentionMetadataBuilder(
         fast_build: bool = False,
         **kwargs: Any,
     ) -> Mamba2AttentionMetadata:
+        if self._prefill_cache_on and not self._capture_build and common_prefix_len == 0:
+            psig = _prefill_signature(common_attn_metadata, kwargs)
+            if psig is not None:
+                return self._build_prefill_cached(
+                    psig, common_prefix_len, common_attn_metadata, fast_build, **kwargs
+                )
         if not self._meta_reuse or self._capture_build or common_prefix_len != 0:
             return self._build_full(
                 common_prefix_len, common_attn_metadata, fast_build, **kwargs
@@ -268,14 +310,6 @@ class Mamba2AttentionMetadataBuilder(
                 acc = kwargs["num_accepted_tokens"]
                 self.decode_num_accepted_tokens[:nd].copy_(acc[:nd], non_blocking=True)
                 _STEP["acc_qsl"] = qsl
-            if _META_REUSE_CHECK:
-                full = self._build_full(
-                    common_prefix_len, common_attn_metadata, fast_build, **kwargs
-                )
-                diffs: list[str] = []
-                _structure_diff(md, full, "mamba2", diffs)
-                if diffs:
-                    raise RuntimeError(f"Mamba2 decode metadata reuse differs: {diffs}")
             return md
         md = self._build_full(
             common_prefix_len, common_attn_metadata, fast_build, **kwargs
@@ -290,10 +324,34 @@ class Mamba2AttentionMetadataBuilder(
             == self.state_indices_tensor_d.data_ptr()
         ):
             self._decode_cache = (sig, md)
-            # the full build copied this step's accepted counts into the shared buffer
             _STEP["acc_qsl"] = common_attn_metadata.query_start_loc
         else:
             self._decode_cache = None
+        return md
+
+    def _build_prefill_cached(
+        self,
+        psig: tuple,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+        **kwargs: Any,
+    ) -> Mamba2AttentionMetadata:
+        sig = (psig, _tensor_key(common_attn_metadata.block_table_tensor))
+        hit = self._prefill_cache
+        if hit is not None and hit[0] == sig:
+            md = hit[1]
+            return md
+        md = self._build_full(
+            common_prefix_len, common_attn_metadata, fast_build, **kwargs
+        )
+        if md.num_decodes == 0 and md.num_prefills == md.num_reqs:
+            for name in _PREFILL_CONST_FIELDS:
+                _mark_const(getattr(md, name, None))
+            _mark_const(md.nums_dict)
+            self._prefill_cache = (sig, md)
+        else:
+            self._prefill_cache = None
         return md
 
     def _build_full(

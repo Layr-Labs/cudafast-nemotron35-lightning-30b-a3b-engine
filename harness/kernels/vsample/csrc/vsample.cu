@@ -1,28 +1,10 @@
-// vsample: the greedy spec-decode verify sampler of a one-request batch in one kernel.
-//
-// Replaces, for the verify of one request with D drafts (logits rows 0..D, bf16), the eager op
-// chain gpu_model_runner._sample -> RejectionSampler._greedy_argmax_sample ->
-// _update_states_after_model_execute runs after the target lm_head (~17 launches):
-//   depth gate:  slot = arange(D); draft' = where(slot >= vrows - 1, -1, draft)   (when vrows given)
-//   row_argmax = logits.argmax(-1)          (torch: NaN wins, then larger value, ties -> lower index)
-//   target = row_argmax[target_logits_indices]; bonus = int32(row_argmax[bonus_logits_indices])
-//   out = full((1, max_spec_len + 1), -1); rejection_greedy_sample_kernel (non-synthetic, greedy):
-//     for pos < nd (nd = cu_num_draft_tokens[0]): out[pos] = int32(target[pos]); stop after the
-//     first pos with draft'[pos] != out[pos]; if none rejected, out[nd] = bonus
-//   vrows.fill_(1 << 30);  num_accepted[0] = int32((out != -1).sum())
-// All integer work and a max under a strict total order on (value, index) pairs, so the result
-// does not depend on how the 2-level reduction is split: identical to torch for every input.
-//
-// Launch: grid (C, R) CTAs, C chunks of every row; each CTA writes its (value, index) partial,
-// the last CTA to finish (atomic counter) reduces the partials of each row and runs the rest.
-// The counter is reset by that CTA, so the next launch on the same stream starts from 0.
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
 
-#define VS_VERSION 1
+#define VS_VERSION 2
 
 namespace {
 
@@ -46,7 +28,6 @@ __device__ __forceinline__ void pdl_launch_dependents() {
 #endif
 }
 
-// torch GreaterOrNan (ATen SharedReduceOps.h): does (a, ia) win over (b, ib)?
 __device__ __forceinline__ bool wins(float a, int ia, float b, int ib) {
   const bool na = a != a, nb = b != b;
   if (na) return nb ? ia < ib : true;
@@ -92,7 +73,6 @@ __global__ void __launch_bounds__(kThreads)
   __shared__ int row_arg[kMaxRows];
 
   pdl_wait();
-  // ---- phase 1: this CTA's chunk of row r
   Best b{-__int_as_float(0x7f800000), 0x7fffffff};  // (-inf, +big): loses to every element
   const unsigned short* row = logits + static_cast<long>(r) * ld;
   const int base = c * kChunk;
@@ -128,7 +108,6 @@ __global__ void __launch_bounds__(kThreads)
   __syncthreads();
   if (!is_last) return;
   __threadfence();
-  // ---- phase 2 (last CTA): reduce every row's partials (warp w -> rows w, w + 8, ...)
   const int w = t >> 5, lane = t & 31;
   for (int rr = w; rr < R; rr += kThreads / 32) {
     Best x{-__int_as_float(0x7f800000), 0x7fffffff};
@@ -139,25 +118,24 @@ __global__ void __launch_bounds__(kThreads)
   __syncthreads();
   if (t == 0) {
     *counter = 0u;  // ready for the next launch (stream order)
-    const int vr = vrows == nullptr ? 0 : *vrows;
+    const int vr = vrows == nullptr ? 0 : __ldcg(vrows);
     for (int p = 0; p < out_len; ++p) out[p] = -1;
-    // nd is the request's draft count; clamp only guards memory (stock never exceeds it)
-    const int nd = max(0, min(cu_num_draft[0], out_len - 1));
+    const int nd = max(0, min(__ldcg(cu_num_draft), out_len - 1));
     bool rejected = false;
     int written = 0;
     for (int pos = 0; pos < nd; ++pos) {
-      int ti = target_idx[pos];
+      int ti = __ldcg(target_idx + pos);
       if (ti < 0) ti += R;  // torch indexing wraps negative indices
       ti = max(0, min(ti, R - 1));
       const int tok = row_arg[ti];
-      int d = draft[pos];
+      int d = __ldcg(draft + pos);
       if (vrows != nullptr && pos >= vr - 1) d = -1;
       out[pos] = tok;
       ++written;
       if (d != tok) { rejected = true; break; }
     }
     if (!rejected) {
-      int bi = bonus_idx[0];
+      int bi = __ldcg(bonus_idx);
       if (bi < 0) bi += R;
       bi = max(0, min(bi, R - 1));
       out[nd] = row_arg[bi];
@@ -165,7 +143,9 @@ __global__ void __launch_bounds__(kThreads)
     }
     if (vrows != nullptr) *vrows = kVrowsAll;
     if (num_accepted != nullptr) *num_accepted = written;
+    __threadfence();
   }
+  __syncthreads();
   pdl_launch_dependents();
 }
 
@@ -181,8 +161,6 @@ int vs_max_vocab() { return kMaxChunks * kChunk; }
 
 int vs_chunk() { return kChunk; }
 
-// logits: bf16 [R, V] with row stride ld elements (16-byte aligned rows: ld % 8 == 0, V % 8 == 0).
-// scratch: >= kMaxRows * kMaxChunks floats + ints; counter: one zeroed unsigned int.
 int vs_greedy_verify(const void* logits, long ld, int R, int V, const int* target_idx,
                      const int* bonus_idx, const int* cu_num_draft, const int* draft, int* vrows,
                      int* out, int out_len, int* num_accepted, float* pval, int* pidx,

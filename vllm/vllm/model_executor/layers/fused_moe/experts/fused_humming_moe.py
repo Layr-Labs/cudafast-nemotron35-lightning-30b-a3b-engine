@@ -25,6 +25,7 @@ from vllm.model_executor.layers.fused_moe.experts.humming_tuned_moe import (
 )
 from vllm.model_executor.layers.fused_moe.experts.humming_zskip import (
     maybe_down as maybe_zskip_down,
+    prealign as maybe_zskip_prealign,
 )
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size,
@@ -746,6 +747,14 @@ class HummingIndexedExperts(HummingExpertsBase):
             expert_map=expert_map,
             expert_tokens_meta=expert_tokens_meta,
         )
+        zskip_pre = (
+            maybe_zskip_prealign(
+                self.layer, topk_ids, topk_ids.size(0),
+                getattr(self, "_moe_block_size", None),
+            )
+            if expert_map is None
+            else None
+        )
 
         inputs, input_scale = HummingMethod.may_quant_input(
             layer=self.layer,
@@ -825,6 +834,7 @@ class HummingIndexedExperts(HummingExpertsBase):
             getattr(self, "_moe_block_size", None),
             moe_kwargs2,
             topk_ids=topk_ids,
+            pre=zskip_pre,
         )
         sparse_weights = getattr(self.layer, "routed_sparse_down", None)
         if (

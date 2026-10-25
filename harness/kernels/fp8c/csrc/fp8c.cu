@@ -47,6 +47,13 @@ __device__ __forceinline__ uint32_t ld1(const uint8_t* p) {
  asm volatile("ld.global.nc.L1::no_allocate.u32 %0, [%1];\n" : "=r"(v) : "l"(p));
  return v;
 }
+// 97bea238-f708-40e2-9bb8-fd0f8f1e2bf9: allocate only immutable sparse
+// exception windows in L1; the larger main-plane stream still bypasses L1.
+__device__ __forceinline__ uint32_t ld_exception(const uint8_t* p) {
+ uint32_t v;
+ asm volatile("ld.global.nc.L1::evict_normal.u32 %0, [%1];\n" : "=r"(v) : "l"(p));
+ return v;
+}
 __device__ __forceinline__ uint32_t bfi8(uint32_t b, uint32_t w, uint32_t pos) {
  uint32_t d;
  asm("bfi.b32 %0, %1, %2, %3, 8;\n" : "=r"(d) : "r"(b), "r"(w), "r"(pos));
@@ -68,7 +75,7 @@ __device__ __forceinline__ void load_x(const uint8_t* tb,int lane,int c,uint32_t
  uint32_t off=__shfl_sync(FULL,ts,c),end=__shfl_sync(FULL,te,c);
  uint32_t q0=off&3u;
  s.q0=q0;
- s.x=(4u*lane<q0+end-off)?ld1(tb+Shape<K>::EXC+(off-q0)+4*lane):0u;
+ s.x=(4u*lane<q0+end-off)?ld_exception(tb+Shape<K>::EXC+(off-q0)+4*lane):0u;
 }
 __device__ __forceinline__ uint32_t lanemask_lt() {
  uint32_t m;
@@ -216,7 +223,9 @@ __global__ __launch_bounds__(128,2) void gemm(P p) {
    if(c<C){
     #pragma unroll
     for(int st=0;st<4;++st)mma(a[j][st][0],a[j][st][1],wc[2*st],wc[2*st+1],acc);
-    if(c+RC<C)load_a<K,!PDL>(p,lane,c+RC,a[j]);
+    if constexpr (K == 2688) {
+     if(c+RC<C)load_a<K,!PDL>(p,lane,c+RC,a[j]);
+    }
     if(c+1<C){
      uint32_t wn[8];
      decode(s[(j+1)%RC],e0x,esc4,lane,wn);
@@ -226,6 +235,11 @@ __global__ __launch_bounds__(128,2) void gemm(P p) {
      }
      #pragma unroll
      for(int i=0;i<8;++i)wc[i]=wn[i];
+    }
+    // Output projection: decode/refill weights before issuing the next
+    // independent activation refill. Keep the original input schedule.
+    if constexpr (K == 4096) {
+     if(c+RC<C)load_a<K,!PDL>(p,lane,c+RC,a[j]);
     }
    }
   }

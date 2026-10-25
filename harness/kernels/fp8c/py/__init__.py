@@ -214,6 +214,12 @@ def prepare(packed: torch.Tensor, return_info: bool = False):
         if not torch.equal(dec, packed):
             bad = int((dec != packed).sum().item())
             return _reject(f"decode differs from the pack in {bad} bytes")
+    # Issued only after the native decoder has verified every weight byte.
+    # A view/device copy without this exact object/storage marker simply keeps
+    # the original contiguous prefetch. This metadata never changes the codec.
+    buf._fp8c_prefetch_layout = (
+        1, n, k, header_bytes(k), MAIN, k // 128, buf.data_ptr()
+    )
     stats["tensors"] += 1
     stats["raw_bytes"] += n * k
     stats["bytes"] += buf.numel()

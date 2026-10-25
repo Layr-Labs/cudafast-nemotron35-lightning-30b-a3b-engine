@@ -14,9 +14,17 @@ arch=${arch%%;*}
 arch=${arch// /}
 arch=${arch%+PTX}
 sm=${arch/./}
-"$nvcc" -O3 -std=c++17 -shared -Xcompiler -fPIC \
+# Never mistake a stale optional library for this build's result.
+rm -f "$out/libl2pf.so"
+if ! "$nvcc" -O3 -std=c++17 -shared -Xcompiler -fPIC \
   -gencode "arch=compute_${sm},code=sm_${sm}" \
-  -o "$out/libl2pf.so" "$here/csrc/l2pf.cu" 2>&1 | grep -v '^$' || true
+  -o "$out/libl2pf.so" "$here/csrc/l2pf.cu"; then
+  rm -f "$out/libl2pf.so"
+  echo "l2pf: optional fp8c tile prefetch unavailable; rebuilding original paths" >&2
+  "$nvcc" -O3 -std=c++17 -shared -Xcompiler -fPIC -DL2PF_NO_FP8C_TILES \
+    -gencode "arch=compute_${sm},code=sm_${sm}" \
+    -o "$out/libl2pf.so" "$here/csrc/l2pf.cu"
+fi
 test -f "$out/libl2pf.so" || { echo "l2pf: build failed" >&2; exit 1; }
 cp "$here/py/__init__.py" "$out/__init__.py"
 echo "l2pf: built $out/libl2pf.so for sm_${sm}"

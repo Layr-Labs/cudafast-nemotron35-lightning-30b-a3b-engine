@@ -326,6 +326,14 @@
     {
       "file": "(composition)",
       "why": "e-man07 composition on dadon's record fc04335b-c894-41f9-b73b-aa9b5aac1fb5: ArthurOstapenko 0f958570-4fab-4ffd-8db5-c5a2c37a5439's tree byte for byte, plus jacklightChen b0d0b0b6's apk12 coherent-PDL attention files and i34-9 c3e16bbb's prefill files (pzskip, humming relu2 epilogue / nvsc / tuned_moe / zskip glue) and marlinx unit-major scales, each carried byte for byte from its author's tree. No new arithmetic by us."
+    },
+    {
+      "file": "model_executor/layers/mamba/ops/mamba_ssm_spec_replay.py; model_executor/layers/mamba/mamba_mixer2.py",
+      "why": "Checkpointed anchor for the spec-decode SSM update (extends dadon b9a63f4f): states are stored only at positions L - 1 + 12 k (L: prompt length, k = 0 the prefill's final state), alternately in slots 0 and 2; a verify loads the last checkpoint before its token 0 and replays the tokens since it from the ring (which now also holds token 0) with the existing per-token fp32 update, then stores the next checkpoint when it is among its tokens. The prefill writes L into the slot-0 page padding after the SSM state. Same per-token update order, outputs and launch configuration. VLLM_MAMBA_REPLAY_LAZY=0 restores an anchor store in every verify."
+    },
+    {
+      "file": "harness/kernels/l2pf/csrc/l2pf.cu; harness/kernels/l2pf/py/__init__.py; harness/kernels/l2pf/build.sh; harness/kernels/fp8c/py/__init__.py; vllm/vllm/model_executor/layers/mamba/mamba_mixer2.py; harness/vllm_resident/test_fp8c_prefetch_tiles.py",
+      "why": "L2PF_FP8C_TILES: distribute the existing small-M Mamba out-projection L2 prefetch budget across all 84 verified fp8c consumer tiles. Each range covers its header, at least six initial compressed chunks and complete exception tail; producer metadata is issued only after original full-byte decoding verification. All ranges are bounded/aligned/disjoint, total bytes do not exceed the previous projection budget, and router reservation, one 128-thread launch, side-stream fork and join are unchanged. Only immutable cache hints change; no arithmetic, encoding or outputs change. Optional ABI and compile fallback retain the original contiguous policy. Local CPU range/dispatch tests only; GPU performance unmeasured."
     }
   ]
 }

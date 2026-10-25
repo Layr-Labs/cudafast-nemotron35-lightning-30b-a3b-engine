@@ -95,6 +95,8 @@ def depth_gate_init(device: torch.device) -> torch.Tensor | None:
             smallk.request_verify_rows()
         except ImportError:
             pass
+    if _l2pf is not None and _GATE is not None and _GATE.device == device:
+        _l2pf.set_gate(_GATE)
     return _GATE
 
 

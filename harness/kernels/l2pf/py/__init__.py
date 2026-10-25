@@ -5,6 +5,10 @@ from the current stream (eager or under CUDA graph capture); ``join(device)``
 makes the current stream wait for them, which a capture needs before it ends.
 Only values already in memory move into L2: no kernel output can change.
 
+When ``set_gate`` has the drafter's device stop flag, the prefetch kernel loads
+that one int and returns without touching DRAM if the flag is set. A null gate
+(nothing registered, or ``l2pf_prefetch``) is the ungated copy.
+
 ``L2PF=0`` in the environment disables every prefetch.
 """
 
@@ -18,7 +22,7 @@ import torch
 __all__ = [
     "LIB_PATH", "ENABLED", "MAMBA_BYTES", "ATTN_BYTES", "MOE_BYTES", "DRAFT_BYTES",
     "AHEAD", "AHEAD_MOE", "DRAFT_SCREEN",
-    "prefetch", "join",
+    "prefetch", "join", "set_gate",
 ]
 
 LIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "libl2pf.so")
@@ -27,7 +31,7 @@ CHUNK = 1 << 16
 # Bytes prefetched per window: what DRAM can deliver while the latency-bound
 # kernels of that window run (more stalls the rejoin).
 MAMBA_BYTES = int(float(os.environ.get("L2PF_MAMBA_MB", "5")) * (1 << 20))
-ATTN_BYTES = int(float(os.environ.get("L2PF_ATTN_MB", "3")) * (1 << 20))
+ATTN_BYTES = int(float(os.environ.get("L2PF_ATTN_MB", "7")) * (1 << 20))
 # The routed down projection of a small call (zskip) is latency-bound and leaves
 # DRAM about half idle: prefetch the head of the next Mamba layer's in_proj then.
 MOE_BYTES = int(float(os.environ.get("L2PF_MOE_MB", "12")) * (1 << 20))
@@ -43,17 +47,36 @@ AHEAD: dict[str, torch.nn.Module] = {}
 AHEAD_MOE: dict[str, torch.nn.Module] = {}
 
 _lib = None
+_gated = None
 _side: dict[int, torch.cuda.Stream] = {}
+_GATE: torch.Tensor | None = None
+
+
+def set_gate(gate: torch.Tensor | None) -> None:
+    """Register the drafter stop flag ``prefetch`` passes to the kernel, or clear it."""
+    global _GATE
+    _GATE = gate
 
 
 def _load():
-    global _lib
+    global _lib, _gated
     try:
         lib = ctypes.CDLL(LIB_PATH)
     except OSError:  # library missing: every call is a no-op
         return None
-    lib.l2pf_prefetch.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p]
-    lib.l2pf_prefetch.restype = ctypes.c_int
+    gated = getattr(lib, "l2pf_prefetch_gated", None)
+    if gated is not None:
+        gated.argtypes = [
+            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
+        ]
+        gated.restype = ctypes.c_int
+        _gated = gated
+    else:
+        lib.l2pf_prefetch.argtypes = [
+            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p,
+        ]
+        lib.l2pf_prefetch.restype = ctypes.c_int
+        _gated = None
     _lib = lib
     return lib
 
@@ -79,7 +102,14 @@ def prefetch(t: torch.Tensor | None, max_bytes: int = 0) -> bool:
     main = torch.cuda.current_stream(t.device)
     side = _side_stream(t.device)
     side.wait_stream(main)
-    rc = _lib.l2pf_prefetch(st.data_ptr(), nbytes, CHUNK, side.cuda_stream)
+    gate = _GATE
+    gate_ptr = None
+    if gate is not None and gate.device == t.device:
+        gate_ptr = gate.data_ptr()
+    if _gated is not None:
+        rc = _gated(st.data_ptr(), nbytes, CHUNK, gate_ptr, side.cuda_stream)
+    else:
+        rc = _lib.l2pf_prefetch(st.data_ptr(), nbytes, CHUNK, side.cuda_stream)
     if rc != 0:
         raise RuntimeError(f"l2pf_prefetch failed: {rc}")
     return True

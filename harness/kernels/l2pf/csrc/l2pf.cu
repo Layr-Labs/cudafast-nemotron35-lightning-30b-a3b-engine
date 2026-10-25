@@ -11,7 +11,9 @@
 #include <cstdint>
 
 namespace l2pf {
-__global__ void prefetch_kernel(const uint8_t* __restrict__ p, size_t bytes, uint32_t chunk) {
+__global__ void prefetch_kernel(const uint8_t* __restrict__ p, size_t bytes, uint32_t chunk,
+                                const int* __restrict__ gate) {
+  if (gate != nullptr && *gate != 0) return;
   for (size_t off = (size_t)threadIdx.x * chunk; off < bytes; off += (size_t)blockDim.x * chunk) {
     const size_t n = bytes - off < chunk ? bytes - off : chunk;
     asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(p + off),
@@ -21,9 +23,14 @@ __global__ void prefetch_kernel(const uint8_t* __restrict__ p, size_t bytes, uin
 }  // namespace l2pf
 
 // 0 on success; -1 for a misaligned range or chunk.
-extern "C" int l2pf_prefetch(const void* p, size_t bytes, int chunk, void* stream) {
+extern "C" int l2pf_prefetch_gated(const void* p, size_t bytes, int chunk, const void* gate,
+                                   void* stream) {
   if (reinterpret_cast<uintptr_t>(p) % 16 || chunk < 16 || chunk % 16) return -1;
   l2pf::prefetch_kernel<<<1, 128, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
-      (const uint8_t*)p, bytes, (uint32_t)chunk);
+      (const uint8_t*)p, bytes, (uint32_t)chunk, (const int*)gate);
   return (int)cudaGetLastError();
+}
+
+extern "C" int l2pf_prefetch(const void* p, size_t bytes, int chunk, void* stream) {
+  return l2pf_prefetch_gated(p, bytes, chunk, nullptr, stream);
 }

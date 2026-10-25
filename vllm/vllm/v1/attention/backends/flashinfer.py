@@ -14,7 +14,6 @@ import functools
 import numpy as np
 
 _FI_FAST_SPEC_PLAN = os.environ.get("VLLM_FI_FAST_SPEC_PLAN", "1") == "1"
-_FI_FRESH_PLAN_REUSE = os.environ.get("VLLM_FI_FRESH_PLAN_REUSE", "1") != "0"
 
 _FI_PAGE_TRIM = os.environ.get("VLLM_FI_PAGE_COPY_TRIM", "1") == "1"
 import torch
@@ -1551,8 +1550,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         _plan = functools.partial(
                             _fast_plan_spec_prefill, prefill_wrapper, self
                         )
-                    if fresh_496 and _FI_FRESH_PLAN_REUSE:
-                        _plan = functools.partial(_reuse_fresh_prefill_plan, prefill_wrapper)
                     _plan(
                         qo_indptr=qo_indptr_prefill_cpu,
                         paged_kv_indptr=paged_kv_indptr_prefill_cpu,
@@ -1572,7 +1569,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         fixed_split_size=self.prefill_fixed_split_size,
                         disable_split_kv=self.disable_split_kv,
                     )
-                if fresh_496 and (self.use_dcp or not _FI_FRESH_PLAN_REUSE):
+                if fresh_496:
                     from vllm.v1.worker.prefill_graph import stabilize_native_plan
 
                     stabilize_native_plan(prefill_wrapper)
@@ -2421,59 +2418,6 @@ class FlashInferImpl(AttentionImpl):
                 layer._k_scale,
                 layer._v_scale,
             )
-
-
-def _reuse_fresh_prefill_plan(wrapper, **kw) -> None:
-    """Reuse only a native fresh-prefill plan with identical structural inputs.
-
-    Page-index values are refreshed every call. Prompt/token tensors and model
-    outputs never enter this cache. Unknown wrapper state uses the native plan.
-    """
-    from vllm.v1.worker.prefill_graph import stabilize_native_plan
-
-    key = None
-    try:
-        cpu_names = ("qo_indptr", "paged_kv_indptr", "paged_kv_last_page_len")
-        indices = kw["paged_kv_indices"]
-        if all(kw[name].device.type == "cpu" for name in cpu_names):
-            constants = tuple(
-                (k, str(v)) for k, v in sorted(kw.items())
-                if k not in (*cpu_names, "paged_kv_indices")
-            )
-            key = (
-                tuple((name, tuple(kw[name].tolist()), str(kw[name].dtype))
-                      for name in cpu_names),
-                constants,
-                indices.data_ptr(), tuple(indices.shape), tuple(indices.stride()),
-                str(indices.dtype), str(indices.device),
-                getattr(wrapper, "_backend", None),
-                id(getattr(wrapper, "_cached_module", None)),
-            )
-        saved = getattr(wrapper, "_fresh_prefill_native_buffers", None)
-        same = (
-            key is not None
-            and getattr(wrapper, "_vp_fresh_plan_key", None) == key
-            and saved is not None
-            and tuple(wrapper._plan_info) == wrapper._fresh_prefill_native_plan_info
-            and all(getattr(wrapper, name) is tensor for name, tensor in saved.items())
-        )
-        if same:
-            dst = saved["_paged_kv_indices_buf"]
-            same = (
-                dst.device == indices.device
-                and (dst.shape, dst.dtype, dst.stride())
-                == (indices.shape, indices.dtype, indices.stride())
-            )
-        if same:
-            dst.copy_(indices, non_blocking=True)
-            return
-    except (AttributeError, KeyError, TypeError, ValueError):
-        key = None
-    wrapper.plan(**kw)
-    stabilize_native_plan(wrapper)
-    # plan() may initialize/replace the cached module on this first call. A key
-    # miss on the next call simply performs one extra native plan, then settles.
-    wrapper._vp_fresh_plan_key = key
 
 
 def _fast_plan_spec_prefill(wrapper, builder, **kw) -> None:

@@ -268,16 +268,16 @@
       "why": "Selectonlygraph-replayadmissiontiming helper frompublicpendingf102bbdb-ebe5-48e5-a1c8-313774419059;24callscycle6real-layerweights,7replaymedian, nohostlaunchbias. Keep4%MIN_GAIN andrankedall-layerexactadmission; paired eagerbaseline/candidatefallback ifreferencegraphunavailable. DoNOTimportdiagnosticstalls,_sleep,stagecodes orMIN_GAIN10. ADFcombined8d/51notealreadycoverednonewmethod; wholecombo remainsunverified,remoteonly."
     },
     {
-      "file": "vllm/model_executor/models/nemotron_h_mtp_packed.py, nemotron_h_mtp_kernels.py, vllm/v1/attention/backends/flashinfer.py, layers/attention/attention.py, vllm/v1/worker/gpu_model_runner.py",
-      "why": "jacklightChen 36efef0d (decode pieces only): native MTP word reads, packed drafter output projection, structural plan reuse. Its prefill-alignment hunks (humming_zskip.py, fused_humming_moe.py, prefill_graph.py) are not carried: the equivalent pieces measured -0.23% on this tree."
-    },
-    {
       "file": "model_executor/layers/fused_moe/experts/humming_relu2_epilogue.py",
       "why": "Default-on HUMMING_EVICT_FIRST: only routed-up M=496, top-6 (2976 valid rows) uses a separately cached derived ReLU2 Humming kernel with L2 evict-first cp.async packed B/BS loads. The pinned loader loop, predicates, bytes, dequantization, ascending K16 MMA chain and BF16/ReLU2 epilogue are unchanged. Other call shapes and decode keep stock; HUMMING_EVICT_FIRST=0 restores stock. Load admission asserts policy source and a distinct cubin/kernel id; compile/load failure logs once and uses stock."
     },
     {
       "file": "harness/kernels/pzskip/csrc/pzskip.cu (+ build.sh)",
       "why": "PZ333 M496/top-6 only: HUMMING_EVICT_PZ defaults on and gives immutable packed B/BS cp.async loads L2 evict-first priority. Loader addresses, bytes, masks, K16 MMA order, negative-zero repair and formats are unchanged. HUMMING_EVICT_PZ=0 restores stock. Separate native template specialization; compile/load failure retains stock PZ333. Stacks independently with the routed-up evf policy; no decode change."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_packed.py, nemotron_h_mtp_kernels.py, vllm/v1/attention/backends/flashinfer.py, layers/attention/attention.py, vllm/v1/worker/gpu_model_runner.py",
+      "why": "e-man07: these five files are restored byte for byte to the 7c0c5713 record (6091812), i.e. jacklightChen 36efef0d's decode pieces (native MTP word reads, packed drafter output projection, structural plan reuse) are removed from the 1fa278d1 tree. On our GB10 the removal measured +0.27%, +0.32% and +0.69% composite against 1fa278d1 in three independent paired A/B gates (9 prompts x 2 runs per leg, identical token streams on every prompt). Every other 1fa278d1 piece is kept unchanged. Official measurement #2 of this stack (same code)."
     }
   ]
 }

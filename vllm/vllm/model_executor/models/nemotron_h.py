@@ -711,6 +711,19 @@ class NemotronHModel(nn.Module, EagleModelMixin):
                     if name is None:
                         name = f"{prefix}.layers.{i}.mixer.experts"
                     _l2pf.AHEAD_MOE[str(name)] = nxt.mixer.in_proj
+            # Source idea: 297e3412-dc4a-45ae-a0f1-b6c3afd76c1b. The
+            # prefetcher shares the existing window budget with this router.
+            for i in range(self.start_layer, self.end_layer - 1):
+                cur, nxt = self.layers[i], self.layers[i + 1]
+                gate = getattr(getattr(nxt, "mixer", None), "gate", None)
+                if not isinstance(nxt, NemotronHMoEDecoderLayer) or gate is None:
+                    continue
+                if isinstance(cur, NemotronHMambaDecoderLayer):
+                    _l2pf.AHEAD_GATE[str(cur.mixer.prefix)] = gate
+                elif isinstance(cur, NemotronHAttentionDecoderLayer):
+                    name = getattr(getattr(cur.mixer, "attn", None), "layer_name", None)
+                    if name is not None:
+                        _l2pf.AHEAD_GATE[str(name)] = gate
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )

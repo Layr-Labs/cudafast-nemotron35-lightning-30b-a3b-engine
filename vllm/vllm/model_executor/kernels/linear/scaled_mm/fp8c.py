@@ -20,6 +20,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 logger = init_logger(__name__)
 SHAPES = {(10304, 2688), (2688, 4096)}
 _logged = False
+_BASE7 = {}  # strong immutable owners; unknown buffers fall back to CUTLASS
 
 
 def prepare_weight(packed: torch.Tensor) -> torch.Tensor | None:
@@ -38,6 +39,15 @@ def prepare_weight(packed: torch.Tensor) -> torch.Tensor | None:
         return None
     if comp is None and fp8c.stats["rejected"] > rejected:
         logger.warning("fp8c: %s; this layer keeps fp8small", fp8c.stats["last_reason"])
+    if comp is not None:
+        _BASE7[(comp.device.index, comp.data_ptr())] = comp
+        try:
+            import fp8d6
+            selected = fp8d6.prepare(packed, comp)
+            if selected is not None:
+                return selected
+        except Exception as exc:  # optional candidate never replaces a failed reference
+            logger.warning("fp8d6 unavailable (%r); current fp8c retained", exc)
     return comp
 
 
@@ -49,8 +59,8 @@ def _log_once(fp8c) -> None:
     s = fp8c.stats
     raw = max(s["raw_bytes"], 1)
     logger.info(
-        "fp8c active: %d Mamba FP8 projections read from the lossless 7-bit code "
-        "(%.1f MB -> %.1f MB, %.3f bits/weight, %d kept fp8small); FP8C=0 disables",
+        "fp8c reference: %d Mamba projections admitted to lossless 7-bit storage "
+        "(%.1f MB -> %.1f MB, %.3f bits/weight, %d kept fp8small); optional fp8d6 logged separately",
         s["tensors"], s["raw_bytes"] / 1e6, s["bytes"] / 1e6, 8.0 * s["bytes"] / raw,
         s["rejected"],
     )
@@ -82,8 +92,19 @@ def _scaled_mm(
     ):
         import fp8c
 
-        _log_once(fp8c)
-        return fp8c.gemm(a, comp, sa, sb, n, k)
+        try:
+            import fp8d6
+        except ImportError:
+            fp8d6 = None
+        if fp8d6 is not None and fp8d6.owns(comp):
+            return fp8d6.gemm(a, comp, sa, sb, n, k)
+        known = _BASE7.get((comp.device.index, comp.data_ptr()))
+        if (known is not None and known.shape == comp.shape
+                and known.stride() == comp.stride()):
+            _log_once(fp8c)
+            return fp8c.gemm(a, comp, sa, sb, n, k)
+        # A copied/migrated unknown encoded buffer is never interpreted as a
+        # different codec. The original FP8 tensor B remains the safe input.
     return ops.cutlass_scaled_mm(a, b, scale_a=sa, scale_b=sb, out_dtype=torch.bfloat16)
 
 

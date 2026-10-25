@@ -17,6 +17,8 @@ from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from .fp8pre import maybe_gemm
+
 logger = init_logger(__name__)
 SHAPES = {(10304, 2688), (2688, 4096)}
 _logged = False
@@ -84,6 +86,10 @@ def _scaled_mm(
 
         _log_once(fp8c)
         return fp8c.gemm(a, comp, sa, sb, n, k)
+    # LOCAL PATCH (cudafast-nemotron35): prefill row counts on an admitted layer (fp8pre.py).
+    out = maybe_gemm(a, b, sa, sb)
+    if out is not None:
+        return out
     return ops.cutlass_scaled_mm(a, b, scale_a=sa, scale_b=sb, out_dtype=torch.bfloat16)
 
 

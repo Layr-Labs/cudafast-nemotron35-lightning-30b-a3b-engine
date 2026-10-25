@@ -342,6 +342,14 @@
     {
       "file": "vllm/v1/spec_decode/nemotron_decode_plan.py (+ llm_base_proposer.py, v1/attention/backends/flashinfer.py)",
       "why": "Own native-MTP FA2 planning-state bank on ENTIRE0e71. Remote startup records original native plan vector, integer prefix and scalar state for each EXACT CPU indptr/last-page/options input, across up to128generic page counts with every valid residue, capped64MiB of plan bytes. Integer-tail/float-arena canaries guard actual installed planner writes; no page-invariance or package-source-equality assumption. Changed private model/hidden/token/gate/KV/live indices/CPU metadata and complete side-stream model-step timing admission mandatory. Only then copy native planning state; current indices/last-page buffers still refreshed. Unknown keys/identities/options fall back before mutation. No request capture or inference output cache. NEMO_MTP_NATIVE_PLAN_BANK=0 disables. Private qualification lineage6cafa6b6-8f26-4ef5-86e1-38c061a207d7 andce5aa6bd-15c2-42c2-8a68-4bc2fe65c23b; no lower tailgraph or L1 runtime imported."
+    },
+    {
+      "file": "model_executor/layers/fused_moe/experts/humming_zskip.py; harness/kernels/zskip/{csrc/zskip.cu,csrc/zskip_pair.cuh,py/__init__.py}",
+      "why": "Schedule variants of the paired M5 routed-down kernel (config 119): configs 160-165 change only the ring depth, warps per CTA (one fused prep shared by the CTA, its row loads issued together) and 64-column tiles per warp; per output the same group sequence, dequantisation, MMA operands, negative-zero repair and epilogue. Each layer admits a variant only after 119's own bitwise checks (M1-8, spread and crowded routing, signed zeros, empty halves, prefix rows) against humming and 119; after 8 layers one CUDA graph over their weights times 119 and the survivors, and the fastest under 97% of 119 replaces it. ZSKIP_VARIANTS=0 disables."
+    },
+    {
+      "file": "harness/kernels/pzskip/{csrc/pzskip.cu,py/__init__.py,tests/exact.py}; vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
+      "why": "Exact schedule variants of the prefill routed down (config 356): 357 and 360-364. 360-364 keep 356's per-output arithmetic, lean copy roles, skip semantics, -0 recompute and epilogue on humming's own 64-row expert blocks (one union mask per block, each warp owning its columns for all of the block's token tiles), so an expert routed 33-64 rows loads its live weight rows once instead of once per 32-row block. Each layer admits a variant only after bitwise checks against 356 (496/512 tokens with skewed routing, 257 near-uniform, each also with -0 zeros); after 4 layers CUDA graphs over their weights time 356 and the survivors on a skewed 496-token call, and the fastest under 97% of 356 replaces it. Any failure keeps 356. PZSKIP_VARIANTS=0 disables."
     }
   ]
 }

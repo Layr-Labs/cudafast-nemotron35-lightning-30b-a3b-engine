@@ -600,7 +600,8 @@ class DraftHeadScreen:
             self.fold = True
 
     def _greedy_row(
-        self, h: torch.Tensor, gated: bool = False, out: torch.Tensor | None = None
+        self, h: torch.Tensor, gated: bool = False, out: torch.Tensor | None = None,
+        _staged: bool = False,
     ) -> torch.Tensor:
         """One row h [K] float32: the cascade (or the single screen) and the
         argmax tie rule, written to out (a fresh int32 scalar when None). Every
@@ -614,18 +615,19 @@ class DraftHeadScreen:
             # torch.topk(sorted=False) returns, in torch's order (_chunk_topk).
             # Same candidate ids in the same order, so every rows_dot, the
             # selection and the depth gate see identical inputs.
-            if self.reuse:
-                _gather_two[(1,)](
-                    h, self.coarse_cols, self._hc, self.rest_cols, self._hr,
-                    NA=self.coarse_cols.numel(), NB=self.rest_cols.numel(),
-                    launch_pdl=mtp_pdl(),
-                )
-            else:
-                _gather_two[(1,)](
-                    h, self.coarse_cols, self._hc, self.cols, self._hs,
-                    NA=self.coarse_cols.numel(), NB=self.cols.numel(),
-                    launch_pdl=mtp_pdl(),
-                )
+            if not _staged:
+                if self.reuse:
+                    _gather_two[(1,)](
+                        h, self.coarse_cols, self._hc, self.rest_cols, self._hr,
+                        NA=self.coarse_cols.numel(), NB=self.rest_cols.numel(),
+                        launch_pdl=mtp_pdl(),
+                    )
+                else:
+                    _gather_two[(1,)](
+                        h, self.coarse_cols, self._hc, self.cols, self._hs,
+                        NA=self.coarse_cols.numel(), NB=self.cols.numel(),
+                        launch_pdl=mtp_pdl(),
+                    )
             _rows_dot(
                 self._hc, self.w_coarse, self.s_coarse, None,
                 self.gscale, self.scores, False, gated,

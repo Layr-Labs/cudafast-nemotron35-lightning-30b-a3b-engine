@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Native Nemotron MTP decode-step graph, prepared only during remote startup."""
 import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 
 import torch
 
@@ -150,9 +154,13 @@ def prepare(p):
                     torch.equal(a, b) for a, b in zip(actual, reference)):
                 logger.warning('Native MTP full-step private rows differ; original path retained')
                 return
+        skip = None
+        if gate is not None and os.environ.get('NEMO_MTP_DRAFT_SKIP', '1') != '0':
+            skip = _skip_graph(p, graph, kwargs, metadata, slots, gate, padded,
+                               used_rows, original_mode)
         # Own strong output references and a private pool throughout replay.
         p._nemo_full = (graph, padded, signature, _inputs(kwargs),
-                        (outputs, private, metadata, zero_row))
+                        (outputs, private, metadata, zero_row), skip)
         logger.info('Native MTP full-step graph prepared at padded=%d', padded)
     except Exception as exc:
         logger.warning('Native MTP full-step graph unavailable: %r', exc)
@@ -162,14 +170,255 @@ def prepare(p):
         p.model.set_moe_row_src(min(p.max_num_tokens, 5), None)
 
 
+def _replay_us(fn, reps=8, rounds=7):
+    """Median GPU time per replay in microseconds (event-timed back-to-back replays)."""
+    fn()
+    torch.cuda.synchronize()
+    ms = []
+    for _ in range(rounds):
+        a = torch.cuda.Event(enable_timing=True)
+        b = torch.cuda.Event(enable_timing=True)
+        a.record()
+        for _ in range(reps):
+            fn()
+        b.record()
+        b.synchronize()
+        ms.append(a.elapsed_time(b))
+    return sorted(ms)[rounds // 2] * 1000.0 / reps
+
+
+_IF_PROBE = """
+import importlib.util, sys, torch, triton
+import triton.language as tl
+
+@triton.jit
+def add1(src, dst, N: tl.constexpr, B: tl.constexpr, launch_pdl: tl.constexpr = False):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    i = tl.program_id(0) * B + tl.arange(0, B)
+    tl.store(dst + i, tl.load(src + i, mask=i < N) + 1.0, mask=i < N)
+
+l2pf = None
+if sys.argv[1] != "-":
+    spec = importlib.util.spec_from_file_location("l2pf", sys.argv[1])
+    l2pf = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(l2pf)
+dev = torch.device("cuda")
+pdl = torch.cuda.get_device_capability(dev)[0] >= 9
+gate = torch.zeros(4, dtype=torch.int32, device=dev)
+pred = torch.zeros((), dtype=torch.bool, device=dev)
+a = torch.randn(4096, device=dev)
+b = torch.empty_like(a)
+c = torch.empty_like(a)
+w = torch.randn(1024, 1024, device=dev, dtype=torch.bfloat16)
+x = torch.randn(5, 1024, device=dev, dtype=torch.bfloat16)
+y = torch.empty(5, 1024, device=dev, dtype=torch.bfloat16)
+
+def body():
+    add1[(4,)](a, b, N=4096, B=1024, launch_pdl=pdl)
+    pf = l2pf is not None and l2pf.prefetch(w)
+    torch.mm(x, w, out=y)
+    if pf:
+        l2pf.join(dev)
+    add1[(4,)](b, c, N=4096, B=1024, launch_pdl=pdl)
+
+probe_stream = torch.cuda.Stream()
+with torch.cuda.stream(probe_stream):
+    body()
+torch.cuda.synchronize()
+ref_c, ref_y = c.clone(), y.clone()
+g = torch.cuda.CUDAGraph()
+with torch.cuda.graph(g, stream=probe_stream):
+    torch.eq(gate[0], 0, out=pred)
+    g.begin_capture_to_if_node(pred)
+    try:
+        body()
+    finally:
+        g.end_capture_to_conditional_node()
+c.zero_()
+y.zero_()
+g.replay()
+torch.cuda.synchronize()
+assert torch.equal(c, ref_c) and torch.equal(y, ref_y)
+gate[0] = 1
+c.fill_(3)
+y.fill_(3)
+g.replay()
+torch.cuda.synchronize()
+assert bool((c == 3).all()) and bool((y == 3).all())
+print("probe-ok")
+"""
+_if_ok = None
+
+
+def _if_probe():
+    """Build and replay, in a child process, a graph of the same shape: the gate
+    compare, then an IF node whose body holds PDL Triton launches, an l2pf
+    side-stream fork/join and a cuBLAS GEMM. A refusal or a device fault there
+    kills only the child; the parent then keeps the record's graph."""
+    global _if_ok
+    if _if_ok is None:
+        from vllm.model_executor.models import nemotron_h_mtp_kernels as kernels
+        l2pf = getattr(kernels._l2pf, '__file__', None) or '-'
+        try:
+            # Triton obtains source with inspect.getsourcelines. A -c string
+            # has no file for that lookup; keep the complete generic probe in
+            # an actual temporary .py file throughout its child/JIT lifetime.
+            # This code executes only in official remote model startup.
+            with tempfile.TemporaryDirectory(prefix='nemo-if-probe-') as probe_dir:
+                probe_path = Path(probe_dir) / 'probe.py'
+                probe_path.write_text(_IF_PROBE, encoding='utf-8')
+                out = subprocess.run([sys.executable, str(probe_path), l2pf],
+                                     capture_output=True, text=True, timeout=240)
+            _if_ok = out.returncode == 0 and 'probe-ok' in out.stdout
+            if not _if_ok:
+                logger.warning('Native MTP draft skip: IF-node probe failed (rc %s): %s',
+                               out.returncode, out.stderr[-400:])
+        except Exception as exc:
+            logger.warning('Native MTP draft skip: IF-node probe did not run (%r)', exc)
+            _if_ok = False
+    return _if_ok
+
+
+def _skip_graph(p, graph, kwargs, metadata, slots, gate, padded, used_rows,
+                original_mode):
+    """The same step graph with the model forward inside a CUDA graph IF node on
+    gate[0] == 0. Once the depth gate stopped the draft loop, a pass's forward is
+    never read: the screen's gated kernels write the +0 scores and fixed candidate
+    ids without reading h (nemotron_h_mtp_screen.py _nvfp4_rows_dot, _chunk_topk),
+    so the stopped draft token does not depend on it, and the stopped pass's KV
+    slot lies past every live pass of the cycle and is rewritten by the next
+    cycle's first pass before any read. A skipped pass leaves its outputs and the
+    gate untouched. Admitted only when it matches the record's graph bit for bit
+    with the gate open, skips with it stopped, and the timing pays; else None."""
+    from vllm.utils.torch_utils import current_stream
+    outer = current_stream()
+    pool = captured = None
+    try:
+        if not _if_probe():
+            return None
+        pred = torch.zeros((), dtype=torch.bool, device=gate.device)
+        skip = torch.cuda.CUDAGraph()
+        pool = torch.cuda.graph_pool_handle()
+        gate.zero_()
+        capture_stream = torch.cuda.Stream(device=p.device)
+        capture_stream.wait_stream(outer)
+        with set_forward_context(metadata, p.vllm_config, num_tokens=padded,
+                                 cudagraph_runtime_mode=CUDAGraphMode.FULL,
+                                 slot_mapping=slots):
+            # Warm on the actual nondefault capture stream, including any
+            # stream-specific cuBLAS workspace and the model's prefetch fork.
+            with torch.cuda.stream(capture_stream):
+                torch.cuda.set_stream(capture_stream)
+                for _ in range(2):
+                    p.model(**kwargs)
+            torch.cuda.synchronize(p.device)
+            from vllm.distributed.device_communicators.pynccl_allocator import (
+                set_graph_pool_id)
+            set_graph_pool_id(pool)
+            with torch.cuda.graph(skip, pool=pool, stream=capture_stream):
+                torch.cuda.set_stream(capture_stream)
+                torch.eq(gate[0], 0, out=pred)
+                skip.begin_capture_to_if_node(pred)
+                try:
+                    # The body captures on a stream torch switched to in C++;
+                    # vLLM's tracked current stream must name it too.
+                    torch.cuda.set_stream(torch.cuda.current_stream())
+                    out = p.model(**kwargs)
+                finally:
+                    try:
+                        skip.end_capture_to_conditional_node()
+                    finally:
+                        torch.cuda.set_stream(capture_stream)
+        captured = True
+        torch.cuda.synchronize(p.device)
+
+        def leaves(value):
+            if isinstance(value, torch.Tensor):
+                return [value]
+            return [t for v in value for t in leaves(v)]
+
+        def rec():
+            with set_forward_context(metadata, p.vllm_config, num_tokens=padded,
+                                     cudagraph_runtime_mode=CUDAGraphMode.FULL,
+                                     slot_mapping=slots):
+                return graph(**kwargs)
+
+        # Stopped: the body must not run (sentinel outputs, gate as set).
+        gate.zero_()
+        gate[0].fill_(1)
+        stopped = gate.clone()
+        for t in leaves(out):
+            t.fill_(3)
+        skip.replay()
+        torch.cuda.synchronize(p.device)
+        if (not all(torch.equal(t, torch.full_like(t, 3)) for t in leaves(out))
+                or not torch.equal(gate, stopped)):
+            logger.warning('Native MTP draft skip: stopped pass ran; original graph kept')
+            return None
+        # Open: bitwise the record's graph and the eager model, after a skipped pass.
+        for case in (1, 0):
+            gate.zero_()
+            p.input_ids[:padded].fill_(case)
+            p.hidden_states[:padded].fill_(0.125 * case)
+            skip.replay()
+            actual = used_rows(out)
+            reference = used_rows(rec())
+            with set_forward_context(metadata, p.vllm_config, num_tokens=padded,
+                                     cudagraph_runtime_mode=original_mode,
+                                     slot_mapping=slots):
+                eager = used_rows(p.model(**kwargs))
+            if len(actual) != len(reference) or not all(
+                    torch.equal(a, b) and torch.equal(a, c)
+                    for a, b, c in zip(actual, reference, eager)):
+                logger.warning('Native MTP draft skip: rows differ; original graph kept')
+                return None
+        # Admission: the IF node's cost on live passes against the stopped-pass saving
+        # (about 3 live passes per half a stopped pass per cycle).
+        # The record's raw graph, so neither side pays the wrapper's host work.
+        raw = graph.concrete_cudagraph_entries[BatchDescriptor(num_tokens=padded)].cudagraph
+        gate.zero_()
+        rec_live = _replay_us(raw.replay)
+        skip_live = _replay_us(skip.replay)
+        gate[0].fill_(1)
+        rec_stop = _replay_us(raw.replay)
+        skip_stop = _replay_us(skip.replay)
+        gate.zero_()
+        cost = max(0.0, skip_live - rec_live)
+        ok = skip_live <= rec_live + 2.0 and rec_stop - skip_stop >= 6.0 * cost
+        logger.info('Native MTP draft skip: live %.1f/%.1f us, stopped %.1f/%.1f us '
+                    '(record/skip), %s', rec_live, skip_live, rec_stop, skip_stop,
+                    'admitted' if ok else 'original graph kept')
+        return (skip, out, pred, pool) if ok else None
+    except Exception as exc:
+        logger.warning('Native MTP draft skip unavailable: %r', exc)
+        if pool is not None and not captured:
+            # A capture that died before capture_end leaves the pool registered
+            # as capturing in the allocator.
+            try:
+                torch._C._cuda_endAllocateToPool(gate.device.index, pool)
+            except Exception:
+                pass
+        return None
+    finally:
+        torch.cuda.set_stream(outer)
+        gate.zero_()
+        p.input_ids[:padded].zero_()
+        p.hidden_states[:padded].zero_()
+
+
 def maybe_run(p, kwargs, metadata, padded, batch_size):
     state = getattr(p, '_nemo_full', None)
     if state is None or batch_size != 1 or padded != state[1]:
         return None
-    graph, _, signature, inputs, _outputs = state
+    graph, _, signature, inputs, _outputs, skip = state
     if (BatchDescriptor(num_tokens=padded) not in graph.concrete_cudagraph_entries
             or _inputs(kwargs) != inputs or _metadata(p, metadata) != signature):
         return None
+    if skip is not None:
+        skip[0].replay()
+        return skip[1]
     with set_forward_context(metadata, p.vllm_config, num_tokens=padded,
                              cudagraph_runtime_mode=CUDAGraphMode.FULL,
                              slot_mapping=p._get_slot_mapping(padded)):

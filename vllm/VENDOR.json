@@ -342,6 +342,18 @@
     {
       "file": "vllm/v1/spec_decode/nemotron_decode_plan.py (+ llm_base_proposer.py, v1/attention/backends/flashinfer.py)",
       "why": "Own native-MTP FA2 planning-state bank on ENTIRE0e71. Remote startup records original native plan vector, integer prefix and scalar state for each EXACT CPU indptr/last-page/options input, across up to128generic page counts with every valid residue, capped64MiB of plan bytes. Integer-tail/float-arena canaries guard actual installed planner writes; no page-invariance or package-source-equality assumption. Changed private model/hidden/token/gate/KV/live indices/CPU metadata and complete side-stream model-step timing admission mandatory. Only then copy native planning state; current indices/last-page buffers still refreshed. Unknown keys/identities/options fall back before mutation. No request capture or inference output cache. NEMO_MTP_NATIVE_PLAN_BANK=0 disables. Private qualification lineage6cafa6b6-8f26-4ef5-86e1-38c061a207d7 andce5aa6bd-15c2-42c2-8a68-4bc2fe65c23b; no lower tailgraph or L1 runtime imported."
+    },
+    {
+      "file": "v1/spec_decode/nemotron_tail_cycle.py; v1/spec_decode/nemotron_tail_fusion.py; v1/spec_decode/llm_base_proposer.py; model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "Own substantive two/three-step native-MTP tail graph on ENTIRE highest0b98b133-8c9b-44ec-9e46-6fc8dca3ec10. New one-CTA exact integer/hidden transition staging and one-CTA BF16/FP16-to-FP32 head conversion/gathers, with exhaustive private raw16 conversion checks and original head math. Full actual-model/token/hidden/gate/KV/sentinel/workspace/CPU metadata qualification plus guarded end-to-end timing mandatory. Private fixture/graph lineage6cafa6b6-8f26-4ef5-86e1-38c061a207d7 and ownce5aa6bd-15c2-42c2-8a68-4bc2fe65c23b; no old negative whole or L1 schedule adopted. Complete combination unvalidated; official remote execution only."
+    },
+    {
+      "file": "v1/spec_decode/nemotron_full_step.py; v1/spec_decode/nemotron_tail_cycle.py",
+      "why": "Material GPU conditional stopped-draft-forward method/code5fedb300-fb71-4398-aa1b-59208c4c05f5. Only full-step IF route, no FP8 prefill kernel. Own actual-source-file child probe and same nondefault capture-stream warmup; extends conditional forward to admitted multi-step tail graphs using canonical parent IF output and per-step raw hidden observers. Live passes execute full model; stopped output/KV nonwrites checked. Unsupported IF keeps original graph. Admission/engagement/gain unknown."
+    },
+    {
+      "file": "harness/kernels/l2pf/csrc/l2pf.cu; harness/kernels/l2pf/py/__init__.py; model_executor/layers/fused_moe/experts/fused_humming_moe.py",
+      "why": "Exact three reviewed checkpoint-anchor L2-prefetch blobs from eca53325-63df-4321-a618-53b8b95eed0e, composed on highest0b98 period20/ring/native-plan whole. Runtime imports actual LAZY_PERIOD. No oldperiod12 whole adopted; read-only L2 requests use original MoE side-stream join. Same idea independently rebased in pendingea18a772-9132-4552-83e2-adea54a875c3, whose source was not copied."
     }
   ]
 }

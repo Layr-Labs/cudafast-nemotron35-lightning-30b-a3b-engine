@@ -22,6 +22,28 @@ def _inputs(kwargs):
                  for k, v in sorted(kwargs.items()))
 
 
+def _decode_state(wrapper):
+    """Guard host launch decisions and exact native workspaces read by replay."""
+    plan = getattr(wrapper, "_plan_info", None)
+    if not isinstance(plan, (tuple, list)) or not all(type(v) is int for v in plan):
+        return None
+    module = getattr(wrapper, "_cached_module", None)
+    if module is None:
+        return None
+    buffers = []
+    for name in ("_float_workspace_buffer", "_int_workspace_buffer",
+                 "_pin_memory_int_workspace_buffer", "_paged_kv_indptr_buf",
+                 "_paged_kv_indices_buf", "_paged_kv_last_page_len_buf"):
+        value = getattr(wrapper, name, None)
+        if value is None:
+            buffers.append((name, None))
+        elif isinstance(value, torch.Tensor):
+            buffers.append((name, _tensor(value)))
+        else:
+            return None
+    return (id(module), tuple(plan), tuple(buffers))
+
+
 def _metadata(p, metadata):
     from vllm.v1.attention.backends.flashinfer import FIDecode, FlashInferMetadata
     result = []
@@ -34,8 +56,11 @@ def _metadata(p, metadata):
         cache = p.compilation_config.static_forward_context[name].kv_cache
         if not isinstance(cache, torch.Tensor) or not cache.is_cuda or not cache.numel():
             return None
+        decode_state = _decode_state(m.decode.wrapper)
+        if decode_state is None:
+            return None
         result.append((name, id(m.decode.wrapper), m.q_data_type_decode,
-                       _tensor(m.slot_mapping), _tensor(cache)))
+                       decode_state, _tensor(m.slot_mapping), _tensor(cache)))
     buffers = tuple(_tensor(getattr(g.get_metadata_builder(), name).gpu)
                     for g in p.draft_attn_groups
                     for name in ('paged_kv_indptr', 'paged_kv_indices', 'paged_kv_last_page_len'))
@@ -170,6 +195,15 @@ def maybe_run(p, kwargs, metadata, padded, batch_size):
     if (BatchDescriptor(num_tokens=padded) not in graph.concrete_cudagraph_entries
             or _inputs(kwargs) != inputs or _metadata(p, metadata) != signature):
         return None
+    # A full replay bypasses FlashInferImpl.forward's Python event wait.
+    # Honor the current step's actual side-plan event before entering the graph.
+    # Do not rely on QKV runtime to hide an unfinished plan upload.
+    waited = set()
+    for md in metadata.values():
+        event = getattr(md, "plan_ready_event", None)
+        if event is not None and id(event) not in waited:
+            torch.cuda.current_stream().wait_event(event)
+            waited.add(id(event))
     with set_forward_context(metadata, p.vllm_config, num_tokens=padded,
                              cudagraph_runtime_mode=CUDAGraphMode.FULL,
                              slot_mapping=p._get_slot_mapping(padded)):

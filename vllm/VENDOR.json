@@ -266,6 +266,10 @@
     {
       "file": "model_executor/models/nemotron_h_attn_packed.py",
       "why": "Selectonlygraph-replayadmissiontiming helper frompublicpendingf102bbdb-ebe5-48e5-a1c8-313774419059;24callscycle6real-layerweights,7replaymedian, nohostlaunchbias. Keep4%MIN_GAIN andrankedall-layerexactadmission; paired eagerbaseline/candidatefallback ifreferencegraphunavailable. DoNOTimportdiagnosticstalls,_sleep,stagecodes orMIN_GAIN10. ADFcombined8d/51notealreadycoverednonewmethod; wholecombo remainsunverified,remoteonly."
+    },
+    {
+      "file": "harness/kernels/zskip/{csrc/zskip.cu,csrc/zskip_pair.cuh,py/__init__.py};model_executor/layers/attention/attention.py;model_executor/models/{nemotron_h_mtp_packed,nemotron_h_mtp_kernels}.py;model_executor/layers/fused_moe/experts/humming_zskip.py;v1/spec_decode/nemotron_full_step.py",
+      "why": "On ENTIRE newesthighest7c0c5713 source retain allA3/nativefullgraph stack. Select6f819974 targetdown empty8rowhalf dequant skip withold113/118fallback andbothnative/priorconfig/prefixremoteadmission. Selectown36efef0d nativeMTPwordread+actualweight/perKprivatebitadmission andnativeo_projpacking/plane-prefetch, notwhole36lowerbase orprefillJ/refresh methods; retainown36guardedfreshnativeplanI andskipneververifiabledraftL2, no alignment/refresh. Public41e5657b-0033-489a-b095-6a22fd5edcd8 compositionnote considered, fullUUIDcredit. Newfullgraphcomposition explicitlywaitsactualcurrentplan_ready_event beforewhole replay andguards nativehostintegerplan_info/module/workspace/indexbuffer descriptors. Source7cpubliclocal1bprefillnegativefeedback guidesexclusion, notclaimedofficialisolatedcause. Wholecombinationunverified;all executionofficialremoteonly."
     }
   ]
 }

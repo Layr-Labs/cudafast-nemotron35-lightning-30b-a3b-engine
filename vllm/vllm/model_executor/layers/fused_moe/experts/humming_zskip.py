@@ -59,6 +59,9 @@ MAX_TOKENS = 8
 PAIR_ENABLED = os.environ.get("ZSKIP_DADON", "1") != "0"
 PAIR_CONFIG = 113
 PAIR_FUSED_CONFIG = 118
+# the same pair kernels without the dequantisation of 8-row k halves whose mask byte is zero
+PAIR_HALFSKIP = os.environ.get("ZSKIP_HALFSKIP", "1") != "0"
+PAIR_HALFSKIP_CONFIG = {PAIR_CONFIG: 114, PAIR_FUSED_CONFIG: 119}
 # Prefill: MoE layers whose relu^2 activations are sparse enough for the skip to beat humming's
 # 64-row blocks on GB10 (measured per layer on prefill-length calls; the others lose). Layer 51,
 # the last, is left out: the boot prefill graph routes all its rows through one row's experts.
@@ -182,6 +185,19 @@ def _prepare_pair(layer: torch.nn.Module) -> None:
                     config = PAIR_FUSED_CONFIG
             except Exception as exc:  # noqa: BLE001
                 logger.warning_once("zskip: paired fused prep unavailable (%r); config 113", exc)
+        if PAIR_HALFSKIP:
+            try:
+                skip = PAIR_HALFSKIP_CONFIG[config]
+                _zskip.config_info(skip)
+                prefix = (os.environ.get("ZSKIP_VERIFY_PREFIX", "1") != "0"
+                          and _zskip.prefix_available())
+                if _pair_check(layer, pair, skip, ms=range(1, 9), ref_config=config) and (
+                    not prefix or _pair_check(layer, pair, skip, prefix=True, ref_config=config)
+                ):
+                    logger.info_once("zskip: empty-half skip config %d replaces %d", skip, config)
+                    config = skip
+            except Exception as exc:  # noqa: BLE001
+                logger.warning_once("zskip: empty-half skip unavailable (%r); config %d", exc, config)
         layer.zskip_pair_w2 = pair
         layer.zskip_pair_config = config
         logger.info_once("zskip: dadon paired decode config %d enabled for M=5", config)
@@ -189,11 +205,14 @@ def _prepare_pair(layer: torch.nn.Module) -> None:
         logger.warning_once("zskip: paired decode unavailable (%r); checked legacy config retained", exc)
 
 
-def _pair_check(layer: torch.nn.Module, packed: Any, config: int, prefix: bool = False) -> bool:
-    """Load-time, bitwise against humming: M=4/5/8, independent plus crowded routing.
+def _pair_check(layer: torch.nn.Module, packed: Any, config: int, prefix: bool = False,
+                ms: Any = (4, 5, 8), ref_config: int | None = None) -> bool:
+    """Load-time, bitwise against humming: M=4/5/8 (or ms), independent plus crowded routing.
 
     Compare all slots, including exact negative-zero activations and all-zero groups.
     The new config never serves prefill. No random state is taken from a request.
+    With ref_config (the checked config it replaces) the call also runs ref_config on the same
+    inputs, which must match too, and each input has empty low and high 8-row k halves.
     """
     import json
 
@@ -213,7 +232,7 @@ def _pair_check(layer: torch.nn.Module, packed: Any, config: int, prefix: bool =
         "use_f16_accum": envs.VLLM_HUMMING_USE_F16_ACCUM,
         "gemm_type": GemmType.INDEXED.value,
     })
-    for m in ((5,) if prefix else (4, 5, 8)):
+    for m in ((5,) if prefix else ms):
         for crowded in (False, True):
             ids = [[(29*i + (0 if crowded else 17*t)) % NUM_EXPERTS
                     for i in range(TOP_K)] for t in range(m)]
@@ -224,6 +243,9 @@ def _pair_check(layer: torch.nn.Module, packed: Any, config: int, prefix: bool =
             keep = torch.rand(m*TOP_K, INTER, generator=gen, device=dev) < 0.1
             act = (u.relu().square() * keep).to(torch.bfloat16).contiguous()
             act[:, :16] = 0  # a wholly empty k16 group
+            if ref_config is not None:
+                act[:, 16:24] = 0  # group 1: only its high half can be live
+                act[:, 40:48] = 0  # group 2: only its low half can be live
             # All-zero rows exercise empty lists; signed zeros exercise the bitmask semantics.
             act[0].zero_()
             bits = act.view(torch.int16)
@@ -248,6 +270,15 @@ def _pair_check(layer: torch.nn.Module, packed: Any, config: int, prefix: bool =
                     logger.warning("zskip: paired prefix=%s config %d differs on %s",
                                    prefix, config, getattr(layer, "layer_name", "?"))
                     return False
+                if ref_config is not None:
+                    old = torch.empty_like(ref)
+                    _zskip.down(act, sorted_ids, expert_ids, ntp, packed, old,
+                                mode=_zskip.SKIP, config=ref_config, max_blocks=m*TOP_K,
+                                verify_rows=vrows)
+                    if not torch.equal(out[:rows].view(torch.int16), old[:rows].view(torch.int16)):
+                        logger.warning("zskip: config %d differs from config %d on %s",
+                                       config, ref_config, getattr(layer, "layer_name", "?"))
+                        return False
                 if prefix and not torch.equal(
                     out[rows:].view(torch.int16), torch.zeros_like(out[rows:]).view(torch.int16)
                 ):

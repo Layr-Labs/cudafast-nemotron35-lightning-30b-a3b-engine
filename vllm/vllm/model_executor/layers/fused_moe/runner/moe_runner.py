@@ -47,6 +47,7 @@ from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExperts,
     SharedExpertsOrder,
 )
+import vllm.envs as envs
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import (
     _USE_LAYERNAME,
@@ -655,6 +656,39 @@ class MoERunner(MoERunnerInterface):
             else nullcontext()
         )
 
+    def _routerbig_route_args(self):
+        """(routerbig, bias, top_k, renormalize, scale, owner) when this layer's router runs
+        vLLM's single-group sigmoid ops.grouped_topk (what routerbig's fused routing reproduces);
+        else None. Decided once per layer from its configuration."""
+        args = self.__dict__.get("_routerbig_args", False)
+        if args is not False:
+            return args
+        args = None
+        try:
+            import routerbig
+        except ImportError:
+            routerbig = None
+        r = self.router
+        bias = getattr(r, "e_score_correction_bias", None)
+        if (
+            routerbig is not None
+            and routerbig.ROUTE_ON
+            and type(r).__name__ == "GroupedTopKRouter"
+            and r.scoring_func == "sigmoid"
+            and r.num_expert_group == 1
+            and r.topk_group == 1
+            and r.num_fused_shared_experts == 0
+            and getattr(r, "eplb_state", None) is None
+            and getattr(r, "capture_fn", None) is None
+            and bias is not None
+            and bias.dtype == torch.float32
+            and envs.VLLM_USE_FUSED_MOE_GROUPED_TOPK
+            and current_platform.is_cuda()
+        ):
+            args = (routerbig, bias, r.top_k, r.renormalize, r.routed_scaling_factor, id(r))
+        self._routerbig_args = args
+        return args
+
     def _maybe_sync_shared_experts_stream(
         self,
         shared_experts_input: torch.Tensor | None,
@@ -892,7 +926,17 @@ class MoERunner(MoERunnerInterface):
                     smallk_router_gemm_impl,
                 )
 
-                router_logits = smallk_router_gemm_impl(
+                # LOCAL PATCH (cudafast-nemotron35): a prefill-sized gate runs routerbig's
+                # fused routing (gate reduce + this router's top-k + align in one kernel,
+                # harness/kernels/routerbig); the router and the align hook take its parked
+                # outputs. Same logits either way.
+                routed = None
+                route_args = self._routerbig_route_args()
+                if route_args is not None and router_logits.shape[0] > 64:
+                    routed = route_args[0].route_prefill(
+                        router_logits, smallk_gate.weight, *route_args[1:]
+                    )
+                router_logits = routed if routed is not None else smallk_router_gemm_impl(
                     router_logits,
                     smallk_gate.weight,
                     row_mask=smallk_gate.__dict__.get("_smallk_row_mask", False),

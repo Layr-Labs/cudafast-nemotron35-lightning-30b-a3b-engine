@@ -13,6 +13,8 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 
+#include <cmath>
+
 #include <type_traits>
 
 namespace {
@@ -152,11 +154,241 @@ __global__ void router_reduce(const float* __restrict__ P, float* __restrict__ Y
   Y[i] = t;
 }
 
+// Fused prefill routing (route_kernel): the 12-partial sum of router_reduce (same order), the
+// grouped top-k of vLLM v0.27.1 single_group_topk_warp_kernel (n_group = topk_group = 1, sigmoid,
+// fp32 bias; the arithmetic of harness/kernels/smallk topk_token, copied below), then, in the last
+// CTA to finish, moe_align_block_size + count_and_sort_expert_tokens for up to two block sizes
+// (sizes, sentinel and -1 fill as vLLM allocates and writes them; within an expert the slot order
+// comes from shared-memory atomics, as stock count_and_sort's global atomics leave it).
+constexpr int kWarp = 32;
+constexpr int kE = BN;          // 128 experts
+constexpr int kRouteWarps = 16;  // tokens per CTA
+constexpr int kMaxNumel = 4096;
+constexpr float kInvalid = -INFINITY;
+
+__device__ __forceinline__ float sigmoid_accurate(float x) { return 0.5f * tanhf(0.5f * x) + 0.5f; }
+__device__ __forceinline__ uint32_t twiddle_in(float v) {
+  const uint32_t b = __float_as_uint(v);
+  return b ^ ((b & 0x80000000u) ? 0xffffffffu : 0x80000000u);
+}
+__device__ __forceinline__ uint64_t make_key(float v, int idx) {
+  return (static_cast<uint64_t>(twiddle_in(v)) << 32) | static_cast<uint64_t>(0xFFFF & (65535 - idx));
+}
+
+// One warp ranks one token's 128 experts (smallk topk_token<4>, unchanged).
+// s_lane[c] is this lane's logit for expert c * 32 + lane (topk_token read it as s[e]).
+__device__ __forceinline__ void topk_token(const float (&s_lane)[kE / kWarp], const float* __restrict__ bias,
+                                           int topk, int renormalize, float routed_scaling_factor,
+                                           float* __restrict__ out_values, int32_t* __restrict__ out_indices) {
+  constexpr int C = kE / kWarp;
+  const int lane = threadIdx.x % kWarp;
+  uint64_t keys[C];
+  float sel[C];
+#pragma unroll
+  for (int c = 0; c < C; ++c) {
+    const int e = c * kWarp + lane;
+    const float in = s_lane[c];
+    const float b = bias[e];
+    float selection = kInvalid;
+    if (isfinite(in) && isfinite(b)) {
+      const float unbiased = sigmoid_accurate(in);
+      const float biased = unbiased + b;
+      selection = biased == 0.0f ? 0.0f : biased;
+    }
+    sel[c] = selection;
+    keys[c] = make_key(selection, e);
+  }
+  unsigned taken = 0;
+  float lane_score = kInvalid;
+  int lane_expert = -1;
+  for (int k = 0; k < topk; ++k) {
+    uint64_t best = 0;
+    int best_c = -1;
+#pragma unroll
+    for (int c = 0; c < C; ++c) {
+      if (!(taken & (1u << c)) && (best_c < 0 || keys[c] > best)) {
+        best = keys[c];
+        best_c = c;
+      }
+    }
+    uint64_t wmax = best;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      const uint64_t o = __shfl_xor_sync(0xffffffffu, wmax, off);
+      wmax = o > wmax ? o : wmax;
+    }
+    const int widx = 65535 - static_cast<int>(wmax & 0xFFFF);
+    if (best_c >= 0 && best == wmax) taken |= 1u << best_c;
+    const int owner = widx % kWarp;
+    const int owner_c = widx / kWarp;
+    float my = kInvalid;
+#pragma unroll
+    for (int c = 0; c < C; ++c)
+      if (c == owner_c) my = sel[c];
+    const float wscore = __shfl_sync(0xffffffffu, my, owner);
+    if (lane == k) {
+      lane_score = wscore;
+      lane_expert = widx;
+    }
+  }
+  float lane_unbiased = 0.0f;
+  if (lane < topk && lane_expert >= 0 && lane_expert < kE) lane_unbiased = lane_score - bias[lane_expert];
+  const bool finite_selection = lane < topk && lane_score != kInvalid;
+  lane_unbiased = finite_selection ? lane_unbiased : 0.0f;
+  const unsigned finite_mask = __ballot_sync(0xffffffffu, finite_selection);
+  float sum = lane_unbiased;
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) sum = sum + __shfl_xor_sync(0xffffffffu, sum, off);
+  if (lane < topk) {
+    float output = 0.0f;
+    if (finite_mask == 0) {
+      if (renormalize) output = 1.0f / static_cast<float>(topk);
+    } else if (finite_selection) {
+      float scale = routed_scaling_factor;
+      if (renormalize) scale /= sum + 1e-20f;
+      output = lane_unbiased * scale;
+    }
+    out_values[lane] = output;
+    out_indices[lane] = lane_expert;
+  }
+}
+
+struct AlignOut {
+  int32_t* sorted;
+  int32_t* eids;
+  int32_t* ntp;
+  int bs, maxpad, maxblk;
+};
+
+__global__ void __launch_bounds__(kRouteWarps * kWarp)
+    route_kernel(const float* __restrict__ P, int M, const float* __restrict__ bias, int topk, int renormalize,
+                 float scale, float* __restrict__ Y, float* __restrict__ vals, int32_t* __restrict__ ids, int nalign,
+                 AlignOut a0, AlignOut a1, unsigned* __restrict__ counter) {
+  __shared__ int32_t s_ids[kMaxNumel];
+  __shared__ int32_t s_cnt[kE];
+  __shared__ int32_t s_cum[2][kE + 1];
+  __shared__ int32_t s_fill[2][kE];
+  __shared__ int s_last;
+  const int lane = threadIdx.x % kWarp;
+  const int warp = threadIdx.x / kWarp;
+  const int token = blockIdx.x * kRouteWarps + warp;
+  if (token < M) {
+    const int total = M * kE;
+    float* y = Y + static_cast<size_t>(token) * kE;
+    float lg[kE / kWarp];
+#pragma unroll
+    for (int c = 0; c < kE / kWarp; ++c) {
+      const int i = token * kE + c * kWarp + lane;
+      float t = P[i];
+#pragma unroll
+      for (int sl = 1; sl < SLICES; ++sl) t = __fadd_rn(t, P[static_cast<size_t>(sl) * total + i]);
+      lg[c] = t;
+      y[c * kWarp + lane] = t;
+    }
+    topk_token(lg, bias, topk, renormalize, scale, vals + token * topk, ids + token * topk);
+  }
+  {  // (b) every CTA writes its share of the sentinel fill; the last CTA scatters over it
+    const int numel = M * topk;
+    const int stride = gridDim.x * blockDim.x;
+    for (int k = 0; k < nalign; ++k) {
+      const AlignOut a = k == 0 ? a0 : a1;
+      for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < a.maxpad; i += stride) a.sorted[i] = numel;
+    }
+  }
+  __threadfence();
+  __syncthreads();
+  if (threadIdx.x == 0) s_last = atomicAdd(counter, 1u) == gridDim.x - 1;
+  __syncthreads();
+  if (!s_last) return;
+  __threadfence();
+  const int numel = M * topk;
+  for (int i = threadIdx.x; i < numel; i += blockDim.x) s_ids[i] = __ldcg(ids + i);
+  for (int e = threadIdx.x; e < kE; e += blockDim.x) {
+    s_cnt[e] = 0;
+    s_fill[0][e] = 0;
+    s_fill[1][e] = 0;
+  }
+  __syncthreads();
+  for (int i = threadIdx.x; i < numel; i += blockDim.x) {
+    const int e = s_ids[i];
+    if (e >= 0 && e < kE) atomicAdd(&s_cnt[e], 1);
+  }
+  __syncthreads();
+  if (warp < nalign) {  // warp k scans the padded counts for block size k (4 experts per lane)
+    const int bs = warp == 0 ? a0.bs : a1.bs;
+    int v[kE / kWarp], sum = 0;
+#pragma unroll
+    for (int j = 0; j < kE / kWarp; ++j) {
+      const int c = s_cnt[lane * (kE / kWarp) + j];
+      v[j] = (c + bs - 1) / bs * bs;
+      sum += v[j];
+    }
+    int incl = sum;
+#pragma unroll
+    for (int off = 1; off < kWarp; off <<= 1) {
+      const int u = __shfl_up_sync(0xffffffffu, incl, off);
+      if (lane >= off) incl += u;
+    }
+    int run = incl - sum;
+#pragma unroll
+    for (int j = 0; j < kE / kWarp; ++j) {
+      s_cum[warp][lane * (kE / kWarp) + j] = run;
+      run += v[j];
+    }
+    if (lane == kWarp - 1) {
+      s_cum[warp][kE] = incl;
+      *(warp == 0 ? a0.ntp : a1.ntp) = incl;
+    }
+  }
+  __syncthreads();
+  for (int k = 0; k < nalign; ++k) {
+    const AlignOut a = k == 0 ? a0 : a1;
+    const int tot = s_cum[k][kE];
+    for (int b = threadIdx.x; b < a.maxblk; b += blockDim.x) {
+      const int pos = b * a.bs;
+      int e = -1;
+      if (pos < tot) {
+        int lo = 0, hi = kE - 1;  // the last expert whose range starts at or before pos
+        while (lo < hi) {
+          const int mid = (lo + hi + 1) / 2;
+          if (s_cum[k][mid] <= pos) lo = mid; else hi = mid - 1;
+        }
+        e = lo;
+      }
+      a.eids[b] = e;
+    }
+    for (int i = threadIdx.x; i < numel; i += blockDim.x) {
+      const int e = s_ids[i];
+      if (e >= 0 && e < kE) a.sorted[s_cum[k][e] + atomicAdd(&s_fill[k][e], 1)] = i;
+    }
+  }
+  if (threadIdx.x == 0) *counter = 0u;
+}
+
 }  // namespace
 
 extern "C" {
 
-int routerbig_version() { return 2; }
+int routerbig_version() { return 3; }
+
+// Fused routing from pass-1 partials P [12, M, 128]: Y = router_reduce(P), top-k values/indices,
+// and moe_align outputs for nalign (0..2) block sizes. counter: one zeroed device uint32 (the
+// kernel leaves it zeroed).
+int routerbig_route(const void* p, int M, const void* bias, int topk, int renormalize, float scale, void* y,
+                    void* vals, void* ids, int nalign, int bs0, void* sorted0, int maxpad0, void* eids0, int maxblk0,
+                    void* ntp0, int bs1, void* sorted1, int maxpad1, void* eids1, int maxblk1, void* ntp1,
+                    void* counter, void* stream) {
+  if (M <= 0 || topk < 1 || topk > kWarp || M * topk > kMaxNumel || nalign < 0 || nalign > 2) return -1;
+  AlignOut a0{static_cast<int32_t*>(sorted0), static_cast<int32_t*>(eids0), static_cast<int32_t*>(ntp0), bs0,
+              maxpad0, maxblk0};
+  AlignOut a1{static_cast<int32_t*>(sorted1), static_cast<int32_t*>(eids1), static_cast<int32_t*>(ntp1), bs1,
+              maxpad1, maxblk1};
+  route_kernel<<<(M + kRouteWarps - 1) / kRouteWarps, kRouteWarps * kWarp, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(p), M, static_cast<const float*>(bias), topk, renormalize, scale,
+      static_cast<float*>(y), static_cast<float*>(vals), static_cast<int32_t*>(ids), nalign, a0, a1,
+      static_cast<unsigned*>(counter));
+  return (int)cudaGetLastError();
+}
 
 static int g_bm = 64;  // rows per CTA of pass 1 (32, 64 or 128); routerbig_set_bm changes it
 

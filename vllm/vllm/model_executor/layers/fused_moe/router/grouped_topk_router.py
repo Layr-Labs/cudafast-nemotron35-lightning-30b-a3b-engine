@@ -32,6 +32,14 @@ try:
 except ImportError:
     _smallk = None
 
+# LOCAL PATCH (cudafast-nemotron35): routerbig.route_prefill (called by the MoE runner for a
+# prefill-sized gate) already computed this router's top-k in its fused routing kernel, with the
+# arithmetic of the ops.grouped_topk kernel this method otherwise runs; take it for the same logits.
+try:
+    import routerbig as _routerbig
+except ImportError:
+    _routerbig = None
+
 
 def fused_grouped_topk(
     hidden_states: torch.Tensor,
@@ -300,6 +308,15 @@ class GroupedTopKRouter(BaseRouter):
         input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute routing using grouped top-k."""
+        if (
+            _routerbig is not None
+            and indices_type in (None, torch.int32)
+            and router_logits.dim() == 2
+            and router_logits.shape[0] > 64
+        ):
+            out = _routerbig.take_topk(router_logits, id(self))
+            if out is not None:
+                return out
         smallk_ok = self.__dict__.get("_smallk_ok")
         if smallk_ok is None:
             smallk_ok = self._smallk_ok = bool(

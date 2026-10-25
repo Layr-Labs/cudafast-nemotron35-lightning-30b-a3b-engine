@@ -15,6 +15,14 @@ try:
 except ImportError:
     _smallk = None
 
+# LOCAL PATCH (cudafast-nemotron35): routerbig's fused prefill routing kernel also writes the align
+# outputs for the block sizes this hook saw for the id count (same integers); take them for the
+# same topk_ids. Prefill-sized calls only (more than 64 ids).
+try:
+    import routerbig as _routerbig
+except ImportError:
+    _routerbig = None
+
 
 def moe_align_block_size(
     topk_ids: torch.Tensor,
@@ -79,6 +87,15 @@ def moe_align_block_size(
     - The padding ensures that the total number of tokens is now divisible
         by block_size for proper block matrix operations.
     """
+    if (
+        _routerbig is not None
+        and not pad_sorted_ids
+        and expert_map is None
+        and topk_ids.numel() > 64
+    ):
+        out = _routerbig.take_align(topk_ids, num_experts, block_size)
+        if out is not None:
+            return out
     if _smallk is not None and not pad_sorted_ids and expert_map is None:
         out = _smallk.maybe_align(topk_ids, num_experts, block_size, expert_map)
         if out is not None:

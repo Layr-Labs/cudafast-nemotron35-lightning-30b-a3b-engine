@@ -142,6 +142,85 @@ def _layer_norm_fwd(
     return out, mean, rstd
 
 
+@triton.jit
+def _grouped_gated_rms_kernel(
+    X,
+    Z,
+    W,
+    Y,
+    stride_x_row,
+    stride_z_row,
+    stride_y_row,
+    N,
+    eps,
+    BLOCK: tl.constexpr,
+):
+    """Eager Mixer2RMSNormGated path, one program per (row, group).
+
+    The CUDA custom-op is enabled, so this chain is not seen by Inductor:
+    fp32 SiLU, round to bf16, bf16 product, bf16 square, fp32 mean rounded
+    back to bf16, rsqrt, round, then the bf16 weight multiply. Group size
+    is 512 on this model (8 groups of the 4096-wide SSM output).
+    """
+    row = tl.program_id(0)
+    group = tl.program_id(1)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < N
+    base_x = row * stride_x_row + group * N
+    base_z = row * stride_z_row + group * N
+    x = tl.load(X + base_x + cols, mask=mask, other=0.0).to(tl.float32)
+    z = tl.load(Z + base_z + cols, mask=mask, other=0.0).to(tl.float32)
+    silu = (z * tl.sigmoid(z)).to(tl.bfloat16).to(tl.float32)
+    prod = (x * silu).to(tl.bfloat16)
+    sq = (prod.to(tl.float32) * prod.to(tl.float32)).to(tl.bfloat16)
+    var = tl.sum(sq.to(tl.float32), axis=0) / N
+    var = var.to(tl.bfloat16).to(tl.float32)
+    y = prod.to(tl.float32) * tl.rsqrt(var + eps)
+    y = y.to(tl.bfloat16)
+    w = tl.load(W + group * N + cols, mask=mask, other=0.0).to(tl.bfloat16)
+    out = (y.to(tl.float32) * w.to(tl.float32)).to(tl.bfloat16)
+    tl.store(Y + row * stride_y_row + group * N + cols, out, mask=mask)
+
+
+def grouped_gated_rms(x, z, weight, group_size: int, eps: float):
+    """One launch for the n_groups != 1 eager gate+RMSNorm. None: keep eager."""
+    if x.ndim < 2 or z.shape != x.shape or weight is None:
+        return None
+    hidden = x.shape[-1]
+    if group_size <= 0 or hidden % group_size != 0:
+        return None
+    if group_size > 512 or triton.next_power_of_2(group_size) != group_size:
+        return None
+    if not x.is_cuda or x.dtype != torch.bfloat16 or z.dtype != torch.bfloat16:
+        return None
+    if weight.dtype != torch.bfloat16 or weight.numel() != hidden:
+        return None
+    x2 = x.reshape(-1, hidden)
+    z2 = z.reshape(-1, hidden)
+    if x2.stride(-1) != 1 or z2.stride(-1) != 1:
+        return None
+    w = weight.reshape(hidden)
+    if w.stride(-1) != 1:
+        return None
+    y = torch.empty_like(x2)
+    m = x2.shape[0]
+    ngroups = hidden // group_size
+    _grouped_gated_rms_kernel[(m, ngroups)](
+        x2,
+        z2,
+        w,
+        y,
+        x2.stride(0),
+        z2.stride(0),
+        y.stride(0),
+        group_size,
+        eps,
+        BLOCK=group_size,
+        num_warps=4,
+    )
+    return y.reshape(x.shape)
+
+
 def rms_norm_gated(
     x, weight, bias, z=None, eps=1e-6, group_size=None, norm_before_gate=True
 ):

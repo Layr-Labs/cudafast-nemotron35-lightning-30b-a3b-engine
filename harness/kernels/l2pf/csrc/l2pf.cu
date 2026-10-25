@@ -57,6 +57,27 @@ __global__ void prefetch_slots2_kernel(const uint8_t* __restrict__ base, long lo
     if (n) asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" :: "l"(p + off), "r"(n));
   }
 }
+// The checkpointed SSM anchor a lazy spec-decode verify will load first (mamba_ssm_spec_replay
+// LAZY): checkpoint k = max(pos0 - L, 0) / period lives in slot 0 (even k) or slot 2 (odd k), where
+// L is the int32 prompt-length word at tag_off in slot 0 and pos0 = seq_lens[0] - (qsl[1] - qsl[0]).
+// Everything is read on the device, so a CUDA graph follows the request.
+__global__ void prefetch_anchor_kernel(const uint8_t* __restrict__ base, long long slot_stride,
+                                       const int* __restrict__ slots, long long slot_col_stride,
+                                       const int* __restrict__ seq_lens, const int* __restrict__ qsl,
+                                       long long tag_off, int period, size_t bytes, uint32_t chunk) {
+  const long long s0 = slots[0], s2 = slots[2 * slot_col_stride];
+  if (s0 < 0 || s2 < 0 || period <= 0) return;
+  const long long L = *reinterpret_cast<const int*>(base + s0 * slot_stride + tag_off);
+  const long long pos0 = (long long)seq_lens[0] - (long long)(qsl[1] - qsl[0]);
+  long long d = pos0 - L;
+  if (d < 0) d = 0;
+  const long long k = d / period;
+  const uint8_t* p = base + ((k & 1) ? s2 : s0) * slot_stride;
+  for (size_t off = (size_t)threadIdx.x * chunk; off < bytes; off += (size_t)blockDim.x * chunk) {
+    const size_t n = bytes - off < chunk ? bytes - off : chunk;
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(p + off), "r"((uint32_t)(n & ~(size_t)15)));
+  }
+}
 }  // namespace l2pf
 
 // 0 on success; -1 for a misaligned range or chunk.
@@ -89,5 +110,17 @@ extern "C" int l2pf_prefetch_slots2(const void* base, long long slot_stride,
     return -1;
   l2pf::prefetch_slots2_kernel<<<1, 32, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
       (const uint8_t*)base, slot_stride, slot0, off0, bytes0, slot1, off1, bytes1, (uint32_t)chunk);
+  return (int)cudaGetLastError();
+}
+
+extern "C" int l2pf_prefetch_anchor(const void* base, long long slot_stride, const int* slots,
+                                    long long slot_col_stride, const int* seq_lens, const int* qsl,
+                                    long long tag_off, int period, size_t bytes, int chunk, void* stream) {
+  if (reinterpret_cast<uintptr_t>(base) % 16 || slot_stride % 16 || !slots || !seq_lens || !qsl ||
+      chunk < 16 || chunk % 16)
+    return -1;
+  l2pf::prefetch_anchor_kernel<<<1, 32, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+      (const uint8_t*)base, slot_stride, slots, slot_col_stride, seq_lens, qsl, tag_off, period, bytes,
+      (uint32_t)chunk);
   return (int)cudaGetLastError();
 }

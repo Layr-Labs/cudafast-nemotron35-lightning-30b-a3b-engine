@@ -329,7 +329,7 @@
     },
     {
       "file": "model_executor/layers/mamba/ops/mamba_ssm_spec_replay.py; model_executor/layers/mamba/mamba_mixer2.py",
-      "why": "Checkpointed anchor for the spec-decode SSM update (extends dadon b9a63f4f): states are stored only at positions L - 1 + 20 k (L: prompt length, k = 0 the prefill's final state), alternately in slots 0 and 2; a verify loads the last checkpoint before its token 0 and replays the tokens since it from the ring (which now also holds token 0) with the existing per-token fp32 update, then stores the next checkpoint when it is among its tokens. The prefill writes L into the slot-0 page padding after the SSM state. Same per-token update order, outputs and launch configuration. VLLM_MAMBA_REPLAY_LAZY=0 restores an anchor store in every verify."
+      "why": "Checkpointed anchor for the spec-decode SSM update (extends dadon b9a63f4f): states are stored only at positions L - 1 + P k (P = LAZY_PERIOD, 16 by default, VLLM_MAMBA_LAZY_P sets it; L: prompt length, k = 0 the prefill's final state), alternately in slots 0 and 2; a verify loads the last checkpoint before its token 0 and replays the tokens since it from the ring (which now also holds token 0) with the existing per-token fp32 update, then stores the next checkpoint when it is among its tokens. The prefill writes L into the slot-0 page padding after the SSM state. Same per-token update order, outputs and launch configuration. VLLM_MAMBA_REPLAY_LAZY=0 restores an anchor store in every verify."
     },
     {
       "file": "harness/kernels/fp8c/csrc/fp8c.cu",
@@ -342,6 +342,30 @@
     {
       "file": "vllm/v1/spec_decode/nemotron_decode_plan.py (+ llm_base_proposer.py, v1/attention/backends/flashinfer.py)",
       "why": "Own native-MTP FA2 planning-state bank on ENTIRE0e71. Remote startup records original native plan vector, integer prefix and scalar state for each EXACT CPU indptr/last-page/options input, across up to128generic page counts with every valid residue, capped64MiB of plan bytes. Integer-tail/float-arena canaries guard actual installed planner writes; no page-invariance or package-source-equality assumption. Changed private model/hidden/token/gate/KV/live indices/CPU metadata and complete side-stream model-step timing admission mandatory. Only then copy native planning state; current indices/last-page buffers still refreshed. Unknown keys/identities/options fall back before mutation. No request capture or inference output cache. NEMO_MTP_NATIVE_PLAN_BANK=0 disables. Private qualification lineage6cafa6b6-8f26-4ef5-86e1-38c061a207d7 andce5aa6bd-15c2-42c2-8a68-4bc2fe65c23b; no lower tailgraph or L1 runtime imported."
+    },
+    {
+      "file": "harness/kernels/l2pf/{csrc/l2pf.cu,py/__init__.py}; model_executor/layers/fused_moe/experts/fused_humming_moe.py",
+      "why": "The same MoE l2pf window also queues an L2 prefetch of the checkpointed SSM state the following Mamba layer's lazy verify loads first (l2pf_prefetch_anchor: checkpoint k = max(pos0 - L, 0) // LAZY_PERIOD, slot 0 for even k and slot 2 for odd k, with L the prompt-length word and pos0 = seq_lens[0] - (query_start_loc[1] - query_start_loc[0]), all read on the device). Moves no value. L2PF_SSM_ANCHOR=0 disables."
+    },
+    {
+      "file": "model_executor/layers/mamba/ops/mamba_ssm_spec_replay.py; mamba_replay_pipeline.py; layers/mamba/mamba_mixer2.py; v1/worker/gpu_model_runner.py",
+      "why": "Own substantial raw-input SSM replay software pipeline on ENTIREhighest0b98 period20; this independent alternative contains no6af conditional/tail/head oranchor-prefetch runtime. Preload next historical raw x/B/dt before dependent scalar/state math; circular index normalized once then add/select; hoist immutable A/bias/D. Exact per-token FP32 expression/reduction and raw ring/checkpoint layout retained; no new cache. Boot-only full guarded backing/output/pre-verify bytes compared on actual loaded parameters, dtype/PDL/prefix/rejection/wrap/checkpoint/empty/null histories; generic private graph timing must improve. Decision reset at real cache binding before compile/capture. Fixture/cache-bind lineage own16e4936c-12ef-4356-80bd-2f5ceb500dce; none of its failed scalar-cache runtime adopted. Combination/admission/whole gain unvalidated, all execution officialremote."
+    },
+    {
+      "file": "model_executor/layers/fused_moe/experts/humming_relu2_epilogue.py; humming_nvsc.py",
+      "why": "Useful pending39b5409c-ab0d-45e4-a9a6-88f936479912 exacttwo-file sourcec85a6beed5349b4d5fd0b079cdda2e8b9f11e7d8. Verify bucket24..48 changesK32/stages8 toK128/stages2, stillserialascendingK16 MMA chain; sixbit scale-loader advances96byteexistingrecord periter_id/2, no new weight format. Exactshape guards andvariantcachekey retained. Author localclaims are not official evidence; combinedwhole/engagementunvalidated."
+    },
+    {
+      "file": "model_executor/layers/mamba/ops/mamba_replay_pipeline.py",
+      "why": "Stack of erc 4226e310 (LAZY_PERIOD 16) with jack a56b1b52: the replay pipeline's layout admission also accepts LAZY_PERIOD 16 (was 20 only). Its boot-time guarded byte comparison against the original replay and its private timing admission are unchanged; any period it cannot reproduce byte for byte falls back to the original replay."
+    },
+    {
+      "file": "model_executor/layers/fused_moe/experts/humming_relu2_epilogue.py",
+      "why": "newjordan 34d21409, carried: the routed-up epilogue's ReLU-square uses packed non-FTZ bf16x2 instructions (max.NaN.bf16x2 with +0, mul.rn.bf16x2) on the original BF16 output instead of widening to fp32; the square of a BF16 value is exact in fp32, so both forms round the same product once to BF16."
+    },
+    {
+      "file": "harness/kernels/l2pf/py/__init__.py; model_executor/models/nemotron_h_mtp.py; model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "Draft screen tail window: after the screen's first-stage dot has streamed the coarse matrix, the rest of the screen (top-k, refine and full-K dots on a few thousand rows, the select) is latency-bound; it queues an L2 prefetch of the head of the next draft pass's packed qkv planes (l2pf DRAFT_NEXT, filled by the MTP model before the screen captures its graph) and joins before the screen returns. Moves no value. L2PF_DRAFT_NEXT_MB=0 disables."
     }
   ]
 }

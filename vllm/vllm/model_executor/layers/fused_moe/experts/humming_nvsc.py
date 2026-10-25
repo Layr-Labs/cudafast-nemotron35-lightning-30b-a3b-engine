@@ -81,7 +81,7 @@ class G2SMemoryLoaderBS {
   static_assert(LayerConfig::kIsGroupWeightScale && !LayerConfig::kIsBlockWeightScale);
   static_assert(!LayerConfig::kIsChannelWeightScale);
   static_assert(LayerConfig::kWeightScaleGroupSize == 16);
-  static_assert(BlockShape::N == 64 && BlockShape::K == 32);
+  static_assert(BlockShape::N == 64 && (BlockShape::K == 32 || BlockShape::K == 128));
   static_assert(ProblemShape::N % 64 == 0 && ProblemShape::K % 32 == 0);
   static_assert(!TuningConfig::kUseTmaBS && !TuningConfig::kUseWarpSpec);
   static_assert(TuningConfig::kUseCpAsync && !TuningConfig::kUseMBarrier);
@@ -139,7 +139,8 @@ class S2RMemoryLoaderBS {
   static_assert(!LayerConfig::kIsChannelWeightScale && !LayerConfig::kUseFusedE8m0Scale);
   static_assert(LayerConfig::kWeightScaleGroupSize == 16);
   static_assert(BlockShape::N == 64 && WarpShape::N == 32);
-  static_assert(BlockShape::K == 32 && WarpShape::K == 32 && 256 / ElementA::kBits == 16);
+  static_assert(BlockShape::K == WarpShape::K &&
+                (BlockShape::K == 32 || BlockShape::K == 128) && 256 / ElementA::kBits == 16);
 
   CUDA_INLINE static uint32_t lookup(uint32_t c) {
     const uint32_t b0 = nvsc_table[c & 0xFFu];
@@ -163,7 +164,8 @@ class S2RMemoryLoaderBS {
     // The stock loader's uint32 index in the 64-byte row (two warps per
     // 64-column mini block).
     const uint32_t j = (threadIdx.x % 32) / 4 * 2 + (threadIdx.x / 32) % 2;
-    const uint8_t *stage = reinterpret_cast<const uint8_t *>(smem_ptr);
+    const uint8_t *stage = reinterpret_cast<const uint8_t *>(smem_ptr)
+        + 96u * (uint32_t(iter_id) / 2u);
     const uint32_t lo = reinterpret_cast<const uint32_t *>(stage)[j];
     const uint32_t hi = reinterpret_cast<const uint16_t *>(stage + 64)[j];
     const uint32_t s = (hi | (hi << 12)) & 0x0F0F0F0Fu;
@@ -319,6 +321,7 @@ def _configs(meta, compute_config: str, tuning_config: str, dyn: bool = False) -
     from vllm.model_executor.layers.fused_moe.experts.humming_relu2_epilogue import (
         _dyn_num_sms,
         _variant_key,
+        _w13_k128_params,
     )
 
     key = (meta.to_str(), compute_config, tuning_config) + _variant_key(dyn)
@@ -343,7 +346,7 @@ def _configs(meta, compute_config: str, tuning_config: str, dyn: bool = False) -
         assert config["block_shape"][1:] == [64, 32], config
         assert config["warp_shape"][1:] == [32, 32], config
         assert not config.get("use_stream_k", False)
-        params = lc | cc | config
+        params = _w13_k128_params(lo, hi, lc | cc | config)
         num_sms = params.pop("num_sms", 0)
         if dyn:  # the claim-when-free decode grid, as for the stock dyn kernel
             num_sms = _dyn_num_sms(lo, hi, num_sms)

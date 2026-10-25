@@ -68,6 +68,26 @@ _CACHE = {}
 # Separate class AND config cache: KernelRuntime interns by class/config.
 _EVICT_CACHE = {}
 _EVICT_FAILED = False
+# The evict-first hint serves humming's prefill-sized bucket: the tuning-config range(s) whose
+# block_m is 64 (above the block_m-16 decode and small-call ranges; humming_tuned_moe.py's last
+# w13 range, valid_shape_m > 384), the same calls pzskip serves for w2. Keyed on the config.
+_EVICT_BLOCK_M = 64
+_EVICT_RANGES = {}
+
+
+def _tuning_list(tuning_config):
+    tc = json.loads(tuning_config)
+    return [[0, 1 << 30, tc]] if isinstance(tc, dict) else tc
+
+
+def _evict_bucket(tuning_config, valid_shape_m):
+    """True when valid_shape_m dispatches (lo < m <= hi) to a block_m-64 range."""
+    ranges = _EVICT_RANGES.get(tuning_config)
+    if ranges is None:
+        ranges = tuple((lo, hi) for lo, hi, config in _tuning_list(tuning_config)
+                       if config["block_shape"][0] == _EVICT_BLOCK_M)
+        _EVICT_RANGES[tuning_config] = ranges
+    return any(lo < valid_shape_m <= hi for lo, hi in ranges)
 _EVICT_PREFIX = r"""
 #include <humming/utils/all.cuh>
 template<bool C, typename T>
@@ -157,7 +177,7 @@ def prepare(meta, compute_config, tuning_config, evict_first=False):
         lc.pop("sublayer_name", None)
         changed = 0
         for i, (lo, hi, config) in enumerate(tc):
-            if not lo < 2976 <= hi:
+            if config["block_shape"][0] != _EVICT_BLOCK_M:
                 continue
             original = HummingKernel._id2kernel[values[4 * i + 2]]
             assert tuple(original.problem_shape[1:]) == (1856, 2688)
@@ -202,8 +222,8 @@ def forward_relu2(
     assert getattr(layer, meta.bias_name, None) is None
     configs = prepare(
         meta, compute_config, tuning_config,
-        evict_first=(inputs.shape[0] == 496 and top_k == 6
-                     and valid_shape_m == 2976
+        evict_first=(top_k == 6
+                     and _evict_bucket(tuning_config, valid_shape_m)
                      and os.environ.get("HUMMING_EVICT_FIRST", "1") != "0"),
     )
     return ops.launch_kernel(

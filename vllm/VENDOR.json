@@ -278,6 +278,34 @@
     {
       "file": "harness/kernels/pzskip/csrc/pzskip.cu (+ build.sh)",
       "why": "PZ333 M496/top-6 only: HUMMING_EVICT_PZ defaults on and gives immutable packed B/BS cp.async loads L2 evict-first priority. Loader addresses, bytes, masks, K16 MMA order, negative-zero repair and formats are unchanged. HUMMING_EVICT_PZ=0 restores stock. Separate native template specialization; compile/load failure retains stock PZ333. Stacks independently with the routed-up evf policy; no decode change."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_pkmm.py, models/nemotron_h_mtp_packed.py; harness/kernels/l2pf; models/nemotron_h.py; layers/mamba/mamba_mixer2.py; layers/attention/attention.py",
+      "why": "New optional native-MTP narrow packed MMA on entire41e5657b-0033-489a-b095-6a22fd5edcd8, derived from297e3412-dc4a-45ae-a0f1-b6c3afd76c1b with exact128tail, original gate-masked arithmetic, actual-weight/private full-output-bit+cold4pct admission. Original packed_small fallback. Budget-shared next-router prefetch inspired by297; immutable exact BF16shadow/originalFP32; at most quarter of existing5/7MiB window, router+projection up to3ranges fused intoone CUDAlaunch/fork withoriginaljoin. No coarse screen/halfskip/quantization/policy change. All execution officialremote only; new combination unverified."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_refine_fused.py, models/nemotron_h_mtp_screen.py",
+      "why": "NEW optional nativeMTP refine dot+original8pass radix survivors fusedinonekernel, original32coarsegroups/256coarse/32refine/fullKpolicy andFP32groupmath/FP4decode/gate unchanged; optionaldirectHCOLS skipsgather. Fourwarps8/16/directfalse/true variants privateallstage rawbits/token/gate eager+changingcapture admission, thencoldwholegraph4pctfilter; ordinaryfailure originalhead. Materialsourcecascade4e916237-ea0f-48f5-8cd6-503252f54bc8, radixA549 original8passhistogram+stableties, f126screenfold/rawe2m1pair, allthroughENTIRE1fa. No localexecution, newcombinationunverified."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_packed.py",
+      "why": "Useful pendingd33b9c7d-dc8e-4098-9171-96b32402d684/73ebd4705532b112688a114655dce793fce6f37f exactGROUP8GEMV helper/admission/caller, fullblobed957ab2e99bf49d593b7b007ff42e367b92af65 +onlytwoalreadyreviewedda9smallM/preparationhunks. Metadataword/base/RI onceper8registers, asserttrivialrestoreoriginalM1layout, unchangedFP32acc/gate/PDL. Authorlocalresultsnotours; smallM/MoEupgroupingnotimported. No newweights/format, sourcefallbackkept. NEW extraexhaustiveactualweight GROUP8decoder bitcheck before enabling, usingexistinggroup8helper/originaluint16weight; stilloriginalthreefullGEMVchecks. Additionalstaticmethodonlyno localexecution."
+    },
+    {
+      "file": "model_executor/layers/fused_moe/experts/humming_relu2_epilogue.py, harness/kernels/pzskip/csrc/pzskip.cu",
+      "why": "Useful pending2e83c0d6-1092-4cea-8f0b-2149b21887e8/d8c15835052dccbfa957ff665b57ceb5708f3c4a genericprefill L2priority gates. Fullwrapperexact868bf66ff80f29cdd085ac53875fd175ba2e9ec3; CPP generic333gate retained withinlater8845P2 source. Hintfollowsblock_m64 tuningrange/pzskipdispatch, nofixturelengthspecialcase. Later8845adds336/337/338withGB10copyfix andsourceadmission; noexpectedfixturegain, newcombinationunverified."
+    },
+    {
+      "file": "harness/kernels/pzskip/{csrc/pzskip.cu,py/__init__.py,build.sh,tests/p2_mapping.py}, vllm/model_executor/layers/fused_moe/experts/humming_zskip.py, humming_relu2_epilogue.py",
+      "why": "pzskip P2 configs 336-338 (p2_kernel): smem4_kernel's 32-row path with a longer-run load phase on the existing zskip swap repack, no new weight copy. 336 (default candidate): 896-column CTAs (14 warps), so each active k row is one 448 B run instead of 192 B and 3 CTAs instead of 7 read an expert block; cp.async slots enumerate only the active rows (no predicated-off lanes); weight rows padded 16 B in shared memory (conflict-free fragment reads); 3 stages of 2 k16 groups in flight; weight/scale copies L2 evict-first unless HUMMING_EVICT_PZ=0. 337 (448 columns, 2 CTAs/SM) and 338 (333's geometry) for PZSKIP_CONFIG sweeps. Same dequantisation, mma operand roles, ascending k16 chain from +0, union masks, -0 dense recompute and epilogue; the kernel body differs from smem4_kernel only in its copy loop. Per layer 336 replaces 333 only if, at load, its outputs equal 333's (humming-checked) bitwise on the 496-token check input and on a sparse/signed-zero variant; any mismatch, launch error or a build without P2 keeps 333. PZSKIP_CONFIG=<id> pins one config (checked against humming); PZSKIP_P2=0 disables the switch. build.sh retries with -DPZSKIP_NO_P2, then -DPZSKIP_NO_CACHE_POLICY, then both. The two evict-first gates are no longer keyed on the fixture's prompt length: PZ333 applies its hint to every pzskip call (was shape_m == 2976), and the routed-up w13 hint applies to every call that dispatches to the tuning list's block_m-64 (prefill) range, i.e. top_k == 6 and lo < valid_shape_m <= hi for a range whose block_shape[0] == 64 (currently valid_shape_m > 384), replacing inputs.shape[0] == 496 and valid_shape_m == 2976; prepare() swaps the kernel of that block_m-64 range (was the range containing 2976). Both hints are byte-neutral: same copies and arithmetic, L2 priority only. Static CPU-only: not CUDA-compiled, GPU-checked or timed locally."
+    },
+    {
+      "file": "harness/kernels/pzskip/csrc/pzskip.cu (cp16_weight_p2 and its two calls in p2_kernel)",
+      "why": "GB10 fix for 73ab2ebf's P2 configs 336-338: their L2-hinted weight/scale cp.async raised cudaErrorIllegalInstruction at load (the hinted copy can compile to an LDGSTS [R+UR] form that traps on GB10), which left the CUDA context unusable even though config 333 was kept. The P2 copies now use cp16_weight_p2, which passes the shared address through an identity lane shuffle (activemask + shfl.sync.idx with the own lane) so it stays in a general register. Same copy, bytes, destination and L2 evict-first policy; no value changes. smem4_kernel (config 333) keeps the original cp16_weight, so its instructions are unchanged."
+    },
+    {
+      "file": "harness/kernels/pzskip; model_executor/layers/fused_moe/experts/humming_zskip.py",
+      "why": "Select useful pending8845a29d-35cc-4b97-a7d4-38cf739be111/7f41801a24d0e73688c3a20c9ad5a435c131b89b complete6nonVendor blobs, derived73ab2ebf-0748-40ea-9902-e9315358bc55 P2 wider896column/compactedcopy/paddedrows withGB10identitylaneshuffle cp.async addressfix. Original333kernel retained; sourceperlayerrawbitadmission andbuildfallbacks unchanged. Generic2e83hummingwrapperexactsameblob. Sourceauthorlocaltests/timing/diagnosisnotours; no localexecution. Newcombinationunverified."
     }
   ]
 }

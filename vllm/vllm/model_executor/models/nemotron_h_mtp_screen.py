@@ -511,8 +511,12 @@ class DraftHeadScreen:
         self.graph = None
         self._h = torch.empty(k, dtype=torch.float32, device=device)
         self._out = torch.empty(1, dtype=torch.int32, device=device)
+        self._refine_mode = None
         if device.type == "cuda" and self.cascade and self.fold:
             self.fold = self._fold_matches(k, device)
+        if device.type == "cuda":
+            from .nemotron_h_mtp_refine_fused import prepare
+            self._refine_mode = prepare(self)
         if device.type == "cuda" and screen_graph_enabled():
             # The captured one-row screen is the gated one (depth gate): allocate
             # the gate first so the graph captures its address.
@@ -614,7 +618,11 @@ class DraftHeadScreen:
             # torch.topk(sorted=False) returns, in torch's order (_chunk_topk).
             # Same candidate ids in the same order, so every rows_dot, the
             # selection and the depth gate see identical inputs.
-            if self.reuse:
+            direct = (self._refine_mode is not None and self.reuse
+                      and self.radix and self._refine_mode[1])
+            if direct:
+                pass  # The dot kernels gather the exact original h columns.
+            elif self.reuse:
                 _gather_two[(1,)](
                     h, self.coarse_cols, self._hc, self.rest_cols, self._hr,
                     NA=self.coarse_cols.numel(), NB=self.rest_cols.numel(),
@@ -627,8 +635,9 @@ class DraftHeadScreen:
                     launch_pdl=mtp_pdl(),
                 )
             _rows_dot(
-                self._hc, self.w_coarse, self.s_coarse, None,
+                h if direct else self._hc, self.w_coarse, self.s_coarse, None,
                 self.gscale, self.scores, False, gated,
+                hcols=self.coarse_cols if direct else None,
             )
             nchunk = self.n // SCREEN_CHUNK
             tgate, tok = _gate_args(self.scores)
@@ -639,7 +648,11 @@ class DraftHeadScreen:
                 num_warps=4 if self.radix else 8, launch_pdl=mtp_pdl(),
                 gate_ptr=tgate, GATED=tgated,
             )
-            if self.reuse:
+            from .nemotron_h_mtp_refine_fused import maybe_refine
+            fused_refine = maybe_refine(self, h, gated)
+            if fused_refine:
+                pass  # Both the original score vector and survivor ids are written.
+            elif self.reuse:
                 # refine score = coarse score (its 32 groups) + the other 32 refine
                 # groups: the same 64-group sum, added in a different fp32 order, so
                 # it reads 256 of the 512 bytes per candidate row (the coarse groups
@@ -654,11 +667,12 @@ class DraftHeadScreen:
                     self._hs, self.w_scr, self.s_scr, self._coarse_cand,
                     self.gscale, self.refine_scores, True, gated,
                 )
-            _chunk_topk[(nchunk,)](
-                self.refine_scores, self._coarse_cand, self._cand,
-                N=CASCADE_PER, K=SCREEN_PER, GATHER=True, RADIX=self.radix,
-                num_warps=4, launch_pdl=mtp_pdl(), gate_ptr=tgate, GATED=tgated,
-            )
+            if not fused_refine:
+                _chunk_topk[(nchunk,)](
+                    self.refine_scores, self._coarse_cand, self._cand,
+                    N=CASCADE_PER, K=SCREEN_PER, GATHER=True, RADIX=self.radix,
+                    num_warps=4, launch_pdl=mtp_pdl(), gate_ptr=tgate, GATED=tgated,
+                )
             cand = self._cand
         elif self.cascade and self.fold:
             # The same arithmetic as the unfolded cascade below, with the column

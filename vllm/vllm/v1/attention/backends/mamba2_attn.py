@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
-from dataclasses import dataclass, replace
+import os
+from dataclasses import dataclass, fields, replace
 from typing import Any
 
 import torch
@@ -111,6 +112,87 @@ class Mamba2AttentionMetadata(BaseMambaAttentionMetadata):
     seq_idx_p: torch.Tensor | None = None
 
 
+# LOCAL PATCH (cudafast-nemotron35): decode metadata reuse. In a spec-decode verify of a
+# pure-decode batch (no prefilling row, mamba_cache_mode "none", no ReplaySSM, full CUDA
+# graphs), every Mamba2 KV-cache group rebuilt the same metadata each step: the same ints and
+# views of the same persistent buffers (query_start_loc, seq_lens, the builder's state-index
+# and accepted-count buffers). The only per-step device work is copying this group's state
+# indices from its block table and the accepted counts into the buffers the verify graph reads.
+# So a builder whose inputs match its last decode build (same ints, same query_start_loc_cpu
+# values, same tensor storages and shapes) returns that metadata object after those copies,
+# and the Mamba2 groups share one accepted-count buffer that is copied once per step.
+# VLLM_MAMBA2_META_REUSE=0 restores the full build every step; VLLM_MAMBA2_META_REUSE_CHECK=1
+# also runs the full build and compares the two structurally.
+_META_REUSE = os.environ.get("VLLM_MAMBA2_META_REUSE", "1") != "0"
+_META_REUSE_CHECK = os.environ.get("VLLM_MAMBA2_META_REUSE_CHECK", "0") == "1"
+# (device, shape, dtype) -> the accepted-count buffer every Mamba2 group's verify graph reads
+_SHARED_ACCEPTED: dict[tuple, torch.Tensor] = {}
+# Per-step state shared by the groups of one step (keyed by the step's query_start_loc
+# tensor object, which every group's shallow-copied CommonAttentionMetadata shares).
+_STEP: dict[str, Any] = {"qsl": None, "sig": None, "acc_qsl": None}
+
+
+def _tensor_key(t: torch.Tensor | None) -> tuple | None:
+    if t is None:
+        return None
+    return (t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.dtype)
+
+
+def _step_signature(
+    common_attn_metadata: CommonAttentionMetadata, kwargs: dict[str, Any]
+) -> tuple | None:
+    """Inputs that decide a decode build's structure, or None when not a reusable
+    pure-decode step. Computed once per step for all groups."""
+    m = common_attn_metadata
+    if _STEP["qsl"] is m.query_start_loc:
+        return _STEP["sig"]
+    sig = None
+    acc = kwargs.get("num_accepted_tokens")
+    isp = m.is_prefilling
+    if (
+        acc is not None
+        and kwargs.get("prev_last_scheduled_idx") is None
+        and isp is not None
+        and not isp.is_cuda
+        and m.query_start_loc_cpu is not None
+    ):
+        n = m.num_reqs
+        if n > 0 and not bool(isp.numpy()[:n].any()):
+            sig = (
+                n,
+                m.num_actual_tokens,
+                m.max_query_len,
+                tuple(m.query_start_loc_cpu.tolist()),
+                _tensor_key(m.query_start_loc),
+                _tensor_key(m.seq_lens),
+                _tensor_key(acc),
+            )
+    _STEP["qsl"] = m.query_start_loc
+    _STEP["sig"] = sig
+    return sig
+
+
+def _structure_diff(a: Any, b: Any, path: str, out: list[str]) -> None:
+    if isinstance(a, torch.Tensor) or isinstance(b, torch.Tensor):
+        if not (
+            isinstance(a, torch.Tensor)
+            and isinstance(b, torch.Tensor)
+            and _tensor_key(a) == _tensor_key(b)
+            and a.device == b.device
+        ):
+            out.append(path)
+        return
+    if type(a) is not type(b):
+        out.append(path)
+        return
+    if hasattr(a, "__dataclass_fields__"):
+        for f in fields(a):
+            _structure_diff(getattr(a, f.name), getattr(b, f.name), f"{path}.{f.name}", out)
+        return
+    if a != b:
+        out.append(path)
+
+
 class Mamba2AttentionMetadataBuilder(
     BaseMambaAttentionMetadataBuilder[Mamba2AttentionMetadata]
 ):
@@ -129,8 +211,92 @@ class Mamba2AttentionMetadataBuilder(
             "chunk_size needs to be set in the model config for Mamba2 models"
         )
         self.chunk_size: int = chunk_size
+        # LOCAL PATCH (cudafast-nemotron35): decode metadata reuse (see _META_REUSE).
+        self._meta_reuse = (
+            _META_REUSE
+            and self.use_spec_decode
+            and vllm_config.cache_config.mamba_cache_mode == "none"
+            and not self.use_replayssm
+            and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+        )
+        self._decode_cache: tuple | None = None
+        self._capture_build = False
+        if self._meta_reuse:
+            buf = self.decode_num_accepted_tokens
+            key = (str(buf.device), tuple(buf.shape), buf.dtype)
+            shared = _SHARED_ACCEPTED.setdefault(key, buf)
+            self.decode_num_accepted_tokens = shared
+
+    def build_for_cudagraph_capture(
+        self, common_attn_metadata: CommonAttentionMetadata
+    ) -> Mamba2AttentionMetadata:
+        self._decode_cache = None
+        self._capture_build = True
+        try:
+            return super().build_for_cudagraph_capture(common_attn_metadata)
+        finally:
+            self._capture_build = False
 
     def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+        **kwargs: Any,
+    ) -> Mamba2AttentionMetadata:
+        if not self._meta_reuse or self._capture_build or common_prefix_len != 0:
+            return self._build_full(
+                common_prefix_len, common_attn_metadata, fast_build, **kwargs
+            )
+        step_sig = _step_signature(common_attn_metadata, kwargs)
+        if step_sig is None:
+            self._decode_cache = None
+            return self._build_full(
+                common_prefix_len, common_attn_metadata, fast_build, **kwargs
+            )
+        sig = (step_sig, _tensor_key(common_attn_metadata.block_table_tensor))
+        cached = self._decode_cache
+        if cached is not None and cached[0] == sig:
+            md = cached[1]
+            nd = md.num_decodes
+            bt = common_attn_metadata.block_table_tensor
+            self.state_indices_tensor_d[:nd].copy_(
+                bt[:nd, : 1 + self.num_spec_tokens], non_blocking=True
+            )
+            qsl = common_attn_metadata.query_start_loc
+            if _STEP["acc_qsl"] is not qsl:
+                acc = kwargs["num_accepted_tokens"]
+                self.decode_num_accepted_tokens[:nd].copy_(acc[:nd], non_blocking=True)
+                _STEP["acc_qsl"] = qsl
+            if _META_REUSE_CHECK:
+                full = self._build_full(
+                    common_prefix_len, common_attn_metadata, fast_build, **kwargs
+                )
+                diffs: list[str] = []
+                _structure_diff(md, full, "mamba2", diffs)
+                if diffs:
+                    raise RuntimeError(f"Mamba2 decode metadata reuse differs: {diffs}")
+            return md
+        md = self._build_full(
+            common_prefix_len, common_attn_metadata, fast_build, **kwargs
+        )
+        if (
+            md.num_prefills == 0
+            and md.num_decodes == md.num_reqs
+            and md.num_decodes <= self.decode_cudagraph_max_bs
+            and md.state_indices_tensor_d is not None
+            and md.num_accepted_tokens is not None
+            and md.state_indices_tensor_d.data_ptr()
+            == self.state_indices_tensor_d.data_ptr()
+        ):
+            self._decode_cache = (sig, md)
+            # the full build copied this step's accepted counts into the shared buffer
+            _STEP["acc_qsl"] = common_attn_metadata.query_start_loc
+        else:
+            self._decode_cache = None
+        return md
+
+    def _build_full(
         self,
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,

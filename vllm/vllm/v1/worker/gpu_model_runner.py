@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import sys
 import threading
 import time
@@ -300,6 +301,10 @@ def _keep_verify_rows_for(
 # Protect asynchronous H2D sources; switchable for in-process cost screening.
 PINNED_SOURCE_GUARDS = True
 
+# LOCAL PATCH (cudafast-nemotron35): spec-decode metadata cache (_calc_spec_decode_metadata).
+_SPEC_META_CACHE = os.environ.get("VLLM_SPEC_META_CACHE", "1") != "0"
+_SPEC_META_CACHE_CHECK = os.environ.get("VLLM_SPEC_META_CACHE_CHECK", "0") == "1"
+
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
@@ -317,6 +322,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         vocab_size: int,
         routed_experts: RoutedExpertsTensors | None = None,
         check_ep_fault: bool = False,
+        copy_ready_event: torch.cuda.Event | None = None,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
@@ -338,7 +344,10 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         # Initiate the copy on a separate stream, but do not synchronize it.
         default_stream = torch.cuda.current_stream()
         with torch.cuda.stream(async_output_copy_stream):
-            async_output_copy_stream.wait_stream(default_stream)
+            if copy_ready_event is None:
+                async_output_copy_stream.wait_stream(default_stream)
+            else:
+                async_output_copy_stream.wait_event(copy_ready_event)
             self.sampled_token_ids_cpu = self._sampled_token_ids.to(
                 "cpu", non_blocking=True
             )
@@ -353,6 +362,8 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
                 else None
             )
             if check_ep_fault:
+                if copy_ready_event is not None:
+                    async_output_copy_stream.wait_stream(default_stream)
                 has_fault = get_ep_all2all_manager().query_fault()
                 self._has_fault = has_fault.to("cpu", non_blocking=True)
             self.async_copy_ready_event.record()
@@ -1643,7 +1654,11 @@ class GPUModelRunner(
         # Valid tokens are contiguous from position 0, so counting non-(-1)
         # tokens gives us the first -1 position (i.e., number of accepted).
         num_reqs = output_token_ids.size(0)
-        self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(dim=1)
+        counted, self._vsample_counted = self._vsample_counted, None
+        if counted is not output_token_ids or num_reqs != 1:
+            self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(
+                dim=1
+            )
 
         if self.cache_config.mamba_cache_mode == "align":
             # Fused GPU postprocess: state copies + per-request accepted-token
@@ -1666,9 +1681,18 @@ class GPUModelRunner(
             assert self.num_accepted_tokens_event is not None
             self.num_accepted_tokens_event.record()
         else:
-            self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
-                self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
-            )
+            # LOCAL PATCH (cudafast-nemotron35): under async scheduling with
+            # mamba_cache_mode "none" nothing reads num_accepted_tokens_cpu (the
+            # _prepare_inputs re-sync is skipped for exactly that case, and
+            # preprocess_mamba runs in "align" mode only), so its D2H copy is
+            # skipped: it sat on the stream between the sampler and the drafter.
+            if not (
+                self.use_async_scheduling
+                and self.cache_config.mamba_cache_mode == "none"
+            ):
+                self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
+                    self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
+                )
             assert self.num_accepted_tokens_event is not None
             self.num_accepted_tokens_event.record()
 
@@ -2942,11 +2966,90 @@ class GPUModelRunner(
 
                 xdrope_pos_ptr += completion_part_len
 
+    # LOCAL PATCH (cudafast-nemotron35): the index tensors of a spec-decode verify depend
+    # only on the batch composition (each request's draft count and scheduled-token count),
+    # never on token values. Keep the last composition's device tensors and gather the draft
+    # ids with one composed index (logits_indices[target_logits_indices + 1]); any other
+    # composition recomputes everything. VLLM_SPEC_META_CACHE=0 disables,
+    # VLLM_SPEC_META_CACHE_CHECK=1 also recomputes and compares every step.
+    _spec_meta_cache: tuple | None = None
+
     def _calc_spec_decode_metadata(
         self,
         num_draft_tokens: np.ndarray,
         cu_num_scheduled_tokens: np.ndarray,
     ) -> SpecDecodeMetadata:
+        if not _SPEC_META_CACHE:
+            return self._calc_spec_decode_metadata_full(
+                num_draft_tokens, cu_num_scheduled_tokens
+            )
+        key = (
+            num_draft_tokens.dtype.str,
+            num_draft_tokens.tobytes(),
+            cu_num_scheduled_tokens.dtype.str,
+            cu_num_scheduled_tokens.tobytes(),
+        )
+        hit = self._spec_meta_cache
+        if hit is not None and hit[0] == key:
+            (
+                cu_num_draft_tokens,
+                cu_num_sampled_tokens,
+                logits_indices,
+                target_logits_indices,
+                bonus_logits_indices,
+                draft_index,
+                num_draft_list,
+            ) = hit[1]
+            md = SpecDecodeMetadata(
+                draft_token_ids=self.input_ids.gpu[draft_index],
+                num_draft_tokens=list(num_draft_list),
+                cu_num_draft_tokens=cu_num_draft_tokens,
+                cu_num_sampled_tokens=cu_num_sampled_tokens,
+                target_logits_indices=target_logits_indices,
+                bonus_logits_indices=bonus_logits_indices,
+                logits_indices=logits_indices,
+            )
+            if _SPEC_META_CACHE_CHECK:
+                ref = self._calc_spec_decode_metadata_full(
+                    num_draft_tokens, cu_num_scheduled_tokens
+                )
+                for f in (
+                    "draft_token_ids",
+                    "cu_num_draft_tokens",
+                    "cu_num_sampled_tokens",
+                    "target_logits_indices",
+                    "bonus_logits_indices",
+                    "logits_indices",
+                ):
+                    a, b = getattr(md, f), getattr(ref, f)
+                    if a.dtype != b.dtype or a.shape != b.shape or not torch.equal(a, b):
+                        raise RuntimeError(f"spec metadata cache differs in {f}")
+                if md.num_draft_tokens != ref.num_draft_tokens:
+                    raise RuntimeError("spec metadata cache differs in num_draft_tokens")
+            return md
+        md, composed = self._calc_spec_decode_metadata_full(
+            num_draft_tokens, cu_num_scheduled_tokens, want_composed=True
+        )
+        self._spec_meta_cache = (
+            key,
+            (
+                md.cu_num_draft_tokens,
+                md.cu_num_sampled_tokens,
+                md.logits_indices,
+                md.target_logits_indices,
+                md.bonus_logits_indices,
+                async_tensor_h2d(composed, device=self.device),
+                tuple(md.num_draft_tokens),
+            ),
+        )
+        return md
+
+    def _calc_spec_decode_metadata_full(
+        self,
+        num_draft_tokens: np.ndarray,
+        cu_num_scheduled_tokens: np.ndarray,
+        want_composed: bool = False,
+    ):
         # Inputs:
         # cu_num_scheduled_tokens:  [  4, 104, 107, 207, 209]
         # num_draft_tokens:         [  3,   0,   2,   0,   1]
@@ -2990,6 +3093,8 @@ class GPUModelRunner(
         # [0, 1, 2, 5, 6, 9]
         target_logits_indices += self._arange_scratch[: cu_num_draft_tokens[-1]]
 
+        logits_indices_np = logits_indices
+        target_logits_indices_np = target_logits_indices
         cu_num_draft_tokens = async_tensor_h2d(cu_num_draft_tokens, device=self.device)
         cu_num_sampled_tokens = async_tensor_h2d(
             cu_num_sampled_tokens, device=self.device
@@ -3007,7 +3112,7 @@ class GPUModelRunner(
         draft_token_ids = self.input_ids.gpu[logits_indices]
         draft_token_ids = draft_token_ids[target_logits_indices + 1]
 
-        return SpecDecodeMetadata(
+        md = SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
             num_draft_tokens=num_draft_tokens.tolist(),
             cu_num_draft_tokens=cu_num_draft_tokens,
@@ -3016,6 +3121,10 @@ class GPUModelRunner(
             bonus_logits_indices=bonus_logits_indices,
             logits_indices=logits_indices,
         )
+        if want_composed:
+            # the same gather as the two above, as one index (spec metadata cache)
+            return md, logits_indices_np[target_logits_indices_np + 1]
+        return md
 
     def _prepare_kv_sharing_fast_prefill(
         self,
@@ -3813,6 +3922,17 @@ class GPUModelRunner(
         # which the greedy kernel rejects, emitting row count - 1's own argmax.
         # Then every row is valid again. See nemotron_h_mtp_kernels.py.
         vrows = _verify_rows_buffer(logits)
+        # LOCAL PATCH (cudafast-nemotron35): vsample (harness/kernels/vsample). For a
+        # one-request greedy verify, the depth-gate masking above, the rejection
+        # sampler's greedy-argmax path, the verify-row reset below and the accepted
+        # count of _update_states_after_model_execute run as one kernel with the same
+        # integer results (argmax under torch's NaN/tie order); the stock path runs
+        # whenever its guard refuses. VSAMPLE=0 disables it.
+        fused = self._vsample_greedy(
+            logits, spec_decode_metadata, sampling_metadata, vrows
+        )
+        if fused is not None:
+            return fused
         if vrows is not None:
             spec_decode_metadata = _reject_unverified_drafts(
                 spec_decode_metadata, vrows
@@ -3826,6 +3946,47 @@ class GPUModelRunner(
         if vrows is not None:
             vrows.fill_(_smallk_module().VROWS_ALL)
         return sampler_output
+
+    # LOCAL PATCH (cudafast-nemotron35): vsample (see _sample). The output tensor whose
+    # accepted count the fused kernel already wrote to num_accepted_tokens.gpu[0].
+    _vsample_counted: torch.Tensor | None = None
+
+    def _vsample_greedy(
+        self,
+        logits: torch.Tensor | None,
+        spec_decode_metadata: SpecDecodeMetadata,
+        sampling_metadata,
+        vrows: torch.Tensor | None,
+    ) -> SamplerOutput | None:
+        self._vsample_counted = None
+        vsample = sys.modules.get("vsample")
+        if vsample is None:
+            try:
+                import vsample  # harness/kernels/vsample
+            except ImportError:
+                return None
+        rs = self.rejection_sampler
+        if (
+            logits is None
+            or not vsample.ENABLED
+            or type(rs) is not RejectionSampler
+            or self.input_batch.num_reqs != 1
+            or logits.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+            or not rs._can_use_greedy_argmax(sampling_metadata)
+        ):
+            return None
+        count = (
+            self.num_accepted_tokens.gpu[:1]
+            if self.speculative_config and self.model_config.is_hybrid
+            else None
+        )
+        out = vsample.maybe_greedy_verify(logits, spec_decode_metadata, vrows, count)
+        if out is None:
+            return None
+        if count is not None:
+            self._vsample_counted = out
+        logger.info_once("vsample: fused greedy verify sampler active")
+        return SamplerOutput(sampled_token_ids=out, logprobs_tensors=None)
 
     def _bookkeeping_sync(
         self,
@@ -4758,6 +4919,21 @@ class GPUModelRunner(
                 self._pp_broadcast_prev_sampled_token_ids(
                     sampler_output.sampled_token_ids
                 )
+            routed_experts_snapshot = None
+            if self.routed_experts_initialized:
+                buf = self.routed_experts_capturer.get_device_buffer()
+                total = scheduler_output.total_num_scheduled_tokens
+                routed_experts_snapshot = RoutedExpertsTensors(
+                    routing_data=buf[:total].clone(),
+                    slot_mapping=self.routed_experts_slot_mapping_device[
+                        :total
+                    ].clone(),
+                )
+            copy_ready_event = torch.cuda.Event(enable_timing=False)
+            copy_ready_event.record()
+        else:
+            routed_experts_snapshot = None
+            copy_ready_event = None
 
         self._draft_token_ids = None
         self._draft_probs = None
@@ -4952,9 +5128,6 @@ class GPUModelRunner(
         with record_function_or_nullcontext(
             "gpu_model_runner: AsyncGPUModelRunnerOutput"
         ):
-            # Async path: produce a device-side snapshot that the async
-            # copy stream can D2H later. Both tensors must be private
-            # clones because:
             #   - ``routing_data`` source is the shared capturer buffer,
             #     which is ``clear_buffer()``-ed at the start of the
             #     next step on the default stream.
@@ -4964,17 +5137,6 @@ class GPUModelRunner(
             #     stream while the D2H is still pending on the copy
             #     stream.
             # Without clones, the copy stream would read torn data.
-            routed_experts_snapshot = None
-            if self.routed_experts_initialized:
-                buf = self.routed_experts_capturer.get_device_buffer()
-                total = scheduler_output.total_num_scheduled_tokens
-                routed_experts_snapshot = RoutedExpertsTensors(
-                    routing_data=buf[:total].clone(),
-                    slot_mapping=self.routed_experts_slot_mapping_device[
-                        :total
-                    ].clone(),
-                )
-
             async_output = AsyncGPUModelRunnerOutput(
                 model_runner_output=output,
                 sampled_token_ids=sampler_output.sampled_token_ids,
@@ -4984,6 +5146,7 @@ class GPUModelRunner(
                 vocab_size=self.input_batch.vocab_size,
                 routed_experts=routed_experts_snapshot,
                 check_ep_fault=self.check_ep_fault,
+                copy_ready_event=copy_ready_event,
             )
         with record_function_or_nullcontext(
             "gpu_model_runner: set_async_sampled_token_ids"

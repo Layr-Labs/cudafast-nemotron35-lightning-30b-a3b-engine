@@ -18,6 +18,7 @@
 # limitations under the License.
 """Inference-only NemotronH model."""
 
+import os
 from collections.abc import Iterable, Mapping
 from itertools import islice
 
@@ -83,6 +84,21 @@ from vllm.model_executor.models.utils import (
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.nemotron_h import NemotronHConfig
 
+
+# LOCAL PATCH (cudafast-nemotron35): programmatic dependent launch for the Triton kernels
+# inductor generates (the residual/RMSNorm/FP8-quant joins of the verify graph): each kernel
+# waits (gdc_wait) before touching a buffer its predecessor writes and lets its dependent launch
+# after its loads, so the launch and prologue of a PDL-aware successor (fp8small, smallk, zskip,
+# the replay kernel) overlap its tail. Codegen adds only those two instructions: same loads,
+# same arithmetic, same stores. NEMO_INDUCTOR_PDL=0 keeps inductor's default (off).
+if os.environ.get("NEMO_INDUCTOR_PDL", "1") != "0":
+    try:
+        import torch._inductor.config as _inductor_config
+
+        if hasattr(_inductor_config.triton, "enable_pdl"):
+            _inductor_config.triton.enable_pdl = True
+    except Exception:  # inductor unavailable: nothing changes
+        pass
 
 # smallk (harness/kernels/smallk): run the router GEMM inside the MoE custom op, after the shared
 # experts' side stream has forked, so the side stream's GEMMs overlap it. Same kernels on the same

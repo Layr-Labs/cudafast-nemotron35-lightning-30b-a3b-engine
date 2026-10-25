@@ -7,7 +7,11 @@ from enum import Enum
 from functools import partial
 from typing import ClassVar
 
+import os
+
 import numpy as np
+
+_FI_PAGE_TRIM = os.environ.get("VLLM_FI_PAGE_COPY_TRIM", "1") == "1"
 import torch
 from flashinfer import (
     BatchDecodeWithPagedKVCacheWrapper,
@@ -1162,13 +1166,18 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # write self.paged_kv_indices inplace
         num_actual_pages = self.paged_kv_indptr.np[num_reqs]
         paged_kv_indices = self.paged_kv_indices.gpu[:num_actual_pages]
-        _copy_page_indices_kernel[(num_reqs,)](
-            paged_kv_indices,
-            block_table_tensor,
-            block_table_tensor.stride(0),
-            paged_kv_indptr,
-            BLOCK_SIZE=1024,
-        )
+        if _FI_PAGE_TRIM and num_reqs == 1:
+            paged_kv_indices.copy_(
+                block_table_tensor[0, :num_actual_pages], non_blocking=True
+            )
+        else:
+            _copy_page_indices_kernel[(num_reqs,)](
+                paged_kv_indices,
+                block_table_tensor,
+                block_table_tensor.stride(0),
+                paged_kv_indptr,
+                BLOCK_SIZE=1024,
+            )
 
         # write self.paged_kv_last_page_len_cpu inplace
         paged_kv_last_page_len_np = seq_lens_np % page_size

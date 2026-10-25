@@ -62,6 +62,12 @@ def _load():
         if hasattr(lib, "marlinx_gemm_zs"):
             lib.marlinx_gemm_zs.argtypes = lib.marlinx_gemm.argtypes + [ctypes.c_void_p]
             lib.marlinx_gemm_zs.restype = ctypes.c_int
+        if hasattr(lib, "marlinx_gemm_zs_vrows"):
+            lib.marlinx_gemm_zs_vrows.argtypes = lib.marlinx_gemm.argtypes + [ctypes.c_void_p, ctypes.c_void_p]
+            lib.marlinx_gemm_zs_vrows.restype = ctypes.c_int
+            if hasattr(lib, "marlinx_gemm_zs_vrows_pdl"):
+                lib.marlinx_gemm_zs_vrows_pdl.argtypes = lib.marlinx_gemm_zs_vrows.argtypes
+                lib.marlinx_gemm_zs_vrows_pdl.restype = ctypes.c_int
         if hasattr(lib, "marlinx_gemm_relu2"):
             lib.marlinx_gemm_relu2.argtypes = lib.marlinx_gemm.argtypes
             lib.marlinx_gemm_relu2.restype = ctypes.c_int
@@ -191,7 +197,7 @@ def zs_repack(w: torch.Tensor, n: int, k: int) -> torch.Tensor:
 
 def gemm(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
          global_scale: torch.Tensor, n: int, k: int, depth: int = DEPTH,
-         relu2: bool = False, zs: torch.Tensor | None = None) -> torch.Tensor:
+         relu2: bool = False, zs: torch.Tensor | None = None, vrows: torch.Tensor | None = None) -> torch.Tensor:
     """out[M, n] for a 2-D bf16 x[M, k] (1 <= M <= 8); no guard beyond the C side's."""
     global _pdl_active
     lib = _load()
@@ -200,7 +206,13 @@ def gemm(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
     out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
     mode = "zs" if zs is not None else "relu2" if relu2 else "gemm"
     use_pdl = _pdl_active
-    op = _ops_pdl[mode] if use_pdl else _ops[mode]
+    use_mzs = zs is not None and vrows is not None and hasattr(lib, "marlinx_gemm_zs_vrows")
+    if use_mzs:
+        assert vrows.dtype == torch.int32 and vrows.device == x.device and vrows.numel() == 1
+        use_pdl = use_pdl and hasattr(lib, "marlinx_gemm_zs_vrows_pdl")
+        op = lib.marlinx_gemm_zs_vrows_pdl if use_pdl else lib.marlinx_gemm_zs_vrows
+    else:
+        op = _ops_pdl[mode] if use_pdl else _ops[mode]
     args = (
         x.data_ptr(), x.stride(0), m,
         weight.data_ptr(), weight_scale.data_ptr(), global_scale.data_ptr(),
@@ -209,11 +221,14 @@ def gemm(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
     )
     if zs is not None:
         args += (zs.data_ptr(),)
+    if use_mzs:
+        args += (vrows.data_ptr(),)
     rc = op(*args)
     if rc and use_pdl and not torch.cuda.is_current_stream_capturing():
         # Match fp8small: only rejected eager launches retry, never capture.
         _pdl_active = False
-        rc = _ops[mode](*args)
+        ordinary = lib.marlinx_gemm_zs_vrows if use_mzs else _ops[mode]
+        rc = ordinary(*args)
     if rc != 0:
         raise RuntimeError(f"marlinx_gemm failed: {rc} (M={m} N={n} K={k} depth={depth})")
     return out
@@ -240,8 +255,17 @@ def maybe_apply(layer, x: torch.Tensor) -> torch.Tensor | None:
     if not _ready and not _init():
         return None
     n = layer.output_size_per_partition
+    zs = getattr(layer, "_marlinx_zs", None)
+    vrows = None
+    if (zs is not None and os.environ.get("MTP_MZS", "1") != "0"
+            and "mtp" not in str(getattr(layer, "prefix", "")).split(".")):
+        try:
+            import smallk
+            vrows = smallk.live_verify_rows(x.device)
+        except ImportError:
+            pass
     out = gemm(x2, layer.weight, layer.weight_scale, layer.weight_global_scale, n, k,
-               zs=getattr(layer, "_marlinx_zs", None))
+               zs=zs, vrows=vrows)
     return out.reshape(*x.shape[:-1], n)
 
 

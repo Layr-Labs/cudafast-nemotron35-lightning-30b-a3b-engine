@@ -20,6 +20,16 @@ piece removes a host wait or host work from the engine core's critical path:
   work. ``StagingGuard`` waits for those copies before a builder rewrites its
   pinned staging buffers (the builder's ``paged_kv_*`` host buffers and the
   FlashInfer wrappers' pinned plan workspace).
+* Draft staging sets. ``StagingGuard`` (and the proposer's per-step plan
+  event) made every draft step's build wait for the previous step's copies,
+  so the CPU never got more than one draft step ahead of the GPU and reached
+  the next verify's launch only after the last draft step had nearly
+  finished. ``DraftStagingSets`` gives each draft step of a cycle its own set
+  of those pinned host buffers instead; a set is rewritten only after the
+  event recorded at its previous use (one cycle earlier) has completed, so no
+  draft step waits and the next verify is queued while the drafts still run.
+  The device buffers the copies fill are unchanged and still shared: stream
+  order serializes them exactly as before.
 * GC. Automatic collection is off in the engine core while it has work; young
   generations are collected while the CPU waits for the GPU anyway
   (``gc_in_shadow``) and automatic collection is back on when it goes idle.
@@ -30,6 +40,7 @@ piece removes a host wait or host work from the engine core's critical path:
 Switches, read once at import in every process (all default on):
   VLLM_HOSTFAST_S1=0     the verify reads seq_lens back from the GPU again
   VLLM_HOSTFAST_S2=0     the first draft step reads seq_lens back again
+  VLLM_HOSTFAST_SETS=0   draft steps share one staging set (StagingGuard)
   VLLM_HOSTFAST_GC=0     automatic GC stays on in the engine core
   VLLM_HOSTFAST_PIN=0    no CPU affinity change
   VLLM_HOSTFAST_CHECK=1  debug, default off: also read seq_lens back from the
@@ -53,6 +64,7 @@ def _flag(name: str, default: str) -> bool:
 
 S1 = _flag("VLLM_HOSTFAST_S1", "1")
 S2 = _flag("VLLM_HOSTFAST_S2", "1")
+SETS = _flag("VLLM_HOSTFAST_SETS", "1")
 GC = _flag("VLLM_HOSTFAST_GC", "1")
 PIN = _flag("VLLM_HOSTFAST_PIN", "1")
 CHECK = _flag("VLLM_HOSTFAST_CHECK", "0")
@@ -205,6 +217,107 @@ class StagingGuard:
         if self._event is None:
             self._event = torch.cuda.Event()
         self._event.record()
+
+
+class _StagingSet:
+    """One draft step's pinned host staging for one FlashInfer builder."""
+
+    def __init__(self, builder) -> None:
+        self.indptr_cpu = torch.zeros_like(builder.paged_kv_indptr.cpu).pin_memory()
+        self.indptr_np = self.indptr_cpu.numpy()
+        self.indptr_buf = torch.zeros_like(builder.paged_kv_indptr_cpu_buffer).pin_memory()
+        self.last_page_len_cpu = torch.zeros_like(
+            builder.paged_kv_last_page_len.cpu
+        ).pin_memory()
+        self.last_page_len_np = self.last_page_len_cpu.numpy()
+        # wrapper id -> (wrapper, this set's pinned plan workspace)
+        self.workspaces: dict[int, tuple[object, torch.Tensor]] = {}
+
+    def install(self, builder) -> None:
+        builder.paged_kv_indptr.cpu = self.indptr_cpu
+        builder.paged_kv_indptr.np = self.indptr_np
+        builder.paged_kv_indptr_cpu_buffer = self.indptr_buf
+        builder.paged_kv_last_page_len.cpu = self.last_page_len_cpu
+        builder.paged_kv_last_page_len.np = self.last_page_len_np
+        for wrapper in DraftStagingSets.wrappers(builder):
+            entry = self.workspaces.get(id(wrapper))
+            if entry is None or entry[0] is not wrapper:
+                buf = torch.empty_like(wrapper._pin_memory_int_workspace_buffer).pin_memory()
+                entry = (wrapper, buf)
+                self.workspaces[id(wrapper)] = entry
+            wrapper._pin_memory_int_workspace_buffer = entry[1]
+
+
+class DraftStagingSets:
+    """Per-draft-step pinned staging for the drafter's FlashInfer builders.
+
+    A FlashInfer build writes, on the host, the builder's ``paged_kv_indptr``
+    and ``paged_kv_last_page_len`` buffers and its indptr staging buffer, and
+    its plan writes the wrapper's pinned plan workspace; host-to-device copies
+    queued behind the GPU read all of them later. Draft step ``i`` of every
+    cycle uses set ``i`` of these buffers (installed on the builder and its
+    wrappers before the build), and set ``i`` is rewritten only once the event
+    recorded after its previous build has completed. The values written, the
+    device buffers they are copied to and the order of those copies on the
+    stream are the same as with one shared set.
+    """
+
+    def __init__(self, builders: list, num_sets: int) -> None:
+        self.builders = builders
+        # Keep every buffer an install replaces alive: copies queued from it
+        # before the replacement may still be pending.
+        self.original = [
+            (b.paged_kv_indptr.cpu, b.paged_kv_indptr_cpu_buffer, b.paged_kv_last_page_len.cpu)
+            for b in builders
+        ]
+        self.original_workspaces: dict[int, tuple[object, torch.Tensor]] = {}
+        self.sets = [[_StagingSet(b) for b in builders] for _ in range(num_sets)]
+        self.events: list[torch.cuda.Event | None] = [None] * num_sets
+        self._current = 0
+
+    @staticmethod
+    def wrappers(builder) -> list:
+        found = []
+        for name in ("_decode_wrappers_cudagraph", "_spec_prefill_wrappers_cudagraph"):
+            found.extend((getattr(builder, name, None) or {}).values())
+        for name in ("_prefill_wrapper", "_decode_wrapper", "_noncausal_prefill_wrapper"):
+            w = getattr(builder, name, None)
+            if w is not None:
+                found.append(w)
+        return [w for w in found if hasattr(w, "_pin_memory_int_workspace_buffer")]
+
+    @staticmethod
+    def supports(builder) -> bool:
+        return all(
+            hasattr(builder, name)
+            for name in (
+                "paged_kv_indptr",
+                "paged_kv_indptr_cpu_buffer",
+                "paged_kv_last_page_len",
+            )
+        ) and getattr(builder, "pin_memory", False)
+
+    def before(self, draft_index: int) -> None:
+        i = draft_index % len(self.sets)
+        event = self.events[i]
+        if event is not None and not event.query():
+            event.synchronize()
+        for builder in self.builders:
+            for wrapper in self.wrappers(builder):
+                if id(wrapper) not in self.original_workspaces:
+                    self.original_workspaces[id(wrapper)] = (
+                        wrapper,
+                        wrapper._pin_memory_int_workspace_buffer,
+                    )
+        for staging, builder in zip(self.sets[i], self.builders):
+            staging.install(builder)
+        self._current = i
+
+    def after(self) -> None:
+        i = self._current
+        if self.events[i] is None:
+            self.events[i] = torch.cuda.Event()
+        self.events[i].record()
 
 
 # --------------------------------------------------------------------------- #

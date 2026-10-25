@@ -44,7 +44,9 @@ except ImportError:
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 
-from .nemotron_h_mtp_kernels import DEPTH_THETA, _gate_args, depth_gate_init, mtp_pdl
+from .nemotron_h_mtp_kernels import (
+    DEPTH_CUMULATIVE, DEPTH_THETA, _gate_args, depth_gate_init, mtp_pdl,
+)
 
 logger = init_logger(__name__)
 
@@ -348,6 +350,7 @@ def _select_token(
     gate_ptr=None,
     GATED: tl.constexpr = False,
     THETA: tl.constexpr = 0.0,
+    CUM: tl.constexpr = False,
     launch_pdl: tl.constexpr = False,
     ref=None,
     TWO_LEVEL: tl.constexpr = False,
@@ -379,11 +382,14 @@ def _select_token(
     if GATED:
         # Depth gate (nemotron_h_mtp_kernels.py): while a draft loop is active and
         # not stopped, count this draft as kept, then stop the loop if its top-1
-        # probability over the candidate logits is below THETA (NaN never stops it).
         if (tl.load(gate_ptr + 2) != 0) & (tl.load(gate_ptr) == 0):
             tl.store(gate_ptr + 1, tl.load(gate_ptr + 1) + 1)
             denom = tl.sum(tl.where(i < N, tl.exp(v - best), 0.0), axis=0)
-            if 1.0 / denom < THETA:
+            conf = 1.0 / denom
+            if CUM:
+                conf = tl.load(gate_ptr + 3).to(tl.float32, bitcast=True) * conf
+                tl.store(gate_ptr + 3, conf.to(tl.int32, bitcast=True))
+            if conf < THETA:
                 tl.store(gate_ptr, 1)
 
 
@@ -508,11 +514,23 @@ class DraftHeadScreen:
         # projection window (nemotron_h_mtp_kernels.py), which prefetches its head.
         if _l2pf is not None and self.cascade:
             _l2pf.DRAFT_SCREEN[:] = [self.w_coarse]
+        self.refine_fused = False
         self.graph = None
         self._h = torch.empty(k, dtype=torch.float32, device=device)
         self._out = torch.empty(1, dtype=torch.int32, device=device)
         if device.type == "cuda" and self.cascade and self.fold:
             self.fold = self._fold_matches(k, device)
+        if (device.type == "cuda" and self.reuse and self.radix
+                and os.environ.get("VLLM_MTP_REFINE_FUSION", "1") != "0"):
+            try:
+                from .nemotron_h_mtp_refine_fused import qualify, run
+
+                self._refine_runner = run
+                self.refine_fused = qualify(self)
+                logger.info("MTP rest-dot/TopK full-screen admission: %s", self.refine_fused)
+            except Exception as exc:
+                self.refine_fused = False
+                logger.warning("MTP rest-dot/TopK kept original path: %r", exc)
         if device.type == "cuda" and screen_graph_enabled():
             # The captured one-row screen is the gated one (depth gate): allocate
             # the gate first so the graph captures its address.
@@ -639,7 +657,9 @@ class DraftHeadScreen:
                 num_warps=4 if self.radix else 8, launch_pdl=mtp_pdl(),
                 gate_ptr=tgate, GATED=tgated,
             )
-            if self.reuse:
+            if self.reuse and self.refine_fused:
+                self._refine_runner(self, gated)
+            elif self.reuse:
                 # refine score = coarse score (its 32 groups) + the other 32 refine
                 # groups: the same 64-group sum, added in a different fp32 order, so
                 # it reads 256 of the 512 bytes per candidate row (the coarse groups
@@ -654,11 +674,12 @@ class DraftHeadScreen:
                     self._hs, self.w_scr, self.s_scr, self._coarse_cand,
                     self.gscale, self.refine_scores, True, gated,
                 )
-            _chunk_topk[(nchunk,)](
-                self.refine_scores, self._coarse_cand, self._cand,
-                N=CASCADE_PER, K=SCREEN_PER, GATHER=True, RADIX=self.radix,
-                num_warps=4, launch_pdl=mtp_pdl(), gate_ptr=tgate, GATED=tgated,
-            )
+            if not self.refine_fused:
+                _chunk_topk[(nchunk,)](
+                    self.refine_scores, self._coarse_cand, self._cand,
+                    N=CASCADE_PER, K=SCREEN_PER, GATHER=True, RADIX=self.radix,
+                    num_warps=4, launch_pdl=mtp_pdl(), gate_ptr=tgate, GATED=tgated,
+                )
             cand = self._cand
         elif self.cascade and self.fold:
             # The same arithmetic as the unfolded cascade below, with the column
@@ -688,7 +709,7 @@ class DraftHeadScreen:
                 self.cand_logits, coarse_idx, out, N=self.cand_logits.numel(),
                 BLOCK=triton.next_power_of_2(self.cand_logits.numel()),
                 gate_ptr=gate, GATED=gated and ok, THETA=DEPTH_THETA,
-                launch_pdl=mtp_pdl(),
+                CUM=DEPTH_CUMULATIVE, launch_pdl=mtp_pdl(),
                 ref=refined, TWO_LEVEL=True, CHUNK=SCREEN_CHUNK, CPER=CASCADE_PER,
                 SPER=SCREEN_PER,
             )
@@ -735,7 +756,7 @@ class DraftHeadScreen:
             self.cand_logits, cand, out, N=self.cand_logits.numel(),
             BLOCK=triton.next_power_of_2(self.cand_logits.numel()),
             gate_ptr=gate, GATED=gated and ok, THETA=DEPTH_THETA,
-            launch_pdl=mtp_pdl(),
+            CUM=DEPTH_CUMULATIVE, launch_pdl=mtp_pdl(),
         )
         return out
 

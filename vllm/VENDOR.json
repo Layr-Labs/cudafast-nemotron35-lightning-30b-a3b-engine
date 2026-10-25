@@ -238,6 +238,20 @@
     {
       "file": "vllm/model_executor/layers/mamba/ops/gated_norm_fp8.py; mamba_mixer2.py",
       "why": "Select priorcompletecorrect823867a3-d280-429c-bd43-c177dc25470a native-order groupedgatednorm/staticFP8 producer only onfulla484; add originalPDL wait-beforeallreads andexistingconfidenceprefixM5 earlyzero withoutweight/gate/SSMreads. Retainstaticcheckpointscale, bothBF16rounds, consumerQuantizedActivationguard, targetformats/fallback. Entirecombinationunverified; no localexecution."
+    },
+    {
+      "piece": "hj-l2pf-defer-join",
+      "file": "harness/kernels/l2pf/py/__init__.py; vllm/compilation/cuda_graph.py; harness/kernels/l2pf/tests/test_defer_join.py",
+      "why": "Decode hints only: postpone existing immutable-weight hint joins within each owning CUDA capture until before the next hint reuses the same side stream or just before capture end. Only the owning stream may defer; unscoped, eager and foreign-stream joins remain immediate. L2PF_DEFER_JOIN=0 restores the original waits. No hint bytes, tensor values, arithmetic, data-producer waits or prefill M>8 call sites change. Measured on 7fac1f9e: +0.055 ms per decode round over two fresh-boot pairs, 60/60 fresh requests token-identical to main."
+    },
+    {
+      "piece": "s28-mzs-shared-only",
+      "file": "harness/kernels/marlinx/csrc/marlinx.cu; harness/kernels/marlinx/py/__init__.py",
+      "why": "Port the shared MARLINX_ZS live-verify-row union from gv2 native MZS, preserving PDL and legacy ABI/fallback. MTP_MZS=0 disables. Existing smallk live_verify_rows bounds only the shared-down union, never MTP or wide prefill; valid arithmetic and row layout unchanged. Current-main paired118 routed prefix and Mamba prefix remain untouched. Credits original MARLINX_ZS 1001d918-90a6-402c-8df5-859e2e9a799f, native gate ca5c19dd-da37-4328-880a-152f8c7b3651 and paired/PDL 06201161-421c-462c-8a37-53146de288af. New port requires fresh admission."
+    },
+    {
+      "file": "vllm/vllm/v1/worker/hostfast.py, vllm/vllm/v1/spec_decode/llm_base_proposer.py, vllm/vllm/v1/worker/gpu_model_runner.py, vllm/vllm/model_executor/layers/fused_moe/runner/shared_experts.py, vllm/vllm/model_executor/models/nemotron_h_mtp_kernels.py",
+      "why": "Compose on ENTIRE highest complete valid AD5 ad5aaec0-2793-418b-bf0d-563b11250a00 (official 2.2171834448539407). Preserve theta0.4, PZ322, exact-order32/64 head,7MB attention/12MB MoE prefetch and deferredshared-down unchanged. Select271fcc12-bfce-400b-9aac-6d99c7585d16 per-depth pinnedplan staging and integer depth-end kernel, omit its other caches. Select0b3ad523-2891-481a-8956-dee4f4a4431a early sampled-token D2H readiness. New pending-shared-down fallback avoids duplicate fullMLP when no routed midpoint hook runs. All execution/bitchecks only officialremote; no isolated or combined gain claimed."
     }
   ]
 }

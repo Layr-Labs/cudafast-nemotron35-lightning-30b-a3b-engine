@@ -53,7 +53,48 @@ def _l2pf_next_layer(layer, num_tokens: int) -> bool:
         w = getattr(nxt, "_fp8small_weight", None)
     if w is None:
         w = getattr(nxt, "weight", None)
-    return _l2pf.prefetch(w, max_bytes=_l2pf.MOE_BYTES)
+    queued = _l2pf.prefetch(w, max_bytes=_l2pf.MOE_BYTES)
+    return _l2pf_next_ssm_ring(layer) or queued
+
+
+def _l2pf_next_ssm_ring(layer) -> bool:
+    """LOCAL PATCH (cudafast-nemotron35): with the lazy anchor (mamba_ssm_spec_replay), also
+    prefetch the following Mamba layer's spec-decode input ring (slot 1, the entries its
+    replay reads) and the prompt-length word after its slot-0 state into L2, in the same
+    window. The slots are read on the device from the decode metadata. Moves no value."""
+    if not getattr(_l2pf, "SSM_RING", False) or not hasattr(_l2pf, "prefetch_slots2"):
+        return False
+    mixer = _l2pf.AHEAD_SSM.get(str(getattr(layer, "layer_name", "")))
+    if mixer is None or not getattr(mixer, "_spec_replay_lazy", False):
+        return False
+    from vllm.forward_context import get_forward_context
+
+    attn_metadata = get_forward_context().attn_metadata
+    if not isinstance(attn_metadata, dict):
+        return False
+    meta = attn_metadata.get(getattr(mixer, "prefix", None))
+    slots = getattr(meta, "state_indices_tensor_d", None)
+    kv = getattr(mixer, "kv_cache", None)
+    if slots is None or slots.dim() != 2 or slots.shape[0] != 1 or slots.shape[1] < 2 or not kv:
+        return False
+    state = kv[1]
+    if state.dim() != 4:
+        return False
+    _, nheads, dim, dstate = state.shape
+    ngroups = getattr(mixer, "n_groups", 0) // max(getattr(mixer, "tp_size", 1), 1)
+    ring_bytes = mixer.spec_replay_ring_len * (nheads * dim + ngroups * dstate + nheads) * 2
+    tag_off = nheads * dim * dstate * state.element_size()
+    queued = _l2pf.prefetch_slots2(state, slots[:, 1], 0, ring_bytes, slots[:, 0], tag_off, 16)
+    if getattr(_l2pf, "SSM_ANCHOR", False) and hasattr(_l2pf, "prefetch_anchor") and slots.shape[1] >= 3:
+        from vllm.model_executor.layers.mamba.ops.mamba_ssm_spec_replay import LAZY_PERIOD
+
+        seq_lens = getattr(meta, "seq_lens", None)
+        qsl = getattr(meta, "query_start_loc_d", None)
+        if seq_lens is not None and qsl is not None and qsl.numel() >= 2:
+            queued = _l2pf.prefetch_anchor(
+                state, slots[0], seq_lens, qsl, tag_off, LAZY_PERIOD, tag_off
+            ) or queued
+    return queued
 from vllm.model_executor.layers.fused_moe.moe_permute_unpermute import (
     MoEPermuteScratch,
     moe_permute,

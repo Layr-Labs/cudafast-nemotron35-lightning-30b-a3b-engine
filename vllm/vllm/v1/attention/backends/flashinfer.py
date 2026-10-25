@@ -2636,7 +2636,10 @@ def fast_plan_decode(
 
     assert self.is_cuda_graph_enabled, "Should be cudagraph only here"
 
-    fast_decode_plan(
+    # Optional native-MTP-only bank, qualified during remote startup.
+    # All other wrappers retain the original native planner.
+    plan = getattr(self, "_nemo_native_plan", None) or fast_decode_plan
+    plan(
         self,
         indptr=indptr_cpu,
         indices=indices,

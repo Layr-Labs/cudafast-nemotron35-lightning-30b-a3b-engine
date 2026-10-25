@@ -8149,6 +8149,13 @@ class GPUModelRunner(
             kv_cache_config, kernel_block_sizes
         )
 
+        # Real layouts and immutable weights exist now. Never calibrate during
+        # a compiled forward; reset on profiling and every cache rebind.
+        for layer in self.compilation_config.static_forward_context.values():
+            prepare_current_dt = getattr(layer, "prepare_current_dt_fusion", None)
+            if prepare_current_dt is not None:
+                prepare_current_dt(enabled=not is_profiling)
+
         if (
             self.speculative_config
             and self.speculative_config.uses_extract_hidden_states()

@@ -12,6 +12,8 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.model_executor.layers.mamba.ops.mamba_ssm import softplus as _ssm_softplus
+from vllm.model_executor.layers.mamba.ops.triton_helpers import fast_exp as _ssm_fast_exp
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
 
 
@@ -806,6 +808,13 @@ def _causal_conv1d_update_kernel(
     HAS_NULL_BLOCK: tl.constexpr,
     BLOCK_N: tl.constexpr,
     launch_pdl: tl.constexpr,
+    dt_raw_ptr=None,
+    dt_A_ptr=None,
+    dt_bias_ptr=None,
+    dt_out_ptr=None,
+    DT_TOKEN_STRIDE: tl.constexpr = 0,
+    DT_HEAD_STRIDE: tl.constexpr = 0,
+    FUSED_DT: tl.constexpr = False,
 ):
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
@@ -1094,6 +1103,25 @@ def _causal_conv1d_update_kernel(
 
         tl.store(o_ptrs, acc, mask=mask_1d)
 
+    if FUSED_DT:
+        # Eight existing conv CTAs own disjoint groups of eight heads. No new
+        # launch or inter-CTA synchronization. All stores precede this original
+        # conv producer's completion, so the SSM's original PDL wait covers them.
+        scalar_block = tl.program_id(1)
+        if scalar_block < 8:
+            dt_h = scalar_block * 8 + tl.arange(0, 8)
+            dt_t = tl.arange(0, 8)
+            dt_token = query_start_index + dt_t
+            dt_valid = (dt_t[:, None] < seqlen) & (dt_token[:, None] < 5)
+            dt_raw = tl.load(dt_raw_ptr + dt_token[:, None] * DT_TOKEN_STRIDE
+                          + dt_h[None, :] * DT_HEAD_STRIDE, mask=dt_valid, other=0).to(tl.float32)
+            dt_bias_vec = tl.load(dt_bias_ptr + dt_h).to(tl.float32)
+            dt_processed = _ssm_softplus(dt_raw + dt_bias_vec[None, :])
+            dt_A_vec = tl.load(dt_A_ptr + dt_h).to(tl.float32)
+            dt_decay = _ssm_fast_exp(dt_A_vec[None, :] * dt_processed)
+            tl.store(dt_out_ptr + dt_token[:, None] * 64 + dt_h[None, :], dt_processed, dt_valid)
+            tl.store(dt_out_ptr + 320 + dt_token[:, None] * 64 + dt_h[None, :], dt_decay, dt_valid)
+
 
 @functools.cache
 def _is_sm121() -> bool:
@@ -1115,6 +1143,7 @@ def causal_conv1d_update(
     initial_state_idx: torch.Tensor | None = None,
     validate_data=False,
     out: torch.Tensor | None = None,
+    _dt_preprocess=None,
 ):
     """
     x: Input tensor which can take the following shapes:
@@ -1243,6 +1272,40 @@ def causal_conv1d_update(
             triton.cdiv(dim, META["BLOCK_N"]),
         )
 
+    fused_dt = False
+    raw_dt = scalar_A = scalar_bias = scalar_out = None
+    if _dt_preprocess is not None:
+        raw_dt, scalar_A, scalar_bias, scalar_out = _dt_preprocess
+        # Caller/consumer engage only if this producer reports True. GPU NULL
+        # and empty-query early returns deliberately leave scratch untouched;
+        # the SSM has the same slot0 and bypasses it for NULL/empty rows.
+        fused_dt = (
+            batch == 1 and dim == 6144 and seqlen == 5 and x.shape == (5, 6144)
+            and query_start_loc is not None and query_start_loc.shape == (2,)
+            and num_accepted_tokens is not None and conv_state_indices is not None
+            and conv_state_indices.shape == (1, 5)
+            and conv_state_indices.stride(1) == 1
+            and block_idx_last_scheduled_token is None and initial_state_idx is None
+            and x.dtype == original_x_dtype == torch.bfloat16 and _is_sm121()
+            and raw_dt.shape == (5, 64) and raw_dt.dtype == torch.bfloat16
+            and raw_dt.stride(1) == 1 and raw_dt.device == x.device
+            and scalar_A.shape == (64,) and scalar_A.dtype == torch.float32
+            and scalar_A.is_contiguous() and scalar_A.device == x.device
+            and scalar_bias.shape == (64,) and scalar_bias.is_contiguous()
+            and scalar_bias.dtype in (torch.float32, torch.bfloat16, torch.float16)
+            and scalar_bias.device == x.device
+            and scalar_out.shape == (2, 5, 64) and scalar_out.is_contiguous()
+            and scalar_out.dtype == torch.float32 and scalar_out.device == x.device
+            and block_n >= 8
+        )
+        if fused_dt:
+            # This private output must be independent of every source and the
+            # recurrent/conv outputs. Metadata only; no device readback.
+            scratch_storage = scalar_out.untyped_storage().data_ptr()
+            fused_dt = all(scratch_storage != t.untyped_storage().data_ptr()
+                           for t in (x, out, conv_state, weight, raw_dt,
+                                     scalar_A, scalar_bias))
+
     _causal_conv1d_update_kernel[grid](
         # Pointers to matrices
         x,
@@ -1287,10 +1350,15 @@ def causal_conv1d_update(
         HAS_NULL_BLOCK=null_block_id is not None,
         BLOCK_N=block_n,
         launch_pdl=current_platform.is_arch_support_pdl(),
+        dt_raw_ptr=raw_dt, dt_A_ptr=scalar_A, dt_bias_ptr=scalar_bias, dt_out_ptr=scalar_out,
+        DT_TOKEN_STRIDE=raw_dt.stride(0) if fused_dt else 0,
+        DT_HEAD_STRIDE=raw_dt.stride(1) if fused_dt else 0,
+        FUSED_DT=fused_dt,
     )
     if unsqueeze:
         out = out.squeeze(-1)
-    return out.to(original_x_dtype)
+    result = out.to(original_x_dtype)
+    return (result, fused_dt) if _dt_preprocess is not None else result
 
 
 if current_platform.is_cpu():

@@ -231,6 +231,8 @@ def _selective_scan_update_spec_replay_kernel(
     LAZY: tl.constexpr = False,
     LAZY_P: tl.constexpr = 20,
     SLOT_ELEMS: tl.constexpr = 0,
+    current_dt_dA_ptr=None,
+    CURRENT_DT: tl.constexpr = False,
 ):
     # The dt/A of a head are scalars (stride-0 expansion over head_dim); that is
     # the only layout the Mamba2 decode path produces and the only one the
@@ -398,13 +400,30 @@ def _selective_scan_update_spec_replay_kernel(
         x_raw = tl.load(x_ptrs, mask=offs_m < dim, other=0.0)
         x = x_raw.to(tl.float32)
         dt_raw = tl.load(dt_ptr)
-        dt = dt_raw.to(tl.float32)
-        if HAS_DT_BIAS:
-            dt += tl.load(dt_bias_ptr).to(tl.float32)
-        if DT_SOFTPLUS:
-            dt = softplus(dt)
-        A = tl.load(A_ptr).to(tl.float32)
-        dA = fast_exp(A * dt)  # scalar, not a matrix
+        if CURRENT_DT:
+            if state_batch_idx != null_block_id:
+                # The original conv's PDL completion covers this FP32 scratch.
+                # Raw dt is still loaded above for the unchanged raw history.
+                scalar_pos = (bos + i_t) * nheads + pid_h
+                dt = tl.load(current_dt_dA_ptr + scalar_pos).to(tl.float32)
+                dA = tl.load(current_dt_dA_ptr + 5 * nheads + scalar_pos).to(tl.float32)
+            else:
+                # Original conv returns before writing scratch on a NULL slot.
+                dt = dt_raw.to(tl.float32)
+                if HAS_DT_BIAS:
+                    dt += tl.load(dt_bias_ptr).to(tl.float32)
+                if DT_SOFTPLUS:
+                    dt = softplus(dt)
+                A = tl.load(A_ptr).to(tl.float32)
+                dA = fast_exp(A * dt)
+        else:
+            dt = dt_raw.to(tl.float32)
+            if HAS_DT_BIAS:
+                dt += tl.load(dt_bias_ptr).to(tl.float32)
+            if DT_SOFTPLUS:
+                dt = softplus(dt)
+            A = tl.load(A_ptr).to(tl.float32)
+            dA = fast_exp(A * dt)  # scalar, not a matrix
 
         B_raw = tl.load(B_ptrs, mask=offs_n < dstate, other=0.0)
         B = B_raw.to(tl.float32)
@@ -566,6 +585,9 @@ def selective_state_update_spec_replay(
     is_blackwell=False,
     replayed_out=None,
     lazy=False,
+    _current_dt_dA=None,
+    _private_verify_rows=None,
+    _private_no_prefix=False,
 ):
     """
     Spec-decode verify update with anchor + input-ring state handling.
@@ -632,6 +654,7 @@ def selective_state_update_spec_replay(
     if (
         N == 1 and max_seqlen == 5 and batch == 5
         and replayed_out is None
+        and _private_verify_rows is None and not _private_no_prefix
         and os.environ.get("VLLM_MAMBA_SPEC_PREFIX", "1") != "0"
     ):
         smallk = sys.modules.get("smallk")
@@ -639,6 +662,17 @@ def selective_state_update_spec_replay(
             # Never import/allocate/rebind the buffer here; its address must
             # already be the same one captured by every router and sampler.
             verify_rows = smallk.live_verify_rows(x.device)
+
+    if _private_verify_rows is not None:
+        verify_rows = _private_verify_rows
+    if _private_no_prefix:
+        verify_rows = None
+    current_dt = (_current_dt_dA is not None and lazy and N == 1 and batch == 5
+                  and max_seqlen == 5 and x.dtype == torch.bfloat16
+                  and dt_softplus and z is None and nheads == 64
+                  and _current_dt_dA.shape == (2, 5, 64)
+                  and _current_dt_dA.dtype == torch.float32
+                  and _current_dt_dA.device == x.device and _current_dt_dA.is_contiguous())
 
     with torch.accelerator.device_index(x.device.index):
         _selective_scan_update_spec_replay_kernel[grid](
@@ -711,4 +745,6 @@ def selective_state_update_spec_replay(
             LAZY=bool(lazy),
             LAZY_P=LAZY_PERIOD,
             SLOT_ELEMS=nheads * dim * dstate,
+            current_dt_dA_ptr=_current_dt_dA,
+            CURRENT_DT=bool(current_dt),
         )

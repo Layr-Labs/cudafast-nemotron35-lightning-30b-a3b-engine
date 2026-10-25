@@ -210,6 +210,21 @@
     {
       "file": "harness/kernels/l2pf/py/__init__.py",
       "why": "Carry useful04706ad7-c4e8-44b9-b8ba-77f14d8b8adf MoE-window immutable prefetch default6to12MB. Its complete official2.19195352041462 is within0.1% of fulla484, but only budget mechanism is combined here on higherfulla484. Prefix pair/SSM combination unverified."
+    },
+    {
+      "piece": "s28-pz333",
+      "file": "harness/kernels/pzskip/csrc/pzskip.cu; vllm/vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
+      "why": "Credit e-man07 submission 51aa1545-b946-46da-bb0f-e0628924c7a1, source 45e5db099d54717fb0a7cce5bb5b667c9ad1bf9e: take only config333 launch_smem4<2,3,6,3,32> and its default selection. Keep theta0.4, top3, depth4 and every decode/prefix path unchanged. No prefill trim. Combined unchanged with Meganpark980320 submission ad5aaec0-2793-418b-bf0d-563b11250a00 (exact fused draft-screen top-k, deferred shared-expert down for decode, L2PF_ATTN_MB 7), credited in full; this archive adds only config333."
+    },
+    {
+      "piece": "hj-l2pf-defer-join",
+      "file": "harness/kernels/l2pf/py/__init__.py; vllm/compilation/cuda_graph.py; harness/kernels/l2pf/tests/test_defer_join.py",
+      "why": "Decode hints only: postpone existing immutable-weight hint joins within each owning CUDA capture until before the next hint reuses the same side stream or just before capture end. Only the owning stream may defer; unscoped, eager and foreign-stream joins remain immediate. L2PF_DEFER_JOIN=0 restores the original waits. No hint bytes, tensor values, arithmetic, data-producer waits or prefill M>8 call sites change. Measured on 7fac1f9e: +0.055 ms per decode round over two fresh-boot pairs, 60/60 fresh requests token-identical to main."
+    },
+    {
+      "piece": "s28-mzs-shared-only",
+      "file": "harness/kernels/marlinx/csrc/marlinx.cu; harness/kernels/marlinx/py/__init__.py",
+      "why": "Port the shared MARLINX_ZS live-verify-row union from gv2 native MZS, preserving PDL and legacy ABI/fallback. MTP_MZS=0 disables. Existing smallk live_verify_rows bounds only the shared-down union, never MTP or wide prefill; valid arithmetic and row layout unchanged. Current-main paired118 routed prefix and Mamba prefix remain untouched. Credits original MARLINX_ZS 1001d918-90a6-402c-8df5-859e2e9a799f, native gate ca5c19dd-da37-4328-880a-152f8c7b3651 and paired/PDL 06201161-421c-462c-8a37-53146de288af. New port requires fresh admission."
     }
   ]
 }

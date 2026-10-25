@@ -5,7 +5,7 @@ import dataclasses
 import weakref
 from collections import Counter
 from collections.abc import Callable
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from typing import Any, ClassVar
 from unittest.mock import patch
 
@@ -25,6 +25,12 @@ from vllm.logger import init_logger
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import current_stream, weak_ref_tensors
+
+# Optional immutable-weight hints. Deferral never crosses a capture boundary.
+try:
+    import l2pf as _l2pf
+except ImportError:
+    _l2pf = None
 
 logger = init_logger(__name__)
 
@@ -314,7 +320,7 @@ class CUDAGraphWrapper:
                     cudagraph,
                     pool=self.graph_pool,
                     stream=current_stream(),
-                ):
+                ), (_l2pf.capture_scope() if _l2pf is not None else nullcontext()):
                     # `output` is managed by pytorch's cudagraph pool
                     output = self.runnable(*args, **kwargs)
                     # Join offloader's copy stream after forward to avoid

@@ -30,6 +30,14 @@ sign, so every later value has the same magnitude and compares equal, and the
 logits and tokens are unchanged. w13's K (2688) needs no padding. The repack is
 input-independent and value-exact.
 
+Decode w13 only: N is then padded to a multiple of 128 (1856 -> 1920,
+``VLLM_HUMMING_W13_PAD128=0`` keeps the multiple of 64). The sweep's
+candidate list drops every ``block_n`` that does not divide the logical N, so
+``block_n=128`` was never timed for w13; w2 already runs that tile
+(2688 % 128 == 0). The 64 new columns are zeros. Humming does not store
+padded columns, and a column's fp32 chain does not read its neighbours, so
+the 1856 live outputs stay on the unpadded chain. w2's N is unchanged.
+
 The configs are keyed by the layer's shapes and only apply when the layer
 matches them exactly (NVFP4 W4A16 group-16 experts with a per-expert global
 scale, BF16 activations, indexed gemm, batch-invariant mode on). Anything else
@@ -53,7 +61,8 @@ STOCK_PAD_K = 128
 # Smallest paddings humming accepts with BF16 activations
 # (prepare_humming_weight asserts padded_n % 64 == 0 and
 # padded_k % (512 / a_bits) == 0): see the module docstring.
-TUNED_PAD_N = 64
+_W13_N128 = os.environ.get("VLLM_HUMMING_W13_PAD128", "1") != "0"
+TUNED_PAD_N = 128 if _W13_N128 else 64
 TUNED_PAD_K = 32
 
 _BIG = 1 << 30
@@ -112,10 +121,10 @@ _PREFILL_W13_SMS = _prefill_w13_sms()
 # M=496 w13 1896.5->1611.5, w2 1877.7->1674.
 TUNED_CONFIGS: dict[tuple[str, int, int, int], list[tuple[int, dict[str, Any]]]] = {
     ("w13", 1856, 2688, 128): [
-        (6, _cfg(16, 64, 16, 32, 6, 4)),  # M = 1
-        (12, _cfg(16, 64, 16, 32, 6, 4)),  # M = 2
-        (24, _cfg(16, 64, 16, 32, 8, 2)),  # M = 3, 4
-        (48, _cfg(16, 64, 16, 32, 8, 2)),  # M = 5..8
+        (6, _cfg(16, 128 if _W13_N128 else 64, 16, 32, 6, 4)),
+        (12, _cfg(16, 128 if _W13_N128 else 64, 16, 32, 6, 4)),
+        (24, _cfg(16, 128 if _W13_N128 else 64, 16, 32, 8, 2)),
+        (48, _cfg(16, 128 if _W13_N128 else 64, 16, 32, 8, 2)),
         (384, _cfg(16, 64, 16, 32, 6, 4)),
         (_BIG, _cfg(64, 64, 32, 32, 4, 4, _PREFILL_W13_SMS)),  # prefill (496 tokens)
     ],
@@ -188,12 +197,15 @@ def select_moe_padding(
 def _meta_matches(meta: Any, sublayer_name: str) -> bool:
     from vllm.utils.humming import WeightScaleType, dtypes
 
-    shape_n, shape_k = TUNED_LAYER_SHAPES[sublayer_name]
+    logical_n, shape_k = TUNED_LAYER_SHAPES[sublayer_name]
     padded_k = -(-shape_k // TUNED_PAD_K) * TUNED_PAD_K
+    padded_n = -(-logical_n // TUNED_PAD_N) * TUNED_PAD_N
+    extra_n = padded_n - logical_n
+    reported_n = meta.shape_n + (meta.pad_shape_n if meta.shape_n == logical_n else 0)
     return (
-        meta.shape_n == shape_n
+        reported_n == padded_n
+        and meta.pad_shape_n in (0, extra_n)
         and meta.shape_k == padded_k
-        and meta.pad_shape_n == 0
         and meta.pad_shape_k == padded_k - shape_k
         and meta.num_experts == TUNED_NUM_EXPERTS
         and meta.a_dtype == dtypes.bfloat16
@@ -246,7 +258,10 @@ def tuned_moe_configs(layer: torch.nn.Module) -> tuple[list, list] | None:
         assert config["block_shape"][1] % 64 == 0
         assert config["warp_shape"][0] % 16 == 0
         assert config["use_stream_k"] is False
-    logger.info_once("humming tuned MoE: unpadded experts, explicit BI configs")
+    logger.info_once(
+        "humming tuned MoE: explicit BI configs"
+        + (", w13 N padded to 128" if _W13_N128 else ", unpadded N")
+    )
     return w13_list, w2_list
 
 

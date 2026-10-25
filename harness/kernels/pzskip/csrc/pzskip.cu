@@ -22,8 +22,6 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
-#include <cstdlib>
-#include <cstdio>
 
 namespace pzskip {
 
@@ -331,20 +329,6 @@ __device__ __forceinline__ void cp16(void* smem, const void* gmem) {
   const unsigned sa = static_cast<unsigned>(__cvta_generic_to_shared(smem));
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(sa), "l"(gmem) : "memory");
 }
-
-// Same cp.async copy and bytes; only immutable B/BS L2 priority changes.
-template<int POLICY>
-__device__ __forceinline__ void cp16_weight(void* smem, const void* gmem) {
-  if constexpr (POLICY == 0) cp16(smem, gmem);
-  else {
-    const unsigned sa = static_cast<unsigned>(__cvta_generic_to_shared(smem));
-    uint64_t policy;
-    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(policy));
-    asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;"
-                 :: "r"(sa), "l"(gmem), "l"(policy) : "memory");
-  }
-}
-
 __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
 template <int N_>
 __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N_) : "memory"); }
@@ -530,7 +514,7 @@ __global__ void __launch_bounds__(64 * NTL, MINB) smem_kernel(const Params p) {
 // BMT = rows per expert block: 64 -> two 32-row halves (2 warps per 64-column tile); 32 or 16 ->
 // one warp per 64-column tile covering the whole block (4 or 2 token tiles). Smaller blocks have
 // sparser union masks (fewer weight rows loaded per block) at the cost of more blocks.
-template <int KG, int NS, int NTL, int MINB = 1, int BMT = BM, int POLICY = 0>
+template <int KG, int NS, int NTL, int MINB = 1, int BMT = BM>
 __global__ void __launch_bounds__(32 * NTL * (BMT == 64 ? 2 : 1), MINB) smem4_kernel(const Params p) {
   constexpr int HALVES = BMT == 64 ? 2 : 1;
   constexpr int TTW = BMT == 64 ? 4 : BMT / 8;  // token tiles per warp
@@ -591,10 +575,10 @@ __global__ void __launch_bounds__(32 * NTL * (BMT == 64 ? 2 : 1), MINB) smem4_ke
           if (q < 16 * WP) {
             const int r = q / WP, piece = q % WP;
             if ((m >> r) & 1u)
-              cp16_weight<POLICY>(&S.w[gi][r][16 * piece], wexp + (long long)(16 * grp + r) * p.w_k + 16 * piece);
+              cp16(&S.w[gi][r][16 * piece], wexp + (long long)(16 * grp + r) * p.w_k + 16 * piece);
           } else if (q < 16 * WP + SP) {
             const int piece = q - 16 * WP;
-            cp16_weight<POLICY>(&S.s[gi][16 * piece], sexp + (long long)grp * p.s_g + 16 * piece);
+            cp16(&S.s[gi][16 * piece], sexp + (long long)grp * p.s_g + 16 * piece);
           } else {
             const int r = (q - 16 * WP - SP) >> 1, piece = (q - 16 * WP - SP) & 1;
             cp16(&S.x[gi][r][16 * piece], p.A + (long long)rows[r] * p.lda + 16 * grp + 8 * piece);
@@ -704,7 +688,7 @@ __global__ void __launch_bounds__(32 * NTL * (BMT == 64 ? 2 : 1), MINB) smem4_ke
   }
 }
 
-template <int KG, int NS, int NTL = 2, int MINB = 1, int BMT = BM, int POLICY = 0>
+template <int KG, int NS, int NTL = 2, int MINB = 1, int BMT = BM>
 static int launch_smem4(const Params& p, cudaStream_t st) {
   static_assert(N % (64 * NTL) == 0, "the column tile must divide N");
   static_assert(BMT == 16 || BMT == 32 || BMT == 64, "block rows");
@@ -714,12 +698,12 @@ static int launch_smem4(const Params& p, cudaStream_t st) {
   const int sm = (int)sizeof(SmemStage<KG, NS, NTL, BMT>) * NS;
   static int attr = 0;
   if (sm > attr) {
-    cudaError_t e = cudaFuncSetAttribute(smem4_kernel<KG, NS, NTL, MINB, BMT, POLICY>, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
+    cudaError_t e = cudaFuncSetAttribute(smem4_kernel<KG, NS, NTL, MINB, BMT>, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
     if (e != cudaSuccess) return (int)e;
     attr = sm;
   }
   dim3 grid(N / (64 * NTL), p.max_blocks);
-  smem4_kernel<KG, NS, NTL, MINB, BMT, POLICY><<<grid, 32 * NTL * (BMT == 64 ? 2 : 1), sm, st>>>(p);
+  smem4_kernel<KG, NS, NTL, MINB, BMT><<<grid, 32 * NTL * (BMT == 64 ? 2 : 1), sm, st>>>(p);
   return (int)cudaGetLastError();
 }
 
@@ -785,32 +769,7 @@ int pzskip_down(const void* A, long long lda, int shape_m, const int* sorted_ids
     case 323: return pzskip::launch_smem4<1, 4, 7, 2, 32>(p, st);   // 448 columns, 7 warps
     case 324: return pzskip::launch_smem4<1, 6, 3, 4, 32>(p, st);
     case 325: return pzskip::launch_smem4<2, 4, 3, 4, 32>(p, st);
-    case 333: {
-#ifndef PZSKIP_NO_CACHE_POLICY
-      const char* enabled = std::getenv("HUMMING_EVICT_PZ");
-      // Fixed target top-6: 496 prompt rows become 2976 routed slots.
-      if (p.shape_m == 2976 && (!enabled || enabled[0] != '0')) {
-        static int loaded = -1;
-        if (loaded < 0) {
-          cudaFuncAttributes attr;
-          cudaError_t e = cudaFuncGetAttributes(&attr, pzskip::smem4_kernel<2, 3, 6, 3, 32, 1>);
-          loaded = e == cudaSuccess;
-          if (!loaded) {
-            cudaGetLastError();
-            std::fprintf(stderr, "pzskip: L2 evict-first load unavailable; stock PZ333 retained\n");
-          }
-        }
-        if (loaded) {
-          int rc = pzskip::launch_smem4<2, 3, 6, 3, 32, 1>(p, st);
-          if (!rc) return 0;
-          loaded = 0;
-          cudaGetLastError();
-          std::fprintf(stderr, "pzskip: L2 evict-first launch unavailable; stock PZ333 retained\n");
-        }
-      }
-#endif
-      return pzskip::launch_smem4<2, 3, 6, 3, 32, 0>(p, st);
-    }   // 384 columns, 2 k16 groups per stage, 3 stages
+    case 333: return pzskip::launch_smem4<2, 3, 6, 3, 32>(p, st);   // 384 columns, 2 k16 groups per stage, 3 stages
     // 16-row blocks: one warp per 64-column tile, 2 token tiles
     case 340: return pzskip::launch_smem4<1, 4, 2, 8, 16>(p, st);
     case 341: return pzskip::launch_smem4<1, 4, 3, 6, 16>(p, st);

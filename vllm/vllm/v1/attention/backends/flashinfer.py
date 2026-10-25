@@ -2471,8 +2471,6 @@ def _reuse_fresh_prefill_plan(wrapper, **kw) -> None:
         key = None
     wrapper.plan(**kw)
     stabilize_native_plan(wrapper)
-    # plan() may initialize/replace the cached module on this first call. A key
-    # miss on the next call simply performs one extra native plan, then settles.
     wrapper._vp_fresh_plan_key = key
 
 

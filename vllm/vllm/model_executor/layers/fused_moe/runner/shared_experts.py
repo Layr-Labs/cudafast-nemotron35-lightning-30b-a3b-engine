@@ -246,6 +246,14 @@ class SharedExperts(torch.nn.Module):
         if order != experts_order:
             return None
 
+        # If another routed backend has no midpoint hook, finish the one
+        # pending shared up/down exactly once instead of launching full MLP
+        # again. The same aux/main join remains the output visibility boundary.
+        if (order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
+                and self._pending_h is not None):
+            self._launch_down()
+            return None
+
         if (
             order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
             and self._output[self._output_idx] is not None

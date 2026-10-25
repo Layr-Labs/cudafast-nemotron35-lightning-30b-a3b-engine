@@ -215,7 +215,8 @@ static_assert(sizeof(BlockHdr) <= BI_HDR, "block header");
 
 // Builds the lists for one expert block into dst (shared or global memory). mask_of(g) returns the
 // group's 16-bit mask. Needs all NT threads; ends with a barrier.
-template <int NT>
+// UROWS > 0 (decode, at most UROWS rows): every row's loads of a group issue before their masks.
+template <int NT, int UROWS = 0>
 __device__ __forceinline__ void build_lists(uint8_t* dst, int nrows_valid, const Params& p, const int* rows,
                                             bool dense) {
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -231,6 +232,19 @@ __device__ __forceinline__ void build_lists(uint8_t* dst, int nrows_valid, const
     if (g < G) {
       if (dense) {
         m = 0xFFFFu;
+      } else if constexpr (UROWS > 0) {
+        uint4 lo[UROWS], hi[UROWS];
+#pragma unroll
+        for (int r = 0; r < UROWS; ++r) {
+          lo[r] = hi[r] = make_uint4(0u, 0u, 0u, 0u);
+          if (r < nrows_valid && rows[r] < row_limit) {
+            const uint4* q = reinterpret_cast<const uint4*>(p.A + (long long)rows[r] * p.lda + 16 * g);
+            lo[r] = __ldg(q);
+            hi[r] = __ldg(q + 1);
+          }
+        }
+#pragma unroll
+        for (int r = 0; r < UROWS; ++r) m |= nz_mask8(lo[r]) | (nz_mask8(hi[r]) << 8);
       } else {
         for (int r = 0; r < nrows_valid; ++r) {
           if (rows[r] >= row_limit) continue;
@@ -347,7 +361,7 @@ __global__ void __launch_bounds__(128) prep_kernel(const Params p) {
 }
 #ifndef ZSKIP_NO_FUSED
 
-template <int NT, int BM, int CAP>
+template <int NT, int BM, int CAP, bool FastPrep = false>
 __device__ __forceinline__ void fused_prep(const Params& p, int mb, uint8_t* bi) {
   static_assert(NT >= 32 && NT % 32 == 0, "fused prep needs whole warps");
   const int tid = threadIdx.x, lane = tid & 31;
@@ -381,7 +395,7 @@ __device__ __forceinline__ void fused_prep(const Params& p, int mb, uint8_t* bi)
   }
   __syncthreads();
   const bool dense = p.mode == DENSE || p.mode == LOADONLY_DENSE;
-  build_lists<NT>(bi, s_nrows, p, s_rows, dense);
+  build_lists<NT, FastPrep ? CAP : 0>(bi, s_nrows, p, s_rows, dense);
 }
 
 #endif
@@ -1767,6 +1781,30 @@ static int launch_pair(const Params& p, cudaStream_t stream) {
   return g_rds_ring2 ? launch_pair_impl<Fused, HalfSkip, 2>(p, stream)
                      : launch_pair_impl<Fused, HalfSkip, 3>(p, stream);
 }
+#ifndef ZSKIP_NO_FUSED
+// config 119's arithmetic (fused prep, empty-half skip) on other schedules: id, ring depth, warps per
+// CTA, 64-column tiles per warp. The load-time check and timing in humming_zskip.py pick one.
+#define ZSKIP_PAIRV_CONFIGS(X) X(160, 2, 1, 2) X(161, 2, 2, 1) X(162, 3, 2, 1) X(163, 2, 3, 2) \
+  X(164, 4, 1, 2) X(165, 2, 6, 1)
+template <int R, int WPC, int TPW>
+static int launch_pairv(const Params& p, cudaStream_t stream) {
+  constexpr int GX = 42 / TPW / WPC;
+  static_assert(GX * TPW * WPC == 42, "column tiles per grid row");
+  auto kernel = down_pair_kernel<true, true, R, WPC, TPW, true>;
+#ifndef ZSKIP_NO_PDL
+  if (g_pdl) {
+    cudaError_t e = launch_pdl(kernel, dim3(GX, p.max_blocks), dim3(WPC * 32), stream, p, BI_BYTES);
+    if (e != cudaSuccess) {
+      cudaGetLastError();
+      return (int)e;
+    }
+    return (int)cudaGetLastError();
+  }
+#endif
+  kernel<<<dim3(GX, p.max_blocks), WPC * 32, BI_BYTES, stream>>>(p);
+  return (int)cudaGetLastError();
+}
+#endif
 
 #endif
 
@@ -1884,6 +1922,11 @@ int zskip_init(void) {
   if ((e = cudaFuncGetAttributes(&attr, down_pair_kernel<true, false, 3>)) != cudaSuccess) return (int)e;
   if ((e = cudaFuncGetAttributes(&attr, down_pair_kernel<true, true, 2>)) != cudaSuccess) return (int)e;
   if ((e = cudaFuncGetAttributes(&attr, down_pair_kernel<true, true, 3>)) != cudaSuccess) return (int)e;
+#define XPV(ID, R_, WPC_, TPW_) \
+  if ((e = cudaFuncGetAttributes(&attr, down_pair_kernel<true, true, R_, WPC_, TPW_, true>)) != cudaSuccess) \
+    return (int)e;
+  ZSKIP_PAIRV_CONFIGS(XPV)
+#undef XPV
 #endif
 #endif
   return 0;
@@ -1948,6 +1991,17 @@ int zskip_config(int id, int* info) {
 #ifndef ZSKIP_NO_FUSED
   PAIR_INFO(118, true, false)
   PAIR_INFO(119, true, true)
+#define XPV(ID, R_, WPC_, TPW_) \
+  if (id == ID) { \
+    auto kernel = down_pair_kernel<true, true, R_, WPC_, TPW_, true>; \
+    if (cudaFuncGetAttributes(&attr, kernel) != cudaSuccess) return -1; \
+    info[0] = attr.numRegs; info[1] = BI_BYTES; info[2] = WPC_; \
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&info[3], kernel, WPC_ * 32, BI_BYTES) != cudaSuccess) \
+      return -1; \
+    return 0; \
+  }
+  ZSKIP_PAIRV_CONFIGS(XPV)
+#undef XPV
 #endif
 #undef PAIR_INFO
 #endif
@@ -1960,7 +2014,8 @@ static int zskip_down_impl(const void* A, long long lda, int shape_m, const int*
                long long s_tile, long long s_g, int mode, int* stats, int config, void* ws, int* queue,
                int ctas_per_sm, void* trace, void* stream, const int* verify_rows) {
   if (verify_rows != nullptr && (shape_m != 30 || mode != SKIP ||
-      (config != 113 && config != 114 && config != 118 && config != 119))) return -5;
+      (config != 113 && config != 114 && config != 118 && config != 119 && (config < 160 || config > 165))))
+    return -5;
   Params p;
   p.verify_rows = verify_rows;
   p.A = reinterpret_cast<const __nv_bfloat16*>(A);
@@ -2025,6 +2080,10 @@ static int zskip_down_impl(const void* A, long long lda, int shape_m, const int*
 #ifndef ZSKIP_NO_FUSED
   if (config == 118) return launch_pair<true>(p, st);
   if (config == 119) return launch_pair<true, true>(p, st);
+#define XPV(ID, R_, WPC_, TPW_) \
+  if (config == ID) return launch_pairv<R_, WPC_, TPW_>(p, st);
+  ZSKIP_PAIRV_CONFIGS(XPV)
+#undef XPV
 #endif
 #endif
   return -2;

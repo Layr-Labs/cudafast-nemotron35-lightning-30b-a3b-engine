@@ -1032,6 +1032,10 @@ class NemotronHForCausalLM(
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
+    def process_weights_after_loading(self) -> None:
+        if _shco is not None:
+            _shco.finalize_cohort(self)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self, skip_prefixes=["mtp"])
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

@@ -86,19 +86,8 @@ def _cfg(
 # <= 128-register build, so each SM keeps room for one shx CTA of the shared expert on the
 # aux stream. Only the persistent grid changes; the accumulation chain is the same (see the
 # module docstring). SHCO=0 or SHCO_HUMMING_SMS=48 restores 4 CTAs per SM.
-def _prefill_w13_sms() -> int:
-    if os.environ.get("SHCO", "1") == "0":
-        return 48
-    try:
-        import shco
-
-        ok = shco.available()
-    except ImportError:
-        ok = False
-    return int(os.environ.get("SHCO_HUMMING_SMS", "36")) if ok else 48
-
-
-_PREFILL_W13_SMS = _prefill_w13_sms()
+# Post-load cohort admission updates the actual cached per-expert configs.
+_PREFILL_W13_SMS = 48
 
 # Tuned on GB10 (48 SMs, ~99 KB smem per block) with
 # harness/tests/humming_moe_exact.py --phase sweep (run hum-sweep3: every

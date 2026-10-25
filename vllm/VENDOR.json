@@ -246,6 +246,14 @@
     {
       "file": "model_executor/kernels/linear/nvfp4/marlin.py; model_executor/models/nemotron_h.py; model_executor/layers/fused_moe/runner/shared_experts.py; model_executor/layers/fused_moe/experts/humming_tuned_moe.py",
       "why": "shco: the shared expert of the 496-token prefill runs on shx (harness/kernels/shco), a small-footprint (1 CTA/SM) NVFP4 W4A16 GEMM bit-identical to Marlin up -> relu^2 -> Marlin down (Marlin's stripe segments, k-warp chains and fp32 fold order), queued on the shared-expert aux stream beside the routed experts; humming's prefill w13 keeps its accumulation chain on a 4 x 36 persistent grid (3 resident CTAs per SM) to leave each SM room for it. Tables built at load; SHCO=0 restores stock."
+    },
+    {
+      "file": "harness/kernels/shco; model_executor/layers/fused_moe/experts/fused_humming_moe.py; model_executor/models/nemotron_h.py",
+      "why": "ENTIRE highest promoted adab284a-bf1d-4ce2-8e90-6720fa0f5435 retained as base (official8fa1318cab3ed8a76e5f815ae3045b5d7a099991/tree8baf0ea6051cb87e9697b6f500e512878dcc8124, score2.266482276126512). New actual-checkpoint SHX M496 up+relu2/down admission at official remote load; all23 target shared experts and their actual cached humming w13 lists/JSON commit together. Any failed cohort uses stock48SM grid and disablesSHX. Preserve originalSHX numeric source, sharedstream joins and whole96/29. Trim optionaldummy probes only; no localexecution."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "Select useful unpublished/cancelled159622c1-8e6d-4ddc-a67e-563134ba0c8b pieceN only: exact screen source blob00d6e15fdebb83c44e811d4b9de8029e23dc902d from publicPR315/dce50f0113391b250bfc29f9d5025925be340ce3. Reuse coarse32group scores and read remaining32 refinegroups, preserve fullK rescore and gate. Float32 grouping can change boundaries, so combinedtrajectory correctness/performance unverified untilofficialremote. No weighted-MoE PDL selected; its isolatedbundle negative2.24339475531112. No negative d6splitmask bundle carried."
     }
   ]
 }

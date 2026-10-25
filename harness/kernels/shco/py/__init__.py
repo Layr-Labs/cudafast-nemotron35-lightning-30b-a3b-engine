@@ -1,8 +1,4 @@
-"""shco: probes (and later the replica) for co-running the shared expert beside the routed up.
-
-dummy(...) launches a compute-bound stand-in with the shared expert's MMA count on the current
-torch stream (see csrc/shco.cu for the modes). Nothing here is used by the engine.
-"""
+"""Production SHX shared-expert prefill; actual-weight admission and joint grid enablement."""
 
 from __future__ import annotations
 
@@ -11,14 +7,7 @@ import os
 
 import torch
 
-__all__ = ["available", "load_error", "dummy", "dummy_attrs", "dummy_occupancy", "steps_for",
-           "marlin_units", "units_tensor", "shx_gemm", "shx_attrs", "shx2_attrs", "Shx"]
-
 LIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "libshco.so")
-
-# shared expert at M = 496: 2 GEMMs of 2 * 496 * 3712 * 2688 FLOP
-SHARED_FLOP_PER_LAYER = 2 * 2 * 496 * 3712 * 2688
-FLOP_PER_STEP = 8 * 2 * 16 * 8 * 16  # 8 mma.m16n8k16 per k16 step
 
 _lib = None
 _load_error: str | None = None
@@ -31,13 +20,6 @@ def _load():
     try:
         lib = ctypes.CDLL(LIB_PATH)
         vp, ci, cll = ctypes.c_void_p, ctypes.c_int, ctypes.c_longlong
-        lib.shco_version.restype = ci
-        lib.shco_dummy_attrs.argtypes = [ci, vp]
-        lib.shco_dummy_attrs.restype = ci
-        lib.shco_dummy_occupancy.argtypes = [ci, ci, vp]
-        lib.shco_dummy_occupancy.restype = ci
-        lib.shco_dummy.argtypes = [ci, ci, ci, ci, ci, vp, cll, vp, vp, vp]
-        lib.shco_dummy.restype = ci
         lib.shx_attrs.argtypes = [ci, vp]
         lib.shx_attrs.restype = ci
         lib.shx_scratch_floats.argtypes = [ci]
@@ -48,9 +30,8 @@ def _load():
         lib.shx2_attrs.restype = ci
         lib.shx2_gemm.argtypes = [vp, cll, ci, vp, vp, vp, vp, cll, ci, ci, vp, ci, vp, ci, ci, vp, ci, vp]
         lib.shx2_gemm.restype = ci
-        lib.shco_version()
         _lib = lib
-    except OSError as e:
+    except (OSError, AttributeError) as e:
         _load_error = repr(e)
     return _lib
 
@@ -62,44 +43,6 @@ def available() -> bool:
 def load_error() -> str | None:
     _load()
     return _load_error
-
-
-def dummy_attrs(mode: int) -> dict:
-    lib = _load()
-    assert lib is not None, _load_error
-    out = (ctypes.c_int * 6)()
-    rc = lib.shco_dummy_attrs(mode, out)
-    if rc != 0:
-        raise RuntimeError(f"shco_dummy_attrs({mode}) failed: {rc}")
-    return {"regs": out[0], "static_smem": out[1], "max_threads": out[2], "local_bytes": out[3],
-            "binary_version": out[4], "max_dynamic_smem": out[5]}
-
-
-def dummy_occupancy(mode: int, threads: int) -> int:
-    lib = _load()
-    assert lib is not None, _load_error
-    n = ctypes.c_int(0)
-    rc = lib.shco_dummy_occupancy(mode, threads, ctypes.byref(n))
-    if rc != 0:
-        raise RuntimeError(f"shco_dummy_occupancy failed: {rc}")
-    return n.value
-
-
-def steps_for(grid: int, threads: int, flop: int = SHARED_FLOP_PER_LAYER) -> int:
-    nwarps = grid * (threads // 32)
-    return -(-flop // (FLOP_PER_STEP * nwarps))
-
-
-def dummy(mode: int, grid: int, threads: int, steps: int, seed: torch.Tensor, out: torch.Tensor,
-          wbuf: torch.Tensor | None = None, ld_every: int = 1) -> None:
-    lib = _load()
-    assert lib is not None, _load_error
-    assert seed.dtype == torch.int32 and seed.numel() >= 1024 and out.dtype == torch.float32
-    wptr, wvecs = (None, 0) if wbuf is None else (wbuf.data_ptr(), wbuf.numel() * wbuf.element_size() // 16)
-    rc = lib.shco_dummy(mode, grid, threads, steps, ld_every, wptr, wvecs, seed.data_ptr(), out.data_ptr(),
-                        torch.cuda.current_stream().cuda_stream)
-    if rc != 0:
-        raise RuntimeError(f"shco_dummy failed: {rc}")
 
 
 # ---------------------------------------------------------------------------------------- shx
@@ -265,6 +208,8 @@ SHX_M = 496  # the prefill row count whose Marlin trees shx reproduces
 SHAPES = frozenset({(3712, 2688), (2688, 3712)})  # (N, K): shared expert up, down
 _ctx: dict[int, Shx] = {}
 _logged = False
+_ready = False
+_experts = []
 
 
 def prepare(layer) -> bool:
@@ -285,8 +230,11 @@ def prepare(layer) -> bool:
     if not ok:
         return False
     idx = w.device.index if w.device.index is not None else torch.cuda.current_device()
+    prop = torch.cuda.get_device_properties(idx)
+    if (prop.major, prop.minor, prop.multi_processor_count) != (12, 1, 48):
+        return False
     if idx not in _ctx:
-        sms = torch.cuda.get_device_properties(idx).multi_processor_count
+        sms = prop.multi_processor_count
         _ctx[idx] = Shx(SHX_M, w.device, sms=sms, grid=sms)
     layer._shx_ok = True
     return True
@@ -294,7 +242,8 @@ def prepare(layer) -> bool:
 
 def _eligible(layer, x: torch.Tensor) -> bool:
     return (
-        ENABLED
+        not torch.compiler.is_compiling()
+        and ENABLED and _ready
         and getattr(layer, "_shx_ok", False)
         and x.dim() == 2
         and x.shape[0] == SHX_M
@@ -304,7 +253,6 @@ def _eligible(layer, x: torch.Tensor) -> bool:
         and x.stride(1) == 1
         and x.stride(0) % 8 == 0
         and x.data_ptr() % 16 == 0
-        and not torch.compiler.is_compiling()
     )
 
 
@@ -344,3 +292,91 @@ def maybe_up_relu2(layer, x: torch.Tensor) -> torch.Tensor | None:
 def maybe_down(layer, a: torch.Tensor) -> torch.Tensor | None:
     """Marlin-exact down(a), or None (caller runs stock)."""
     return _run(layer, a, False)
+
+
+# All execution here is part of official remote model loading, never a local preflight.
+def register_expert(expert):
+    import weakref
+    _experts.append(weakref.ref(expert))
+
+
+def _admit(up, down):
+    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import apply_fp4_marlin_linear
+
+    def stock(layer, x):
+        return apply_fp4_marlin_linear(
+            input=x, weight=layer.weight, weight_scale=layer.weight_scale,
+            weight_global_scale=layer.weight_global_scale, workspace=layer.workspace,
+            size_n=layer.output_size_per_partition, size_k=layer.input_size_per_partition, bias=None)
+
+    dev = up.weight.device
+    idx = dev.index if dev.index is not None else torch.cuda.current_device()
+    ctx = _ctx[idx]
+    ids = torch.arange(SHX_M * 2688, device=dev, dtype=torch.int32).reshape(SHX_M, 2688)
+    pattern = ((ids % 127).float() - 63) / 32
+    # Dense, low amplitude, high amplitude, sparse and signed-zero cases, at actual M496.
+    for case in range(5):
+        if case < 3:
+            x = (pattern * (1.0, 0.0001, 64.0)[case]).to(torch.bfloat16)
+        elif case == 3:
+            x = torch.where(ids % 17 == 0, pattern, 0.0).to(torch.bfloat16)
+        else:
+            x = torch.where(ids % 2 == 0, -0.0, 0.0).to(torch.bfloat16)
+        ref = stock(up, x)
+        ref = ref.float().clamp_min_(0).square_().to(torch.bfloat16)
+        act = torch.empty_like(ref)
+        ctx.up(x, up, act)
+        if not torch.equal(act.view(torch.int16), ref.view(torch.int16)):
+            return False
+        expected = stock(down, ref)
+        out = torch.empty_like(expected)
+        ctx.down(act, down, out)
+        if not torch.equal(out.view(torch.int16), expected.view(torch.int16)):
+            return False
+    return True
+
+
+def finalize_cohort(model):
+    """Commit the 23 shared experts and their already-built humming grids together.
+
+    No persistent-grid reduction is left behind if any actual-weight admission fails.
+    Original main/aux stream joins continue to serialize the per-device SHX scratch.
+    """
+    import json
+    import logging
+
+    global _ready
+    _ready = False
+    modules = list(model.modules())
+    ids = {id(m) for m in modules}
+    pairs = [m for m in modules if type(m).__name__ == "NemotronHMLP"]
+    experts = [e for r in _experts if (e := r()) is not None and id(e.layer) in ids]
+    ok = ENABLED and len(pairs) == len(experts) == 23
+    ok = ok and all(getattr(m.up_proj, "_shx_ok", False)
+                    and getattr(m.down_proj, "_shx_ok", False) for m in pairs)
+    ok = ok and all(getattr(e, "_fused_relu2", False)
+                    and e.w13_tuning_config[-1][1] == 1 << 30 for e in experts)
+    try:
+        sms = int(os.environ.get("SHCO_HUMMING_SMS", "36"))
+        ok = ok and sms in (36, 48)
+        if ok:
+            # Attributes constrain co-residency, not the numerical admission.
+            attrs = shx2_attrs(False) if VERSION == 2 else shx_attrs(False)
+            ok = attrs["regs"] <= 128 and attrs["static_smem"] <= 32768
+        if ok:
+            with torch.inference_mode():
+                ok = all(_admit(m.up_proj, m.down_proj) for m in pairs)
+    except Exception as exc:
+        logging.getLogger("vllm").warning("SHX cohort admission unavailable: %s", exc)
+        ok = False
+    for e in experts:
+        # init_humming_moe cached both a list and its JSON before the model hook.
+        e.w13_tuning_config[-1][2]["num_sms"] = sms if ok else 48
+        e.w13_tuning_config_str = json.dumps(e.w13_tuning_config)
+    if not ok:
+        for m in pairs:
+            m.up_proj._shx_ok = m.down_proj._shx_ok = False
+    _ready = bool(ok)
+    logging.getLogger("vllm").info("SHX cohort: ready=%s shared=%d routed=%d sms=%d",
+                                   _ready, len(pairs), len(experts), sms if ok else 48)
+    return _ready

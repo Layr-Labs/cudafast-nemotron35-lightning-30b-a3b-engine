@@ -253,6 +253,12 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
         self.compute_config_str = json.dumps(self.compute_config)
         self.w13_tuning_config_str = json.dumps(self.w13_tuning_config)
         self.w2_tuning_config_str = json.dumps(self.w2_tuning_config)
+        # LOCAL PATCH: register initialized configs for atomic SHX cohort admission.
+        try:
+            import shco
+            shco.register_expert(self)
+        except ImportError:
+            pass
 
     def _get_permute_scratch(self) -> MoEPermuteScratch | None:
         if self._permute_scratch is None and moe_permute_unpermute_supported():

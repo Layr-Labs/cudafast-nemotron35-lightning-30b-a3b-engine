@@ -16,7 +16,7 @@ __device__ __forceinline__ uint4 ldg_u128(const void* p) {
 // weight fragments of a group serve all NB n-blocks.
 // HALF (TPW = 1): the warp's 64-column tile is one half of a "swap2" pair (4-byte words, 8-byte
 // scales at the tile's offset in the pair) instead of a "swap" tile.
-template <bool Fused>
+template <bool Fused, bool HalfSkip>
 __global__ void __launch_bounds__(32) down_pair_kernel(const Params p) {
   constexpr int TPW = 2, WPC = 1, R = 3, NB = 1;
   constexpr bool HALF = false;
@@ -153,22 +153,67 @@ __global__ void __launch_bounds__(32) down_pair_kernel(const Params p) {
               const uint32_t s23 = hmul2_u32(fp8_to_bf16x2(((sx >> 8) & 0x0000FF00u) | (sx & 0xFF000000u)), kExp120);
               const uint32_t s45 = hmul2_u32(fp8_to_bf16x2(((sy << 8) & 0x0000FF00u) | ((sy << 16) & 0xFF000000u)), kExp120);
               const uint32_t s67 = hmul2_u32(fp8_to_bf16x2(((sy >> 8) & 0x0000FF00u) | (sy & 0xFF000000u)), kExp120);
+              if constexpr (!HalfSkip) {
 #pragma unroll
-              for (int c = 0; c < 4; ++c) {
-                const uint32_t sp = c == 0 ? s01 : (c == 1 ? s23 : (c == 2 ? s45 : s67));
-                const uint32_t slo = __byte_perm(sp, 0, 0x1010);  // column g8 (h = 0)
-                const uint32_t shi = __byte_perm(sp, 0, 0x3232);  // column g8 + 8 (h = 1)
-                const uint32_t sel = c | (c << 4) | ((c + 4) << 8) | ((c + 4) << 12);
-                const uint32_t x01 = __byte_perm(w[0][tt], w[1][tt], sel);  // bytes: w0[c], w0[c], w1[c], w1[c]
-                const uint32_t x23 = __byte_perm(w[2][tt], w[3][tt], sel);
-                const uint32_t a0 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x01 << 12), kExp124), slo) & keep01;
-                const uint32_t a1 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x01 << 8), kExp124), shi) & keep01;
-                const uint32_t a2 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x23 << 12), kExp124), slo) & keep23;
-                const uint32_t a3 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x23 << 8), kExp124), shi) & keep23;
+                for (int c = 0; c < 4; ++c) {
+                  const uint32_t sp = c == 0 ? s01 : (c == 1 ? s23 : (c == 2 ? s45 : s67));
+                  const uint32_t slo = __byte_perm(sp, 0, 0x1010);  // column g8 (h = 0)
+                  const uint32_t shi = __byte_perm(sp, 0, 0x3232);  // column g8 + 8 (h = 1)
+                  const uint32_t sel = c | (c << 4) | ((c + 4) << 8) | ((c + 4) << 12);
+                  const uint32_t x01 = __byte_perm(w[0][tt], w[1][tt], sel);  // bytes: w0[c], w0[c], w1[c], w1[c]
+                  const uint32_t x23 = __byte_perm(w[2][tt], w[3][tt], sel);
+                  const uint32_t a0 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x01 << 12), kExp124), slo) & keep01;
+                  const uint32_t a1 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x01 << 8), kExp124), shi) & keep01;
+                  const uint32_t a2 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x23 << 12), kExp124), slo) & keep23;
+                  const uint32_t a3 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x23 << 8), kExp124), shi) & keep23;
 #pragma unroll
-                for (int nb = 0; nb < NB; ++nb) {
-                  // n-blocks without valid rows (warp-uniform) issue no MMA
-                  if (nb == 0 || nrows > nb * 8) mma_bf16(acc[tt * 4 + c][nb], a0, a1, a2, a3, bb[nb][0], bb[nb][1]);
+                  for (int nb = 0; nb < NB; ++nb) {
+                    // n-blocks without valid rows (warp-uniform) issue no MMA
+                    if (nb == 0 || nrows > nb * 8) mma_bf16(acc[tt * 4 + c][nb], a0, a1, a2, a3, bb[nb][0], bb[nb][1]);
+                  }
+                }
+              } else {
+                uint32_t slo[4], shi[4], alo[4][2];
+#pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                  const uint32_t sp = c == 0 ? s01 : (c == 1 ? s23 : (c == 2 ? s45 : s67));
+                  slo[c] = __byte_perm(sp, 0, 0x1010);
+                  shi[c] = __byte_perm(sp, 0, 0x3232);
+                }
+                if (m & 0x00FFu) {
+#pragma unroll
+                  for (int c = 0; c < 4; ++c) {
+                    const uint32_t sel = c | (c << 4) | ((c + 4) << 8) | ((c + 4) << 12);
+                    const uint32_t x01 = __byte_perm(w[0][tt], w[1][tt], sel);
+                    alo[c][0] = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x01 << 12), kExp124), slo[c]) & keep01;
+                    alo[c][1] = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x01 << 8), kExp124), shi[c]) & keep01;
+                  }
+                } else {
+#pragma unroll
+                  for (int c = 0; c < 4; ++c) alo[c][0] = alo[c][1] = 0u;
+                }
+                if (m & 0xFF00u) {
+#pragma unroll
+                  for (int c = 0; c < 4; ++c) {
+                    const uint32_t sel = c | (c << 4) | ((c + 4) << 8) | ((c + 4) << 12);
+                    const uint32_t x23 = __byte_perm(w[2][tt], w[3][tt], sel);
+                    const uint32_t a2 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x23 << 12), kExp124), slo[c]) & keep23;
+                    const uint32_t a3 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x23 << 8), kExp124), shi[c]) & keep23;
+#pragma unroll
+                    for (int nb = 0; nb < NB; ++nb) {
+                      if (nb == 0 || nrows > nb * 8)
+                        mma_bf16(acc[tt * 4 + c][nb], alo[c][0], alo[c][1], a2, a3, bb[nb][0], bb[nb][1]);
+                    }
+                  }
+                } else {
+#pragma unroll
+                  for (int c = 0; c < 4; ++c) {
+#pragma unroll
+                    for (int nb = 0; nb < NB; ++nb) {
+                      if (nb == 0 || nrows > nb * 8)
+                        mma_bf16(acc[tt * 4 + c][nb], alo[c][0], alo[c][1], 0u, 0u, bb[nb][0], bb[nb][1]);
+                    }
+                  }
                 }
               }
             }

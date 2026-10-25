@@ -208,6 +208,10 @@
       "why": "Original confidence-prefix paired decode masks: optional separate C entry preserves old ABI. Only checkedM5pair113/118 may ignore invalid suffix rows when building zero union masks, use zero invalid activations and explicitlyzero invalid outputs. Existing valid operands/Korder/MMA/dequant/rounding unchanged. Remote per-layer finite admission checks allprefixcounts1..5 against humming validrows on spread/crowded/signedzero inputs; failurekeepsoriginalpair. No newcleargrid; all executionofficialremote."
     },
     {
+      "file": "harness/kernels/zskip/csrc/zskip.cu; zskip_pair.cuh; py/__init__.py; tests/zskip_exact.py; vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
+      "why": "Carry kaankolcu cf7016b4-4a4b-4267-8aaa-40ba3be589be decode routed down: configs 114/119 are pair kernels 113/118 that skip the dequantisation of an 8-row k half whose zero-mask byte is zero (its A fragments are +0 on every lane, so the same MMAs take literal +0). Weight bytes, K order, MMA chain and bf16 epilogue unchanged. Admitted per layer only after a load-time bitwise check against humming and against the 113/118 config it replaces, on inputs with half-empty groups; otherwise the checked pair config stays."
+    },
+    {
       "file": "harness/kernels/l2pf/py/__init__.py",
       "why": "Carry useful04706ad7-c4e8-44b9-b8ba-77f14d8b8adf MoE-window immutable prefetch default6to12MB. Its complete official2.19195352041462 is within0.1% of fulla484, but only budget mechanism is combined here on higherfulla484. Prefix pair/SSM combination unverified."
     },
@@ -266,6 +270,10 @@
     {
       "file": "model_executor/models/nemotron_h_attn_packed.py",
       "why": "Selectonlygraph-replayadmissiontiming helper frompublicpendingf102bbdb-ebe5-48e5-a1c8-313774419059;24callscycle6real-layerweights,7replaymedian, nohostlaunchbias. Keep4%MIN_GAIN andrankedall-layerexactadmission; paired eagerbaseline/candidatefallback ifreferencegraphunavailable. DoNOTimportdiagnosticstalls,_sleep,stagecodes orMIN_GAIN10. ADFcombined8d/51notealreadycoverednonewmethod; wholecombo remainsunverified,remoteonly."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_packed.py, nemotron_h_mtp_kernels.py, vllm/v1/attention/backends/flashinfer.py, layers/attention/attention.py, vllm/v1/worker/gpu_model_runner.py",
+      "why": "jacklightChen 36efef0d (decode pieces only): native MTP word reads, packed drafter output projection, structural plan reuse. Its prefill-alignment hunks (humming_zskip.py, fused_humming_moe.py, prefill_graph.py) are not carried: the equivalent pieces measured -0.23% on this tree."
     }
   ]
 }

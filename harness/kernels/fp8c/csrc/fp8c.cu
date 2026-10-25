@@ -28,7 +28,7 @@ template<int K> struct Shape {
  static constexpr int HDR = (((4 * C + 1) * 2 + 64) + 127) / 128 * 128;
  static constexpr int EXC = HDR + C * MAIN;
 };
-struct P {const uint8_t *a,*w;const float *sa,*sb;__nv_bfloat16 *c;int m;int tile_bytes;};
+struct P {const uint8_t *a,*w;const float *sa,*sb;__nv_bfloat16 *c;int m;int tile_bytes;int tile0;};
 struct Slot {uint32_t c[7];uint32_t x;uint32_t q0;};
 
 __device__ __forceinline__ uint4 ld4(const uint8_t* p) {
@@ -187,7 +187,8 @@ template<int N,int K,int RC,bool PDL=false>
 __global__ __launch_bounds__(128,2) void gemm(P p) {
  constexpr int C=Shape<K>::C;
  int lane=threadIdx.x%32,warp=threadIdx.x/32;
- const uint8_t* tb=p.w+(size_t)blockIdx.x*p.tile_bytes;
+ int tile=blockIdx.x+p.tile0;
+ const uint8_t* tb=p.w+(size_t)tile*p.tile_bytes;
  const uint16_t* tab=(const uint16_t*)tb;
  uint32_t ts=0,te=0;
  if(lane<C){ts=__ldg(tab+lane*4+warp);te=__ldg(tab+lane*4+warp+1);}
@@ -233,7 +234,7 @@ __global__ __launch_bounds__(128,2) void gemm(P p) {
 #ifndef FP8C_NO_PDL
  if constexpr (PDL) pdl_launch_dependents();
 #endif
- float sa=__ldg(p.sa),sb=__ldg(p.sb);int row=lane>>2,col=(blockIdx.x*4+warp)*8+(lane&3)*2;
+ float sa=__ldg(p.sa),sb=__ldg(p.sb);int row=lane>>2,col=(tile*4+warp)*8+(lane&3)*2;
  if(row<p.m){p.c[row*N+col]=__float2bfloat16_rn(__fmul_rn(__fmul_rn(acc[0],sb),sa));p.c[row*N+col+1]=__float2bfloat16_rn(__fmul_rn(__fmul_rn(acc[1],sb),sa));}
 }
 // Load-time proof: the same loads and decoder, storing the rebuilt words in the
@@ -261,11 +262,11 @@ __global__ __launch_bounds__(128) void decode_kernel(const uint8_t* buf,int tile
  }
 }
 template<int N,int K,int RC,bool PDL>
-cudaError_t launch(const P&p,cudaStream_t stream) {
+cudaError_t launch(const P&p,cudaStream_t stream,int tiles) {
 #ifndef FP8C_NO_PDL
  if constexpr (PDL) {
   cudaLaunchConfig_t cfg={};
-  cfg.gridDim=dim3(N/32);cfg.blockDim=dim3(128);cfg.dynamicSmemBytes=0;cfg.stream=stream;
+  cfg.gridDim=dim3(tiles);cfg.blockDim=dim3(128);cfg.dynamicSmemBytes=0;cfg.stream=stream;
   cudaLaunchAttribute attr[1];
   attr[0].id=cudaLaunchAttributeProgrammaticStreamSerialization;
   attr[0].val.programmaticStreamSerializationAllowed=1;
@@ -273,13 +274,18 @@ cudaError_t launch(const P&p,cudaStream_t stream) {
   return cudaLaunchKernelEx(&cfg,gemm<N,K,RC,true>,p);
  }
 #endif
- gemm<N,K,RC,false><<<N/32,128,0,stream>>>(p);
+ gemm<N,K,RC,false><<<tiles,128,0,stream>>>(p);
  return cudaGetLastError();
 }
 template<int RC,bool PDL>
 cudaError_t dispatch(const P&p,int n,int k,cudaStream_t stream) {
- if(n==10304&&k==2688)return launch<10304,2688,RC,PDL>(p,stream);
- if(n==2688&&k==4096)return launch<2688,4096,RC,PDL>(p,stream);
+ if(n==10304&&k==2688)return launch<10304,2688,RC,PDL>(p,stream,n/32);
+ if(n==2688&&k==4096)return launch<2688,4096,RC,PDL>(p,stream,n/32);
+ return cudaErrorInvalidValue;
+}
+template<int RC,bool PDL>
+cudaError_t dispatch_tiles(const P&p,int n,int k,int tiles,cudaStream_t stream) {
+ if(n==10304&&k==2688)return launch<10304,2688,RC,PDL>(p,stream,tiles);
  return cudaErrorInvalidValue;
 }
 }  // namespace fp8c
@@ -289,7 +295,7 @@ extern "C" int fp8c_run(const void*a,const void*w,const void*sa,const void*sb,vo
                         int tile_bytes,int pdl,int ring,void*stream) {
  using namespace fp8c;
  if(m<1||m>8)return (int)cudaErrorInvalidValue;
- P p{(const uint8_t*)a,(const uint8_t*)w,(const float*)sa,(const float*)sb,(__nv_bfloat16*)c,m,tile_bytes};
+ P p{(const uint8_t*)a,(const uint8_t*)w,(const float*)sa,(const float*)sb,(__nv_bfloat16*)c,m,tile_bytes,0};
  cudaStream_t st=(cudaStream_t)stream;
  cudaError_t rc;
 #ifdef FP8C_NO_PDL
@@ -302,6 +308,25 @@ extern "C" int fp8c_run(const void*a,const void*w,const void*sa,const void*sb,vo
   default: return (int)cudaErrorInvalidValue;
  }
  if(rc!=cudaSuccess){cudaGetLastError();return (int)rc;}  // cleared: the caller may retry without PDL
+ return (int)cudaGetLastError();
+}
+extern "C" int fp8c_run_tiles(const void*a,const void*w,const void*sa,const void*sb,void*c,int m,int n,int k,
+                        int tile_bytes,int pdl,int ring,void*stream,int tile0,int ntiles) {
+ using namespace fp8c;
+ if(m<1||m>8||ntiles<1||tile0<0||tile0+ntiles>n/32)return (int)cudaErrorInvalidValue;
+ P p{(const uint8_t*)a,(const uint8_t*)w,(const float*)sa,(const float*)sb,(__nv_bfloat16*)c,m,tile_bytes,tile0};
+ cudaStream_t st=(cudaStream_t)stream;
+ cudaError_t rc;
+#ifdef FP8C_NO_PDL
+ if(pdl)return (int)cudaErrorNotSupported;
+#endif
+ switch(ring){
+  case 3: rc=pdl?dispatch_tiles<3,true>(p,n,k,ntiles,st):dispatch_tiles<3,false>(p,n,k,ntiles,st);break;
+  case 4: rc=pdl?dispatch_tiles<4,true>(p,n,k,ntiles,st):dispatch_tiles<4,false>(p,n,k,ntiles,st);break;
+  case 6: rc=pdl?dispatch_tiles<6,true>(p,n,k,ntiles,st):dispatch_tiles<6,false>(p,n,k,ntiles,st);break;
+  default: return (int)cudaErrorInvalidValue;
+ }
+ if(rc!=cudaSuccess){cudaGetLastError();return (int)rc;}
  return (int)cudaGetLastError();
 }
 extern "C" int fp8c_decode(const void*buf,int tile_bytes,void*out,int n,int k,void*stream) {

@@ -27,6 +27,7 @@ MAX_M = 8
 # Register-ring depth in k16 blocks (csrc/marlinx.cu supports 4 and 8; same bits).
 DEPTH = int(os.environ.get("MARLINX_DEPTH", "8"))
 ENABLED = os.environ.get("MARLINX", "1") != "0"
+_RDS_RING4 = os.environ.get("RDS_SHARED_RING4", "1") != "0"
 
 _lib = None
 _load_error: str | None = None
@@ -197,6 +198,8 @@ def gemm(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
     lib = _load()
     assert lib is not None, _load_error
     m = x.shape[0]
+    if _RDS_RING4 and zs is not None and (m, n, k, depth) == (5, 2688, 3712, 8):
+        depth = 4
     out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
     mode = "zs" if zs is not None else "relu2" if relu2 else "gemm"
     use_pdl = _pdl_active

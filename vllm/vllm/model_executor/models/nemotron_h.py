@@ -1010,7 +1010,7 @@ class NemotronHForCausalLM(
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
-    def set_last_moe_row_src(self, row_src: torch.Tensor | None) -> bool:
+    def set_last_moe_row_src(self, row_src: torch.Tensor | None, lite: bool = False) -> bool:
         """Route every row of the last layer's MoE through row `row_src` (a
         1-element GPU index tensor), or restore per-row routing with None.
 
@@ -1035,6 +1035,7 @@ class NemotronHForCausalLM(
         if runner is None:
             return False
         runner.keep_m_row_src = row_src
+        runner.keep_m_lite = bool(lite) and row_src is not None
         return True
 
     def forward(

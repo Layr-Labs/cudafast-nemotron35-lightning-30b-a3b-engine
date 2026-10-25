@@ -50,6 +50,12 @@ def _load():
             [ctypes.c_void_p] * 5 + [ctypes.c_int] * 6 + [ctypes.c_void_p]
         )
         lib.fp8c_run.restype = ctypes.c_int
+        if hasattr(lib, "fp8c_run_tiles"):
+            lib.fp8c_run_tiles.argtypes = (
+                [ctypes.c_void_p] * 5 + [ctypes.c_int] * 6 + [ctypes.c_void_p]
+                + [ctypes.c_int] * 2
+            )
+            lib.fp8c_run_tiles.restype = ctypes.c_int
         lib.fp8c_decode.argtypes = [
             ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
             ctypes.c_void_p,

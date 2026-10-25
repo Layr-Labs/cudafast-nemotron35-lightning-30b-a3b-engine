@@ -20,6 +20,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 logger = init_logger(__name__)
 SHAPES = {(10304, 2688), (2688, 4096)}
 _logged = False
+_BASE7 = {}
 
 
 def prepare_weight(packed: torch.Tensor) -> torch.Tensor | None:
@@ -38,6 +39,15 @@ def prepare_weight(packed: torch.Tensor) -> torch.Tensor | None:
         return None
     if comp is None and fp8c.stats["rejected"] > rejected:
         logger.warning("fp8c: %s; this layer keeps fp8small", fp8c.stats["last_reason"])
+    if comp is not None:
+        _BASE7[(comp.device.index, comp.data_ptr())] = comp
+        try:
+            import fp8d6
+            selected = fp8d6.prepare(packed, comp)
+            if selected is not None:
+                return selected
+        except Exception as exc:
+            logger.warning("fp8d6 unavailable (%r); current fp8c retained", exc)
     return comp
 
 
@@ -49,8 +59,8 @@ def _log_once(fp8c) -> None:
     s = fp8c.stats
     raw = max(s["raw_bytes"], 1)
     logger.info(
-        "fp8c active: %d Mamba FP8 projections read from the lossless 7-bit code "
-        "(%.1f MB -> %.1f MB, %.3f bits/weight, %d kept fp8small); FP8C=0 disables",
+        "fp8c reference: %d Mamba projections admitted to lossless 7-bit storage "
+        "(%.1f MB -> %.1f MB, %.3f bits/weight, %d kept fp8small); optional fp8d6 logged separately",
         s["tensors"], s["raw_bytes"] / 1e6, s["bytes"] / 1e6, 8.0 * s["bytes"] / raw,
         s["rejected"],
     )
@@ -82,8 +92,17 @@ def _scaled_mm(
     ):
         import fp8c
 
-        _log_once(fp8c)
-        return fp8c.gemm(a, comp, sa, sb, n, k)
+        try:
+            import fp8d6
+        except ImportError:
+            fp8d6 = None
+        if fp8d6 is not None and fp8d6.owns(comp):
+            return fp8d6.gemm(a, comp, sa, sb, n, k)
+        known = _BASE7.get((comp.device.index, comp.data_ptr()))
+        if (known is not None and known.shape == comp.shape
+                and known.stride() == comp.stride()):
+            _log_once(fp8c)
+            return fp8c.gemm(a, comp, sa, sb, n, k)
     return ops.cutlass_scaled_mm(a, b, scale_a=sa, scale_b=sb, out_dtype=torch.bfloat16)
 
 
@@ -98,3 +117,61 @@ def _scaled_mm_fake(
 
 
 direct_register_custom_op("fp8c_scaled_mm", _scaled_mm, fake_impl=_scaled_mm_fake)
+
+
+def gemm_tiles(
+    a: torch.Tensor,
+    comp: torch.Tensor,
+    sa: torch.Tensor,
+    sb: torch.Tensor,
+    n: int,
+    k: int,
+    out: torch.Tensor,
+    tile0: int,
+    tiles: int,
+    stream: torch.cuda.Stream | None = None,
+    pdl: bool = True,
+) -> bool:
+    """Write columns [tile0, tile0+tiles) * 32 of the 10304-wide in_proj into out.
+
+    Same tiles, scales and MMA chain as the full gemm. Returns False when the
+    loaded library has no ranged launch, so the caller keeps the full gemm.
+    """
+    if (n, k) != (10304, 2688) or tile0 < 0 or tiles < 1 or tile0 + tiles > n // 32:
+        return False
+    try:
+        import fp8d6
+    except ImportError:
+        fp8d6 = None
+    use_d6 = fp8d6 is not None and fp8d6.owns(comp)
+    if use_d6:
+        lib = fp8d6._load()
+        fn = getattr(lib, "fp8d6_run_tiles", None) if lib is not None else None
+        ring = 3
+        use_pdl = pdl and fp8d6._pdl
+    else:
+        import fp8c
+        lib = fp8c._load()
+        fn = getattr(lib, "fp8c_run_tiles", None) if lib is not None else None
+        known = _BASE7.get((comp.device.index, comp.data_ptr()))
+        if known is None or known.shape != comp.shape or known.stride() != comp.stride():
+            return False
+        ring = 3
+        use_pdl = pdl and fp8c._pdl
+    if fn is None:
+        return False
+    st = stream if stream is not None else torch.cuda.current_stream(a.device)
+    args = [
+        a.data_ptr(), comp.data_ptr(), sa.data_ptr(), sb.data_ptr(), out.data_ptr(),
+        a.shape[0], n, k, comp.shape[1], int(use_pdl), ring, st.cuda_stream,
+        tile0, tiles,
+    ]
+    rc = fn(*args)
+    if rc and use_pdl and not torch.cuda.is_current_stream_capturing():
+        args[9] = 0
+        rc = fn(*args)
+    if rc:
+        raise RuntimeError(
+            f"fp8 tile launch failed: {rc} tile0={tile0} tiles={tiles}"
+        )
+    return True

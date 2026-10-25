@@ -78,6 +78,9 @@ except ImportError:
     _l2pf = None
 
 
+_GATE_STREAMS: dict[int, torch.cuda.Stream] = {}
+
+
 def _out_proj_weight(mixer) -> torch.Tensor:
     # The fp8c buffer when present (tile-major, the order its kernel reads), else
     # the fp8small pack, else the weight.
@@ -591,13 +594,96 @@ class MambaMixer2(MambaBase, PluggableLayer):
         # Check if running on Blackwell (SM100+) for kernel tuning
         self.is_blackwell = current_platform.is_device_capability_family(100)
 
+    def _split_in_proj(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        """in_proj with the gate columns (the first 4096) queued beside conv+SSM.
+
+        Those columns are not read until the gated norm. The conv/SSM half is
+        launched on this stream; the gate half waits until that launch is queued
+        and then runs on a side stream, so its weight read overlaps the
+        latency-bound conv and SSM. Same tiles and the same output columns as
+        the single gemm. None keeps self.in_proj.
+        """
+        if (
+            self.tp_size != 1
+            or self.intermediate_size != 4096
+            or hidden_states.ndim != 2
+            or not (1 <= hidden_states.shape[0] <= 8)
+            or hidden_states.shape[1] != 2688
+            or not hidden_states.is_cuda
+            or hidden_states.dtype != torch.bfloat16
+        ):
+            return None
+        proj = self.in_proj
+        kernel = getattr(getattr(proj, "quant_method", None), "fp8_linear", None)
+        comp = getattr(kernel, "_fp8c_weight", None) if kernel is not None else None
+        if comp is None or not hasattr(kernel, "quant_fp8"):
+            return None
+        w, w_s, x_s, x_s_ub = kernel._get_layer_params(proj)
+        if (
+            tuple(w.shape) != (2688, 10304)
+            or comp.shape[0] != 10304 // 32
+            or not comp.is_contiguous()
+            or getattr(proj, "bias", None) is not None
+        ):
+            return None
+        dev = hidden_states.device
+        idx = dev.index if dev.index is not None else torch.cuda.current_device()
+        side = _GATE_STREAMS.get(idx)
+        if side is None:
+            if torch.cuda.is_current_stream_capturing():
+                return None
+            side = torch.cuda.Stream(device=idx)
+            _GATE_STREAMS[idx] = side
+        from vllm.model_executor.kernels.linear.scaled_mm.fp8c import gemm_tiles
+
+        x_q, x_scale = kernel.quant_fp8(
+            hidden_states.contiguous(), x_s, x_s_ub
+        )
+        if x_q.shape != hidden_states.shape or not x_q.is_contiguous():
+            return None
+        out = torch.empty(
+            (hidden_states.shape[0], 10304),
+            dtype=torch.bfloat16, device=dev,
+        )
+        if not gemm_tiles(
+            x_q, comp, x_scale, w_s, 10304, 2688, out,
+            tile0=4096 // 32, tiles=(10304 - 4096) // 32, pdl=True,
+        ):
+            return None
+        side.wait_stream(torch.cuda.current_stream(dev))
+        for t in (out, x_q, comp, x_scale, w_s):
+            t.record_stream(side)
+        self._gate_hold = (x_q, out)
+        self._gate_side = side
+        try:
+            launched = gemm_tiles(
+                x_q, comp, x_scale, w_s, 10304, 2688, out,
+                tile0=0, tiles=4096 // 32, stream=side, pdl=False,
+            )
+        except Exception:
+            self._join_gate()
+            raise
+        if not launched:
+            self._join_gate()
+            raise RuntimeError("mamba gate-column launch missing after the tail launch")
+        return out
+
+    def _join_gate(self) -> None:
+        side = getattr(self, "_gate_side", None)
+        if side is None:
+            return
+        torch.cuda.current_stream().wait_stream(side)
+        self._gate_side = None
+        self._gate_hold = None
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         mup_vector: torch.Tensor | None = None,
     ):
-        # 1. Gated MLP's linear projection
-        projected_states, _ = self.in_proj(hidden_states)
+        projected_states = None if mup_vector is not None else self._split_in_proj(hidden_states)
+        if projected_states is None:
+            projected_states, _ = self.in_proj(hidden_states)
         if mup_vector is not None:
             projected_states = projected_states * mup_vector
 
@@ -614,11 +700,14 @@ class MambaMixer2(MambaBase, PluggableLayer):
         # 3. conv + SSM
         # (split `projected_states` into hidden_states_B_C, dt in the custom op to
         # ensure it is not treated as an intermediate tensor by torch compile)
-        torch.ops.vllm.mamba_mixer2(
-            projected_states,
-            ssm_output,
-            _encode_layer_name(self.prefix),
-        )
+        try:
+            torch.ops.vllm.mamba_mixer2(
+                projected_states,
+                ssm_output,
+                _encode_layer_name(self.prefix),
+            )
+        finally:
+            self._join_gate()
 
         # 4. gated MLP
         # GatedRMSNorm internally applying SiLU to the gate

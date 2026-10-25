@@ -120,6 +120,8 @@ def _nvfp4_rows_dot(
     CHUNK: tl.constexpr = 1,
     CPER: tl.constexpr = 1,
     SPER: tl.constexpr = 1,
+    base_ptr=None,  # [N] fp32 per-row scores already computed over other groups, when BASE
+    BASE: tl.constexpr = False,
 ):
     """RMODE 0: rows from GATHER as before. 1: rows = rows_ptr[r] + (r // CPER) * CHUNK
     (first-stage top-k indices within their chunk). 2: rows = rows_ptr[c * CPER + ref_ptr[r]]
@@ -184,11 +186,17 @@ def _nvfp4_rows_dot(
         part = lo * hl[None, :] + hi * hh[None, :]
         part = tl.reshape(part, (BR, BB // 8, 8))
         acc += tl.sum(tl.sum(part, axis=2) * sc, axis=1)
-    tl.store(out_ptr + r, acc * gscale, mask=rmask)
+    if BASE:
+        # LOCAL PATCH (cudafast-nemotron35): base[row] (the coarse stage's score over
+        # its own groups) plus this kernel's dot over the remaining groups.
+        b = tl.load(base_ptr + rows, mask=wr, other=0.0)
+        tl.store(out_ptr + r, b + acc * gscale, mask=rmask)
+    else:
+        tl.store(out_ptr + r, acc * gscale, mask=rmask)
 
 
 def _rows_dot(h, w, s, rows, gscale, out, gather, gated=False, hcols=None, ref=None,
-              rmode=0, cper=1, sper=1):
+              rmode=0, cper=1, sper=1, base=None):
     n_out = out.numel()
     nbytes = w.shape[1]
     gather = gather or rmode != 0
@@ -209,12 +217,20 @@ def _rows_dot(h, w, s, rows, gscale, out, gather, gated=False, hcols=None, ref=N
         launch_pdl=mtp_pdl(),
         hcols_ptr=hcols, HCOLS=hcols is not None,
         ref_ptr=ref, RMODE=rmode, CHUNK=SCREEN_CHUNK, CPER=cper, SPER=sper,
+        base_ptr=base, BASE=base is not None,
     )
 
 
 def screen_topk_enabled() -> bool:
     """Kill switch for the fused exact top-k: VLLM_MTP_SCREEN_TOPK=0."""
     return os.environ.get("VLLM_MTP_SCREEN_TOPK", "1") != "0"
+
+
+def screen_reuse_enabled() -> bool:
+    """Refine stage = coarse score + dot over the refine-only groups (the coarse
+    groups are a subset of the refine groups). VLLM_MTP_SCREEN_REUSE=0 restores the
+    full 64-group refine dot."""
+    return os.environ.get("VLLM_MTP_SCREEN_REUSE", "1") != "0"
 
 
 @triton.jit
@@ -423,6 +439,19 @@ class DraftHeadScreen:
                 self.coarse_cols.numel(), dtype=torch.float32, device=device
             )
             self._hs = torch.empty(cols.numel(), dtype=torch.float32, device=device)
+        # LOCAL PATCH (cudafast-nemotron35): the refine groups minus the coarse groups.
+        self.reuse = self.fused_topk and screen_reuse_enabled()
+        if self.reuse:
+            rest_groups = ranked_groups[CASCADE_FRAC_GROUPS:SCREEN_FRAC_GROUPS].sort().values
+            rest_cols = (rest_groups[:, None] * 16 + torch.arange(16)[None, :]).reshape(-1)
+            self.reuse = _pow2(rest_cols.numel())
+        if self.reuse:
+            self.w_rest = (
+                w.view(n, ng, 8)[:, rest_groups, :].reshape(n, -1).to(device).contiguous()
+            )
+            self.s_rest = s[:, rest_groups].to(device).contiguous()
+            self.rest_cols = rest_cols.to(device)
+            self._hr = torch.empty(rest_cols.numel(), dtype=torch.float32, device=device)
         self.chunk_off = (
             torch.arange(n // SCREEN_CHUNK, device=device) * SCREEN_CHUNK
         )[:, None]
@@ -507,11 +536,18 @@ class DraftHeadScreen:
             # torch.topk(sorted=False) returns, in torch's order (_chunk_topk).
             # Same candidate ids in the same order, so every rows_dot, the
             # selection and the depth gate see identical inputs.
-            _gather_two[(1,)](
-                h, self.coarse_cols, self._hc, self.cols, self._hs,
-                NA=self.coarse_cols.numel(), NB=self.cols.numel(),
-                launch_pdl=mtp_pdl(),
-            )
+            if self.reuse:
+                _gather_two[(1,)](
+                    h, self.coarse_cols, self._hc, self.rest_cols, self._hr,
+                    NA=self.coarse_cols.numel(), NB=self.rest_cols.numel(),
+                    launch_pdl=mtp_pdl(),
+                )
+            else:
+                _gather_two[(1,)](
+                    h, self.coarse_cols, self._hc, self.cols, self._hs,
+                    NA=self.coarse_cols.numel(), NB=self.cols.numel(),
+                    launch_pdl=mtp_pdl(),
+                )
             _rows_dot(
                 self._hc, self.w_coarse, self.s_coarse, None,
                 self.gscale, self.scores, False, gated,
@@ -522,10 +558,21 @@ class DraftHeadScreen:
                 N=SCREEN_CHUNK, K=CASCADE_PER, GATHER=False,
                 num_warps=8, launch_pdl=mtp_pdl(),
             )
-            _rows_dot(
-                self._hs, self.w_scr, self.s_scr, self._coarse_cand,
-                self.gscale, self.refine_scores, True, gated,
-            )
+            if self.reuse:
+                # refine score = coarse score (its 32 groups) + the other 32 refine
+                # groups: the same 64-group sum, added in a different fp32 order, so
+                # it reads 256 of the 512 bytes per candidate row (the coarse groups
+                # are a subset of the refine groups). VLLM_MTP_SCREEN_REUSE=0 keeps
+                # the full 64-group dot.
+                _rows_dot(
+                    self._hr, self.w_rest, self.s_rest, self._coarse_cand,
+                    self.gscale, self.refine_scores, True, gated, base=self.scores,
+                )
+            else:
+                _rows_dot(
+                    self._hs, self.w_scr, self.s_scr, self._coarse_cand,
+                    self.gscale, self.refine_scores, True, gated,
+                )
             _chunk_topk[(nchunk,)](
                 self.refine_scores, self._coarse_cand, self._cand,
                 N=CASCADE_PER, K=SCREEN_PER, GATHER=True,

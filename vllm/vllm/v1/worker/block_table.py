@@ -4,7 +4,11 @@
 import math
 from enum import Enum
 
+import os
+
 import numpy as np
+
+_COMMIT_ALWAYS = os.environ.get("VLLM_BLOCK_TABLE_COMMIT_ALWAYS", "0") == "1"
 import torch
 
 from vllm.distributed import get_dcp_group, get_pcp_group
@@ -140,6 +144,7 @@ class BlockTable:
         block_ids: list[int],
         row_idx: int,
     ) -> None:
+        self._commit_dirty = True
         if not block_ids:
             return
 
@@ -158,12 +163,14 @@ class BlockTable:
         self.append_row(block_ids, row_idx)
 
     def clear_row(self, row_idx: int) -> None:
+        self._commit_dirty = True
         num_blocks = self.num_blocks_per_row[row_idx]
         if num_blocks > 0:
             self.block_table.np[row_idx, :num_blocks] = 0
         self.num_blocks_per_row[row_idx] = 0
 
     def move_row(self, src: int, tgt: int) -> None:
+        self._commit_dirty = True
         num_blocks = self.num_blocks_per_row[src]
         block_table_np = self.block_table.np
         block_table_np[tgt, :num_blocks] = block_table_np[src, :num_blocks]
@@ -175,6 +182,7 @@ class BlockTable:
         self.num_blocks_per_row[src] = 0
 
     def swap_row(self, src: int, tgt: int) -> None:
+        self._commit_dirty = True
         src_tgt, tgt_src = [src, tgt], [tgt, src]
         self.num_blocks_per_row[src_tgt] = self.num_blocks_per_row[tgt_src]
         self.block_table.np[src_tgt] = self.block_table.np[tgt_src]
@@ -210,12 +218,24 @@ class BlockTable:
             BLOCK_SIZE=1024,
         )
 
+    # LOCAL PATCH (cudafast-nemotron35, crypto-a6): every write to the CPU table goes
+    # through the row methods above, which mark it dirty, and the GPU table is written
+    # only here and by clear(). A commit of rows that are unchanged since the last
+    # commit (and already covered by it) re-sends the same bytes, so it is skipped.
+    # VLLM_BLOCK_TABLE_COMMIT_ALWAYS=1 restores the unconditional copy.
+    _commit_dirty: bool = True
+    _committed_rows: int = -1
+
     def commit_block_table(self, num_reqs: int) -> None:
-        self.block_table.copy_to_gpu(num_reqs)
+        if _COMMIT_ALWAYS or self._commit_dirty or num_reqs > self._committed_rows:
+            self.block_table.copy_to_gpu(num_reqs)
+            self._commit_dirty = False
+            self._committed_rows = num_reqs
 
     def clear(self) -> None:
         self.block_table.gpu.fill_(0)
         self.block_table.cpu.fill_(0)
+        self._commit_dirty = True
 
     @staticmethod
     def map_to_kernel_blocks(

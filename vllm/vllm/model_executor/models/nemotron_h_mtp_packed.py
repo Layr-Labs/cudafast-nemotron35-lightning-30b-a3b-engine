@@ -337,6 +337,9 @@ def _packed_linear_impl(
         if x.stride(1) != 1:
             x = x.contiguous()
         y = x.new_empty((x.shape[0], n))
+        from .nemotron_h_mtp_pkmm import maybe_run
+        if maybe_run(p, x, y, gate, gated, word_load_enabled(x.device), mtp_pdl()):
+            return y
         packed_small[(triton.cdiv(n, 64),)](
             x, *p.planes, y, x.shape[0], n, k, x.stride(0), y.stride(0), gate,
             GATED=gated, num_warps=4, num_stages=4, launch_pdl=mtp_pdl(),
@@ -422,6 +425,8 @@ def prepare_mtp_packed(module):
             p = pack_bf16(w)
             if p is None:
                 continue
+            from .nemotron_h_mtp_pkmm import prepare
+            prepare(p, word_load_enabled(w.device))
             raw_bytes += w.numel() * 2
             packed_bytes += p.nbytes
             values += w.numel()

@@ -278,6 +278,30 @@
     {
       "file": "harness/kernels/pzskip/csrc/pzskip.cu (+ build.sh)",
       "why": "PZ333 M496/top-6 only: HUMMING_EVICT_PZ defaults on and gives immutable packed B/BS cp.async loads L2 evict-first priority. Loader addresses, bytes, masks, K16 MMA order, negative-zero repair and formats are unchanged. HUMMING_EVICT_PZ=0 restores stock. Separate native template specialization; compile/load failure retains stock PZ333. Stacks independently with the routed-up evf policy; no decode change."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_down_packed.py, models/nemotron_h_mtp_compact.py, models/nemotron_h_mtp_kernels.py",
+      "why": "ENTIRE new highest1fa278d1-a47e-4a2a-afab-a442a3c8436d officialf0214807a8bcaa7b672dd26fc019acab84d37247/treec997375b68c7adcd8bfc125e9f7f9bcfee6299e5 retained, includingresidentgenerator/halfskip/e614. New optional lossless12bit storage of existing finite BF16 nativeMTP transposed downweights, gatheredonlybytheoriginalnonzeroindices. Sourcecodec3d51cab6-7079-4fb2-98e4-f2a238077897, compactiond53d22ff-7e89-45da-8923-37dcced5dc56, originalslotparallel526d6e53-7b8b-4ce8-b4a1-b3c7a53be9d9, originalorderedfolda3c4810f-ad61-4e4a-b56a-12b6a5bb91a6 inheritedthroughENTIRE41e5657b-0033-489a-b095-6a22fd5edcd8. Originaltransposedweights/compact/combine/residual kept. Privateactualweight exhaustivecodec +all128expert/fullN/TOPK3&6/density/scales/finite/subnormal/Inf/NaN slot-FP32bits admission, samePDL, thenprivatecold4pct selectorBN32/64; miss/fail/disallowedconfig keepsoriginalslots. Additionalpackedresidentmemorynotmemoryreductionclaim. Allvalidationofficialremoteonly. Prototypeunvalidated; refreshhighestandrebasefullsourcebeforeupload."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_pkmm.py, models/nemotron_h_mtp_packed.py; harness/kernels/l2pf; models/nemotron_h.py; layers/mamba/mamba_mixer2.py; layers/attention/attention.py",
+      "why": "New optional native-MTP narrow packed MMA on entire41e5657b-0033-489a-b095-6a22fd5edcd8, derived from297e3412-dc4a-45ae-a0f1-b6c3afd76c1b with exact128tail, original gate-masked arithmetic, actual-weight/private full-output-bit+cold4pct admission. Original packed_small fallback. Budget-shared next-router prefetch inspired by297; immutable exact BF16shadow/originalFP32; at most quarter of existing5/7MiB window, router+projection up to3ranges fused intoone CUDAlaunch/fork withoriginaljoin. No coarse screen/halfskip/quantization/policy change. All execution officialremote only; new combination unverified."
+    },
+    {
+      "file": "harness/kernels/pzskip/build.sh, harness/kernels/pzskip/csrc/pzskip.cu, model_executor/layers/fused_moe/experts/humming_relu2_epilogue.py",
+      "why": "Three complete exact Gitblobs frome6141f8e-002a-4064-95be-b36cd70a6ac3/aceba6e13d92c7ee2e6adb2d1db9af9cbf52895f. Its whole score2.34709633343952 is0.0312039pct below41, within0.1pct threshold; useful prefill-only evict-first immutableexpert-weight/scale hint withoriginalmath/fallback. Whole41 stays baseline, new composition unverified; prior40111 whole1.65577pct regression excluded, no isolated blame/gain."
+    },
+    {
+      "file": "model_executor/layers/fused_moe/{moe_fused_mul_sum.py,experts/fused_humming_moe.py,runner/shared_experts.py,runner/moe_runner.py}",
+      "why": "Select4386ba36-de9e-450f-b218-71a32de63478 targetshared-add-combine idea, fourpublishedPRblobs verified d78a395ff0c34c4d581e2fe54a68be0da8294e0e; notwholelowerB86baseline orPycs. NEWseparate single-output opaqueop+matchingfake preservesoldtwo-outputschema; explicitauxjoin andlease commitafteradmission; retainoldkernel byteexact andnewoptionalBF16roundedcombine+shared(leftoperand)double-roundingkernel. RemotestickyprivatebitadmissionM1..8/topk6/D2688/3scales+signedzero/subnormal/extrema/inf/NaN patterns, oldinsideopadd fallback. Noisolatedgain orcorrectnessclaim; entire41baseline."
+    },
+    {
+      "file": "v1/spec_decode/nemotron_full_step.py",
+      "why": "NativeMTPfullgraph inheritedthrough7c0c5713-b165-45c3-a839-05742e7350f8 onENTIREhighest41e5657b-0033-489a-b095-6a22fd5edcd8. NEW3slot bounded external-event relay atnativeFlashInfer attention wait, originalgraphretainedfirst, eventneverre-recordedbeforepriorgraphretired.query, graph/privatepool/outputsstrong. Startuporiginalmodel firstrowexactchecksper3slots/changeinputs/gates, unavailable/busy ->actualplan_event orderedfullgraph. Only readinessidea fromown0e8bb4ee-f97f-4e33-bd26-75270404bf78/528c6b75-628b-427b-9dab-07f2e7a9a3c1; theirwholelower/failedbundlesNOTbaseline, NOrouter/Gluon/halfskip orhostplanguards copied. NativePyTorch externalEventAPI source/docs citedinpublicnote. Allruntimeofficialremote; wholecompositionunvalidated."
+    },
+    {
+      "file": "vllm/vllm/model_executor/layers/fused_moe/moe_fused_mul_sum.py,vllm/vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py,vllm/vllm/model_executor/layers/fused_moe/runner/shared_experts.py,vllm/vllm/model_executor/layers/fused_moe/runner/moe_runner.py,vllm/vllm/v1/spec_decode/nemotron_full_step.py",
+      "why": "Useful pending35cd3477-dee7-441f-90e6-018db7c00ab3 readme motivates recomposition of original own3de1592a-008f-4777-9dad-516e3f3248f2 exact5runtimefiles onENTIREhighest1fa. NewoneTensor shared-addcombine/privateexactadmission andboundednativefullgraph eventready/retirement/orderedfallback. Allfivebaseblobsexact41/1fa; disjointwithnewpackeddown/da9prefetch. Whole3deold2.3398236530201193 excludedasbaseline; source35cdpending notverified; no isolatedgain/localtestclaim. Original shared-addidea4386ba36-de9e-450f-b218-71a32de63478 andreadyidea0e8bb4ee-f97f-4e33-bd26-75270404bf78/528c6b75-628b-427b-9dab-07f2e7a9a3c1 explicitlycredited. No40111fullmodel+screenheadgraph/denseuppack."
     }
   ]
 }

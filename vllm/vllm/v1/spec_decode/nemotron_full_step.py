@@ -42,6 +42,108 @@ def _metadata(p, metadata):
     return tuple(result), buffers
 
 
+def _launch_ready_slot(p, slot, relay, kwargs, metadata, padded, events):
+    """Relay current plan readiness without blocking the graph's EH/QKV prefix.
+
+    The caller owns a retired slot: its external event cannot be re-recorded
+    while an earlier launch could still reach the captured attention wait.
+    No request tensors are read or copied by the relay stream.
+    """
+    main = torch.cuda.current_stream()
+    relay.wait_stream(main)
+    for event in events:
+        relay.wait_event(event)
+    slot['ready'].record(relay)
+    with set_forward_context(metadata, p.vllm_config, num_tokens=padded,
+                             cudagraph_runtime_mode=CUDAGraphMode.FULL,
+                             slot_mapping=p._get_slot_mapping(padded)):
+        outputs = slot['graph'](**kwargs)
+    slot['retired'].record(main)
+    slot['busy'] = True
+    return outputs
+
+
+def _prepare_ready_pool(p, kwargs, metadata, slots, padded, used_rows,
+                        original_mode, gate):
+    """Optional remote-startup admission; never replace the original graph.
+
+    Three fixed graphs each own their pool, outputs and external event. A
+    completed retirement is required before event reuse, so a future plan
+    record cannot turn an earlier graph's wait into a cycle.
+    """
+    p._nemo_full_ready_pool = None
+    if os.environ.get('NEMO_MTP_READY_RELAY', '1') == '0':
+        return
+    unique = tuple({id(m): m for m in metadata.values()}.values())
+    saved = [(m, hasattr(m, 'plan_ready_event'),
+              getattr(m, 'plan_ready_event', None)) for m in unique]
+    pool = []
+    try:
+        relay = torch.cuda.Stream(device=p.device)
+        source = torch.cuda.Event()
+        for _ in range(3):
+            # Event construction is lazy. Initialize and complete its record
+            # before capture; external=True then emits a real wait node at
+            # the native FlashInfer call, rather than an internal dependency.
+            ready = torch.cuda.Event(external=True)
+            ready.record()
+            ready.synchronize()
+            for m in unique:
+                m.plan_ready_event = ready
+            with set_forward_context(metadata, p.vllm_config, num_tokens=padded,
+                                     cudagraph_runtime_mode=CUDAGraphMode.FULL,
+                                     slot_mapping=slots):
+                for _warm in range(2):
+                    p.model(**kwargs)
+                torch.cuda.synchronize(p.device)
+                graph = CUDAGraphWrapper(
+                    p.model, p.vllm_config, CUDAGraphMode.FULL,
+                    CUDAGraphOptions(weak_ref_output=False))
+                graph.graph_pool = torch.cuda.graph_pool_handle()
+                outputs = graph(**kwargs)
+            torch.cuda.synchronize(p.device)
+            key = BatchDescriptor(num_tokens=padded)
+            if key not in graph.concrete_cudagraph_entries:
+                raise RuntimeError('readiness graph was not captured')
+            slot = dict(graph=graph, ready=ready, retired=torch.cuda.Event(),
+                        busy=False, outputs=outputs)
+            # Exercise the actual relay and each graph on changing private
+            # inputs/gate states against the unchanged original model path.
+            for case in range(4 if gate is not None else 3):
+                if slot['busy'] and not slot['retired'].query():
+                    raise RuntimeError('private readiness slot is still busy')
+                if gate is not None:
+                    gate.zero_()
+                    if case == 3:
+                        gate[0].fill_(1)
+                p.input_ids[:padded].fill_(case % 2)
+                p.hidden_states[:padded].fill_((0.0, 0.125, -0.25, 0.0)[case])
+                source.record()
+                actual = used_rows(_launch_ready_slot(
+                    p, slot, relay, kwargs, metadata, padded, (source,)))
+                with set_forward_context(
+                        metadata, p.vllm_config, num_tokens=padded,
+                        cudagraph_runtime_mode=original_mode,
+                        slot_mapping=slots):
+                    for _reference in range(2):
+                        expected = p.model(**kwargs)
+                    reference = used_rows(expected)
+                if len(actual) != len(reference) or not all(
+                        torch.equal(a, b) for a, b in zip(actual, reference)):
+                    raise RuntimeError('readiness graph private first row differs')
+            pool.append(slot)
+        p._nemo_full_ready_pool = (tuple(pool), relay)
+        logger.info('Native MTP bounded readiness relay: %d admitted slots', len(pool))
+    except Exception as exc:
+        logger.warning('Native MTP readiness relay unavailable; original graph retained: %r', exc)
+    finally:
+        for m, existed, value in saved:
+            if existed:
+                m.plan_ready_event = value
+            elif hasattr(m, 'plan_ready_event'):
+                delattr(m, 'plan_ready_event')
+
+
 def prepare(p):
     """Build the graph outside requests, preserving the existing padded model shape."""
     if getattr(p, '_nemo_full_attempted', False):
@@ -154,6 +256,8 @@ def prepare(p):
         p._nemo_full = (graph, padded, signature, _inputs(kwargs),
                         (outputs, private, metadata, zero_row))
         logger.info('Native MTP full-step graph prepared at padded=%d', padded)
+        _prepare_ready_pool(p, kwargs, metadata, slots, padded, used_rows,
+                            original_mode, gate)
     except Exception as exc:
         logger.warning('Native MTP full-step graph unavailable: %r', exc)
     finally:
@@ -164,12 +268,31 @@ def prepare(p):
 
 def maybe_run(p, kwargs, metadata, padded, batch_size):
     state = getattr(p, '_nemo_full', None)
-    if state is None or batch_size != 1 or padded != state[1]:
+    if (state is None or batch_size != 1 or padded != state[1]
+            or torch.cuda.is_current_stream_capturing()):
         return None
     graph, _, signature, inputs, _outputs = state
     if (BatchDescriptor(num_tokens=padded) not in graph.concrete_cudagraph_entries
             or _inputs(kwargs) != inputs or _metadata(p, metadata) != signature):
         return None
+    events = {}
+    for md in metadata.values():
+        event = getattr(md, "plan_ready_event", None)
+        if event is not None:
+            events[id(event)] = event
+    ready_pool = getattr(p, '_nemo_full_ready_pool', None)
+    if events and ready_pool is not None:
+        pool, relay = ready_pool
+        for slot in pool:
+            if (BatchDescriptor(num_tokens=padded) in
+                    slot['graph'].concrete_cudagraph_entries
+                    and (not slot['busy'] or slot['retired'].query())):
+                return _launch_ready_slot(
+                    p, slot, relay, kwargs, metadata, padded, events.values())
+    # Busy/disabled/failed optional pool: preserve the original full graph
+    # with explicit ordering on the actual current plan event(s).
+    for event in events.values():
+        torch.cuda.current_stream().wait_event(event)
     with set_forward_context(metadata, p.vllm_config, num_tokens=padded,
                              cudagraph_runtime_mode=CUDAGraphMode.FULL,
                              slot_mapping=p._get_slot_mapping(padded)):

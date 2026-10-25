@@ -69,15 +69,9 @@ def mtp_pdl() -> bool:
 # Confidence-gated draft depth
 # --------------------------------------------------------------------------- #
 # Once a draft's top-1 probability (the screen's token select, over its candidate
-# logits) falls below DEPTH_THETA, the cycle's remaining draft passes stream no
-# weights: the kernels below mask their weight loads with the gate's stop flag and
-# produce zeros. The kept drafts are counted on device; the proposer hands the count
-# to the verify (smallk verify rows: rows past the last kept draft reuse a kept row's
-# experts) and the sampler rejects every draft past it, so the emitted tokens are those
-# of a verify at the kept depth, i.e. the target's. The stop flag is only ever set
-# inside the proposer's draft loop. MTP_DEPTH_GATE=0 disables.
 DEPTH_GATE = os.environ.get("MTP_DEPTH_GATE", "1") != "0"
 DEPTH_THETA = float(os.environ.get("MTP_DEPTH_THETA", "0.5"))
+DEPTH_MIN_KEEP = max(1, int(os.environ.get("MTP_DEPTH_MIN_KEEP", "2")))
 _GATE: torch.Tensor | None = None  # int32 [stop, kept drafts, draft loop active]
 _GATE_START: torch.Tensor | None = None  # [0, 0, 1] on the gate's device (no H2D per cycle)
 

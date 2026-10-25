@@ -318,7 +318,10 @@ def prepare_mtp_packed(module):
     for name, layer in module.named_modules():
         w = getattr(layer, "weight", None)
         if (w is not None
-                and name.endswith("qkv_proj") and tuple(w.shape) == (4608, 2688)
+                and (
+                    (name.endswith("qkv_proj") and tuple(w.shape) == (4608, 2688))
+                    or (name.endswith("o_proj") and tuple(w.shape) == (2688, 4096))
+                )
                 and type(getattr(layer, "quant_method", None)).__name__ == "MTPSmallLinearMethod"):
             p = pack_bf16(w)
             if p is None:

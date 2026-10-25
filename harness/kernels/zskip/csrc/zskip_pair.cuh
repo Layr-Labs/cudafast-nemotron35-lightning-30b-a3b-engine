@@ -1,4 +1,4 @@
-// Port of dadon 12f98e36 (31889a4), decode config 113 only. Main's BI layout and
+// Port of dadon 12f98e36 (31889a4) paired decode kernels. Main's BI layout and
 // prep are deliberately retained. Fused=true composes fkiene bc524594's prep.
 #ifndef ZSKIP_NO_PAIR
 __device__ __forceinline__ uint4 ldg_u128(const void* p) {
@@ -16,13 +16,16 @@ __device__ __forceinline__ uint4 ldg_u128(const void* p) {
 // weight fragments of a group serve all NB n-blocks.
 // HALF (TPW = 1): the warp's 64-column tile is one half of a "swap2" pair (4-byte words, 8-byte
 // scales at the tile's offset in the pair) instead of a "swap" tile.
-template <bool Fused>
-__global__ void __launch_bounds__(32) down_pair_kernel(const Params p) {
-  constexpr int TPW = 2, WPC = 1, R = 3, NB = 1;
+template <bool Fused, int WPC = 1, int R = 3, int Dynamic = 0>
+__global__ void __launch_bounds__(WPC * 32) down_pair_kernel(const Params p) {
+  constexpr int TPW = 2, NB = 1;
   constexpr bool HALF = false;
   static_assert(TPW == 1 || TPW == 2, "tiles per warp");
+  static_assert(WPC >= 1 && (21 % WPC == 0 || WPC == 2), "complete or single-warp-tail grid");
   static_assert(NB >= 1 && NB <= 4, "n-blocks per warp");
   static_assert(!HALF || TPW == 1, "half pairs are single tiles");
+  static_assert(Dynamic >= 0 && Dynamic <= 2, "dynamic pair roles");
+  static_assert(Dynamic == 0 || !Fused, "dynamic paired schedules use separate prep");
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   const int g8 = lane >> 2, t = lane & 3;
   const int mb = blockIdx.y;
@@ -31,12 +34,25 @@ __global__ void __launch_bounds__(32) down_pair_kernel(const Params p) {
   pdl_wait();
   pdl_launch_dependents();
 #endif
+  if constexpr (Dynamic != 0) {
+    const int rows = p.verify_rows ? *p.verify_rows : (1 << 30);
+    const bool use_r4 = rows == 1 || rows >= 5;
+    if ((Dynamic == 1) != use_r4) return;
+  }
+  if constexpr (WPC == 2) {
+    if (P >= 21) return;
+  }
   if (mb * 16 >= *p.num_tokens_padded) return;
   const uint8_t* bi = p.ws + (long long)mb * BI_BYTES;
 #ifndef ZSKIP_NO_FUSED
   extern __shared__ __align__(16) uint8_t smem_pair[];
   if constexpr (Fused) {
-    fused_prep<32, 16, 8>(p, mb, smem_pair);
+    if constexpr (WPC == 2) {
+      if (P == 20) fused_prep<32, 16, 8>(p, mb, smem_pair);
+      else fused_prep<WPC * 32, 16, 8>(p, mb, smem_pair);
+    } else {
+      fused_prep<WPC * 32, 16, 8>(p, mb, smem_pair);
+    }
     bi = smem_pair;
   }
 #endif

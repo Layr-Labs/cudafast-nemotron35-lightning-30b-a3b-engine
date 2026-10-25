@@ -1740,7 +1740,7 @@ static int launch4f(const Params& p, cudaStream_t stream) {
 #endif
 
 #ifndef ZSKIP_NO_PAIR
-template <bool Fused>
+template <bool Fused, int WPC = 1, int R = 3>
 static int launch_pair(const Params& p, cudaStream_t stream) {
   constexpr int SM = Fused ? BI_BYTES : 0;
 #ifndef ZSKIP_NO_PDL
@@ -1749,7 +1749,7 @@ static int launch_pair(const Params& p, cudaStream_t stream) {
     if constexpr (!Fused)
       e = launch_pdl(prep_kernel<16, 8>, dim3(p.max_blocks), dim3(128), stream, p);
     if (e == cudaSuccess)
-      e = launch_pdl(down_pair_kernel<Fused>, dim3(21, p.max_blocks), dim3(32), stream, p, SM);
+      e = launch_pdl(down_pair_kernel<Fused, WPC, R>, dim3((21 + WPC - 1) / WPC, p.max_blocks), dim3(WPC * 32), stream, p, SM);
     if (e != cudaSuccess) {
       cudaGetLastError();
       return (int)e;
@@ -1758,7 +1758,28 @@ static int launch_pair(const Params& p, cudaStream_t stream) {
   }
 #endif
   if constexpr (!Fused) prep_kernel<16, 8><<<p.max_blocks, 128, 0, stream>>>(p);
-  down_pair_kernel<Fused><<<dim3(21, p.max_blocks), 32, SM, stream>>>(p);
+  down_pair_kernel<Fused, WPC, R><<<dim3((21 + WPC - 1) / WPC, p.max_blocks), WPC * 32, SM, stream>>>(p);
+  return (int)cudaGetLastError();
+}
+
+static int launch_dynamic(const Params& p, cudaStream_t stream) {
+#ifndef ZSKIP_NO_PDL
+  if (g_pdl) {
+    cudaError_t e = launch_pdl(prep_kernel<16, 8>, dim3(p.max_blocks), dim3(128), stream, p);
+    if (e == cudaSuccess)
+      e = launch_pdl(down_pair_kernel<false, 1, 4, 1>, dim3(21, p.max_blocks), dim3(32), stream, p);
+    if (e == cudaSuccess)
+      e = launch_pdl(down_pair_kernel<false, 2, 3, 2>, dim3(11, p.max_blocks), dim3(64), stream, p);
+    if (e != cudaSuccess) {
+      cudaGetLastError();
+      return (int)e;
+    }
+    return (int)cudaGetLastError();
+  }
+#endif
+  prep_kernel<16, 8><<<p.max_blocks, 128, 0, stream>>>(p);
+  down_pair_kernel<false, 1, 4, 1><<<dim3(21, p.max_blocks), 32, 0, stream>>>(p);
+  down_pair_kernel<false, 2, 3, 2><<<dim3(11, p.max_blocks), 64, 0, stream>>>(p);
   return (int)cudaGetLastError();
 }
 #endif
@@ -1911,19 +1932,41 @@ int zskip_config(int id, int* info) {
 #undef X4F
 #endif
 #ifndef ZSKIP_NO_PAIR
-#define PAIR_INFO(ID, FUSED) \
+#define PAIR_INFO(ID, FUSED, WPC, R) \
   if (id == ID) { \
     constexpr int SM = FUSED ? BI_BYTES : 0; \
-    if (cudaFuncGetAttributes(&attr, down_pair_kernel<FUSED>) != cudaSuccess) return -1; \
-    info[0] = attr.numRegs; info[1] = SM; info[2] = 1; \
-    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&info[3], down_pair_kernel<FUSED>, 32, SM) != cudaSuccess) \
+    if (cudaFuncGetAttributes(&attr, down_pair_kernel<FUSED, WPC, R>) != cudaSuccess) return -1; \
+    info[0] = attr.numRegs; info[1] = SM; info[2] = WPC; \
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&info[3], down_pair_kernel<FUSED, WPC, R>, WPC * 32, SM) != cudaSuccess) \
       return -1; \
     return 0; \
   }
-  PAIR_INFO(113, false)
+  PAIR_INFO(113, false, 1, 3)
+  PAIR_INFO(119, false, 3, 3)
+  PAIR_INFO(154, false, 2, 3)
 #ifndef ZSKIP_NO_FUSED
-  PAIR_INFO(118, true)
+  PAIR_INFO(118, true, 1, 3)
+  PAIR_INFO(153, true, 3, 3)
+  PAIR_INFO(155, true, 2, 3)
+  PAIR_INFO(156, true, 1, 2)
+  PAIR_INFO(157, true, 1, 4)
 #endif
+  if (id == 158) {
+    cudaFuncAttributes other;
+    if (cudaFuncGetAttributes(&attr, down_pair_kernel<false, 1, 4, 1>) != cudaSuccess) return -1;
+    if (cudaFuncGetAttributes(&other, down_pair_kernel<false, 2, 3, 2>) != cudaSuccess) return -1;
+    info[0] = max(attr.numRegs, other.numRegs);
+    info[1] = 0;
+    info[2] = 2;
+    int ca, cb;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&ca, down_pair_kernel<false, 1, 4, 1>, 32, 0) != cudaSuccess)
+      return -1;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&cb, down_pair_kernel<false, 2, 3, 2>, 64, 0) != cudaSuccess)
+      return -1;
+    if (ca < 1 || cb < 1) return -1;
+    info[3] = min(ca, cb);
+    return 0;
+  }
 #undef PAIR_INFO
 #endif
   return -2;
@@ -1935,7 +1978,8 @@ static int zskip_down_impl(const void* A, long long lda, int shape_m, const int*
                long long s_tile, long long s_g, int mode, int* stats, int config, void* ws, int* queue,
                int ctas_per_sm, void* trace, void* stream, const int* verify_rows) {
   if (verify_rows != nullptr && (shape_m != 30 || mode != SKIP ||
-      (config != 113 && config != 118))) return -5;
+      (config != 113 && config != 118 && config != 119 && config != 153 &&
+       config != 154 && config != 155 && config != 156 && config != 157 && config != 158))) return -5;
   Params p;
   p.verify_rows = verify_rows;
   p.A = reinterpret_cast<const __nv_bfloat16*>(A);
@@ -1996,8 +2040,15 @@ static int zskip_down_impl(const void* A, long long lda, int shape_m, const int*
 #undef X8
 #ifndef ZSKIP_NO_PAIR
   if (config == 113) return launch_pair<false>(p, st);
+  if (config == 119) return launch_pair<false, 3>(p, st);
+  if (config == 154) return launch_pair<false, 2>(p, st);
+  if (config == 158) return launch_dynamic(p, st);
 #ifndef ZSKIP_NO_FUSED
   if (config == 118) return launch_pair<true>(p, st);
+  if (config == 153) return launch_pair<true, 3>(p, st);
+  if (config == 155) return launch_pair<true, 2>(p, st);
+  if (config == 156) return launch_pair<true, 1, 2>(p, st);
+  if (config == 157) return launch_pair<true, 1, 4>(p, st);
 #endif
 #endif
   return -2;

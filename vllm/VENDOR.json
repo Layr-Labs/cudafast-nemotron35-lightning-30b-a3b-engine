@@ -238,6 +238,10 @@
     {
       "file": "vllm/model_executor/layers/mamba/ops/gated_norm_fp8.py; mamba_mixer2.py",
       "why": "Select priorcompletecorrect823867a3-d280-429c-bd43-c177dc25470a native-order groupedgatednorm/staticFP8 producer only onfulla484; add originalPDL wait-beforeallreads andexistingconfidenceprefixM5 earlyzero withoutweight/gate/SSMreads. Retainstaticcheckpointscale, bothBF16rounds, consumerQuantizedActivationguard, targetformats/fallback. Entirecombinationunverified; no localexecution."
+    },
+    {
+      "file": "harness/kernels/zskip/{csrc/zskip.cu,csrc/zskip_pair.cuh,py/__init__.py,tests/zskip_exact.py,README.md}; vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
+      "why": "Carry complete current leader29b022a9 (61d40ab), including exact screen top-k, deferred shared-down,7MB attention prefetch, drafter bandwidth/compaction, grouped-normalizationFP8,threshold0.5 and pzskip333 unchanged. Add config158: one separate prep, then R4 for prefix1 or at least5 and two-warp R3 for prefixes2/3/4. The second launch reads the existing device verify-row count without a host readback; only the selected kernel writes outputs. Preserve original113/118 checks/fallback and all valid-row arithmetic. All23-layer ordinary and PDL proofs each passed1371009024 element comparisons and1104 replays with no mismatch. Direct medians for158 versus118: prefix1 71.39/87.38us, prefix2 104.02/105.71us, prefix3 135.93/143.67us, prefix4 172.74/181.01us, prefix5 213.11/225.44us, all-rows214.06/225.59us. Static WPC/ring alternatives remain optional, not selected."
     }
   ]
 }

@@ -59,6 +59,7 @@ MAX_TOKENS = 8
 PAIR_ENABLED = os.environ.get("ZSKIP_DADON", "1") != "0"
 PAIR_CONFIG = 113
 PAIR_FUSED_CONFIG = 118
+PAIR_GROUPED_CONFIG = 158
 # Prefill: MoE layers whose relu^2 activations are sparse enough for the skip to beat humming's
 # 64-row blocks on GB10 (measured per layer on prefill-length calls; the others lose). Layer 51,
 # the last, is left out: the boot prefill graph routes all its rows through one row's experts.
@@ -182,6 +183,12 @@ def _prepare_pair(layer: torch.nn.Module) -> None:
                     config = PAIR_FUSED_CONFIG
             except Exception as exc:  # noqa: BLE001
                 logger.warning_once("zskip: paired fused prep unavailable (%r); config 113", exc)
+            try:
+                _zskip.config_info(PAIR_GROUPED_CONFIG)
+                if _pair_check(layer, pair, PAIR_GROUPED_CONFIG):
+                    config = PAIR_GROUPED_CONFIG
+            except Exception as exc:  # noqa: BLE001
+                logger.warning_once("zskip: grouped pair unavailable (%r); checked pair retained", exc)
         layer.zskip_pair_w2 = pair
         layer.zskip_pair_config = config
         logger.info_once("zskip: dadon paired decode config %d enabled for M=5", config)
@@ -237,13 +244,13 @@ def _pair_check(layer: torch.nn.Module, packed: Any, config: int, prefix: bool =
                 tuning_config=json.dumps(configs[1]),
             )
             out = torch.empty_like(ref)
-            for count in ((1, 2, 3, 4, 5) if prefix else (None,)):
+            for count in ((1, 2, 3, 4, 5, 1 << 30) if prefix else (None,)):
                 vrows = (torch.tensor([count], dtype=torch.int32, device=dev)
                          if count is not None else None)
                 _zskip.down(act, sorted_ids, expert_ids, ntp, packed, out,
                             mode=_zskip.SKIP, config=config, max_blocks=m*TOP_K,
                             verify_rows=vrows)
-                rows = m*TOP_K if count is None else count*TOP_K
+                rows = m*TOP_K if count is None else min(count, m)*TOP_K
                 if not torch.equal(out[:rows].view(torch.int16), ref[:rows].view(torch.int16)):
                     logger.warning("zskip: paired prefix=%s config %d differs on %s",
                                    prefix, config, getattr(layer, "layer_name", "?"))

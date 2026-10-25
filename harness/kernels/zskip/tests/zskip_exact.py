@@ -13,6 +13,7 @@ Phases (--phase, comma-separated):
   capture  real MoE inputs: eager in-process engine, prefill of prompt + reference continuation
            (sequences.json), records each MoE layer's input x (as harness/sparsity/relu2_probe.py).
   exact    per layer and input: stock humming w2 output vs zskip DENSE and SKIP, bitwise.
+  prefix   paired old/new bitwise checks at M5/M9, prefixes 1..5/all, ordinary/PDL graph replay.
   time     CUDA-graph time per call over the loaded layers (cold weights): stock, zskip modes,
            configs and layouts, plus the load-only timing probes and byte counts.
 """
@@ -439,6 +440,123 @@ def phase_exact(args, ctx):
         ctx["exact_failed"] = True
 
 
+# ---------------------------------------------------------------------------------- prefix
+
+
+def phase_prefix(args, ctx):
+    zskip.init()
+    expected_pdl = os.environ.get("ZSKIP_PDL", "1") != "0"
+    if zskip._pdl_on != expected_pdl:
+        raise RuntimeError(f"PDL fallback before prefix proof: requested={expected_pdl}, active={zskip._pdl_on}")
+    stats = torch.zeros(4, dtype=torch.int32, device="cuda")
+    mismatches, checks, values, replays = [], 0, 0, 0
+
+    def call(cfg, act, kw, pk, out, vrows):
+        out.view(torch.int16).fill_(0x7FBF)
+        return zskip.down(act, kw["sorted_ids"], kw["expert_ids"], kw["num_tokens_padded"], pk, out,
+                          mode=zskip.SKIP, config=cfg, max_blocks=act.shape[0], stats=stats,
+                          verify_rows=vrows)
+
+    def check(got, ref, label):
+        nonlocal checks, values
+        got, ref = got.view(torch.int16), ref.view(torch.int16)
+        checks += 1
+        values += got.numel()
+        if not torch.equal(got, ref):
+            mismatches.append({"case": label, "different": int((got != ref).sum().item())})
+            log(f"PREFIX MISMATCH {label}")
+
+    for li, L in enumerate(ctx["layer_ids"]):
+        ex, pk = ctx["ex"][li], ctx["packed"][li]["swap2"]
+        for m in (5, 9):
+            for crowded in (False, True):
+                ids = [[(29*i + (0 if crowded else 17*t)) % NUM_EXPERTS
+                        for i in range(TOP_K)] for t in range(m)]
+                if m == 9 and crowded:
+                    ids[-1] = [31 + 7*i for i in range(TOP_K)]
+                topk_ids = torch.tensor(ids, dtype=torch.int32, device="cuda")
+                _, kw = ex.prepare_humming_moe_kwargs(topk_ids, None, None)
+                gen = torch.Generator(device="cuda")
+                gen.manual_seed(3719 + 97*L + 13*m + int(crowded))
+                u = torch.randn(m*TOP_K, INTER, generator=gen, device="cuda")
+                keep = torch.rand(m*TOP_K, INTER, generator=gen, device="cuda") < 0.08
+                sparse = (u.relu().square() * keep).to(torch.bfloat16).contiguous()
+                sparse[:, :32] = 0
+                sparse[0].zero_()
+                sparse.view(torch.int16)[sparse == 0] = -32768
+                signed = (u * keep).to(torch.bfloat16).contiguous()
+                signed[:, 32:48] = 0
+                signed[1].zero_()
+                zero = torch.zeros_like(sparse)
+                acts = (sparse, signed, zero)
+                act = sparse.clone()
+                vrows = torch.tensor([1 << 30], dtype=torch.int32, device="cuda") if m == 5 else None
+                for ai, source in enumerate(acts):
+                    act.copy_(source)
+                    for control, candidate in ((113, 119), (118, 153), (113, 154), (118, 155), (118, 156), (118, 157), (154, 158)):
+                        ref = call(control, act, kw, pk, torch.empty(
+                            m*TOP_K, HIDDEN, dtype=torch.bfloat16, device="cuda"), None)
+                        got = call(candidate, act, kw, pk, torch.empty_like(ref), None)
+                        check(got, ref, f"L{L} M{m} crowded={crowded} act={ai} c{control}->c{candidate} ordinary")
+                        for count in ((1, 2, 3, 4, 5, 1 << 30) if m == 5 else ()):
+                            vrows.fill_(count)
+                            ref = call(control, act, kw, pk, torch.empty_like(ref), vrows)
+                            got = call(candidate, act, kw, pk, torch.empty_like(ref), vrows)
+                            rows = min(count, 5) * TOP_K
+                            check(got[:rows], ref[:rows],
+                                  f"L{L} M{m} act={ai} c{control}->c{candidate} prefix={count} valid")
+                            check(got[rows:], torch.zeros_like(got[rows:]),
+                                  f"L{L} M{m} act={ai} c{control}->c{candidate} prefix={count} suffix")
+                outs = {cfg: torch.empty(m*TOP_K, HIDDEN, dtype=torch.bfloat16, device="cuda")
+                        for cfg in zskip.PAIR_CONFIGS}
+
+                def calls():
+                    for cfg, out in outs.items():
+                        zskip.down(act, kw["sorted_ids"], kw["expert_ids"], kw["num_tokens_padded"], pk, out,
+                                   mode=zskip.SKIP, config=cfg, max_blocks=m*TOP_K, stats=stats,
+                                   verify_rows=vrows)
+
+                calls()
+                torch.cuda.synchronize()
+                if zskip._pdl_on != expected_pdl:
+                    raise RuntimeError(f"PDL fallback before graph capture: active={zskip._pdl_on}")
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    calls()
+                for ai, source in enumerate(acts):
+                    act.copy_(source)
+                    for count in ((None, 1, 2, 3, 4, 5, 1 << 30) if m == 5 else (None,)):
+                        if vrows is not None:
+                            vrows.fill_(count if count is not None else 1 << 30)
+                        for out in outs.values():
+                            out.view(torch.int16).fill_(0x7FBF)
+                        graph.replay()
+                        replays += 1
+                        rows = m*TOP_K if count is None else min(count, 5)*TOP_K
+                        for control, candidate in ((113, 119), (118, 153), (113, 154), (118, 155), (118, 156), (118, 157), (154, 158)):
+                            ref, got = outs[control], outs[candidate]
+                            check(got[:rows], ref[:rows],
+                                  f"L{L} M{m} act={ai} c{control}->c{candidate} replay={count} valid")
+                            if count is not None:
+                                check(got[rows:], torch.zeros_like(got[rows:]),
+                                      f"L{L} M{m} act={ai} c{control}->c{candidate} replay={count} suffix")
+                torch.cuda.synchronize()
+                del graph
+        torch.cuda.synchronize()
+        log(f"prefix L{L}: ordinary/PDL/depth8/replay running mismatches={len(mismatches)}")
+    if zskip._pdl_on != expected_pdl:
+        raise RuntimeError(f"PDL fallback during prefix proof: active={zskip._pdl_on}")
+    result = {"all_ok": not mismatches and stats.tolist()[1] == 0, "layers": len(ctx["layer_ids"]),
+              "comparisons": checks, "elements": values, "graph_replays": replays,
+              "pdl_requested": expected_pdl, "pdl_active": zskip._pdl_on,
+              "pair_configs": {str(cfg): zskip.config_info(cfg) for cfg in zskip.PAIR_CONFIGS},
+              "dense_redo": stats.tolist()[0], "oversize_blocks": stats.tolist()[1],
+              "mismatches": mismatches}
+    dump("prefix-pdl" if expected_pdl else "prefix-ordinary", result)
+    if not result["all_ok"]:
+        raise RuntimeError("paired prefix exactness failed")
+
+
 # ------------------------------------------------------------------------------------------ time
 
 
@@ -448,7 +566,12 @@ def graph_time(fn, reps):
 
 def phase_time(args, ctx):
     zskip.init()
+    prefix_counts = [int(v) for v in args.time_prefix.split(",")] if args.time_prefix else [None]
+    if any(c is not None and (c < 1 or (c > 5 and c != 1 << 30)) for c in prefix_counts):
+        raise ValueError("prefix timing counts must be 1..5 or 1<<30")
     for m in args.time_ms:
+        if m != 5 and any(c is not None for c in prefix_counts):
+            raise ValueError("prefix timing requires M=5")
         per_layer = []
         for li, L in enumerate(ctx["layer_ids"]):
             ex = ctx["ex"][li]
@@ -464,6 +587,7 @@ def phase_time(args, ctx):
             per_layer.append({"ex": ex, "act": st["act"], "kw2": kw2, "packed": ctx["packed"][li],
                               "tid32": tid.to(torch.int32).contiguous(),
                               "out": torch.empty(m * TOP_K, HIDDEN, dtype=torch.bfloat16, device="cuda"),
+                              "verify_rows": torch.tensor([1 << 30], dtype=torch.int32, device="cuda") if m == 5 else None,
                               "act_k": ak, "act_g": ag, "nrows": nr, "sect": sc_, "case": name})
         nb = sum(len(p["act_k"]) for p in per_layer)
         dense_bytes = nb * (INTER * HIDDEN // 2 + (INTER // 16) * HIDDEN)
@@ -491,7 +615,7 @@ def phase_time(args, ctx):
                 for p in per_layer:
                     zskip.down(p["act"], p["kw2"]["sorted_ids"], p["kw2"]["expert_ids"],
                                p["kw2"]["num_tokens_padded"], p["packed"][lay], p["out"], mode=mode,
-                               config=cfg)
+                               config=cfg, verify_rows=p["verify_rows"] if prefix_count is not None else None)
             return fn
 
         variants = [("stock", stock_fn)]
@@ -516,25 +640,33 @@ def phase_time(args, ctx):
                     if mn in ("loadonly", "setuponly") and not args.time_loadonly:
                         continue
                     variants.append((f"{mn}/{lay}/c{cfg}", mk(mode, cfg, lay)))
-        times = {k: [] for k, _ in variants}
-        for _ in range(args.rounds):
-            for k, fn in variants:
-                times[k] += graph_time(fn, args.time_reps)
-        rows = []
-        for k, _ in variants:
-            us = statistics.median(times[k]) * 1000 / Lc
-            mode = k.split("/")[0]
-            byt = (dense_bytes if mode in ("stock", "dense", "loadonly_dense")
-                   else rs_bytes if mode == "routed_sparse" else skip_bytes)
-            rows.append({"variant": k, "us_per_call": round(us, 2),
-                         "GBps": round(byt / Lc / (us * 1e-6) / 1e9, 1),
-                         "min_us": round(min(times[k]) * 1000 / Lc, 2)})
-        rows.sort(key=lambda r: r["us_per_call"])
-        stock_us = next(r["us_per_call"] for r in rows if r["variant"] == "stock")
-        for r in rows:
-            r["speedup_vs_stock"] = round(stock_us / r["us_per_call"], 3)
-            log(f"   M={m} {r['variant']:28s} {r['us_per_call']:8.2f} us  {r['GBps']:6.1f} GB/s  x{r['speedup_vs_stock']}")
-        dump(f"time-M{m}", {"info": info, "rows": rows})
+        for prefix_count in prefix_counts:
+            if prefix_count is not None:
+                for p in per_layer:
+                    p["verify_rows"].fill_(prefix_count)
+            times = {k: [] for k, _ in variants}
+            for round_index in range(args.rounds):
+                ordered = variants if round_index % 2 == 0 else reversed(variants)
+                for k, fn in ordered:
+                    times[k] += graph_time(fn, args.time_reps)
+            rows = []
+            for k, _ in variants:
+                us = statistics.median(times[k]) * 1000 / Lc
+                mode = k.split("/")[0]
+                byt = (dense_bytes if mode in ("stock", "dense", "loadonly_dense")
+                       else rs_bytes if mode == "routed_sparse" else skip_bytes)
+                rows.append({"variant": k, "us_per_call": round(us, 2),
+                             "GBps": None if prefix_count is not None else round(byt / Lc / (us * 1e-6) / 1e9, 1),
+                             "min_us": round(min(times[k]) * 1000 / Lc, 2)})
+            rows.sort(key=lambda r: r["us_per_call"])
+            stock_us = next(r["us_per_call"] for r in rows if r["variant"] == "stock")
+            for r in rows:
+                r["speedup_vs_stock"] = round(stock_us / r["us_per_call"], 3)
+                bandwidth = f"{r['GBps']:6.1f}" if r["GBps"] is not None else "   n/a"
+                log(f"   M={m} {r['variant']:28s} {r['us_per_call']:8.2f} us  {bandwidth} GB/s  x{r['speedup_vs_stock']}")
+            suffix = "" if prefix_count is None else f"-prefix{prefix_count}"
+            dump(f"time-M{m}{suffix}", {"info": info, "verify_rows": prefix_count,
+                                       "rows": rows, "times_ms": times})
 
 
 # ------------------------------------------------------------------------------------------ main
@@ -551,9 +683,10 @@ def main():
     ap.add_argument("--windows", type=int, default=2)
     ap.add_argument("--capture", default="", help="'' (none), 'all' or comma-separated sequence names")
     ap.add_argument("--layouts", default="rows,swap")
-    ap.add_argument("--pair", action="store_true", help="also check/time swap2 decode 113 and fused 118")
+    ap.add_argument("--pair", action="store_true", help="also check/time paired configs 113/119/154 and fused 118/153/155")
     ap.add_argument("--time-ms", default="4")
     ap.add_argument("--time-configs", default="all")
+    ap.add_argument("--time-prefix", default=None, help="comma-separated M5 verify-row counts: 1..5 or 1<<30")
     ap.add_argument("--time-all-dense", action="store_true")
     ap.add_argument("--time-loadonly", action="store_true")
     ap.add_argument("--rounds", type=int, default=3)
@@ -574,14 +707,19 @@ def main():
     assert zskip.available(), zskip.load_error()
     torch.cuda.set_device(0)
     for cfg in list(zskip.CONFIGS) + list(zskip.CONFIGS4):
-        log(f"zskip config {cfg}: {zskip.config_info(cfg)}")
+        try:
+            log(f"zskip config {cfg}: {zskip.config_info(cfg)}")
+        except ValueError as exc:
+            log(f"optional config {cfg} unavailable: {exc}")
     log(f"routed_sparse available: {routed_sparse is not None}")
     phases = args.phase.split(",")
     ctx = {}
+    if "prefix" in phases:
+        args.pair = True
     if args.pair:
         assert "swap" in args.layouts.split(","), "--pair needs the original swap layout"
         ctx["pair_configs"] = []
-        for cfg in (113, 118):
+        for cfg in zskip.PAIR_CONFIGS:
             try:
                 log(f"pair config {cfg}: {zskip.config_info(cfg)}")
                 ctx["pair_configs"].append(cfg)
@@ -594,7 +732,7 @@ def main():
         if not args.capture:
             args.capture = "all"
         phase_capture(args, ctx)
-    if any(p in phases for p in ("exact", "time", "epi")) and ("exact" in phases or "time" in phases):
+    if "exact" in phases or "time" in phases or "prefix" in phases:
         from vllm.model_executor.layers.fused_moe.experts import humming_tuned_moe  # noqa
 
         snap = hme.Snapshot(os.environ["NEMO_SNAPSHOT"])
@@ -631,6 +769,8 @@ def main():
         phase_exact(args, ctx)
     if ctx.get("exact_failed"):
         raise SystemExit("zskip exactness failed; see exact.json")
+    if "prefix" in phases:
+        phase_prefix(args, ctx)
     if "time" in phases:
         phase_time(args, ctx)
     log("done")

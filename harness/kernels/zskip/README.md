@@ -132,3 +132,46 @@ includes real/synthetic/adversarial M1..8 tests in dense and skip modes;
 These require the pinned CUDA image and snapshot. This port has NOT been
 CUDA-compiled, GPU-run, token-verified or timed locally. The new fused variant
 has no published timing. Dadon's c113 timing cannot be claimed for c118.
+
+## Prefix-selected paired schedules
+
+The paired family retains the original 113/118 paths and adds optional CTA
+and register-ring variants. Config 158 is the selected experiment. One separate
+prep builds the block metadata, then two launches read the existing device
+verify-row count: R=4 with one warp per pair for prefix 1 or at least 5, and
+R=3 with two warps per CTA for prefixes 2, 3, and 4. Only the selected launch
+writes outputs. There is no host readback, partial mask, new weight format,
+or cross-request cache. Original 113/118 checks run before the new config's
+per-layer bitwise guard, and a failure keeps the checked pair.
+
+All 21 tile pairs are covered. The two-warp path has a guarded single-warp CTA
+for the odd pair. Each active warp keeps the original TPW=2 operands, ascending
+K MMA sequence, dequantization, FP32 accumulation, global scale, and BF16 output
+rounding. `ZSKIP_DADON=0` removes the paired path and keeps the legacy choices.
+
+The proof covers all 23 real MoE layers, M5 and M9, spread/crowded routing,
+signed and all-zero rows, empty K16 groups, changing activations, prefixes 1
+through 5 and the all-rows sentinel, and ordinary/PDL graph replay with changing
+prefix counts. PDL passed 1,371,009,024 element comparisons and 1,104 replays
+with no mismatch. Median direct timing over all layers and six alternating
+rounds was:
+
+| verify rows | leader 118 us | dynamic 158 us |
+|---|---:|---:|
+| 1 | 87.38 | 71.39 |
+| 2 | 105.71 | 104.02 |
+| 3 | 143.67 | 135.93 |
+| 4 | 181.01 | 172.74 |
+| 5 | 225.44 | 213.11 |
+| all-rows sentinel | 225.59 | 214.06 |
+
+Static WPC=3 and fused-WPC=2 were rejected on direct timing. Static R=2/R=4
+and unfused two-warp R=3 remain available as comparisons, not silent defaults.
+The selector's second launch and separate-prep costs are included in these
+numbers, rather than inferred from an isolated kernel's best case.
+
+Reproduce with `--phase prefix,time --layers all --layouts swap --pair
+--time-ms 5 --time-configs 113,118,154,156,157,158 --time-prefix
+1,2,3,4,5,1073741824` in the pinned image. Use `ZSKIP_PDL=0` for the ordinary
+launch proof. Prefix timings omit GB/s because the recorded byte counts use
+full-M5 masks; raw times are preserved per prefix and round.

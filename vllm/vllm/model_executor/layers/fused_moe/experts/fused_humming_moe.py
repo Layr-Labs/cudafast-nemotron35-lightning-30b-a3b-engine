@@ -40,7 +40,7 @@ except ImportError:
 
 def _l2pf_next_layer(layer, num_tokens: int) -> bool:
     """LOCAL PATCH (cudafast-nemotron35): small calls only: queue an L2 prefetch
-    of the head of the next Mamba layer's in_proj weight (its fp8small pack when
+    of the head of the next Mamba layer's in_proj weight (its fp8c buffer or fp8small pack when
     present) on a side stream while the latency-bound routed down projection
     runs. Moves no value; the caller rejoins after the down projection."""
     if _l2pf is None or num_tokens > 8 or _l2pf.MOE_BYTES <= 0:
@@ -48,7 +48,9 @@ def _l2pf_next_layer(layer, num_tokens: int) -> bool:
     nxt = _l2pf.AHEAD_MOE.get(str(getattr(layer, "layer_name", "")))
     if nxt is None:
         return False
-    w = getattr(nxt, "_fp8small_weight", None)
+    w = getattr(nxt, "_fp8c_weight", None)  # fp8c buffer: tile-major, read order
+    if w is None:
+        w = getattr(nxt, "_fp8small_weight", None)
     if w is None:
         w = getattr(nxt, "weight", None)
     return _l2pf.prefetch(w, max_bytes=_l2pf.MOE_BYTES)

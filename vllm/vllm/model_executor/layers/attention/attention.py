@@ -820,21 +820,23 @@ direct_register_custom_op(
 )
 
 
-def _prefetch_ahead(ahead, rows: int) -> bool:
+def _prefetch_ahead(ahead, rows: int, budget: int | None = None,
+                    gate=None, gate_bytes: int = 0) -> bool:
     """Queue the L2 prefetch of the projection that follows the attention kernel: the
     packed planes the 5-row verify reads (nemotron_h_attn_packed.py) when the
     projection has them, else its weight."""
+    budget = _l2pf.ATTN_BYTES if budget is None else budget
     native_sm = getattr(ahead, "_mtp_pk_sm", None)
     if native_sm is not None:
-        queued = _l2pf.prefetch(native_sm, max_bytes=_l2pf.ATTN_BYTES * 2 // 3)
-        return _l2pf.prefetch(
-            ahead._mtp_pk_ex, max_bytes=_l2pf.ATTN_BYTES // 3
-        ) or queued
+        return _l2pf.prefetch_many(((gate, gate_bytes),
+                                   (native_sm, budget * 2 // 3),
+                                   (ahead._mtp_pk_ex, budget - budget * 2 // 3)))
     planes = getattr(ahead, "_apk_planes", None)
     if planes is None or rows != 5:
-        return _l2pf.prefetch(ahead.weight, max_bytes=_l2pf.ATTN_BYTES)
-    queued = _l2pf.prefetch(planes[0], max_bytes=_l2pf.ATTN_BYTES * 2 // 3)
-    return _l2pf.prefetch(planes[1], max_bytes=_l2pf.ATTN_BYTES // 3) or queued
+        return _l2pf.prefetch_many(((gate, gate_bytes), (ahead.weight, budget)))
+    return _l2pf.prefetch_many(((gate, gate_bytes),
+                               (planes[0], budget * 2 // 3),
+                               (planes[1], budget - budget * 2 // 3)))
 
 
 @eager_break_during_capture
@@ -860,12 +862,11 @@ def unified_attention_with_output(
     # of the following projection's weight into L2 on a side stream while the
     # (latency-bound) attention kernel runs, then rejoin. Moves no value.
     ahead = _l2pf.AHEAD.get(layer_name) if _l2pf is not None else None
-    pf = (
-        ahead is not None
-        and query.shape[0] <= 8
-        and _l2pf.ATTN_BYTES > 0
-        and _prefetch_ahead(ahead, query.shape[0])
-    )
+    pf = False
+    if (ahead is not None and query.shape[0] <= 8 and _l2pf.ATTN_BYTES > 0):
+        gate, reserved = _l2pf.gate_weight(layer_name, _l2pf.ATTN_BYTES)
+        pf = _prefetch_ahead(ahead, query.shape[0],
+                             _l2pf.ATTN_BYTES - reserved, gate, reserved)
     self.impl.forward(
         self,
         query,

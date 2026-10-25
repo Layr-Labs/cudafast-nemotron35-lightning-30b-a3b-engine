@@ -1079,3 +1079,10 @@ def convert_to_humming_moe_kernel_format(
 
     if tuned:
         humming_zskip.finalize(layer)
+
+    # LOCAL PATCH (cudafast-nemotron35, nvsc): lossless 6-bit copy of the w13
+    # block scales for the decode up kernel (fused_moe/experts/humming_nvsc.py).
+    if tuned:
+        from vllm.model_executor.layers.fused_moe.experts import humming_nvsc
+
+        humming_nvsc.prepare_layer(layer)

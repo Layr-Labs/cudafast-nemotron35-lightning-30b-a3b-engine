@@ -158,6 +158,7 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         self, c: FP8ScaledMMLinearLayerConfig, layer_param_names: Sequence[str]
     ) -> None:
         self._fp8small_weight: torch.Tensor | None = None
+        self._fp8c_weight: torch.Tensor | None = None
         self.logical_output_size: int | None = None
         super().__init__(c, layer_param_names)
 
@@ -221,8 +222,18 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
 
                 packed = prepare_weight(weight)
                 if packed is not None:
-                    layer.register_buffer("_fp8small_weight", packed, persistent=False)
-                    self._fp8small_weight = packed
+                    # LOCAL PATCH (cudafast-nemotron35): fp8c, a verified lossless
+                    # 7-bit coding of the same pack (harness/kernels/fp8c); a layer
+                    # it rejects keeps fp8small. FP8C=0 disables.
+                    from .fp8c import prepare_weight as prepare_fp8c
+
+                    comp = prepare_fp8c(packed)
+                    if comp is not None:
+                        layer.register_buffer("_fp8c_weight", comp, persistent=False)
+                        self._fp8c_weight = comp
+                    else:
+                        layer.register_buffer("_fp8small_weight", packed, persistent=False)
+                        self._fp8small_weight = packed
             return
 
         # B is column-major [K, N]
@@ -275,6 +286,12 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
             bias = self._pad_to_alignment(bias, dim=0, alignment=16)
 
         if (
+            self._fp8c_weight is not None
+            and bias is None
+            and out_dtype == torch.bfloat16
+        ):
+            output = torch.ops.vllm.fp8c_scaled_mm(A, B, self._fp8c_weight, As, Bs)
+        elif (
             self._fp8small_weight is not None
             and bias is None
             and out_dtype == torch.bfloat16

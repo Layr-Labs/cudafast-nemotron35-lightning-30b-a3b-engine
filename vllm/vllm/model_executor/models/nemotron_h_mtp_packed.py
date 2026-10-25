@@ -100,6 +100,48 @@ def _word_kernel_probe(packed, original):
             raise RuntimeError("word specialization differs from original kernel")
 
 
+_GROUP8_LOAD = os.environ.get("MTP_PACK12_GROUP8", "1") != "0"
+_GROUP8_OK: dict[tuple[int, int, int], bool] = {}
+
+
+def group8_enabled(device, n, k):
+    return _GROUP8_LOAD and _GROUP8_OK.get((_device_index(device), n, k), False)
+
+
+def _admit_group8(packed, original):
+    if not _GROUP8_LOAD or original.dim() != 2:
+        return
+    n, k = original.shape
+    if (n, k) not in ((4608, 2688), (2688, 4096)):
+        return
+    key = (_device_index(original.device), n, k)
+    if key in _GROUP8_OK:
+        return
+    try:
+        gate = torch.zeros(3, dtype=torch.int32, device=original.device)
+        gen = torch.Generator(device=original.device).manual_seed(74113)
+        for scale in (0.001, 1.0, 32.0):
+            x = (torch.randn((1, k), dtype=torch.float32, generator=gen,
+                             device=original.device) * scale).to(torch.bfloat16)
+            outputs = []
+            for grouped in (False, True):
+                y = x.new_empty((1, n))
+                packed_gemv[(triton.cdiv(n, 8),)](
+                    x, *packed.planes, y, n, k, k, gate,
+                    BN=8, BK=512, EVICT=True, GATED=True, launch_pdl=True,
+                    WORD=False, GROUP8=grouped, num_warps=4, num_stages=3,
+                )
+                outputs.append(y)
+            if not torch.equal(outputs[0].view(torch.int16), outputs[1].view(torch.int16)):
+                raise RuntimeError("GROUP8 differs from original packed_gemv")
+        _GROUP8_OK[key] = True
+        print(f"MTP_PACK12_GROUP8 exact shape={(n, k)}", flush=True)
+    except Exception as exc:
+        _GROUP8_OK[key] = False
+        print(f"MTP_PACK12_GROUP8 unavailable, original packed_gemv kept: {exc!r}",
+              flush=True)
+
+
 @gluon.jit
 def load_packed(SM, EX, BASE, RI, RAW, index, mask, EVICT:tl.constexpr=True,
                 WORD:tl.constexpr=False):
@@ -142,16 +184,45 @@ def stopped_zero(ptrs, mask, lay:tl.constexpr, BN:tl.constexpr):
 
 
 @gluon.jit
+def load_packed_group8(SM, EX, BASE, RI, RAW, index, lane, mask, value_mask,
+                       EVICT:tl.constexpr=True):
+    bid=index//128
+    rawid=tl.load(RI+bid,mask=mask,other=-1,eviction_policy='evict_first' if EVICT else '')
+    coded=mask&(rawid<0)
+    index8=index[:,None]+lane[None,:]
+    rawid8,_=tl.broadcast(rawid[:,None],index8)
+    sm=tl.load(SM+index8,mask=value_mask&(rawid8<0),other=0,eviction_policy='evict_first' if EVICT else '').to(tl.uint16)
+    words=EX.to(tl.pointer_type(tl.uint32))
+    word=tl.load(words+index//8,mask=coded,other=0,eviction_policy='evict_first' if EVICT else '')
+    code=((word[:,None]>>(lane[None,:].to(tl.uint32)*4))&15).to(tl.uint16)
+    base=tl.load(BASE+bid,mask=coded,other=1,eviction_policy='evict_first' if EVICT else '').to(tl.uint16)
+    base8,_=tl.broadcast(base[:,None],index8)
+    exp=tl.where(code==0,0,base8+code-1)
+    bits=((sm&128)<<8)|(exp<<7)|(sm&127)
+    raw=tl.load(RAW+rawid8.to(tl.int64)*128+index8%128,
+                mask=value_mask&(rawid8>=0),other=0,eviction_policy='evict_first' if EVICT else '')
+    bits=tl.where(rawid8>=0,raw,bits)
+    bits=tl.where(value_mask,bits,0).to(tl.uint16)
+    return bits.to(tl.bfloat16,bitcast=True)
+
+
+@gluon.jit
 def packed_gemv(x_ptr, SM, EX, BASE, RI, RAW, y_ptr, N, K, stride_wn,
                 gate_ptr, BN:tl.constexpr, BK:tl.constexpr, EVICT:tl.constexpr,
                 GATED:tl.constexpr=False, launch_pdl:tl.constexpr=False,
-                WORD:tl.constexpr=False):
+                WORD:tl.constexpr=False, GROUP8:tl.constexpr=False):
     if launch_pdl:
         pdl_prologue()
     layout:tl.constexpr=BlockedLayout([1,8],[1,32],[2,2],[1,0])
     pid=tl.program_id(0)
     offs_n=pid*BN+tl.arange(0,BN,layout=SliceLayout(1,layout))
     offs_k=tl.arange(0,BK,layout=SliceLayout(0,layout))
+    if GROUP8:
+        group_layout:tl.constexpr=BlockedLayout([1,8],[32,1],[4,1],[1,0])
+        group=tl.arange(0,BN*(BK//8),layout=SliceLayout(1,group_layout))
+        lane=tl.arange(0,8,layout=SliceLayout(0,group_layout))
+        group_n=pid*BN+group//(BK//8)
+        group_k=(group%(BK//8))*8
     nmask=offs_n<N
     if GATED:
         if tl.load(gate_ptr)!=0:
@@ -163,7 +234,15 @@ def packed_gemv(x_ptr, SM, EX, BASE, RI, RAW, y_ptr, N, K, stride_wn,
     for k0 in range(0,K,BK):
         kk=k0+offs_k
         kmask=kk<K
-        w=load_packed(SM,EX,BASE,RI,RAW,offs_n[:,None]*stride_wn+kk[None,:],wn[:,None]&kmask[None,:],EVICT=EVICT,WORD=WORD)
+        if GROUP8:
+            gk=k0+group_k
+            index=group_n*stride_wn+gk
+            mask=(group_n<N)&(gk<K)
+            value_mask=mask[:,None]&(gk[:,None]+lane[None,:]<K)
+            w8=load_packed_group8(SM,EX,BASE,RI,RAW,index,lane,mask,value_mask,EVICT=EVICT)
+            w=tl.convert_layout(tl.reshape(w8,(BN,BK)),layout,assert_trivial=True)
+        else:
+            w=load_packed(SM,EX,BASE,RI,RAW,offs_n[:,None]*stride_wn+kk[None,:],wn[:,None]&kmask[None,:],EVICT=EVICT,WORD=WORD)
         x=tl.load(x_ptr+kk,mask=kmask,other=0.0)
         acc+=w.to(tl.float32)*x[None,:].to(tl.float32)
     y=tl.sum(acc,axis=1)
@@ -263,11 +342,12 @@ class PackedBF16:
 
 
 @torch.no_grad()
-def pack_bf16(w):
+def pack_bf16(w, check_group8=False):
     """Deterministic input-independent GPU pack with exhaustive bit validation.
 
     Only row-contained 128-value blocks are supported; callers retain the
     original tensor for unsupported shapes. No source BF16 storage is retained.
+    check_group8 additionally compares the grouped native projection with BYTE.
     """
     if (not w.is_cuda or w.dtype != torch.bfloat16 or not w.is_contiguous()
             or w.dim() < 2 or w.shape[-1] % 128):
@@ -306,6 +386,8 @@ def pack_bf16(w):
     if bad:
         raise RuntimeError(f"MTP lossless pack failed: {bad}/{n} decoded BF16 bits differ")
     _admit_word_decode(packed, w, counter)
+    if check_group8:
+        _admit_group8(packed, w)
     print(f"MTP_PACK12 tensor shape={packed.shape} values={n} mismatches=0 "
           f"raw_bytes={2*n} packed_bytes={packed.nbytes} escapes={count}", flush=True)
     return packed
@@ -326,7 +408,8 @@ def _packed_linear_impl(
         packed_gemv[(triton.cdiv(n, 8),)](
             x, *p.planes, y, n, k, k, gate, BN=8, BK=512, EVICT=True,
             GATED=gated, num_warps=4, num_stages=3, launch_pdl=mtp_pdl(),
-            WORD=word_load_enabled(x.device))
+            WORD=word_load_enabled(x.device),
+            GROUP8=group8_enabled(x.device, n, k))
         return y
     if fallback.numel():
         return mtp_small_linear_impl(x, fallback)
@@ -337,6 +420,9 @@ def _packed_linear_impl(
         if x.stride(1) != 1:
             x = x.contiguous()
         y = x.new_empty((x.shape[0], n))
+        from .nemotron_h_mtp_pkmm import maybe_run
+        if maybe_run(p, x, y, gate, gated, word_load_enabled(x.device), mtp_pdl()):
+            return y
         packed_small[(triton.cdiv(n, 64),)](
             x, *p.planes, y, x.shape[0], n, k, x.stride(0), y.stride(0), gate,
             GATED=gated, num_warps=4, num_stages=4, launch_pdl=mtp_pdl(),
@@ -419,9 +505,11 @@ def prepare_mtp_packed(module):
                      or (_PACK_OPROJ and name.endswith("o_proj")
                          and tuple(w.shape) == (2688, 4096)))
                 and type(getattr(layer, "quant_method", None)).__name__ == "MTPSmallLinearMethod"):
-            p = pack_bf16(w)
+            p = pack_bf16(w, check_group8=True)
             if p is None:
                 continue
+            from .nemotron_h_mtp_pkmm import prepare
+            prepare(p, word_load_enabled(w.device))
             raw_bytes += w.numel() * 2
             packed_bytes += p.nbytes
             values += w.numel()

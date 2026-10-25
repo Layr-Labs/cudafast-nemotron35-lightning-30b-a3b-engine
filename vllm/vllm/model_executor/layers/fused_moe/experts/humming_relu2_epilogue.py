@@ -196,10 +196,21 @@ def forward_relu2(
     top_k,
     valid_shape_m,
     input_scale=None,
+    nvsc=None,
 ):
     meta = layer.humming_metas["w13"]
     assert inputs.dtype == outputs.dtype == torch.bfloat16 and input_scale is None
     assert getattr(layer, meta.bias_name, None) is None
+    # LOCAL PATCH (cudafast-nemotron35, nvsc): <= 8 tokens on a repacked layer
+    # read 6-bit block scales (humming_nvsc.py); nvsc=False forces stock.
+    if nvsc is not False and inputs.shape[0] <= 8:
+        from vllm.model_executor.layers.fused_moe.experts import humming_nvsc
+
+        if humming_nvsc.launch(
+            layer, inputs, outputs, compute_config, tuning_config, sorted_ids,
+            expert_ids, num_tokens_padded, top_k, valid_shape_m,
+        ):
+            return outputs
     configs = prepare(
         meta, compute_config, tuning_config,
         evict_first=(inputs.shape[0] == 496 and top_k == 6

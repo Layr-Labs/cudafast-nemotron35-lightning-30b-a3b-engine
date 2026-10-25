@@ -41,6 +41,9 @@ DRAFT_SCREEN: list[torch.Tensor] = []
 AHEAD: dict[str, torch.nn.Module] = {}
 # MoE layer name -> the next layer's in_proj module (filled by the model).
 AHEAD_MOE: dict[str, torch.nn.Module] = {}
+# Previous Mamba/attention op -> the actual following target MoE router.
+AHEAD_GATE: dict[str, torch.nn.Module] = {}
+_GATE_PREFETCH = os.environ.get("L2PF_GATE", "1") != "0"
 
 _lib = None
 _side: dict[int, torch.cuda.Stream] = {}
@@ -54,6 +57,14 @@ def _load():
         return None
     lib.l2pf_prefetch.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p]
     lib.l2pf_prefetch.restype = ctypes.c_int
+    try:
+        lib.l2pf_prefetch3.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
+                                     ctypes.c_void_p, ctypes.c_size_t,
+                                     ctypes.c_void_p, ctypes.c_size_t,
+                                     ctypes.c_int, ctypes.c_void_p]
+        lib.l2pf_prefetch3.restype = ctypes.c_int
+    except AttributeError:
+        pass  # Older library: retain the original per-range launch ABI.
     _lib = lib
     return lib
 
@@ -88,6 +99,65 @@ def prefetch(t: torch.Tensor | None, max_bytes: int = 0) -> bool:
 def join(device: torch.device) -> None:
     """Make the current stream wait for the side stream's prefetches."""
     torch.cuda.current_stream(device).wait_stream(_side_stream(device))
+
+
+def gate_weight(layer_name: str, budget: int) -> tuple[torch.Tensor | None, int]:
+    """Reserve at most a quarter of the existing window for next-router bytes.
+
+    Prefetches the exact immutable BF16 shadow the existing router selects,
+    or its original FP32 weight. Never changes a weight or an arithmetic path.
+    The caller subtracts the reservation from its projection prefetch budget.
+    """
+    if not _GATE_PREFETCH or not ENABLED or _lib is None or budget <= 0:
+        return None, 0
+    gate = AHEAD_GATE.get(layer_name)
+    if gate is None:
+        return None, 0
+    weight = gate.weight
+    try:
+        import smallk
+        shadow = smallk.gate_w16(weight)
+    except (ImportError, AttributeError):
+        shadow = None
+    if shadow is not None:
+        weight = shadow
+    reserved = min(weight.untyped_storage().nbytes(), budget // 4)
+    if reserved <= 0:
+        return None, 0
+    return weight, reserved
+
+
+def prefetch_many(ranges) -> bool:
+    """Up to three immutable ranges in one CUDA launch and side-stream fork."""
+    if not ENABLED or _lib is None:
+        return False
+    selected = [(t, int(limit)) for t, limit in ranges
+                if t is not None and t.is_cuda and limit > 0]
+    if not selected:
+        return False
+    if len(selected) > 3 or any(t.device != selected[0][0].device for t, _ in selected):
+        return False
+    if len(selected) == 1:
+        return prefetch(selected[0][0], max_bytes=selected[0][1])
+    fused = getattr(_lib, "l2pf_prefetch3", None)
+    if fused is None:
+        queued = False
+        for tensor, limit in selected:
+            queued = prefetch(tensor, max_bytes=limit) or queued
+        return queued
+    args = []
+    for tensor, limit in selected:
+        storage = tensor.untyped_storage()
+        args.extend((storage.data_ptr(), min(storage.nbytes(), limit)))
+    args.extend([0, 0] * (3 - len(selected)))
+    device = selected[0][0].device
+    main = torch.cuda.current_stream(device)
+    side = _side_stream(device)
+    side.wait_stream(main)
+    rc = fused(*args, CHUNK, side.cuda_stream)
+    if rc != 0:
+        raise RuntimeError(f"l2pf_prefetch3 failed: {rc}")
+    return True
 
 
 if ENABLED:

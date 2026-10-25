@@ -5407,7 +5407,11 @@ class GPUModelRunner(
             found: dict = {}
             target = dict(self.get_model().named_parameters())
             target.update(dict(self.get_model().named_buffers()))
-            for name in ("layers.0.mixer.in_proj._fp8small_weight", "layers.0.mixer.in_proj.weight"):
+            for name in (
+                "layers.0.mixer.in_proj._fp8c_weight",
+                "layers.0.mixer.in_proj._fp8small_weight",
+                "layers.0.mixer.in_proj.weight",
+            ):
                 hit = [t for n, t in target.items() if n.endswith(name)]
                 if hit and "target" not in found:
                     found["target"] = hit[0]

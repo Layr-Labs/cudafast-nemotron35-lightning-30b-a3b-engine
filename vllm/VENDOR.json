@@ -278,6 +278,30 @@
     {
       "file": "harness/kernels/pzskip/csrc/pzskip.cu (+ build.sh)",
       "why": "PZ333 M496/top-6 only: HUMMING_EVICT_PZ defaults on and gives immutable packed B/BS cp.async loads L2 evict-first priority. Loader addresses, bytes, masks, K16 MMA order, negative-zero repair and formats are unchanged. HUMMING_EVICT_PZ=0 restores stock. Separate native template specialization; compile/load failure retains stock PZ333. Stacks independently with the routed-up evf policy; no decode change."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_pkmm.py, models/nemotron_h_mtp_packed.py; harness/kernels/l2pf; models/nemotron_h.py; layers/mamba/mamba_mixer2.py; layers/attention/attention.py",
+      "why": "jacklightChen da9a764c (from ercumentyildirim 297e3412), carried unchanged as in AvinashNayak27 2ff1c240: optional narrow packed MMA for the native MTP drafter's M=2..5 projections with an exact K128 tail, admitted per shape only after full-output bit equality with packed_small and a cold timing filter (MTP_PACK12_MM=0 disables); next-MoE-router L2 prefetch sharing the existing Mamba/attention prefetch window in one launch. Moves no value; original paths kept as fallback."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_attn_packed.py; harness/kernels/apk12",
+      "why": "kaankolcu 8d510eaa, carried unchanged: a CUDA mma.sync kernel over a fragment-order copy of the 12-bit attention planes for the 5-row verify QKV/output projections. Ranked with the Triton configurations under the record's graph-replay speed guard (0.96 of F.linear) and bitwise F.linear check on every layer, after a child-process probe and a load-time decode check of every weight. Same accumulation chain (ascending K from +0, one RN rounding). ATTN_PACK12=0 disables the packed path."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_packed.py; harness/tests/packed_gemv_group8_exact.py; harness/vllm_resident/test_ssd_prefill_fused.py",
+      "why": "ivanfioravanti c0ce642d, carried unchanged: opt-in GROUP8 decoder for the native MTP M=1 packed QKV/output GEMV (eight-value register groups, one uint32 EX word per group, original layout restored with assert_trivial=True). Same BF16 bits, raw escapes, gate, PDL launch, tile, FP32 accumulation and reduction. Enabled per shape only after load-time byte equality with the published packed_gemv at three magnitudes; failure keeps the published path. MTP_PACK12_GROUP8=0 disables it. Disjoint from the M=2..5 narrow packed MMA branch. Test-only SSD fixture corrections."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_down_packed.py, models/nemotron_h_mtp_compact.py, models/nemotron_h_mtp_kernels.py",
+      "why": "jacklightChen 7c65206e, carried unchanged: optional lossless 12-bit storage (the existing pack_bf16 codec) of the native MTP drafter's transposed routed/shared down weights, decoded on demand in the compact slot kernel at the original sorted nonzero indices; same FP32 products, slot order, combine and residual. Admitted per TOPK only after raw FP32 bit equality with _down_slots over all experts and a cold timing filter; original BF16 weights kept as fallback. MTP_DOWN_PACK12=0 disables it."
+    },
+    {
+      "file": "vllm/model_executor/kernels/linear/scaled_mm/{fp8c.py,cutlass.py}, layers/mamba/mamba_mixer2.py, layers/fused_moe/experts/fused_humming_moe.py, v1/worker/gpu_model_runner.py; harness/kernels/fp8c",
+      "why": "fp8c: lossless load-time repack of the two Mamba FP8 projection weights (in_proj 10304x2688, out_proj 2688x4096) for the 1-8 row path. Per output column an 8-exponent window gives a 7-bit code s|e-e0|mmm; the column's least frequent window code is the escape and escaped bytes are stored raw in a per-tile exception area (u16 offsets per chunk and warp in the tile header). 7.19 bits/weight (800.5 of 890.3 MB). Input-independent; every byte is preserved: at load the kernel's own decoder rebuilds the whole fp8small pack and it is compared byte for byte; any mismatch, window overflow or size above 93% keeps fp8small for that layer. The kernel rebuilds the exact fp8small B-fragment words in registers and issues the same native e4m3 m16n8k32 MMA chain (ascending K from +0) and FP32 scale-B, scale-A, RN BF16 epilogue, so outputs are bit-identical (1840 real-weight cases vs fp8small and CUTLASS, graph replay). PDL like fp8small (load-time data before griddepcontrol.wait). The l2pf hooks prefetch the head of the fp8c buffer, which is tile-major in the kernel's read order. CUTLASS keeps the original weight for prefill and M>8. FP8C=0 restores fp8small; FP8C_PDL=0 disables PDL."
+    },
+    {
+      "file": "model_executor/layers/fused_moe/experts/humming_nvsc.py (+ humming_relu2_epilogue.py forward_relu2, quantization/utils/humming_utils.py)",
+      "why": "nvsc, default on: at load, a routed w13 layer whose FP8 E4M3 block scales take <= 64 distinct bytes keeps a 64-entry table plus a tile-major 6-bit index stream (load check decodes every byte back; otherwise the layer stays stock). For <= 8 tokens a derived ReLU2 humming kernel replaces only the two B-scale loaders (cp.async of 96 instead of 128 bytes per stage; shared->register decode to the identical uint32 of original E4M3 bytes), so dequantization, the K16 MMA chain and the epilogue are stock and the output is bit-identical. Prefill keeps the stock kernel and scale tensor (re-pointed into the same allocation). NVSC=0 restores current behaviour; compile/load failure logs once and uses stock."
     }
   ]
 }

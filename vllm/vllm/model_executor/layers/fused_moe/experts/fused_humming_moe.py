@@ -84,7 +84,17 @@ def _l2pf_next_ssm_ring(layer) -> bool:
     ngroups = getattr(mixer, "n_groups", 0) // max(getattr(mixer, "tp_size", 1), 1)
     ring_bytes = mixer.spec_replay_ring_len * (nheads * dim + ngroups * dstate + nheads) * 2
     tag_off = nheads * dim * dstate * state.element_size()
-    return _l2pf.prefetch_slots2(state, slots[:, 1], 0, ring_bytes, slots[:, 0], tag_off, 16)
+    queued = _l2pf.prefetch_slots2(state, slots[:, 1], 0, ring_bytes, slots[:, 0], tag_off, 16)
+    if getattr(_l2pf, "SSM_ANCHOR", False) and hasattr(_l2pf, "prefetch_anchor") and slots.shape[1] >= 3:
+        from vllm.model_executor.layers.mamba.ops.mamba_ssm_spec_replay import LAZY_PERIOD
+
+        seq_lens = getattr(meta, "seq_lens", None)
+        qsl = getattr(meta, "query_start_loc_d", None)
+        if seq_lens is not None and qsl is not None and qsl.numel() >= 2:
+            queued = _l2pf.prefetch_anchor(
+                state, slots[0], seq_lens, qsl, tag_off, LAZY_PERIOD, tag_off
+            ) or queued
+    return queued
 from vllm.model_executor.layers.fused_moe.moe_permute_unpermute import (
     MoEPermuteScratch,
     moe_permute,

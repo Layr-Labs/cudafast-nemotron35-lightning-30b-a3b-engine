@@ -22,7 +22,7 @@
 
 #include <cstdint>
 
-#define VS_VERSION 1
+#define VS_VERSION 2
 
 namespace {
 
@@ -139,25 +139,25 @@ __global__ void __launch_bounds__(kThreads)
   __syncthreads();
   if (t == 0) {
     *counter = 0u;  // ready for the next launch (stream order)
-    const int vr = vrows == nullptr ? 0 : *vrows;
+    const int vr = vrows == nullptr ? 0 : __ldcg(vrows);
     for (int p = 0; p < out_len; ++p) out[p] = -1;
     // nd is the request's draft count; clamp only guards memory (stock never exceeds it)
-    const int nd = max(0, min(cu_num_draft[0], out_len - 1));
+    const int nd = max(0, min(__ldcg(cu_num_draft), out_len - 1));
     bool rejected = false;
     int written = 0;
     for (int pos = 0; pos < nd; ++pos) {
-      int ti = target_idx[pos];
+      int ti = __ldcg(target_idx + pos);
       if (ti < 0) ti += R;  // torch indexing wraps negative indices
       ti = max(0, min(ti, R - 1));
       const int tok = row_arg[ti];
-      int d = draft[pos];
+      int d = __ldcg(draft + pos);
       if (vrows != nullptr && pos >= vr - 1) d = -1;
       out[pos] = tok;
       ++written;
       if (d != tok) { rejected = true; break; }
     }
     if (!rejected) {
-      int bi = bonus_idx[0];
+      int bi = __ldcg(bonus_idx);
       if (bi < 0) bi += R;
       bi = max(0, min(bi, R - 1));
       out[nd] = row_arg[bi];
@@ -165,7 +165,11 @@ __global__ void __launch_bounds__(kThreads)
     }
     if (vrows != nullptr) *vrows = kVrowsAll;
     if (num_accepted != nullptr) *num_accepted = written;
+    __threadfence();
   }
+  // every output is written before this CTA lets a dependent grid launch (a dependent
+  // still has to griddepcontrol.wait for this grid; this only orders the trigger)
+  __syncthreads();
   pdl_launch_dependents();
 }
 

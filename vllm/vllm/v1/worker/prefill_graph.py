@@ -40,6 +40,16 @@ def _refresh(dst, src, seen):
     if isinstance(dst, torch.Tensor):
         assert (dst.shape, dst.dtype, dst.stride()) == (
             src.shape, src.dtype, src.stride())
+        # LOCAL PATCH (cudafast-nemotron35): a tensor its builder marked constant (built
+        # once for a batch shape, never written after) already sits in dst if dst's last
+        # copy came from that same object (mamba2_attn.py prefill metadata cache).
+        if getattr(src, "_vp_const", False):
+            if getattr(dst, "_vp_last_src", None) is src:
+                return
+            dst.copy_(src, non_blocking=True)
+            dst._vp_last_src = src
+            return
+        dst._vp_last_src = None
         dst.copy_(src, non_blocking=True)
     elif dataclasses.is_dataclass(dst):
         assert type(src) is type(dst)

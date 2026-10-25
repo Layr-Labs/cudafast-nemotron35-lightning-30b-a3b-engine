@@ -120,6 +120,8 @@ def _nvfp4_rows_dot(
     CHUNK: tl.constexpr = 1,
     CPER: tl.constexpr = 1,
     SPER: tl.constexpr = 1,
+    base_ptr=None,  # [N] fp32 per-row scores already computed over other groups, when BASE
+    BASE: tl.constexpr = False,
 ):
     """RMODE 0: rows from GATHER as before. 1: rows = rows_ptr[r] + (r // CPER) * CHUNK
     (first-stage top-k indices within their chunk). 2: rows = rows_ptr[c * CPER + ref_ptr[r]]
@@ -187,11 +189,17 @@ def _nvfp4_rows_dot(
         part = lo * hl[None, :] + hi * hh[None, :]
         part = tl.reshape(part, (BR, BB // 8, 8))
         acc += tl.sum(tl.sum(part, axis=2) * sc, axis=1)
-    tl.store(out_ptr + r, acc * gscale, mask=rmask)
+    if BASE:
+        # LOCAL PATCH (cudafast-nemotron35): base[row] (the coarse stage's score over
+        # its own groups) plus this kernel's dot over the remaining groups.
+        b = tl.load(base_ptr + rows, mask=wr, other=0.0)
+        tl.store(out_ptr + r, b + acc * gscale, mask=rmask)
+    else:
+        tl.store(out_ptr + r, acc * gscale, mask=rmask)
 
 
 def _rows_dot(h, w, s, rows, gscale, out, gather, gated=False, hcols=None, ref=None,
-              rmode=0, cper=1, sper=1):
+              rmode=0, cper=1, sper=1, base=None):
     n_out = out.numel()
     nbytes = w.shape[1]
     gather = gather or rmode != 0
@@ -212,12 +220,20 @@ def _rows_dot(h, w, s, rows, gscale, out, gather, gated=False, hcols=None, ref=N
         launch_pdl=mtp_pdl(),
         hcols_ptr=hcols, HCOLS=hcols is not None,
         ref_ptr=ref, RMODE=rmode, CHUNK=SCREEN_CHUNK, CPER=cper, SPER=sper,
+        base_ptr=base, BASE=base is not None,
     )
 
 
 def screen_topk_enabled() -> bool:
     """Kill switch for the fused exact top-k: VLLM_MTP_SCREEN_TOPK=0."""
     return os.environ.get("VLLM_MTP_SCREEN_TOPK", "1") != "0"
+
+
+def screen_reuse_enabled() -> bool:
+    """Refine stage = coarse score + dot over the refine-only groups (the coarse
+    groups are a subset of the refine groups). VLLM_MTP_SCREEN_REUSE=0 restores the
+    full 64-group refine dot."""
+    return os.environ.get("VLLM_MTP_SCREEN_REUSE", "1") != "0"
 
 
 @triton.jit
@@ -241,6 +257,7 @@ def _chunk_topk(
     launch_pdl: tl.constexpr = False,
     gate_ptr=None,
     GATED: tl.constexpr = False,
+    RADIX: tl.constexpr = False,
 ):
     """The indices torch.topk(scores.view(C, N), K, dim=-1, sorted=False) returns,
     in its order (CUDA sbtopk::gatherTopK: every key above the K-th largest in
@@ -264,12 +281,36 @@ def _chunk_topk(
             return
     i = tl.arange(0, N)
     key = _topk_key(tl.load(scores_ptr + c * N + i))
-    # The K-th largest key: the largest t with count(key >= t) >= K, bit by bit.
-    t = tl.sum(key * 0, axis=0)
-    for b in tl.static_range(31, -1, -1):
-        trial = t | (1 << b)
-        cnt = tl.sum((key >= trial).to(tl.int32), axis=0)
-        t = tl.where(cnt >= K, trial, t)
+    if RADIX:
+        # Exact 4-bit radix selection: eight histograms replace 32 serial
+        # whole-block threshold reductions. Keys include NaNs and signed zeros
+        # in the original torch order; survivor scattering below is unchanged.
+        low = tl.min(key, axis=0)
+        high = tl.max(key, axis=0)
+        if low == high:
+            # Stopped draft rows normally produce uniform scores. Finish exact
+            # tie selection without any histogram, while still writing all K ids.
+            t = low
+        else:
+            active = tl.full((N,), True, tl.int1)
+            left = tl.full((), K, tl.int32)
+            bins = tl.arange(0, 16)
+            t = tl.full((), 0, tl.int64)
+            for shift in tl.static_range(28, -1, -4):
+                digit = ((key >> shift) & 15).to(tl.int32)
+                hist = tl.histogram(digit, 16, mask=active)
+                suffix = tl.sum(hist, axis=0) - tl.cumsum(hist, axis=0) + hist
+                pick = tl.max(tl.where(suffix >= left, bins, 0), axis=0)
+                left -= tl.sum(tl.where(bins > pick, hist, 0), axis=0)
+                t |= pick.to(tl.int64) << shift
+                active = active & (digit == pick)
+    else:
+        # Original binary radix selection, retained for remote admission/fallback.
+        t = tl.sum(key * 0, axis=0)
+        for b in tl.static_range(31, -1, -1):
+            trial = t | (1 << b)
+            cnt = tl.sum((key >= trial).to(tl.int32), axis=0)
+            t = tl.where(cnt >= K, trial, t)
     gt = (key > t).to(tl.int32)
     eq = (key == t).to(tl.int32)
     n_gt = tl.sum(gt, axis=0)
@@ -439,6 +480,22 @@ class DraftHeadScreen:
                 self.coarse_cols.numel(), dtype=torch.float32, device=device
             )
             self._hs = torch.empty(cols.numel(), dtype=torch.float32, device=device)
+        # LOCAL PATCH (cudafast-nemotron35): the refine groups minus the coarse groups.
+        self.reuse = self.fused_topk and screen_reuse_enabled()
+        if self.reuse:
+            rest_groups = ranked_groups[CASCADE_FRAC_GROUPS:SCREEN_FRAC_GROUPS].sort().values
+            rest_cols = (rest_groups[:, None] * 16 + torch.arange(16)[None, :]).reshape(-1)
+            self.reuse = _pow2(rest_cols.numel())
+        if self.reuse:
+            self.w_rest = (
+                w.view(n, ng, 8)[:, rest_groups, :].reshape(n, -1).to(device).contiguous()
+            )
+            self.s_rest = s[:, rest_groups].to(device).contiguous()
+            self.rest_cols = rest_cols.to(device)
+            self._hr = torch.empty(rest_cols.numel(), dtype=torch.float32, device=device)
+        self.radix = self.fused_topk and os.environ.get("VLLM_MTP_RADIX_TOPK", "1") != "0"
+        if self.radix:
+            self.radix = self._radix_matches(device)
         self.chunk_off = (
             torch.arange(n // SCREEN_CHUNK, device=device) * SCREEN_CHUNK
         )[:, None]
@@ -483,6 +540,40 @@ class DraftHeadScreen:
             self.fused_topk, self.graph is not None,
         )
 
+    def _radix_matches(self, device: torch.device) -> bool:
+        """Official remote model-load admission, no request data or local execution."""
+        try:
+            for n, k, gather in ((SCREEN_CHUNK, CASCADE_PER, False),
+                                 (CASCADE_PER, SCREEN_PER, True)):
+                index = torch.arange(2 * n, device=device, dtype=torch.int32)
+                src = (torch.arange(2 * n, device=device, dtype=torch.int64) + 10000).flip(0)
+                for case in range(4):
+                    if case == 0:
+                        scores = (index * 1103515245 + 12345).view(torch.float32)
+                    elif case == 1:
+                        bits = torch.where(index % 2 == 0, 0, -2147483648).to(torch.int32)
+                        scores = bits.view(torch.float32)
+                    elif case == 2:
+                        scores = (index % 19).float() - 9
+                        scores[:n // 16] = float("nan")
+                        scores[n // 16:n // 8] = float("inf")
+                        scores[n:n + n // 8] = -float("inf")
+                    else:
+                        scores = torch.full((2 * n,), 42.0, device=device)
+                    a = torch.empty(2 * k, dtype=torch.int64, device=device)
+                    b = torch.empty_like(a)
+                    for radix, out in ((False, a), (True, b)):
+                        _chunk_topk[(2,)](scores, src, out, N=n, K=k, GATHER=gather,
+                                          RADIX=radix, num_warps=4 if radix or n != SCREEN_CHUNK else 8,
+                                          launch_pdl=mtp_pdl())
+                    if not torch.equal(a, b):
+                        logger.warning("MTP radix top-k differs; original selection retained")
+                        return False
+            return True
+        except Exception as exc:
+            logger.warning("MTP radix top-k unavailable (%r); original selection retained", exc)
+            return False
+
     def _fold_matches(self, k: int, device: torch.device) -> bool:
         """Load time, before capture: the folded cascade against the unfolded one on
         random rows, bitwise on every stage's scores and on the token."""
@@ -523,11 +614,18 @@ class DraftHeadScreen:
             # torch.topk(sorted=False) returns, in torch's order (_chunk_topk).
             # Same candidate ids in the same order, so every rows_dot, the
             # selection and the depth gate see identical inputs.
-            _gather_two[(1,)](
-                h, self.coarse_cols, self._hc, self.cols, self._hs,
-                NA=self.coarse_cols.numel(), NB=self.cols.numel(),
-                launch_pdl=mtp_pdl(),
-            )
+            if self.reuse:
+                _gather_two[(1,)](
+                    h, self.coarse_cols, self._hc, self.rest_cols, self._hr,
+                    NA=self.coarse_cols.numel(), NB=self.rest_cols.numel(),
+                    launch_pdl=mtp_pdl(),
+                )
+            else:
+                _gather_two[(1,)](
+                    h, self.coarse_cols, self._hc, self.cols, self._hs,
+                    NA=self.coarse_cols.numel(), NB=self.cols.numel(),
+                    launch_pdl=mtp_pdl(),
+                )
             _rows_dot(
                 self._hc, self.w_coarse, self.s_coarse, None,
                 self.gscale, self.scores, False, gated,
@@ -537,16 +635,28 @@ class DraftHeadScreen:
             tgated = gated and tok
             _chunk_topk[(nchunk,)](
                 self.scores, self.scores, self._coarse_cand,
-                N=SCREEN_CHUNK, K=CASCADE_PER, GATHER=False,
-                num_warps=8, launch_pdl=mtp_pdl(), gate_ptr=tgate, GATED=tgated,
+                N=SCREEN_CHUNK, K=CASCADE_PER, GATHER=False, RADIX=self.radix,
+                num_warps=4 if self.radix else 8, launch_pdl=mtp_pdl(),
+                gate_ptr=tgate, GATED=tgated,
             )
-            _rows_dot(
-                self._hs, self.w_scr, self.s_scr, self._coarse_cand,
-                self.gscale, self.refine_scores, True, gated,
-            )
+            if self.reuse:
+                # refine score = coarse score (its 32 groups) + the other 32 refine
+                # groups: the same 64-group sum, added in a different fp32 order, so
+                # it reads 256 of the 512 bytes per candidate row (the coarse groups
+                # are a subset of the refine groups). VLLM_MTP_SCREEN_REUSE=0 keeps
+                # the full 64-group dot.
+                _rows_dot(
+                    self._hr, self.w_rest, self.s_rest, self._coarse_cand,
+                    self.gscale, self.refine_scores, True, gated, base=self.scores,
+                )
+            else:
+                _rows_dot(
+                    self._hs, self.w_scr, self.s_scr, self._coarse_cand,
+                    self.gscale, self.refine_scores, True, gated,
+                )
             _chunk_topk[(nchunk,)](
                 self.refine_scores, self._coarse_cand, self._cand,
-                N=CASCADE_PER, K=SCREEN_PER, GATHER=True,
+                N=CASCADE_PER, K=SCREEN_PER, GATHER=True, RADIX=self.radix,
                 num_warps=4, launch_pdl=mtp_pdl(), gate_ptr=tgate, GATED=tgated,
             )
             cand = self._cand

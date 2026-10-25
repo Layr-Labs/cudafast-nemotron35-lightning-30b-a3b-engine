@@ -27,7 +27,7 @@ _lib = None
 _load_error: str | None = None
 _max_rows = 0
 _max_vocab = 0
-_scratch: dict = {}  # device index -> (pval, pidx, counter)
+_scratch: dict = {}  # (device index, stream) -> (pval, pidx, counter)
 
 
 def _load():
@@ -55,13 +55,16 @@ def available() -> bool:
 
 
 def _bufs(device: torch.device):
+    # one scratch set (partials + done counter) per (device, stream): launches on one
+    # stream are ordered, so a set is never used by two launches at once
     idx = device.index if device.index is not None else torch.cuda.current_device()
-    b = _scratch.get(idx)
+    key = (idx, torch.cuda.current_stream(device).cuda_stream)
+    b = _scratch.get(key)
     if b is None:
         n = max(_max_rows, 1) * 64
         b = (torch.empty(n, dtype=torch.float32, device=device), torch.empty(n, dtype=torch.int32, device=device),
              torch.zeros(1, dtype=torch.int32, device=device))
-        _scratch[idx] = b
+        _scratch[key] = b
     return b
 
 

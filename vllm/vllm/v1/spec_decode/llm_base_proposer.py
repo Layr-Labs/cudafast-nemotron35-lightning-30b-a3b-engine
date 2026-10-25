@@ -1967,6 +1967,8 @@ class SpecDecodeBaseProposer:
         if is_graph_capturing and not torch.cuda.is_current_stream_capturing():
             from vllm.v1.spec_decode.nemotron_full_step import prepare
             prepare(self)
+            from vllm.v1.spec_decode.nemotron_decode_plan import prepare as prepare_plan
+            prepare_plan(self)
 
     def _get_eagle3_use_aux_hidden_state_from_config(self) -> bool:
         """

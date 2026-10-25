@@ -455,6 +455,19 @@ class SpecDecodeBaseProposer:
             return self.vocab_mapping.map_draft_to_target_ids(draft_token_ids)
         return self.model.compute_logits(hidden_states).argmax(dim=-1)
 
+    def _retain_screen_ids(self, draft_token_ids: torch.Tensor) -> torch.Tensor:
+        """A multi-draft propose keeps every screen id until torch.stack.
+
+        The ring is sized for the manifest depth. A longer draft clones each
+        id so a wrap cannot overwrite one still in that list. Other samplers
+        already return fresh storage, so this is a no-op for them.
+        """
+        screen = getattr(self, "_draft_head_screen", None)
+        outs = getattr(screen, "_outs", None)
+        if outs is not None and self.num_speculative_tokens > len(outs):
+            return draft_token_ids.clone()
+        return draft_token_ids
+
     def _sample_from_logits(
         self,
         logits: torch.Tensor,
@@ -661,7 +674,15 @@ class SpecDecodeBaseProposer:
                 self._last_draft_probs = draft_probs.view(
                     -1, self.num_speculative_tokens, draft_probs.shape[-1]
                 ).contiguous()
-            return draft_token_ids.view(-1, self.num_speculative_tokens)
+            drafted = draft_token_ids.view(-1, self.num_speculative_tokens)
+            screen = getattr(self, "_draft_head_screen", None)
+            outs = getattr(screen, "_outs", None)
+            if outs is not None and any(
+                drafted.untyped_storage().data_ptr() == t.untyped_storage().data_ptr()
+                for t in outs
+            ):
+                drafted = drafted.clone()
+            return drafted
 
         if self.uses_mrope:
             positions = self.mrope_positions[:, token_indices_to_sample]
@@ -682,6 +703,7 @@ class SpecDecodeBaseProposer:
         draft_token_ids, draft_probs = self._sample_draft_tokens(
             sample_hidden_states, sampling_metadata
         )
+        draft_token_ids = self._retain_screen_ids(draft_token_ids)
         draft_probs_list = None if draft_probs is None else [draft_probs]
 
         if self.allowed_attn_types is not None:
@@ -857,6 +879,7 @@ class SpecDecodeBaseProposer:
             draft_token_ids, draft_probs = self._sample_draft_tokens(
                 last_hidden_states[:batch_size], sampling_metadata
             )
+            draft_token_ids = self._retain_screen_ids(draft_token_ids)
             if draft_probs is not None:
                 assert draft_probs_list is not None
                 draft_probs_list.append(draft_probs)

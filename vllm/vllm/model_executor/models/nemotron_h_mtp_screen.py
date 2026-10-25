@@ -53,6 +53,7 @@ SCREEN_CHUNK = 2048
 SCREEN_PER = 32
 CASCADE_FRAC_GROUPS = 32
 CASCADE_PER = 256
+SCREEN_OUT_RING = 8
 
 
 def screen_enabled() -> bool:
@@ -510,7 +511,13 @@ class DraftHeadScreen:
             _l2pf.DRAFT_SCREEN[:] = [self.w_coarse]
         self.graph = None
         self._h = torch.empty(k, dtype=torch.float32, device=device)
-        self._out = torch.empty(1, dtype=torch.int32, device=device)
+        self._outs = [
+            torch.empty(1, dtype=torch.int32, device=device)
+            for _ in range(SCREEN_OUT_RING)
+        ]
+        self._out = self._outs[0]
+        self._graphs: list[torch.cuda.CUDAGraph] = []
+        self._slot = 0
         if device.type == "cuda" and self.cascade and self.fold:
             self.fold = self._fold_matches(k, device)
         if device.type == "cuda" and screen_graph_enabled():
@@ -522,14 +529,17 @@ class DraftHeadScreen:
                 for _ in range(2):
                     self._greedy_row(self._h, gated=True, out=self._out)
                 torch.cuda.synchronize(device)
-                self.graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(
-                    self.graph, pool=torch.cuda.graph_pool_handle()
-                ):
-                    self._greedy_row(self._h, gated=True, out=self._out)
+                pool = torch.cuda.graph_pool_handle()
+                for out in self._outs:
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph, pool=pool):
+                        self._greedy_row(self._h, gated=True, out=out)
+                    self._graphs.append(graph)
                 torch.cuda.synchronize(device)
+                self.graph = self._graphs[0]
             except Exception as exc:
                 self.graph = None
+                self._graphs = []
                 logger.warning("MTP draft-head screen graph disabled: %s", exc)
             if gate is not None:
                 gate.zero_()  # the warm-up rows above may have counted or stopped
@@ -742,9 +752,11 @@ class DraftHeadScreen:
     def greedy(self, hidden: torch.Tensor) -> torch.Tensor:
         """Draft ids [B] for hidden [B, K] (B is small; one pass per row)."""
         if self.graph is not None and hidden.shape[0] == 1:
+            slot = self._slot
+            self._slot = (slot + 1) % SCREEN_OUT_RING
             self._h.copy_(hidden[0])
-            self.graph.replay()
-            return self._out.clone()
+            self._graphs[slot].replay()
+            return self._outs[slot]
         out = []
         for i in range(hidden.shape[0]):
             out.append(self._greedy_row(hidden[i].float().contiguous()))

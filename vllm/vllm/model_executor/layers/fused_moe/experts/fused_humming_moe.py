@@ -38,12 +38,17 @@ except ImportError:
     _l2pf = None
 
 
-def _l2pf_next_layer(layer, num_tokens: int) -> bool:
+def _l2pf_next_layer(layer, num_tokens: int, *, early: bool = False) -> bool:
     """LOCAL PATCH (cudafast-nemotron35): small calls only: queue an L2 prefetch
-    of the head of the next Mamba layer's in_proj weight (its fp8small pack when
-    present) on a side stream while the latency-bound routed down projection
-    runs. Moves no value; the caller rejoins after the down projection."""
-    if _l2pf is None or num_tokens > 8 or _l2pf.MOE_BYTES <= 0:
+    of the next Mamba layer's in_proj weight (its fp8small pack when present)
+    on a side stream. early=True starts it before the routed-up GEMM, whose
+    weight loads are L2 evict-first, and pulls MOE_EARLY_BYTES; otherwise it
+    runs beside the latency-bound routed down and pulls MOE_BYTES. Moves no
+    value; the caller rejoins after the down projection."""
+    if _l2pf is None or num_tokens > 8:
+        return False
+    cap = _l2pf.MOE_EARLY_BYTES if early else _l2pf.MOE_BYTES
+    if cap <= 0:
         return False
     nxt = _l2pf.AHEAD_MOE.get(str(getattr(layer, "layer_name", "")))
     if nxt is None:
@@ -51,7 +56,7 @@ def _l2pf_next_layer(layer, num_tokens: int) -> bool:
     w = getattr(nxt, "_fp8small_weight", None)
     if w is None:
         w = getattr(nxt, "weight", None)
-    return _l2pf.prefetch(w, max_bytes=_l2pf.MOE_BYTES)
+    return _l2pf.prefetch(w, max_bytes=cap)
 from vllm.model_executor.layers.fused_moe.moe_permute_unpermute import (
     MoEPermuteScratch,
     moe_permute,
@@ -758,6 +763,11 @@ class HummingIndexedExperts(HummingExpertsBase):
         # inside its epilogue, then writes relu(output)**2 directly to the
         # activation buffer. Other shapes, formats and activations keep the
         # ordinary projection and activation calls.
+        l2pf_pending = False
+        if topk_ids.size(0) <= 8 and expert_map is None:
+            l2pf_pending = _l2pf_next_layer(
+                self.layer, topk_ids.size(0), early=True
+            )
         if (
             activation == MoEActivation.RELU2_NO_MUL
             and getattr(self, "_fused_relu2", False)
@@ -808,9 +818,10 @@ class HummingIndexedExperts(HummingExpertsBase):
         )
 
         down_output = buffers["down_output"].view(-1, hidden_states.size(-1))
-        l2pf_pending = expert_map is None and _l2pf_next_layer(
-            self.layer, topk_ids.size(0)
-        )
+        if not l2pf_pending:
+            l2pf_pending = expert_map is None and _l2pf_next_layer(
+                self.layer, topk_ids.size(0)
+            )
         # LOCAL PATCH (cudafast-nemotron35): zskip computes humming's w2 output
         # for <= 8 tokens, and for prefill on the sparse layers, without loading
         # the weight rows whose activations are zero (humming_zskip.py);

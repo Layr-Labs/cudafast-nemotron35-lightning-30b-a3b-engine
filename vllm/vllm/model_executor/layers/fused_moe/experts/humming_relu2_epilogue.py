@@ -156,25 +156,46 @@ def prepare(meta, compute_config, tuning_config, evict_first=False):
         lc = json.loads(meta.to_str())
         lc.pop("sublayer_name", None)
         changed = 0
+        decode_changed = 0
+        want_decode = os.environ.get("HUMMING_EVICT_DECODE", "1") != "0"
         for i, (lo, hi, config) in enumerate(tc):
-            if not lo < 2976 <= hi:
+            prefill = bool(lo < 2976 <= hi)
+            decode = bool(want_decode and hi <= 48)
+            if not prefill and not decode:
                 continue
-            original = HummingKernel._id2kernel[values[4 * i + 2]]
-            assert tuple(original.problem_shape[1:]) == (1856, 2688)
-            assert config["block_shape"] == [64, 64, 32]
-            params = lc | json.loads(compute_config) | config
-            params.pop("num_sms", None)
-            kernel = EvictFirstRelu2HummingKernel(**params)
-            kernel.load_cubin()
-            # Exclude the stock-cubin singleton no-op before admitting the hint.
-            assert type(kernel) is EvictFirstRelu2HummingKernel
-            assert "createpolicy.fractional.L2::evict_first" in kernel.code
-            assert "cp.async.cg.shared.global.L2::cache_hint" in kernel.code
-            assert kernel.kernel_filename != original.kernel_filename
-            assert kernel.kernel_id != original.kernel_id
-            values[4 * i + 2] = kernel.kernel_id
-            changed += 1
-        assert changed == 1
+
+            def _build_evict(prefill=prefill, config=config, i=i):
+                original = HummingKernel._id2kernel[values[4 * i + 2]]
+                assert tuple(original.problem_shape[1:]) == (1856, 2688)
+                if prefill:
+                    assert config["block_shape"] == [64, 64, 32]
+                else:
+                    assert config["block_shape"][0] == 16
+                    assert config["block_shape"][2] == 32
+                params = lc | json.loads(compute_config) | config
+                params.pop("num_sms", None)
+                kernel = EvictFirstRelu2HummingKernel(**params)
+                kernel.load_cubin()
+                assert type(kernel) is EvictFirstRelu2HummingKernel
+                assert "createpolicy.fractional.L2::evict_first" in kernel.code
+                assert "cp.async.cg.shared.global.L2::cache_hint" in kernel.code
+                assert kernel.kernel_filename != original.kernel_filename
+                assert kernel.kernel_id != original.kernel_id
+                values[4 * i + 2] = kernel.kernel_id
+
+            if prefill:
+                _build_evict()
+                changed += 1
+            else:
+                try:
+                    _build_evict()
+                except Exception as exc:
+                    logger.warning_once(
+                        "humming decode evict-first skipped: %s", exc
+                    )
+                else:
+                    decode_changed += 1
+        assert changed == 1 or decode_changed > 0
         configs = torch.tensor(values, dtype=torch.int64, device="cpu")
         _EVICT_CACHE[key] = configs
         return configs
@@ -202,9 +223,13 @@ def forward_relu2(
     assert getattr(layer, meta.bias_name, None) is None
     configs = prepare(
         meta, compute_config, tuning_config,
-        evict_first=(inputs.shape[0] == 496 and top_k == 6
-                     and valid_shape_m == 2976
-                     and os.environ.get("HUMMING_EVICT_FIRST", "1") != "0"),
+        evict_first=(
+            (inputs.shape[0] == 496 and top_k == 6
+             and valid_shape_m == 2976
+             and os.environ.get("HUMMING_EVICT_FIRST", "1") != "0")
+            or (inputs.shape[0] <= 8 and top_k == 6
+                and os.environ.get("HUMMING_EVICT_DECODE", "1") != "0")
+        ),
     )
     return ops.launch_kernel(
         configs=configs,

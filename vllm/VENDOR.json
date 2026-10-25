@@ -238,6 +238,34 @@
     {
       "file": "vllm/model_executor/layers/mamba/ops/gated_norm_fp8.py; mamba_mixer2.py",
       "why": "Select priorcompletecorrect823867a3-d280-429c-bd43-c177dc25470a native-order groupedgatednorm/staticFP8 producer only onfulla484; add originalPDL wait-beforeallreads andexistingconfidenceprefixM5 earlyzero withoutweight/gate/SSMreads. Retainstaticcheckpointscale, bothBF16rounds, consumerQuantizedActivationguard, targetformats/fallback. Entirecombinationunverified; no localexecution."
+    },
+    {
+      "file": "vllm/v1/worker/hostfast.py",
+      "why": "DraftStagingSets: one set of the pinned host buffers a FlashInfer build and plan write (the builder's paged_kv_indptr and paged_kv_last_page_len host buffers, its indptr staging buffer, each wrapper's pinned plan workspace) per draft step; a set is rewritten only after the event recorded at its previous use has completed, and the buffers it replaces stay referenced. UploadOnChange: CpuGpuBuffer.copy_to_gpu that skips re-sending bytes identical to its last upload (never while capturing), for buffers whose device copy only that upload writes. VLLM_HOSTFAST_SETS=0 / VLLM_HOSTFAST_UPLOAD=0 disable them."
+    },
+    {
+      "file": "vllm/v1/spec_decode/llm_base_proposer.py",
+      "why": "build_per_group_and_layer_attn_metadata installs the draft step's staging set (hostfast DraftStagingSets) before the build and records its event after it, in place of the single staging guard; the draft loop's per-step plan event wait is skipped while sets are in use. Plans, copies and their stream order are unchanged."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_kernels.py",
+      "why": "depth_gate_end: the verify-row update (kept + 1, or every row when nothing was kept) and the clearing of the stop flag and active mark in one Triton launch on the same int32 buffers. MTP_GATE_END_FUSED=0 keeps the torch ops."
+    },
+    {
+      "file": "vllm/v1/sample/rejection_sampler.py",
+      "why": "rejection_greedy_one_request_kernel and RejectionSampler.greedy_one_request: forward's greedy-argmax path for one request with drafts in one launch after the row argmax, fused with the runner's draft masking at the verify-row count, its accepted-token count and the verify-row reset. Falls back to the general path for anything else."
+    },
+    {
+      "file": "vllm/v1/worker/gpu_model_runner.py",
+      "why": "One-request spec-decode fast paths: _one_request_input_ids writes the sampled token and the drafts with two slice copies (VLLM_ONE_REQ_INPUT_IDS); _calc_spec_decode_metadata reuses its uploaded index tensors and one precomputed gather index when its inputs repeat (VLLM_SPEC_INDEX_CACHE); UploadOnChange on seven input buffers; _sample uses RejectionSampler.greedy_one_request and _update_states_after_model_execute skips the count that kernel wrote (VLLM_ONE_REQ_GREEDY)."
+    },
+    {
+      "file": "vllm/v1/worker/block_table.py",
+      "why": "commit_block_table sends the rows only when they differ from the rows it last sent (the device table has no other writer) and TABLE_GENERATION counts device-table writes. VLLM_BLOCK_TABLE_COMMIT_ON_CHANGE=0 sends them every step."
+    },
+    {
+      "file": "vllm/v1/attention/backends/flashinfer.py",
+      "why": "_compute_flashinfer_kv_metadata skips the device indptr upload and the page-index gather when the block counts and the block-table generation equal the builder's previous build (only this method writes those buffers; the trtllm prefill path that rewrites the indptr resets the key). VLLM_FLASHINFER_KV_INDICES_ON_CHANGE=0 rebuilds them every time."
     }
   ]
 }

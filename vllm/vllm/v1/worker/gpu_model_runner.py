@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import sys
 import threading
 import time
@@ -299,6 +300,12 @@ def _keep_verify_rows_for(
 
 # Protect asynchronous H2D sources; switchable for in-process cost screening.
 PINNED_SOURCE_GUARDS = True
+
+# LOCAL PATCH (cudafast-nemotron35): one-request fast paths of the spec-decode
+# step (default on; each writes the values its general path writes).
+_ONE_REQ_INPUT_IDS = os.environ.get("VLLM_ONE_REQ_INPUT_IDS", "1") != "0"
+_SPEC_INDEX_CACHE = os.environ.get("VLLM_SPEC_INDEX_CACHE", "1") != "0"
+_ONE_REQ_GREEDY = os.environ.get("VLLM_ONE_REQ_GREEDY", "1") != "0"
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -711,6 +718,12 @@ class GPUModelRunner(
 
         self.num_spec_tokens = 0
         self.prev_num_spec_tokens = 0
+        # LOCAL PATCH (cudafast-nemotron35): _calc_spec_decode_metadata's last
+        # (key, uploaded index tensors...), see there.
+        self._spec_index_cache: tuple | None = None
+        # LOCAL PATCH (cudafast-nemotron35): sampled_token_ids whose accepted
+        # count the one-request greedy kernel already wrote (_sample).
+        self._accepted_counted_for: torch.Tensor | None = None
         self.valid_sampled_token_count_gpu: torch.Tensor | None = None
         if self.speculative_config:
             self.num_spec_tokens = self.speculative_config.num_speculative_tokens
@@ -898,6 +911,21 @@ class GPUModelRunner(
         self.arange_np = np.arange(arange_size, dtype=np.int64)
         self.query_pos = self._make_buffer(arange_size, dtype=torch.int64)
         self._arange_scratch = np.empty(arange_size, dtype=np.int64)
+
+        # LOCAL PATCH (cudafast-nemotron35): hostfast UploadOnChange. Only the
+        # uploads below write these device buffers, and a steady one-request
+        # decode re-sends the same bytes every step; skip those re-sends.
+        if hostfast.UPLOAD:
+            for buf in (
+                self.query_start_loc,
+                self.prev_positions,
+                self.prev_num_draft_tokens,
+                self.req_indices,
+                self.query_pos,
+                self.num_scheduled_tokens,
+                self.num_decode_draft_tokens,
+            ):
+                hostfast.UploadOnChange(buf)
 
         # Layer pairings for cross-layer KV sharing.
         # If an Attention layer `layer_name` is in the keys of this dict, it
@@ -1643,7 +1671,14 @@ class GPUModelRunner(
         # Valid tokens are contiguous from position 0, so counting non-(-1)
         # tokens gives us the first -1 position (i.e., number of accepted).
         num_reqs = output_token_ids.size(0)
-        self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(dim=1)
+        # LOCAL PATCH (cudafast-nemotron35): the one-request greedy kernel
+        # (_sample) already wrote this count for these outputs.
+        counted = self._accepted_counted_for is output_token_ids
+        self._accepted_counted_for = None
+        if not counted:
+            self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(
+                dim=1
+            )
 
         if self.cache_config.mamba_cache_mode == "align":
             # Fused GPU postprocess: state copies + per-request accepted-token
@@ -1866,6 +1901,13 @@ class GPUModelRunner(
                 self.is_token_ids.copy_to_gpu(total_num_scheduled_tokens)
             return
 
+        # LOCAL PATCH (cudafast-nemotron35): one request continuing from row 0
+        # of the previous step with d >= 1 drafts.
+        if self._one_request_input_ids(
+            scheduler_output, num_reqs, total_num_scheduled_tokens, cu_num_tokens
+        ):
+            return
+
         # Async scheduling case, where some decode requests from the previous
         # iteration won't have entries in input_ids_cpu and need to be copied
         # on the GPU from prev_sampled_token_ids.
@@ -1971,6 +2013,49 @@ class GPUModelRunner(
             index=draft_tokens_index_tensor,
             src=draft_token_ids.flatten()[prev_draft_token_indices_tensor],
         )
+
+    def _one_request_input_ids(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_reqs: int,
+        total_num_scheduled_tokens: int,
+        cu_num_tokens: np.ndarray,
+    ) -> bool:
+        """LOCAL PATCH (cudafast-nemotron35): the async path for one request
+        that was row 0 of the previous step and is scheduled 1 + d tokens, d >= 1
+        of them its previous drafts. The general path then scatters the sampled
+        token to slot 0 and drafts 0..d-1 of row 0 to slots 1..d (its index lists
+        are [0], [0], [1..d] and [0..d-1]); this writes the same values with two
+        slice copies and no index uploads. False leaves it to the general path.
+        VLLM_ONE_REQ_INPUT_IDS=0 disables."""
+        if (
+            not _ONE_REQ_INPUT_IDS
+            or num_reqs != 1
+            or self.enable_prompt_embeds
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return False
+        draft_token_ids = self._draft_token_ids
+        prev_sampled = self.input_batch.prev_sampled_token_ids
+        if not isinstance(draft_token_ids, torch.Tensor) or prev_sampled is None:
+            return False
+        if int(self.prev_positions.np[0]) != 0:
+            return False
+        req_id = self.input_batch.req_ids[0]
+        d = len(scheduler_output.scheduled_spec_decode_tokens.get(req_id, ()))
+        if (
+            d < 1
+            or total_num_scheduled_tokens != d + 1
+            or int(cu_num_tokens[0]) != d + 1
+            or d > self.prev_num_spec_tokens
+            or draft_token_ids.numel() < d
+        ):
+            return False
+        self.input_ids.gpu[0:1].copy_(prev_sampled[0:1, 0], non_blocking=True)
+        self.input_ids.gpu[1 : d + 1].copy_(
+            draft_token_ids.flatten()[:d], non_blocking=True
+        )
+        return True
 
     def _get_encoder_seq_lens(
         self,
@@ -2957,6 +3042,40 @@ class GPUModelRunner(
         # target_logits_indices:    [  0,   1,   2,   5,   6,   9]
         # bonus_logits_indices:     [  3,   4,   7,   8,  10]
 
+        # LOCAL PATCH (cudafast-nemotron35): every index tensor below is a pure
+        # function of (num_draft_tokens, cu_num_scheduled_tokens), and nothing
+        # writes them after the upload. When both repeat the previous call's
+        # values (every step of a steady decode), reuse the uploaded tensors and
+        # gather the draft ids with one precomputed index
+        # (logits_indices[target_logits_indices + 1]). VLLM_SPEC_INDEX_CACHE=0
+        # rebuilds and uploads them every step.
+        cache_key = None
+        if _SPEC_INDEX_CACHE and not torch.cuda.is_current_stream_capturing():
+            cache_key = (
+                tuple(num_draft_tokens.tolist()),
+                tuple(np.asarray(cu_num_scheduled_tokens).tolist()),
+            )
+            cached = self._spec_index_cache
+            if cached is not None and cached[0] == cache_key:
+                (
+                    _,
+                    cu_num_draft_tokens_gpu,
+                    cu_num_sampled_tokens_gpu,
+                    logits_indices_gpu,
+                    target_logits_indices_gpu,
+                    bonus_logits_indices_gpu,
+                    draft_gather_gpu,
+                ) = cached
+                return SpecDecodeMetadata(
+                    draft_token_ids=self.input_ids.gpu[draft_gather_gpu],
+                    num_draft_tokens=num_draft_tokens.tolist(),
+                    cu_num_draft_tokens=cu_num_draft_tokens_gpu,
+                    cu_num_sampled_tokens=cu_num_sampled_tokens_gpu,
+                    target_logits_indices=target_logits_indices_gpu,
+                    bonus_logits_indices=bonus_logits_indices_gpu,
+                    logits_indices=logits_indices_gpu,
+                )
+
         # Compute the logits indices.
         # [4, 1, 3, 1, 2]
         num_sampled_tokens = num_draft_tokens + 1
@@ -2989,6 +3108,9 @@ class GPUModelRunner(
         )
         # [0, 1, 2, 5, 6, 9]
         target_logits_indices += self._arange_scratch[: cu_num_draft_tokens[-1]]
+        if cache_key is not None:
+            # [1, 2, 3, 105, 106, 208]: the draft_token_indices below, on the CPU.
+            draft_gather = logits_indices[target_logits_indices + 1].astype(np.int64)
 
         cu_num_draft_tokens = async_tensor_h2d(cu_num_draft_tokens, device=self.device)
         cu_num_sampled_tokens = async_tensor_h2d(
@@ -3006,6 +3128,17 @@ class GPUModelRunner(
         # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
         draft_token_ids = self.input_ids.gpu[logits_indices]
         draft_token_ids = draft_token_ids[target_logits_indices + 1]
+
+        if cache_key is not None:
+            self._spec_index_cache = (
+                cache_key,
+                cu_num_draft_tokens,
+                cu_num_sampled_tokens,
+                logits_indices,
+                target_logits_indices,
+                bonus_logits_indices,
+                async_tensor_h2d(draft_gather, device=self.device),
+            )
 
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
@@ -3813,6 +3946,26 @@ class GPUModelRunner(
         # which the greedy kernel rejects, emitting row count - 1's own argmax.
         # Then every row is valid again. See nemotron_h_mtp_kernels.py.
         vrows = _verify_rows_buffer(logits)
+        # LOCAL PATCH (cudafast-nemotron35): one greedy request: the masking
+        # below, the greedy rejection, the vrows reset and the accepted-token
+        # count of _update_states_after_model_execute in one kernel
+        # (RejectionSampler.greedy_one_request). VLLM_ONE_REQ_GREEDY=0 disables.
+        if (
+            _ONE_REQ_GREEDY
+            and self.speculative_config is not None
+            and self.model_config.is_hybrid
+        ):
+            sampler_output = self.rejection_sampler.greedy_one_request(
+                spec_decode_metadata,
+                logits,
+                sampling_metadata,
+                self.num_accepted_tokens.gpu,
+                vrows,
+                _smallk_module().VROWS_ALL if vrows is not None else 0,
+            )
+            if sampler_output is not None:
+                self._accepted_counted_for = sampler_output.sampled_token_ids
+                return sampler_output
         if vrows is not None:
             spec_decode_metadata = _reject_unverified_drafts(
                 spec_decode_metadata, vrows

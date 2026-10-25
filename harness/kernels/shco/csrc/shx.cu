@@ -115,6 +115,21 @@ __device__ __forceinline__ __nv_bfloat16 round_output(float scaled) {
   return rounded;
 }
 
+__device__ __forceinline__ __nv_bfloat162 round_output2_relu2(float a, float b) {
+  union {
+    __nv_bfloat162 h;
+    uint32_t u;
+  } cvt;
+  cvt.h = __floats2bfloat162_rn(a, b);
+  uint32_t out;
+  asm("{ .reg .b32 x, z;\n"
+      "mov.b32 z, 0; max.NaN.bf16x2 x, %1, z;\n"
+      "mul.rn.bf16x2 %0, x, x; }\n"
+      : "=r"(out) : "r"(cvt.u));
+  cvt.u = out;
+  return cvt.h;
+}
+
 // One stage (two k16 blocks of one chain) of one warp: 2 m16 x 4 n8 tiles.
 __device__ __forceinline__ void stage_mma(uint32_t sA, uint32_t sB, uint32_t sS, int rw, int cw, int lane,
                                           float (&acc)[2][4][4]) {
@@ -290,8 +305,13 @@ __global__ void __launch_bounds__(128, 4) gemm_kernel(const Params p) {
           const int r = r_lo + 8 * hh;
           if (r < nrows) {
             __nv_bfloat162 v;
-            v.x = round_output<Relu2>(__fmul_rn(accA[mi][t][2 * hh], g));
-            v.y = round_output<Relu2>(__fmul_rn(accA[mi][t][2 * hh + 1], g));
+            if constexpr (Relu2) {
+              v = round_output2_relu2(__fmul_rn(accA[mi][t][2 * hh], g),
+                                      __fmul_rn(accA[mi][t][2 * hh + 1], g));
+            } else {
+              v.x = round_output<false>(__fmul_rn(accA[mi][t][2 * hh], g));
+              v.y = round_output<false>(__fmul_rn(accA[mi][t][2 * hh + 1], g));
+            }
             *reinterpret_cast<__nv_bfloat162*>(p.C + static_cast<long long>(row0 + r) * p.ldc + f) = v;
           }
         }
@@ -522,8 +542,13 @@ __global__ void __launch_bounds__(128, 4) gemm2_kernel(const Params2 q) {
           const int r = r_lo + 8 * hh;
           if (r < nrows) {
             __nv_bfloat162 v;
-            v.x = round_output<Relu2>(__fmul_rn(acc[mi][t][2 * hh], g));
-            v.y = round_output<Relu2>(__fmul_rn(acc[mi][t][2 * hh + 1], g));
+            if constexpr (Relu2) {
+              v = round_output2_relu2(__fmul_rn(acc[mi][t][2 * hh], g),
+                                      __fmul_rn(acc[mi][t][2 * hh + 1], g));
+            } else {
+              v.x = round_output<false>(__fmul_rn(acc[mi][t][2 * hh], g));
+              v.y = round_output<false>(__fmul_rn(acc[mi][t][2 * hh + 1], g));
+            }
             *reinterpret_cast<__nv_bfloat162*>(p.C + static_cast<long long>(row0 + r) * p.ldc + f) = v;
           }
         }

@@ -8149,6 +8149,13 @@ class GPUModelRunner(
             kv_cache_config, kernel_block_sizes
         )
 
+        # Real cache binding precedes any optional private admission. Profiling
+        # and every rebind explicitly reset the decision before graph capture.
+        for layer in self.compilation_config.static_forward_context.values():
+            prepare_pipeline = getattr(layer, "prepare_spec_replay_pipeline", None)
+            if prepare_pipeline is not None:
+                prepare_pipeline(enabled=not is_profiling)
+
         if (
             self.speculative_config
             and self.speculative_config.uses_extract_hidden_states()

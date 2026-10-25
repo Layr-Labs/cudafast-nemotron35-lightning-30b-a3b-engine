@@ -278,6 +278,18 @@
     {
       "file": "harness/kernels/pzskip/csrc/pzskip.cu (+ build.sh)",
       "why": "PZ333 M496/top-6 only: HUMMING_EVICT_PZ defaults on and gives immutable packed B/BS cp.async loads L2 evict-first priority. Loader addresses, bytes, masks, K16 MMA order, negative-zero repair and formats are unchanged. HUMMING_EVICT_PZ=0 restores stock. Separate native template specialization; compile/load failure retains stock PZ333. Stacks independently with the routed-up evf policy; no decode change."
+    },
+    {
+      "file": "model_executor/layers/fused_moe/{moe_fused_mul_sum.py,experts/fused_humming_moe.py,runner/shared_experts.py,runner/moe_runner.py}",
+      "why": "Select4386ba36-de9e-450f-b218-71a32de63478 targetshared-add-combine idea, fourpublishedPRblobs verified d78a395ff0c34c4d581e2fe54a68be0da8294e0e; notwholelowerB86baseline orPycs. NEWseparate single-output opaqueop+matchingfake preservesoldtwo-outputschema; explicitauxjoin andlease commitafteradmission; retainoldkernel byteexact andnewoptionalBF16roundedcombine+shared(leftoperand)double-roundingkernel. RemotestickyprivatebitadmissionM1..8/topk6/D2688/3scales+signedzero/subnormal/extrema/inf/NaN patterns, oldinsideopadd fallback. Noisolatedgain orcorrectnessclaim; entire41baseline."
+    },
+    {
+      "file": "v1/spec_decode/nemotron_full_step.py",
+      "why": "NativeMTPfullgraph inheritedthrough7c0c5713-b165-45c3-a839-05742e7350f8 onENTIREhighest41e5657b-0033-489a-b095-6a22fd5edcd8. NEW3slot bounded external-event relay atnativeFlashInfer attention wait, originalgraphretainedfirst, eventneverre-recordedbeforepriorgraphretired.query, graph/privatepool/outputsstrong. Startuporiginalmodel firstrowexactchecksper3slots/changeinputs/gates, unavailable/busy ->actualplan_event orderedfullgraph. Only readinessidea fromown0e8bb4ee-f97f-4e33-bd26-75270404bf78/528c6b75-628b-427b-9dab-07f2e7a9a3c1; theirwholelower/failedbundlesNOTbaseline, NOrouter/Gluon/halfskip orhostplanguards copied. NativePyTorch externalEventAPI source/docs citedinpublicnote. Allruntimeofficialremote; wholecompositionunvalidated."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_pkmm.py, models/nemotron_h_mtp_packed.py; harness/kernels/l2pf; models/nemotron_h.py; layers/mamba/mamba_mixer2.py; layers/attention/attention.py",
+      "why": "New optional native-MTP narrow packed MMA on entire41e5657b-0033-489a-b095-6a22fd5edcd8, derived from297e3412-dc4a-45ae-a0f1-b6c3afd76c1b with exact128tail, original gate-masked arithmetic, actual-weight/private full-output-bit+cold4pct admission. Original packed_small fallback. Budget-shared next-router prefetch inspired by297; immutable exact BF16shadow/originalFP32; at most quarter of existing5/7MiB window, router+projection up to3ranges fused intoone CUDAlaunch/fork withoriginaljoin. No coarse screen/halfskip/quantization/policy change. All execution officialremote only; new combination unverified."
     }
   ]
 }

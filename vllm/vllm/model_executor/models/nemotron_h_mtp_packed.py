@@ -236,8 +236,6 @@ def _packed_linear_impl(
             x, *p.planes, y, n, k, k, gate, BN=8, BK=512, EVICT=True,
             GATED=gated, num_warps=4, num_stages=3, launch_pdl=mtp_pdl())
         return y
-    if fallback.numel():
-        return mtp_small_linear_impl(x, fallback)
     if x.numel() == 0:
         return x.new_empty((*x.shape[:-1], n))
     if (x.is_cuda and x.dtype == torch.bfloat16 and x.dim() == 2
@@ -249,6 +247,8 @@ def _packed_linear_impl(
             x, *p.planes, y, x.shape[0], n, k, x.stride(0), y.stride(0), gate,
             GATED=gated, num_warps=4, num_stages=4, launch_pdl=mtp_pdl())
         return y
+    if fallback.numel():
+        return mtp_small_linear_impl(x, fallback)
     return mtp_small_linear_impl(x, p.decode())
 
 
@@ -330,6 +330,19 @@ def prepare_mtp_packed(module):
                 layer.register_buffer("_mtp_pk_" + suffix, tensor, persistent=False)
             layer._mtp_pk_n, layer._mtp_pk_k = p.shape
             w.data = torch.empty(0, dtype=w.dtype, device=w.device)
+        elif (w is not None
+                and name.endswith("o_proj") and tuple(w.shape) == (2688, 4096)
+                and type(getattr(layer, "quant_method", None)).__name__ == "MTPSmallLinearMethod"):
+            p = pack_bf16(w)
+            if p is None:
+                continue
+            raw_bytes += w.numel() * 2
+            packed_bytes += p.nbytes
+            values += w.numel()
+            retained_bytes += w.numel() * 2
+            for suffix, tensor in zip(("sm", "ex", "base", "ri", "raw"), p.planes):
+                layer.register_buffer("_mtp_pk_" + suffix, tensor, persistent=False)
+            layer._mtp_pk_n, layer._mtp_pk_k = p.shape
         if not getattr(layer, "_fast_moe", False):
             continue
         weights = layer._fast_moe_weights or mtp_moe_weights(layer)

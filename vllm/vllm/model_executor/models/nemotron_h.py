@@ -116,6 +116,11 @@ try:
 except ImportError:
     _l2pf = None
 
+try:
+    from vllm.model_executor.models import nemotron_h_attn_packed as _attn_packed
+except Exception:
+    _attn_packed = None
+
 # shco (harness/kernels/shco): the shared expert at the prefill M (496 rows) on shx,
 # bit-identical to Marlin up -> relu^2 -> Marlin down; absent or ineligible, stock runs.
 try:
@@ -566,10 +571,16 @@ class NemotronHAttention(nn.Module):
         hidden_states: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        if _attn_packed is None:
+            qkv, _ = self.qkv_proj(hidden_states)
+        else:
+            qkv = _attn_packed.apply(self.qkv_proj, hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         attn_output = self.attn(q, k, v)
-        output, _ = self.o_proj(attn_output)
+        if _attn_packed is None:
+            output, _ = self.o_proj(attn_output)
+        else:
+            output = _attn_packed.apply(self.o_proj, attn_output)
         return output
 
 
@@ -1034,4 +1045,10 @@ class NemotronHForCausalLM(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self, skip_prefixes=["mtp"])
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        if _attn_packed is not None:
+            try:
+                _attn_packed.prepare(self)
+            except Exception as exc:
+                _attn_packed.logger.warning("attention pack12 off: %r", exc)
+        return loaded

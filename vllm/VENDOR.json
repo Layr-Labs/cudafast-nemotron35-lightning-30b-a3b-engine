@@ -250,6 +250,10 @@
     {
       "file": "model_executor/models/nemotron_h_mtp_packed.py; model_executor/models/nemotron_h_mtp_kernels.py; model_executor/models/nemotron_h_mtp_screen.py; model_executor/models/nemotron_h_mtp_compact.py",
       "why": "Drafter only, same values. (1) Depth-gated draft passes: packed_gemv, packed_moe_up and _nvfp4_rows_dot return right after their PDL prologue once the gate's stop flag is set, storing the +0 their masked weight loads sum to; _chunk_topk (now given the gate) writes the first K ids of each chunk, the selection an all-equal score row produces. (2) packed_moe_up takes WN warps along N ([WN, 4] warps, K layout 8 x 32 x 4 unchanged) and launches with 2 rows per program and WN = 2, so every row keeps its accumulation and reduction order. (3) The compact down projection computes each slot's column sums in its own program (_down_slots, _down's tile, chunk order and tl.sum) and applies _down's epilogue in _down's order (_down_combine). MTP_DOWN_SLOTS=0 restores the single-kernel down."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_attn_packed.py and nemotron_h_attn_packed_kernel.py (new); model_executor/models/nemotron_h.py; model_executor/layers/attention/attention.py (prefetch target); model_executor/models/nemotron_h_mtp_packed.py",
+      "why": "Decode-path BF16 streams still on the 5-row verify and the decode MTP steps. (1) The six target attention layers' QKV (4608x2688) and o_proj (2688x4096) decode the drafter's lossless 12-bit codec in registers (one tl.dot chain over K tiles of 128 into fp32, one RN to BF16). A child process compiles the kernel on synthetic planes first; every packed layer must match F.linear bit for bit and the cold median must be strictly under F.linear, else that shape stays on cuBLAS (ATTN_PACK12=0 disables). Prefill and M!=5 stay on F.linear. (2) The MTP drafter's o_proj, same shape and codec, takes packed_gemv (M=1) or packed_small (M=2..16) on every decode drafter step; the BF16 matrix is retained so the drafter prefill (M>16) keeps mtp_small_linear (MTP_PACK12=0 disables). Formats and the target argmax are unchanged."
     }
   ]
 }

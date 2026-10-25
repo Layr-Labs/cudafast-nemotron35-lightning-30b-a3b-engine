@@ -234,6 +234,12 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
                     else:
                         layer.register_buffer("_fp8small_weight", packed, persistent=False)
                         self._fp8small_weight = packed
+                    # LOCAL PATCH (cudafast-nemotron35): prefill row counts through
+                    # fp8pre when this layer passes its bit and timing guards; else
+                    # CUTLASS. FP8PRE=0 disables.
+                    from .fp8pre import prepare_weight as prepare_fp8pre
+
+                    prepare_fp8pre(weight)
             return
 
         # B is column-major [K, N]

@@ -12,12 +12,14 @@ import os
 
 import torch
 
-__all__ = ["LIB_PATH", "available", "down", "BM", "block_rows"]
+__all__ = ["LIB_PATH", "available", "down", "BM", "block_rows", "has_config", "P2_CONFIGS"]
 
 LIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "libpzskip.so")
 ENABLED = os.environ.get("PZSKIP", "1") != "0"
 WPC = int(os.environ.get("PZSKIP_WPC", "6"))
 BM = 64
+# P2 configs (32-row blocks): compiled out by a -DPZSKIP_NO_P2 fallback build
+P2_CONFIGS = (336, 337, 338)
 
 _lib = None
 _load_error: str | None = None
@@ -45,8 +47,24 @@ def available() -> bool:
     return ENABLED and _load() is not None
 
 
+def has_config(wpc: int) -> bool:
+    """False for a P2 config when the library was built without it (or predates it)."""
+    lib = _load()
+    if lib is None:
+        return False
+    if wpc not in P2_CONFIGS:
+        return True
+    fn = getattr(lib, "pzskip_has_p2", None)
+    if fn is None:
+        return False
+    fn.argtypes = []
+    fn.restype = ctypes.c_int
+    return bool(fn())
+
+
 def block_rows(wpc: int) -> int:
-    """Expert block rows a config expects in its moe_align layout (320-339: 32, 340-359: 16)."""
+    """Expert block rows a config expects in its moe_align layout (320-339: 32, incl. P2
+    336-338; 340-359: 16)."""
     return 32 if 320 <= wpc < 340 else (16 if 340 <= wpc < 360 else BM)
 
 

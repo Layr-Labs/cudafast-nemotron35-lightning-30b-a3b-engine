@@ -242,20 +242,34 @@ class Shx:
         self.version = VERSION if version is None else version
         self.hint = HINT if hint is None else hint
         uf = 128 if self.version == 2 else 64
-        self.units_up = units_tensor(marlin_units(m, 3712, 2688, sms, uf), device)
-        self.units_dn = units_tensor(marlin_units(m, 2688, 3712, sms, uf), device)
+        up, dn = marlin_units(m, 3712, 2688, sms, uf), marlin_units(m, 2688, 3712, sms, uf)
+        self.units_up = units_tensor(up, device)
+        self.units_dn = units_tensor(dn, device)
+        # The units of Marlin's last launch (the rows holding row m - 1), each with the rows,
+        # features and segments it has in the full call: for a call whose caller reads only
+        # row m - 1 (TAIL_ONLY).
+        self.units_up_tail = units_tensor(_tail_units(up, m, 3712), device)
+        self.units_dn_tail = units_tensor(_tail_units(dn, m, 2688), device)
         lib = _load()
         assert lib is not None, _load_error
         self.scratch = torch.empty(lib.shx_scratch_floats(grid), dtype=torch.float32, device=device)
         self.work = torch.zeros(2, dtype=torch.int32, device=device)
 
-    def up(self, x, layer, out, relu2=True):
-        shx_gemm(x, layer.weight, layer.weight_scale, layer.weight_global_scale, out, self.units_up,
+    def up(self, x, layer, out, relu2=True, tail=False):
+        shx_gemm(x, layer.weight, layer.weight_scale, layer.weight_global_scale, out,
+                 self.units_up_tail if tail else self.units_up,
                  self.scratch, relu2=relu2, grid=self.grid, version=self.version, work=self.work, hint=self.hint)
 
-    def down(self, a, layer, out):
-        shx_gemm(a, layer.weight, layer.weight_scale, layer.weight_global_scale, out, self.units_dn,
+    def down(self, a, layer, out, tail=False):
+        shx_gemm(a, layer.weight, layer.weight_scale, layer.weight_global_scale, out,
+                 self.units_dn_tail if tail else self.units_dn,
                  self.scratch, grid=self.grid, version=self.version, work=self.work, hint=self.hint)
+
+
+def _tail_units(units, m: int, n: int):
+    """The units of marlin_mm's last launch for M = m (the launch holding row m - 1)."""
+    row0 = _launches(m, n)[-1][0]
+    return [u for u in units if u[0] >= row0]
 
 
 # ------------------------------------------------------------------------- engine entry points
@@ -265,6 +279,10 @@ SHX_M = 496  # the prefill row count whose Marlin trees shx reproduces
 SHAPES = frozenset({(3712, 2688), (2688, 3712)})  # (N, K): shared expert up, down
 _ctx: dict[int, Shx] = {}
 _logged = False
+# Set by the MoE runner around a call whose caller reads only the last row (the last MoE
+# layer of a prefill that samples one token and drafts nothing): shx then runs only the
+# units of Marlin's last launch, whose rows include that row. Other rows are not written.
+TAIL_ONLY = False
 
 
 def prepare(layer) -> bool:
@@ -325,9 +343,9 @@ def _run(layer, x: torch.Tensor, relu2: bool) -> torch.Tensor | None:
         return None
     out = torch.empty((x.shape[0], layer.output_size_per_partition), dtype=torch.bfloat16, device=x.device)
     if relu2:
-        ctx.up(x, layer, out, relu2=True)
+        ctx.up(x, layer, out, relu2=True, tail=TAIL_ONLY)
     else:
-        ctx.down(x, layer, out)
+        ctx.down(x, layer, out, tail=TAIL_ONLY)
     if not _logged:
         _logged = True
         import logging

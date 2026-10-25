@@ -740,7 +740,18 @@ class SpecDecodeBaseProposer:
         if set_moe_row_src is not None:
             # Padded rows of the single-token steps copy row 0.
             set_moe_row_src(input_batch_size, self._moe_row_zero)
-        for token_index in range(self.num_speculative_tokens - 1):
+        burst_tail = None
+        if getattr(self, "_nemo_burst", None) is not None:
+            from vllm.v1.spec_decode.nemotron_draft_burst import maybe_run as burst_run
+
+            burst_tail = burst_run(
+                self, positions, common_attn_metadata, hidden_states,
+                draft_token_ids_list[0], batch_size, input_batch_size,
+                not self._enable_probabilistic_draft_probs or sampling_metadata.all_greedy,
+                depth_gate)
+        if burst_tail is not None:
+            draft_token_ids_list.extend(burst_tail.unbind(1))
+        for token_index in range(0 if burst_tail is not None else self.num_speculative_tokens - 1):
             # Update the inputs.
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax() returns int64 by default.
@@ -1969,6 +1980,8 @@ class SpecDecodeBaseProposer:
             prepare(self)
             from vllm.v1.spec_decode.nemotron_decode_plan import prepare as prepare_plan
             prepare_plan(self)
+            from vllm.v1.spec_decode.nemotron_draft_burst import prepare as prepare_burst
+            prepare_burst(self)
 
     def _get_eagle3_use_aux_hidden_state_from_config(self) -> bool:
         """

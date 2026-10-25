@@ -76,10 +76,10 @@ __global__ __launch_bounds__(128, 3) void gemm(P p) {
     load_w<K>(p, tile, warp, lane, r, s[r], x[r], b[r]);
     load_a(p, lane, r, a[r]);
   }
-  for (int g0 = 0; g0 < GN; g0 += R) {
+  for (int batch = 0; batch < apk_group_batches(GN, R); ++batch) {
 #pragma unroll
     for (int r = 0; r < R; ++r) {
-      int G = g0 + r;
+      int G = apk_group_index(batch, r, R);
       if (G < GN) {
         uint32_t w[8];
         fragment<K>(p, tile, warp, lane, G, s[r], x[r], b[r], w);
@@ -125,24 +125,41 @@ __global__ void check(P p, const uint16_t* w, unsigned int* bad) {
 }
 }  // namespace apk12
 using apk12::P;
+#define APK12_CHECK_GEMM(N, K, R) \
+  if (rc == cudaSuccess) rc = cudaFuncGetAttributes(&attr, apk12::gemm<N, K, R>)
 extern "C" int apk12_init() {
   cudaFuncAttributes attr;
-  cudaError_t rc = cudaFuncGetAttributes(&attr, apk12::gemm<4608, 2688, 4>);
-  if (rc == cudaSuccess) rc = cudaFuncGetAttributes(&attr, apk12::gemm<2688, 4096, 4>);
+  cudaError_t rc = cudaSuccess;
+  APK12_CHECK_GEMM(4608, 2688, 1);
+  APK12_CHECK_GEMM(4608, 2688, 2);
+  APK12_CHECK_GEMM(4608, 2688, 4);
+  APK12_CHECK_GEMM(2688, 4096, 1);
+  APK12_CHECK_GEMM(2688, 4096, 2);
+  APK12_CHECK_GEMM(2688, 4096, 4);
+#undef APK12_CHECK_GEMM
   if (rc == cudaSuccess) rc = cudaFuncGetAttributes(&attr, apk12::check<4608, 2688>);
   if (rc == cudaSuccess) rc = cudaFuncGetAttributes(&attr, apk12::check<2688, 4096>);
   return (int)rc;
 }
 extern "C" int apk12_run(const void* x, const void* sm, const void* ex, const void* meta,
                          const void* ri, const void* raw, void* y, int m, int n, int k,
-                         int ldx, void* stream) {
-  if (m < 1 || m > 8) return (int)cudaErrorInvalidValue;
+                         int ldx, int groups, void* stream) {
+  if (m < 1 || m > 8 || (groups != 1 && groups != 2 && groups != 4))
+    return (int)cudaErrorInvalidValue;
   P p{(const __nv_bfloat16*)x, (const uint4*)sm, (const uint2*)ex, (const uint8_t*)meta,
       (const int32_t*)ri, (const uint16_t*)raw, (__nv_bfloat16*)y, m, ldx};
   cudaStream_t st = (cudaStream_t)stream;
-  if (n == 4608 && k == 2688) apk12::gemm<4608, 2688, 4><<<4608 / 32, 128, 0, st>>>(p);
-  else if (n == 2688 && k == 4096) apk12::gemm<2688, 4096, 4><<<2688 / 32, 128, 0, st>>>(p);
-  else return (int)cudaErrorInvalidValue;
+  if (n == 4608 && k == 2688) {
+    if (groups == 1) apk12::gemm<4608, 2688, 1><<<4608 / 32, 128, 0, st>>>(p);
+    else if (groups == 2) apk12::gemm<4608, 2688, 2><<<4608 / 32, 128, 0, st>>>(p);
+    else apk12::gemm<4608, 2688, 4><<<4608 / 32, 128, 0, st>>>(p);
+  } else if (n == 2688 && k == 4096) {
+    if (groups == 1) apk12::gemm<2688, 4096, 1><<<2688 / 32, 128, 0, st>>>(p);
+    else if (groups == 2) apk12::gemm<2688, 4096, 2><<<2688 / 32, 128, 0, st>>>(p);
+    else apk12::gemm<2688, 4096, 4><<<2688 / 32, 128, 0, st>>>(p);
+  } else {
+    return (int)cudaErrorInvalidValue;
+  }
   return (int)cudaGetLastError();
 }
 extern "C" int apk12_check(const void* sm, const void* ex, const void* meta, const void* ri,

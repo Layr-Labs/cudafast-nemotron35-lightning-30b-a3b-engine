@@ -2,6 +2,7 @@
 """Boot-only whole-forward graph for one fresh, exact 496-token prefill."""
 
 import dataclasses
+import os
 
 import torch
 
@@ -112,8 +113,27 @@ class FreshPrefillGraph:
         with torch.cuda.graph(self.graph, pool=self.pool):
             self.hidden, self.logits = self._forward()
         torch.cuda.synchronize()
+        # LOCAL PATCH (cudafast-nemotron35): a second graph for a prefill that samples
+        # one token and drafts nothing (gpu_model_runner._drafts_can_be_verified() is
+        # False): its last MoE layer computes row 495 alone (moe_runner keep_m_lite).
+        # Row 495's logits are the ones the graph above gives. Its own pool, so the
+        # outputs above are never overwritten by it. PREFILL_LITE=0 disables.
+        self.graph_lite = None
+        if os.environ.get("PREFILL_LITE", "1") != "0":
+            try:
+                self.pool_lite = torch.cuda.graph_pool_handle()
+                for _ in range(2):
+                    self._forward(lite=True)
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, pool=self.pool_lite):
+                    self.hidden_lite, self.logits_lite = self._forward(lite=True)
+                torch.cuda.synchronize()
+                self.graph_lite = graph
+            except Exception:  # noqa: BLE001
+                self.graph_lite = None
 
-    def _forward(self):
+    def _forward(self, lite: bool = False):
         # Only row 495 of the final hidden state is read (:94, :115, and the
         # same index in replay). While this call runs, the last MoE layer
         # routes every row through that row's experts, so it reads 6 experts'
@@ -127,7 +147,7 @@ class FreshPrefillGraph:
         # never re-decides it, and the clear keeps every later forward (the
         # decode graphs are captured earlier, :7036 against :7024) untouched.
         model = self.runner.get_model()
-        model.set_last_moe_row_src(self.logits_indices)
+        model.set_last_moe_row_src(self.logits_indices, lite=lite)
         try:
             with set_forward_context(
                 self.metadata, self.runner.vllm_config, num_tokens=496,
@@ -142,7 +162,7 @@ class FreshPrefillGraph:
             model.set_last_moe_row_src(None)
         return hidden, logits
 
-    def replay(self, metadata, slots, input_ids, positions):
+    def replay(self, metadata, slots, input_ids, positions, lite: bool = False):
         # Rewrite every captured request tensor, even shape-derived constants.
         seen = set()
         _refresh(self.metadata, metadata, seen)
@@ -150,6 +170,9 @@ class FreshPrefillGraph:
         self.input_ids.copy_(input_ids)
         self.positions.copy_(positions)
         self.logits_indices.fill_(495)
-        self.graph.replay()
         self.replays += 1
+        if lite and self.graph_lite is not None:
+            self.graph_lite.replay()
+            return self.hidden_lite, self.logits_lite
+        self.graph.replay()
         return self.hidden, self.logits

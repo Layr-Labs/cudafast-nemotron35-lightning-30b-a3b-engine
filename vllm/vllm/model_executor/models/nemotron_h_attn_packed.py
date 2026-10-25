@@ -50,7 +50,6 @@ ENABLED = os.environ.get("ATTN_PACK12", "1") != "0"
 SHAPES = frozenset({(4608, 2688), (2688, 4096)})
 MIN_GAIN = 0.96
 KERNEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nemotron_h_attn_packed_kernel.py")
-CUDA = ("apk12",)
 
 _chosen: dict[tuple[int, int], tuple] = {}
 _word_ok = False
@@ -107,22 +106,26 @@ for n, k in ((4608, 2688), (2688, 4096)):
     w = torch.where(esc, raw.int().view(-1, 128)[ri.clamp(min=0)].view(-1), w).short()
     cp = m.pack((sm, ex, base, ri, raw), n, k)
     assert m.check(cp, w, n, k) == 0
-    y = m.gemm(torch.randn(5, k, device=dev, dtype=torch.bfloat16), cp, n, k)
-    torch.cuda.synchronize()
-    assert y.shape == (5, n)
+    x = torch.randn(5, k, device=dev, dtype=torch.bfloat16)
+    for groups in m.PIPE_GROUPS:
+        y = m.gemm(x, cp, n, k, groups)
+        torch.cuda.synchronize()
+        assert y.shape == (5, n)
 print("probe-ok")
 """
 
+CUDA = tuple(("apk12", groups) for groups in (_apk12.PIPE_GROUPS if _apk12 else ()))
+
 
 def _run(x: torch.Tensor, planes, n: int, k: int, cfg: tuple) -> torch.Tensor:
-    if cfg == CUDA:
-        return _apk12.gemm(x, planes, n, k)
+    if cfg in CUDA:
+        return _apk12.gemm(x, planes, n, k, cfg[1])
     return run(x, *planes, n, k, cfg)
 
 
 def _planes(item, cfg: tuple):
     """An item is (proj, codec planes, apk12's copy of them or None)."""
-    return item[2] if cfg == CUDA else item[1]
+    return item[2] if cfg in CUDA else item[1]
 
 
 def _linear_impl(x: torch.Tensor, w: torch.Tensor, n: int, k: int, pid: int) -> torch.Tensor:
@@ -185,7 +188,7 @@ def _probe() -> bool:
 
 
 def _probe_cuda(dev: torch.device) -> bool:
-    return (_apk12 is not None and _probe_group(CUDA[0], _PROBE_CUDA, _apk12.__file__)
+    return (_apk12 is not None and _probe_group("apk12", _PROBE_CUDA, _apk12.__file__)
             and _apk12.ready(dev))
 
 
@@ -272,11 +275,11 @@ def _choose(items, n: int, k: int, flush: torch.Tensor):
         use_graph = False
         linear_us = _op_us(lambda: F.linear(x, proj.weight), flush)
     choices = []
-    cuda = [CUDA] if all(it[2] is not None for it in items) else []
+    cuda = list(CUDA) if all(it[2] is not None for it in items) else []
     for cfg in cuda + (list(CONFIGS) if _triton_ok else []):
         if len(cfg) == 4 and not _word_ok:
             continue
-        if cfg != CUDA and n % cfg[0]:
+        if cfg not in CUDA and n % cfg[0]:
             continue
         try:
             if use_graph:

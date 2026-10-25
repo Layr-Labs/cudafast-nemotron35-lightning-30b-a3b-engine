@@ -342,6 +342,14 @@
     {
       "file": "vllm/v1/spec_decode/nemotron_decode_plan.py (+ llm_base_proposer.py, v1/attention/backends/flashinfer.py)",
       "why": "Own native-MTP FA2 planning-state bank on ENTIRE0e71. Remote startup records original native plan vector, integer prefix and scalar state for each EXACT CPU indptr/last-page/options input, across up to128generic page counts with every valid residue, capped64MiB of plan bytes. Integer-tail/float-arena canaries guard actual installed planner writes; no page-invariance or package-source-equality assumption. Changed private model/hidden/token/gate/KV/live indices/CPU metadata and complete side-stream model-step timing admission mandatory. Only then copy native planning state; current indices/last-page buffers still refreshed. Unknown keys/identities/options fall back before mutation. No request capture or inference output cache. NEMO_MTP_NATIVE_PLAN_BANK=0 disables. Private qualification lineage6cafa6b6-8f26-4ef5-86e1-38c061a207d7 andce5aa6bd-15c2-42c2-8a68-4bc2fe65c23b; no lower tailgraph or L1 runtime imported."
+    },
+    {
+      "file": "model_executor/layers/mamba/ops/mamba_ssm_spec_replay.py; mamba_replay_pipeline.py; layers/mamba/mamba_mixer2.py; v1/worker/gpu_model_runner.py",
+      "why": "Own substantial raw-input SSM replay software pipeline on ENTIREhighest0b98 period20; this independent alternative contains no6af conditional/tail/head oranchor-prefetch runtime. Preload next historical raw x/B/dt before dependent scalar/state math; circular index normalized once then add/select; hoist immutable A/bias/D. Exact per-token FP32 expression/reduction and raw ring/checkpoint layout retained; no new cache. Boot-only full guarded backing/output/pre-verify bytes compared on actual loaded parameters, dtype/PDL/prefix/rejection/wrap/checkpoint/empty/null histories; generic private graph timing must improve. Decision reset at real cache binding before compile/capture. Fixture/cache-bind lineage own16e4936c-12ef-4356-80bd-2f5ceb500dce; none of its failed scalar-cache runtime adopted. Combination/admission/whole gain unvalidated, all execution officialremote."
+    },
+    {
+      "file": "model_executor/layers/fused_moe/experts/humming_relu2_epilogue.py; humming_nvsc.py",
+      "why": "Useful pending39b5409c-ab0d-45e4-a9a6-88f936479912 exacttwo-file sourcec85a6beed5349b4d5fd0b079cdda2e8b9f11e7d8. Verify bucket24..48 changesK32/stages8 toK128/stages2, stillserialascendingK16 MMA chain; sixbit scale-loader advances96byteexistingrecord periter_id/2, no new weight format. Exactshape guards andvariantcachekey retained. Author localclaims are not official evidence; combinedwhole/engagementunvalidated."
     }
   ]
 }

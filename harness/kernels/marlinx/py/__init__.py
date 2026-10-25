@@ -168,6 +168,8 @@ def prepare(layer) -> bool:
 # read only the k rows whose activation is nonzero in some row (see csrc).
 ZS_ENABLED = os.environ.get("MARLINX_ZS", "1") != "0"
 ZS_SHAPE = (2688, 3712)
+ZS_VERIFY_DEPTH = 4 if os.environ.get("MARLINX_ZS_VERIFY_RING4", "1") != "0" else DEPTH
+ZS_VERIFY_M = 5
 # bit offsets inside Marlin's word for k = 2t, 2t+1, 2t+8, 2t+9: (feature g, feature g+8)
 _ZS_POS = ((0, 8), (16, 24), (4, 12), (20, 28))
 
@@ -240,8 +242,10 @@ def maybe_apply(layer, x: torch.Tensor) -> torch.Tensor | None:
     if not _ready and not _init():
         return None
     n = layer.output_size_per_partition
+    zs = getattr(layer, "_marlinx_zs", None)
+    depth = ZS_VERIFY_DEPTH if zs is not None and m == ZS_VERIFY_M else DEPTH
     out = gemm(x2, layer.weight, layer.weight_scale, layer.weight_global_scale, n, k,
-               zs=getattr(layer, "_marlinx_zs", None))
+               depth=depth, zs=zs)
     return out.reshape(*x.shape[:-1], n)
 
 

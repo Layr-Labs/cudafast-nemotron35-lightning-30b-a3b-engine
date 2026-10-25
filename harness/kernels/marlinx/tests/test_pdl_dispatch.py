@@ -104,6 +104,75 @@ class DispatchTests(unittest.TestCase):
             self.assertEqual(module._ops_pdl[mode].calls, 1)
             self.assertEqual(module._ops[mode].calls, 0)
 
+    def test_verify_shared_down_ring_depth(self):
+        """M=5 zero-skip shared down passes depth 4; every other call stays at DEPTH."""
+        module, _, torch = load_module()
+        torch.compiler = SimpleNamespace(is_compiling=lambda: False)
+        seen = []
+
+        def capture(*args):
+            seen.append(args)
+            return 0
+
+        module._ops_pdl["zs"] = capture
+        module._ops_pdl["gemm"] = capture
+
+        class Row:
+            def __init__(self, m, k):
+                self.shape = (m, k)
+                self.dtype = torch.bfloat16
+                self.device = SimpleNamespace(index=0)
+
+            def reshape(self, *args):
+                return self
+
+            def stride(self, dim):
+                return 1 if dim == -1 else 16
+
+            def data_ptr(self):
+                return 16
+
+        class Buf:
+            def data_ptr(self):
+                return 32
+
+        class Out:
+            def data_ptr(self):
+                return 64
+
+            def reshape(self, *args):
+                return self
+
+        torch.empty = lambda *args, **kwargs: Out()
+        layer = SimpleNamespace(
+            _marlinx_ok=True,
+            output_size_per_partition=2688,
+            weight=Buf(),
+            weight_scale=Buf(),
+            weight_global_scale=Buf(),
+            _marlinx_zs=Buf(),
+        )
+        self.assertIsNotNone(module.maybe_apply(layer, Row(5, 3712)))
+        self.assertEqual(seen[-1][2], 5)
+        self.assertEqual(seen[-1][8], 2688)
+        self.assertEqual(seen[-1][9], 3712)
+        self.assertEqual(seen[-1][11], module.ZS_VERIFY_DEPTH)
+        self.assertEqual(len(seen[-1]), 14)
+
+        module.maybe_apply(layer, Row(4, 3712))
+        self.assertEqual(seen[-1][2], 4)
+        self.assertEqual(seen[-1][11], module.DEPTH)
+
+        layer._marlinx_zs = None
+        module.maybe_apply(layer, Row(5, 3712))
+        self.assertEqual(seen[-1][11], module.DEPTH)
+        self.assertEqual(len(seen[-1]), 13)
+
+        layer._marlinx_zs = Buf()
+        module.ZS_VERIFY_DEPTH = module.DEPTH
+        module.maybe_apply(layer, Row(5, 3712))
+        self.assertEqual(seen[-1][11], module.DEPTH)
+
 
 if __name__ == "__main__":
     unittest.main()

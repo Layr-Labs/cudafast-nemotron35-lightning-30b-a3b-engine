@@ -342,6 +342,10 @@
     {
       "file": "vllm/v1/spec_decode/nemotron_decode_plan.py (+ llm_base_proposer.py, v1/attention/backends/flashinfer.py)",
       "why": "Own native-MTP FA2 planning-state bank on ENTIRE0e71. Remote startup records original native plan vector, integer prefix and scalar state for each EXACT CPU indptr/last-page/options input, across up to128generic page counts with every valid residue, capped64MiB of plan bytes. Integer-tail/float-arena canaries guard actual installed planner writes; no page-invariance or package-source-equality assumption. Changed private model/hidden/token/gate/KV/live indices/CPU metadata and complete side-stream model-step timing admission mandatory. Only then copy native planning state; current indices/last-page buffers still refreshed. Unknown keys/identities/options fall back before mutation. No request capture or inference output cache. NEMO_MTP_NATIVE_PLAN_BANK=0 disables. Private qualification lineage6cafa6b6-8f26-4ef5-86e1-38c061a207d7 andce5aa6bd-15c2-42c2-8a68-4bc2fe65c23b; no lower tailgraph or L1 runtime imported."
+    },
+    {
+      "file": "harness/kernels/marlinx/csrc/marlinx.cu; harness/kernels/shco/csrc/shx.cu; vllm/model_executor/layers/fused_moe/experts/humming_relu2_epilogue.py; harness/tests/humming_relu2_exact.py",
+      "why": "Packed non-FTZ BF16 ReLU-square (max.NaN.bf16x2 against +0, then mul.rn.bf16x2) on every live shared-expert and routed-expert up epilogue. Scalar round_output<false> is unchanged. The packed square matches bf16(relu(x)^2) via one f32 multiply and one rn rounding on all 65536 bf16 patterns, including canonical NaN 0x7fff."
     }
   ]
 }

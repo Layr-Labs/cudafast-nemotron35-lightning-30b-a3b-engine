@@ -758,7 +758,24 @@ class HummingIndexedExperts(HummingExpertsBase):
         # inside its epilogue, then writes relu(output)**2 directly to the
         # activation buffer. Other shapes, formats and activations keep the
         # ordinary projection and activation calls.
+        up_done = False
         if (
+            activation == MoEActivation.RELU2_NO_MUL
+            and expert_map is None
+            and inputs.dtype == torch.bfloat16
+            and input_scale is None
+            and topk_ids.shape[0] <= 8
+        ):
+            packed_up = getattr(self.layer, "routed_up", None)
+            if packed_up is not None:
+                from routed_up import forward as routed_up_forward
+
+                up_done = routed_up_forward(
+                    inputs, topk_ids, buffers["activation_output"], packed_up
+                )
+        if up_done:
+            pass
+        elif (
             activation == MoEActivation.RELU2_NO_MUL
             and getattr(self, "_fused_relu2", False)
             and inputs.dtype == torch.bfloat16

@@ -1053,6 +1053,20 @@ def convert_to_humming_moe_kernel_format(
                 layer.w2_weight, layer.w2_weight_scale, layer.w2_weight_scale_2
             )
 
+    layer.routed_up = None
+    if tuned and all(
+        hasattr(layer, name)
+        for name in ("w13_weight", "w13_weight_scale", "w13_weight_scale_2")
+    ):
+        try:
+            from routed_up import prepare as prepare_routed_up
+        except ImportError:
+            pass
+        else:
+            layer.routed_up = prepare_routed_up(
+                layer.w13_weight, layer.w13_weight_scale, layer.w13_weight_scale_2
+            )
+
     for sublayer_name, configs in sublayer_configs.items():
         final_weight_schema, final_input_schema = _process_single_sublayer(
             layer=layer,

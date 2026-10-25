@@ -266,6 +266,14 @@
     {
       "file": "model_executor/models/nemotron_h_attn_packed.py",
       "why": "Selectonlygraph-replayadmissiontiming helper frompublicpendingf102bbdb-ebe5-48e5-a1c8-313774419059;24callscycle6real-layerweights,7replaymedian, nohostlaunchbias. Keep4%MIN_GAIN andrankedall-layerexactadmission; paired eagerbaseline/candidatefallback ifreferencegraphunavailable. DoNOTimportdiagnosticstalls,_sleep,stagecodes orMIN_GAIN10. ADFcombined8d/51notealreadycoverednonewmethod; wholecombo remainsunverified,remoteonly."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_packed.py, nemotron_h_mtp_kernels.py, vllm/v1/attention/backends/flashinfer.py, layers/attention/attention.py, vllm/v1/worker/gpu_model_runner.py",
+      "why": "jacklightChen 36efef0d (decode pieces only): native MTP word reads, packed drafter output projection, structural plan reuse. Its prefill-alignment hunks (humming_zskip.py, fused_humming_moe.py, prefill_graph.py) are not carried: the equivalent pieces measured -0.23% on this tree."
+    },
+    {
+      "file": "harness/kernels/routed_up, fused_moe/experts/fused_humming_moe.py, quantization/utils/humming_utils.py",
+      "why": "Decode/verify routed up (w13, M<=8) on the routed_sparse dense MMA schedule with the humming relu2 bf16 epilogue folded in. Prefill stays on humming. Not the zskip k-row schedule."
     }
   ]
 }

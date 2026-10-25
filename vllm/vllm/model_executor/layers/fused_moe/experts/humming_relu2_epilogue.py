@@ -38,16 +38,13 @@ class EpilogueArithmetic : public UnfusedEpilogueArithmetic<
   static_assert(!TuningConfig::kUseStreamK);
   CUDA_INLINE void may_apply_on_smem_write(uint32_t &regs, uint32_t row, uint32_t col) {
     Base::may_apply_on_smem_write(regs, row, col);
-    // regs already contains the original BF16 output. Use explicit non-FTZ
-    // operations even if Humming enables fast math for unrelated arithmetic.
+    // regs contains the original BF16 output. Packed non-FTZ instructions
+    // retain NaN propagation and the same single BF16 square rounding.
     uint32_t squared;
     asm volatile(
-        "{ .reg .b16 lo, hi; .reg .f32 x, y;\n"
-        "mov.b32 {lo, hi}, %1;\n"
-        "cvt.f32.bf16 x, lo; cvt.f32.bf16 y, hi;\n"
-        "max.NaN.f32 x, x, 0f00000000; max.NaN.f32 y, y, 0f00000000;\n"
-        "mul.rn.f32 x, x, x; mul.rn.f32 y, y, y;\n"
-        "cvt.rn.bf16x2.f32 %0, y, x; }\n"
+        "{ .reg .b32 x, z;\n"
+        "mov.b32 z, 0; max.NaN.bf16x2 x, %1, z;\n"
+        "mul.rn.bf16x2 %0, x, x; }\n"
         : "=r"(squared) : "r"(regs));
     regs = squared;
   }

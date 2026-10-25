@@ -571,6 +571,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
         self.spec_replay_ring_len = spec_replay_ring_len(self.num_spec)
         self._spec_replay_ok: bool | None = None
         self._spec_replay_lazy: bool | None = None
+        self._conv_x_ok = False
         if self.use_spec_replay:
             logger.info_once(
                 "Mamba2 spec decode: anchor-state replay (ring of %d tokens).",
@@ -1099,8 +1100,30 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 state_indices_tensor_d_input = state_indices_tensor_d
                 state_indices_tensor_d_output = state_indices_tensor_d
 
-            # 2. Convolution sequence transformation
-            hidden_states_B_C_d = causal_conv1d_update(
+            # 2. Convolution sequence transformation. A partial producer can
+            # run only after the SAME actual spec-replay support decision that
+            # will select its SSU consumer; no fallback after partial execution.
+            partial_x = bool(
+                self._conv_x_ok and not is_mamba_cache_all
+                and self.use_spec_replay and not self.use_replayssm
+                and num_decodes == 1 and num_decode_tokens == 5 and not has_prefill
+                and num_accepted_tokens is not None and query_start_loc_d is not None
+                and state_indices_tensor_d.shape == (1, 5)
+                and block_idx_last_scheduled_token_d is None
+                and block_idx_last_computed_token_d is None
+                and self._lazy_anchor(ssm_state))
+            if partial_x and self._spec_replay_ok is None:
+                # Layout-only views, once before any partial producer writes.
+                # Actual bytes do not enter the support decision.
+                self._spec_replay_ready(
+                    ssm_state, hidden_states_B_C_d[:, :4096].view(5, 64, 64),
+                    dt_d[:, :, None].expand(-1, -1, 64),
+                    self.A[:, None, None].expand(-1, 64, 128),
+                    hidden_states_B_C_d[:, 4096:5120].view(5, 8, 128),
+                    self.dt_bias[:, None].expand(-1, 64), state_indices_tensor_d,
+                )
+            partial_x = partial_x and self._spec_replay_ok is True
+            conv_result = causal_conv1d_update(
                 hidden_states_B_C_d,
                 conv_state,
                 self.conv_weights,
@@ -1112,7 +1135,14 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 num_accepted_tokens=num_accepted_tokens,
                 query_start_loc=query_start_loc_d,
                 max_query_len=state_indices_tensor_d.size(-1),
+                _partial_x=partial_x,
             )
+            if partial_x:
+                hidden_states_B_C_d, produced_partial_x = conv_result
+            else:
+                hidden_states_B_C_d, produced_partial_x = conv_result, False
+            prepared_conv_x = ((conv_state, self.conv_weights, self.conv1d.bias)
+                               if produced_partial_x else None)
 
             hidden_states_d, B_d, C_d = self.split_hidden_states_B_C_fn(
                 hidden_states_B_C_d
@@ -1205,6 +1235,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     ring_len=self.spec_replay_ring_len,
                     is_blackwell=self.is_blackwell,
                     lazy=self._lazy_anchor(ssm_state),
+                    _conv_x=prepared_conv_x,
                 )
             else:
                 selective_state_update(
@@ -1224,6 +1255,23 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     cu_seqlens=query_start_loc_d,
                     is_blackwell=self.is_blackwell,
                 )
+
+    def prepare_conv_x_fusion(self, enabled: bool = True) -> None:
+        """Private actual-weight admission after real cache bind only."""
+        self._conv_x_ok = False
+        if (not enabled or not self.use_spec_replay or self.use_replayssm
+                or self.num_spec != 4 or self.cache_config.mamba_cache_mode != "none"
+                or self.activation not in ("silu", "swish")
+                or not self._lazy_anchor(self.kv_cache[1])):
+            return
+        conv = (self.kv_cache[0] if is_conv_state_dim_first()
+                else self.kv_cache[0].transpose(-1, -2))
+        from vllm.model_executor.layers.mamba.ops.mamba_convolution_x import prepare
+        self._conv_x_ok = prepare(
+            conv, self.kv_cache[1], self.model_config.dtype,
+            self.conv_weights, self.conv1d.bias, self.A, self.dt_bias, self.D,
+            self.spec_replay_ring_len, self.is_blackwell,
+        )
 
     def _lazy_anchor(self, ssm_state: torch.Tensor) -> bool:
         """Whether verifies keep the checkpointed anchor (and prefills write the

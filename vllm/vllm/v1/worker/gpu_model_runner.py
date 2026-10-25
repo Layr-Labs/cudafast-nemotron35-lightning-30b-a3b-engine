@@ -8149,6 +8149,13 @@ class GPUModelRunner(
             kv_cache_config, kernel_block_sizes
         )
 
+        # Private actual-weight qualification before requests/capture. Reset on
+        # every profiling/cache-rebind pass; no tuning in a compiled forward.
+        for layer in self.compilation_config.static_forward_context.values():
+            prepare_conv_x = getattr(layer, "prepare_conv_x_fusion", None)
+            if prepare_conv_x is not None:
+                prepare_conv_x(enabled=not is_profiling)
+
         if (
             self.speculative_config
             and self.speculative_config.uses_extract_hidden_states()

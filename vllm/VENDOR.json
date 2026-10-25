@@ -342,6 +342,18 @@
     {
       "file": "vllm/v1/spec_decode/nemotron_decode_plan.py (+ llm_base_proposer.py, v1/attention/backends/flashinfer.py)",
       "why": "Own native-MTP FA2 planning-state bank on ENTIRE0e71. Remote startup records original native plan vector, integer prefix and scalar state for each EXACT CPU indptr/last-page/options input, across up to128generic page counts with every valid residue, capped64MiB of plan bytes. Integer-tail/float-arena canaries guard actual installed planner writes; no page-invariance or package-source-equality assumption. Changed private model/hidden/token/gate/KV/live indices/CPU metadata and complete side-stream model-step timing admission mandatory. Only then copy native planning state; current indices/last-page buffers still refreshed. Unknown keys/identities/options fall back before mutation. No request capture or inference output cache. NEMO_MTP_NATIVE_PLAN_BANK=0 disables. Private qualification lineage6cafa6b6-8f26-4ef5-86e1-38c061a207d7 andce5aa6bd-15c2-42c2-8a68-4bc2fe65c23b; no lower tailgraph or L1 runtime imported."
+    },
+    {
+      "file": "model_executor/layers/mamba/{mamba_mixer2.py,ops/causal_conv1d.py,ops/mamba_ssm_spec_replay.py,ops/mamba_convolution_x.py}; v1/worker/gpu_model_runner.py",
+      "why": "Own conv-X/SSM fusion on ENTIRE34d21409-8c2e-479f-b1cf-d7b02e5e2e53. Existing conv computes B/C only after joint producer-consumer support/admission. Each original SSM M tile owns unique X channels, preloads raw current rows/history, computes original ordered width4 SiLU convolution, preserves BF16 projection/ring rounding and raw conv history. Original period20, replay recurrence, tile/warp and prefix behavior retained. Actual-weight private fullchain multi-history/all-physical-backing equality and cold/warm graph timing before real requests/capture; failure retains original fullconv+SSM. Fixture/lifecycle adapted from own321fc52b-40e5-4d7e-846d-f1c0847617da, d3189214-8a45-4ab3-9faa-39f0a5e2c24a, 4df35f29-cf54-40f3-8380-3b37a7c9bf07 and16e4936c-12ef-4356-80bd-2f5ceb500dce; lower whole bundles excluded, no P5/scalar cache/prefill variants imported. No local execution; entire new combination unverified until official remote result."
+    },
+    {
+      "file": "harness/kernels/marlinx/csrc/marlinx.cu; harness/kernels/shco/csrc/shx.cu",
+      "why": "Pending798532d4-c011-41b7-8d73-a1f7c25c8b1b/PR496 exact full source blobs5364238181c6326769febda8e86bca6393353172 anda49115a014f856d850ca1a5eaf65ef56f67854ea. Extend highest34d2 non-FTZ packed BF16 ReLU-square to existing shared expert up epilogues; preserve prior BF16 round, non-ReLU scalar branches, MMA, stores and geometry. Author host results are not our execution; entire combination unverified."
+    },
+    {
+      "file": "harness/kernels/pzskip/csrc/pzskip.cu",
+      "why": "Pending3dbe8a26-6e42-4581-b1da-d6ec02078389/PR497 exact full blob13f0b34457e15c0f24af69b26362ad2f9d81f5c0. Hoist CTA-uniform NT row-count dispatch out of original sparse prefill reduction using integral_constant specializations; same active K group order/MMA/copy/barrier/dense negative-zero repair. Nonoverlapping with ConvX and packed epilogues. Author local receipts not our validation; whole combination unverified."
     }
   ]
 }

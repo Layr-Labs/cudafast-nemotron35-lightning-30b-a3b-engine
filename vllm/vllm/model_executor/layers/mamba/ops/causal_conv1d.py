@@ -806,6 +806,7 @@ def _causal_conv1d_update_kernel(
     HAS_NULL_BLOCK: tl.constexpr,
     BLOCK_N: tl.constexpr,
     launch_pdl: tl.constexpr,
+    FEATURE_BASE: tl.constexpr = 0,
 ):
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
@@ -818,7 +819,7 @@ def _causal_conv1d_update_kernel(
         return
 
     # [BLOCK_N,] elements along the feature-dimension (channel)
-    idx_feats = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    idx_feats = FEATURE_BASE + tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
 
     if IS_APC_ENABLED:
         # Get the state from the initial_state_idx
@@ -1115,6 +1116,7 @@ def causal_conv1d_update(
     initial_state_idx: torch.Tensor | None = None,
     validate_data=False,
     out: torch.Tensor | None = None,
+    _partial_x: bool = False,
 ):
     """
     x: Input tensor which can take the following shapes:
@@ -1237,10 +1239,23 @@ def causal_conv1d_update(
     if batch == 1 and dim % 128 == 0 and _is_sm121():
         block_n = 128
 
+    partial_x = bool(_partial_x and batch == 1 and dim == 6144 and seqlen == 5
+                     and x.shape == (5, 6144) and width == 4
+                     and query_start_loc is not None and query_start_loc.shape == (2,)
+                     and conv_state_indices is not None and conv_state_indices.shape == (1, 5)
+                     and conv_state_indices.stride(1) == 1
+                     and num_accepted_tokens is not None
+                     and block_idx_last_scheduled_token is None and initial_state_idx is None
+                     and null_block_id == NULL_BLOCK_ID
+                     and x.dtype == original_x_dtype == torch.bfloat16
+                     and activation in ("silu", "swish") and _is_sm121()
+                     and x.stride(1) == 1 and out.data_ptr() == x.data_ptr())
+    feature_base = 4096 if partial_x else 0
+
     def grid(META):
         return (
             batch,
-            triton.cdiv(dim, META["BLOCK_N"]),
+            triton.cdiv(dim - feature_base, META["BLOCK_N"]),
         )
 
     _causal_conv1d_update_kernel[grid](
@@ -1287,10 +1302,12 @@ def causal_conv1d_update(
         HAS_NULL_BLOCK=null_block_id is not None,
         BLOCK_N=block_n,
         launch_pdl=current_platform.is_arch_support_pdl(),
+        FEATURE_BASE=feature_base,
     )
     if unsqueeze:
         out = out.squeeze(-1)
-    return out.to(original_x_dtype)
+    result = out.to(original_x_dtype)
+    return (result, partial_x) if _partial_x else result
 
 
 if current_platform.is_cpu():

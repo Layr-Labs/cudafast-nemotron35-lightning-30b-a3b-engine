@@ -143,6 +143,17 @@ def spec_replay_ring_elems(nheads: int, dim: int, ngroups: int, dstate: int) -> 
     return nheads * dim + ngroups * dstate + nheads
 
 
+@triton.jit
+def _convx4(a, b, c, d, w0, w1, w2, w3, bias):
+    # Preserve the original conv expression and ordered four accumulations.
+    acc = bias
+    acc += a * w0
+    acc += b * w1
+    acc += c * w2
+    acc += d * w3
+    return acc / (1 + tl.exp(-acc))
+
+
 @triton.heuristics({"HAS_DT_BIAS": lambda args: args["dt_bias_ptr"] is not None})
 @triton.heuristics({"HAS_D": lambda args: args["D_ptr"] is not None})
 @triton.heuristics({"HAS_Z": lambda args: args["z_ptr"] is not None})
@@ -231,6 +242,16 @@ def _selective_scan_update_spec_replay_kernel(
     LAZY: tl.constexpr = False,
     LAZY_P: tl.constexpr = 20,
     SLOT_ELEMS: tl.constexpr = 0,
+    convx_state_ptr=None,
+    convx_weight_ptr=None,
+    convx_bias_ptr=None,
+    CONVX_STATE_BATCH: tl.constexpr = 0,
+    CONVX_STATE_DIM: tl.constexpr = 0,
+    CONVX_STATE_TOKEN: tl.constexpr = 0,
+    CONVX_WEIGHT_DIM: tl.constexpr = 0,
+    CONVX_WEIGHT_TOKEN: tl.constexpr = 0,
+    CONVX: tl.constexpr = False,
+    CONVX_BIAS: tl.constexpr = False,
 ):
     # The dt/A of a head are scalars (stride-0 expansion over head_dim); that is
     # the only layout the Mamba2 decode path produces and the only one the
@@ -337,6 +358,56 @@ def _selective_scan_update_spec_replay_kernel(
 
     mask = (offs_m[:, None] < dim) & (offs_n[None, :] < dstate)
     mask &= anchor_idx != null_block_id
+    if CONVX:
+        # Each original M tile owns distinct X channels and conv history.
+        # Preload ALL raw rows before any in-place output/history store.
+        cx_out0 = tl.zeros((BLOCK_SIZE_M,), tl.bfloat16)
+        cx_out1 = tl.zeros((BLOCK_SIZE_M,), tl.bfloat16)
+        cx_out2 = tl.zeros((BLOCK_SIZE_M,), tl.bfloat16)
+        cx_out3 = tl.zeros((BLOCK_SIZE_M,), tl.bfloat16)
+        cx_out4 = tl.zeros((BLOCK_SIZE_M,), tl.bfloat16)
+        if state_batch_idx != null_block_id:
+            cx_channel = pid_h * dim + offs_m
+            cx_mask = offs_m < dim
+            cx_accepted = tl.load(num_accepted_tokens_ptr + pid_b).to(tl.int64) - 1
+            cx_base = (convx_state_ptr + state_batch_idx * CONVX_STATE_BATCH
+                       + cx_channel * CONVX_STATE_DIM)
+            cx_old0 = tl.load(cx_base + (cx_accepted + 0) * CONVX_STATE_TOKEN, cx_mask, other=0)
+            cx_old1 = tl.load(cx_base + (cx_accepted + 1) * CONVX_STATE_TOKEN, cx_mask, other=0)
+            cx_old2 = tl.load(cx_base + (cx_accepted + 2) * CONVX_STATE_TOKEN, cx_mask, other=0)
+            cx_raw0 = tl.load(x_ptr + 0 * stride_x_batch + offs_m * stride_x_dim, mask=cx_mask & (0 < seq_len), other=0)
+            cx_raw1 = tl.load(x_ptr + 1 * stride_x_batch + offs_m * stride_x_dim, mask=cx_mask & (1 < seq_len), other=0)
+            cx_raw2 = tl.load(x_ptr + 2 * stride_x_batch + offs_m * stride_x_dim, mask=cx_mask & (2 < seq_len), other=0)
+            cx_raw3 = tl.load(x_ptr + 3 * stride_x_batch + offs_m * stride_x_dim, mask=cx_mask & (3 < seq_len), other=0)
+            cx_raw4 = tl.load(x_ptr + 4 * stride_x_batch + offs_m * stride_x_dim, mask=cx_mask & (4 < seq_len), other=0)
+            cx_w0 = tl.load(convx_weight_ptr + cx_channel * CONVX_WEIGHT_DIM + 0 * CONVX_WEIGHT_TOKEN, cx_mask, other=0)
+            cx_w1 = tl.load(convx_weight_ptr + cx_channel * CONVX_WEIGHT_DIM + 1 * CONVX_WEIGHT_TOKEN, cx_mask, other=0)
+            cx_w2 = tl.load(convx_weight_ptr + cx_channel * CONVX_WEIGHT_DIM + 2 * CONVX_WEIGHT_TOKEN, cx_mask, other=0)
+            cx_w3 = tl.load(convx_weight_ptr + cx_channel * CONVX_WEIGHT_DIM + 3 * CONVX_WEIGHT_TOKEN, cx_mask, other=0)
+            if CONVX_BIAS:
+                cx_bias = tl.load(convx_bias_ptr + cx_channel, cx_mask, other=0).to(tl.float32)
+            else:
+                cx_bias = tl.zeros((BLOCK_SIZE_M,), tl.float32)
+            cx_out0 = _convx4(cx_old0, cx_old1, cx_old2, cx_raw0, cx_w0, cx_w1, cx_w2, cx_w3, cx_bias).to(x_ptr.dtype.element_ty)
+            cx_out1 = _convx4(cx_old1, cx_old2, cx_raw0, cx_raw1, cx_w0, cx_w1, cx_w2, cx_w3, cx_bias).to(x_ptr.dtype.element_ty)
+            cx_out2 = _convx4(cx_old2, cx_raw0, cx_raw1, cx_raw2, cx_w0, cx_w1, cx_w2, cx_w3, cx_bias).to(x_ptr.dtype.element_ty)
+            cx_out3 = _convx4(cx_raw0, cx_raw1, cx_raw2, cx_raw3, cx_w0, cx_w1, cx_w2, cx_w3, cx_bias).to(x_ptr.dtype.element_ty)
+            cx_out4 = _convx4(cx_raw1, cx_raw2, cx_raw3, cx_raw4, cx_w0, cx_w1, cx_w2, cx_w3, cx_bias).to(x_ptr.dtype.element_ty)
+            # Effective original state_len is actual_query_len + 2. Its first
+            # two entries are shifted old values; the remainder are raw X rows.
+            tl.store(cx_base, cx_old1, cx_mask)
+            tl.store(cx_base + CONVX_STATE_TOKEN, cx_old2, cx_mask)
+            tl.store(cx_base + 2 * CONVX_STATE_TOKEN, cx_raw0, mask=cx_mask & (0 < seq_len))
+            tl.store(x_ptr + 0 * stride_x_batch + offs_m * stride_x_dim, cx_out0, mask=cx_mask & (0 < seq_len))
+            tl.store(cx_base + 3 * CONVX_STATE_TOKEN, cx_raw1, mask=cx_mask & (1 < seq_len))
+            tl.store(x_ptr + 1 * stride_x_batch + offs_m * stride_x_dim, cx_out1, mask=cx_mask & (1 < seq_len))
+            tl.store(cx_base + 4 * CONVX_STATE_TOKEN, cx_raw2, mask=cx_mask & (2 < seq_len))
+            tl.store(x_ptr + 2 * stride_x_batch + offs_m * stride_x_dim, cx_out2, mask=cx_mask & (2 < seq_len))
+            tl.store(cx_base + 5 * CONVX_STATE_TOKEN, cx_raw3, mask=cx_mask & (3 < seq_len))
+            tl.store(x_ptr + 3 * stride_x_batch + offs_m * stride_x_dim, cx_out3, mask=cx_mask & (3 < seq_len))
+            tl.store(cx_base + 6 * CONVX_STATE_TOKEN, cx_raw4, mask=cx_mask & (4 < seq_len))
+            tl.store(x_ptr + 4 * stride_x_batch + offs_m * stride_x_dim, cx_out4, mask=cx_mask & (4 < seq_len))
+
     state = tl.load(state_ptrs, mask=mask, other=0.0).to(tl.float32)
 
     if HAS_DT_BIAS:
@@ -395,7 +466,16 @@ def _selective_scan_update_spec_replay_kernel(
             z_ptrs = z_ptr + offs_m * stride_z_dim
         out_ptrs = out_ptr + offs_m * stride_out_dim
 
-        x_raw = tl.load(x_ptrs, mask=offs_m < dim, other=0.0)
+        if CONVX:
+            if state_batch_idx != null_block_id:
+                x_raw = tl.where(i_t == 0, cx_out0,
+                         tl.where(i_t == 1, cx_out1,
+                         tl.where(i_t == 2, cx_out2,
+                         tl.where(i_t == 3, cx_out3, cx_out4))))
+            else:
+                x_raw = tl.load(x_ptrs, mask=offs_m < dim, other=0.0)
+        else:
+            x_raw = tl.load(x_ptrs, mask=offs_m < dim, other=0.0)
         x = x_raw.to(tl.float32)
         dt_raw = tl.load(dt_ptr)
         dt = dt_raw.to(tl.float32)
@@ -566,6 +646,9 @@ def selective_state_update_spec_replay(
     is_blackwell=False,
     replayed_out=None,
     lazy=False,
+    _conv_x=None,
+    _private_verify_rows=None,
+    _private_no_prefix=False,
 ):
     """
     Spec-decode verify update with anchor + input-ring state handling.
@@ -631,7 +714,7 @@ def selective_state_update_spec_replay(
     verify_rows = None
     if (
         N == 1 and max_seqlen == 5 and batch == 5
-        and replayed_out is None
+        and replayed_out is None and _private_verify_rows is None and not _private_no_prefix
         and os.environ.get("VLLM_MAMBA_SPEC_PREFIX", "1") != "0"
     ):
         smallk = sys.modules.get("smallk")
@@ -639,6 +722,23 @@ def selective_state_update_spec_replay(
             # Never import/allocate/rebind the buffer here; its address must
             # already be the same one captured by every router and sampler.
             verify_rows = smallk.live_verify_rows(x.device)
+
+    if _private_verify_rows is not None:
+        verify_rows = _private_verify_rows
+    if _private_no_prefix:
+        verify_rows = None
+    convx_state = convx_weight = convx_bias = None
+    if _conv_x is not None:
+        # A producer that reported partial MUST reach this consumer; refusing
+        # here cannot silently run the old SSU on untransformed raw X.
+        convx_state, convx_weight, convx_bias = _conv_x
+        assert lazy and N == 1 and batch == max_seqlen == 5
+        assert nheads == dim == 64 and dstate == 128 and x.dtype == torch.bfloat16
+        assert convx_state.dtype == torch.bfloat16 and convx_state.ndim == 3
+        assert convx_state.shape[1] == 6144 and convx_state.shape[2] >= 7
+        assert convx_weight.shape == (6144, 4) and convx_weight.stride(1) == 1
+        assert convx_state.device == convx_weight.device == x.device
+        assert convx_bias is None or (convx_bias.shape == (6144,) and convx_bias.device == x.device)
 
     with torch.accelerator.device_index(x.device.index):
         _selective_scan_update_spec_replay_kernel[grid](
@@ -711,4 +811,12 @@ def selective_state_update_spec_replay(
             LAZY=bool(lazy),
             LAZY_P=LAZY_PERIOD,
             SLOT_ELEMS=nheads * dim * dstate,
+            convx_state_ptr=convx_state, convx_weight_ptr=convx_weight,
+            convx_bias_ptr=convx_bias,
+            CONVX_STATE_BATCH=convx_state.stride(0) if _conv_x is not None else 0,
+            CONVX_STATE_DIM=convx_state.stride(1) if _conv_x is not None else 0,
+            CONVX_STATE_TOKEN=convx_state.stride(2) if _conv_x is not None else 0,
+            CONVX_WEIGHT_DIM=convx_weight.stride(0) if _conv_x is not None else 0,
+            CONVX_WEIGHT_TOKEN=convx_weight.stride(1) if _conv_x is not None else 0,
+            CONVX=_conv_x is not None, CONVX_BIAS=convx_bias is not None,
         )

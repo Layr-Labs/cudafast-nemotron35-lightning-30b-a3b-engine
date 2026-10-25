@@ -278,6 +278,30 @@
     {
       "file": "harness/kernels/pzskip/csrc/pzskip.cu (+ build.sh)",
       "why": "PZ333 M496/top-6 only: HUMMING_EVICT_PZ defaults on and gives immutable packed B/BS cp.async loads L2 evict-first priority. Loader addresses, bytes, masks, K16 MMA order, negative-zero repair and formats are unchanged. HUMMING_EVICT_PZ=0 restores stock. Separate native template specialization; compile/load failure retains stock PZ333. Stacks independently with the routed-up evf policy; no decode change."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_pkmm.py, models/nemotron_h_mtp_packed.py; harness/kernels/l2pf; models/nemotron_h.py; layers/mamba/mamba_mixer2.py; layers/attention/attention.py",
+      "why": "jacklightChen da9a764c (from ercumentyildirim 297e3412), carried unchanged as in AvinashNayak27 2ff1c240: optional narrow packed MMA for the native MTP drafter's M=2..5 projections with an exact K128 tail, admitted per shape only after full-output bit equality with packed_small and a cold timing filter (MTP_PACK12_MM=0 disables); next-MoE-router L2 prefetch sharing the existing Mamba/attention prefetch window in one launch. Moves no value; original paths kept as fallback."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_attn_packed.py; harness/kernels/apk12",
+      "why": "kaankolcu 8d510eaa, carried unchanged: a CUDA mma.sync kernel over a fragment-order copy of the 12-bit attention planes for the 5-row verify QKV/output projections. Ranked with the Triton configurations under the record's graph-replay speed guard (0.96 of F.linear) and bitwise F.linear check on every layer, after a child-process probe and a load-time decode check of every weight. Same accumulation chain (ascending K from +0, one RN rounding). ATTN_PACK12=0 disables the packed path."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_packed.py; harness/tests/packed_gemv_group8_exact.py; harness/vllm_resident/test_ssd_prefill_fused.py",
+      "why": "ivanfioravanti c0ce642d, carried unchanged: opt-in GROUP8 decoder for the native MTP M=1 packed QKV/output GEMV (eight-value register groups, one uint32 EX word per group, original layout restored with assert_trivial=True). Same BF16 bits, raw escapes, gate, PDL launch, tile, FP32 accumulation and reduction. Enabled per shape only after load-time byte equality with the published packed_gemv at three magnitudes; failure keeps the published path. MTP_PACK12_GROUP8=0 disables it. Disjoint from the M=2..5 narrow packed MMA branch. Test-only SSD fixture corrections."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_down_packed.py, models/nemotron_h_mtp_compact.py, models/nemotron_h_mtp_kernels.py",
+      "why": "jacklightChen 7c65206e, carried unchanged: optional lossless 12-bit storage (the existing pack_bf16 codec) of the native MTP drafter's transposed routed/shared down weights, decoded on demand in the compact slot kernel at the original sorted nonzero indices; same FP32 products, slot order, combine and residual. Admitted per TOPK only after raw FP32 bit equality with _down_slots over all experts and a cold timing filter; original BF16 weights kept as fallback. MTP_DOWN_PACK12=0 disables it."
+    },
+    {
+      "file": "harness/kernels/marlinx/py/__init__.py",
+      "why": "RDS M5 shared-down only: use the existing marlinx P=4 register loader ring in place of P=8, retaining every per-output Cursor, MMA operand, K order, segment fold, zero/NaN handling and format. RDS_SHARED_RING4=0 restores f0214807 P=8. All other calls unchanged. Word probes on real decode inputs: 23 layers, 7,418,880 output words, 0 differences."
+    },
+    {
+      "file": "harness/kernels/l2pf/py/__init__.py",
+      "why": "e-man07 (author of l2pf): the Mamba-window L2 prefetch budget default goes from 5 to 8 MB. With the apk12 attention kernel and GROUP8 in place the Mamba window leaves more DRAM idle than when 5 MB was chosen. Measured on GB10 on the apk12 + GROUP8 tree: 8 MB +0.34%, +0.23%, +0.15% composite (decode +0.37%, +0.32%, +0.20%); 3 MB -0.89%, 10 MB -0.23%, 12 MB -0.85%; identical token streams on every prompt. Everything else in this archive is ArthurOstapenko's 57e48c1a byte for byte. Official measurement #2 of this stack (same code)."
     }
   ]
 }

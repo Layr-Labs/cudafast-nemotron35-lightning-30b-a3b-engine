@@ -15,6 +15,8 @@ from vllm.platforms import current_platform
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+_SSD_STATE_NSPLIT = int(os.environ.get("VLLM_SSD_STATE_NSPLIT", "1"))
+_SSD_SCAN_HSPLIT = int(os.environ.get("VLLM_SSD_SCAN_HSPLIT", "2"))
 _final_logged = False
 from vllm.triton_utils import tl, triton
 
@@ -56,7 +58,7 @@ def _state_pass_kernel(
     start = tl.load(LAST + batch - 1, mask=batch > 0, other=-1) + 1
     end = tl.load(LAST + batch) + 1
     m = tl.arange(0, BM)
-    n = tl.arange(0, BN)
+    n = tl.program_id(2) * BN + tl.arange(0, BN)
     kk = tl.arange(0, BK)
     state_offsets = m[:, None] * OS[2] + n[None, :] * OS[3]
     state_mask = (m[:, None] < H) & (n[None, :] < N)
@@ -159,10 +161,12 @@ def _cb_scan_kernel(
     BK: tl.constexpr,
     BC: tl.constexpr,
     DN: tl.constexpr,
+    HSPLIT: tl.constexpr = 1,
 ):
     tile = tl.program_id(0)
     chunk = tl.program_id(1)
-    group = tl.program_id(2)
+    group = tl.program_id(2) // HSPLIT
+    part = tl.program_id(2) % HSPLIT
     begin = tl.load(CU + chunk)
     limit = tl.load(CU + chunk + 1) - begin
     rows = tile * BM + tl.arange(0, BM)
@@ -197,7 +201,8 @@ def _cb_scan_kernel(
         other=0.0,
     )
 
-    for local_head in range(RATIO):
+    for part_head in range(RATIO // HSPLIT):
+        local_head = part * (RATIO // HSPLIT) + part_head
         head = group * RATIO + local_head
         xp = X + begin * XS[0] + head * XS[1]
         tp = DT + head * TS[0] + chunk * TS[1]
@@ -364,7 +369,9 @@ def fused_prefill(
         _final_logged = True
         logger.info("ssd prefill: terminal state stored by the state kernel (cache sink active)")
     with torch.accelerator.device_index(x.device.index):
-        _state_pass_kernel[(last.numel(), heads)](
+        nsplit = _SSD_STATE_NSPLIT if dstate % (16 * _SSD_STATE_NSPLIT) == 0 else 1
+        hsplit = _SSD_SCAN_HSPLIT if (heads // groups) % _SSD_SCAN_HSPLIT == 0 else 1
+        _state_pass_kernel[(last.numel(), heads, nsplit)](
             x,
             B,
             dt,
@@ -390,12 +397,12 @@ def fused_prefill(
             FS=final_strides,
             CACHE_SLOTS=final_cache.shape[0] if write_final else 0,
             BM=64,
-            BN=128,
+            BN=128 // nsplit,
             BK=32,
             num_warps=4,
             num_stages=4,
         )
-        _cb_scan_kernel[(triton.cdiv(chunk, 64), chunks, groups)](
+        _cb_scan_kernel[(triton.cdiv(chunk, 64), chunks, groups * hsplit)](
             x,
             B,
             C,
@@ -431,6 +438,7 @@ def fused_prefill(
             BK=64,
             BC=32,
             DN=128,
+            HSPLIT=hsplit,
             num_warps=8,
             num_stages=1,
         )

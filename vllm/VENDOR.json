@@ -326,6 +326,10 @@
     {
       "file": "(composition)",
       "why": "e-man07 composition on dadon's record fc04335b-c894-41f9-b73b-aa9b5aac1fb5: ArthurOstapenko 0f958570-4fab-4ffd-8db5-c5a2c37a5439's tree byte for byte, plus jacklightChen b0d0b0b6's apk12 coherent-PDL attention files and i34-9 c3e16bbb's prefill files (pzskip, humming relu2 epilogue / nvsc / tuned_moe / zskip glue) and marlinx unit-major scales, each carried byte for byte from its author's tree. No new arithmetic by us."
+    },
+    {
+      "file": "vllm/vllm/v1/spec_decode/nemotron_tail_cycle.py; vllm/vllm/v1/spec_decode/llm_base_proposer.py; harness/vllm_resident/test_nemotron_tail_cycle.py",
+      "why": "jungjipdo 0be51a3a-c593-4be4-b37c-1cda1ff77039's boot-admitted depth-four native MTP tail graph, carried byte for byte onto e-man07's bd384670 record (which does not include it): after the first draft step's ordinary update and plan, the three remaining draft steps (positions, slot mapping, FlashInfer decode metadata for unchanged page counts, MTP layer and draft-head screen) replay as one CUDA graph instead of three host-planned per-step replays. Admission compares outputs and mutable KV/state against the native loop at boot; page transitions and unsupported cases keep the original loop. NEMO_MTP_TAIL_CYCLE=0 disables."
     }
   ]
 }

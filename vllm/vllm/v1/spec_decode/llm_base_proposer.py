@@ -831,6 +831,15 @@ class SpecDecodeBaseProposer:
                     batch_size,
                 )
 
+            if token_index == 0 and getattr(self, "_nemo_tail", None) is not None:
+                from vllm.v1.spec_decode.nemotron_tail_cycle import maybe_run
+                tail_tokens = maybe_run(
+                    self, common_attn_metadata, per_layer_attn_metadata,
+                    input_batch_size, batch_size, sampling_metadata, depth_gate)
+                if tail_tokens is not None:
+                    draft_token_ids_list.extend(tail_tokens)
+                    break
+
             with set_forward_context(
                 per_layer_attn_metadata,
                 self.vllm_config,
@@ -1967,6 +1976,8 @@ class SpecDecodeBaseProposer:
         if is_graph_capturing and not torch.cuda.is_current_stream_capturing():
             from vllm.v1.spec_decode.nemotron_full_step import prepare
             prepare(self)
+            from vllm.v1.spec_decode.nemotron_tail_cycle import prepare as prepare_tail
+            prepare_tail(self)
 
     def _get_eagle3_use_aux_hidden_state_from_config(self) -> bool:
         """

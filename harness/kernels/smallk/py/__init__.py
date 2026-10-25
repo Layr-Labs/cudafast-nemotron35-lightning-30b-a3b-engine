@@ -89,10 +89,11 @@ _vrows_missed = False
 _has_vrows_entry = False
 _w16: dict = {}  # gate weight data_ptr -> (weight, bf16 shadow or None when not bf16-exact)
 _has_w16_entry = False
+_has_x16_entry = False
 
 
 def _load():
-    global _lib, _load_error, _has_vrows_entry, _has_w16_entry
+    global _lib, _load_error, _has_vrows_entry, _has_w16_entry, _has_x16_entry
     if _lib is not None or _load_error is not None:
         return _lib
     try:
@@ -118,6 +119,12 @@ def _load():
             _has_w16_entry = current
         except AttributeError:
             _has_w16_entry = False
+        try:
+            lib.sk_router_gemm_x16.argtypes = [vp, cl, ci, vp, ci, ci, vp, cl, ci, ci, vp, ci, vp]
+            lib.sk_router_gemm_x16.restype = ci
+            _has_x16_entry = True
+        except AttributeError:
+            _has_x16_entry = False
         lib.sk_topk_sigmoid.argtypes = [vp, vp, ci, ci, ci, ci, cf, vp, vp, ci, ci, vp]
         lib.sk_topk_sigmoid.restype = ci
         lib.sk_align.argtypes = [vp, ci, ci, ci, vp, ci, vp, ci, vp, ci, vp]
@@ -178,7 +185,19 @@ def router_gemm(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor | None = Non
     rows = ROUTER_ROWS if rows is None else rows
     if vrows is not None:
         assert _has_vrows_entry and vrows.dtype == torch.int32 and vrows.device == x.device
-    if w16 is not None:
+    if x.dtype == torch.bfloat16:
+        assert _has_x16_entry and mode == 0 and x.stride(1) == 1
+        wptr = w.data_ptr()
+        w16_flag = 0
+        if w16 is not None:
+            assert _has_w16_entry and w16.dtype == torch.bfloat16 and w16.shape == w.shape
+            assert w16.is_contiguous() and w16.device == w.device
+            wptr = w16.data_ptr()
+            w16_flag = 1
+        rc = lib.sk_router_gemm_x16(x.data_ptr(), x.stride(0), m, wptr, n, k, out.data_ptr(),
+                                    out.stride(0), rows, _pdl(pdl),
+                                    None if vrows is None else vrows.data_ptr(), w16_flag, _stream(x))
+    elif w16 is not None:
         assert _has_w16_entry and mode == 0 and w16.dtype == torch.bfloat16 and w16.shape == w.shape
         assert w16.is_contiguous() and w16.device == w.device
         rc = lib.sk_router_gemm_w16(x.data_ptr(), x.stride(0), m, w16.data_ptr(), n, k, out.data_ptr(),
@@ -314,7 +333,7 @@ def maybe_router_gemm(x: torch.Tensor, w: torch.Tensor, row_mask: bool = False) 
         return None
     if (
         (m, n, k) not in ROUTER_SHAPES
-        or x.dtype != torch.float32
+        or x.dtype not in (torch.float32, torch.bfloat16)
         or w.dtype != torch.float32
         or w.shape[1] != k
         or x.stride(1) != 1
@@ -323,6 +342,8 @@ def maybe_router_gemm(x: torch.Tensor, w: torch.Tensor, row_mask: bool = False) 
     ):
         return None
     if not _usable():
+        return None
+    if x.dtype == torch.bfloat16 and not _has_x16_entry:
         return None
     vrows = None
     if row_mask:

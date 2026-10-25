@@ -3,9 +3,14 @@
 #ifndef ZSKIP_NO_PAIR
 __device__ __forceinline__ uint4 ldg_u128(const void* p) {
   uint4 v;
-  asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];\n"
-               : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
-               : "l"(p));
+  asm volatile(
+      "{\n\t"
+      ".reg .b64 pol;\n\t"
+      "createpolicy.fractional.L2::evict_first.b64 pol, 1.0;\n\t"
+      "ld.global.nc.L1::no_allocate.L2::cache_hint.v4.u32 {%0,%1,%2,%3}, [%4], pol;\n\t"
+      "}\n"
+      : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+      : "l"(p));
   return v;
 }
 

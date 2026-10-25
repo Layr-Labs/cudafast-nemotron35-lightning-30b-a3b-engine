@@ -702,12 +702,24 @@ __global__ void __launch_bounds__(W * 32) down3_kernel(const Params p) {
 
 __device__ __forceinline__ uint32_t ldg_u32(const void* p) {
   uint32_t v;
-  asm volatile("ld.global.nc.L1::no_allocate.u32 %0, [%1];\n" : "=r"(v) : "l"(p));
+  asm volatile(
+      "{\n\t"
+      ".reg .b64 pol;\n\t"
+      "createpolicy.fractional.L2::evict_first.b64 pol, 1.0;\n\t"
+      "ld.global.nc.L1::no_allocate.L2::cache_hint.u32 %0, [%1], pol;\n\t"
+      "}\n"
+      : "=r"(v) : "l"(p));
   return v;
 }
 __device__ __forceinline__ uint2 ldg_u64(const void* p) {
   uint2 v;
-  asm volatile("ld.global.nc.L1::no_allocate.v2.u32 {%0,%1}, [%2];\n" : "=r"(v.x), "=r"(v.y) : "l"(p));
+  asm volatile(
+      "{\n\t"
+      ".reg .b64 pol;\n\t"
+      "createpolicy.fractional.L2::evict_first.b64 pol, 1.0;\n\t"
+      "ld.global.nc.L1::no_allocate.L2::cache_hint.v2.u32 {%0,%1}, [%2], pol;\n\t"
+      "}\n"
+      : "=r"(v.x), "=r"(v.y) : "l"(p));
   return v;
 }
 __device__ __forceinline__ uint32_t ldg_u32_l1(const void* p) {  // activations: L2 resident, reused
@@ -1336,7 +1348,13 @@ __global__ void __launch_bounds__(WPC * 32) down7_kernel(const Params p) {
 // redistributes them through shared memory into down4's per-lane words. Same fragments and order.
 __device__ __forceinline__ uint4 ldg_v4(const void* p) {
   uint4 v;
-  asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];\n" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
+  asm volatile(
+      "{\n\t"
+      ".reg .b64 pol;\n\t"
+      "createpolicy.fractional.L2::evict_first.b64 pol, 1.0;\n\t"
+      "ld.global.nc.L1::no_allocate.L2::cache_hint.v4.u32 {%0,%1,%2,%3}, [%4], pol;\n\t"
+      "}\n"
+      : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
   return v;
 }
 template <int WPC, int R, int NH, int BM>

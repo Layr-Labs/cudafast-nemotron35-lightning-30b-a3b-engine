@@ -66,10 +66,36 @@ def launch_pending_shared_down() -> None:
         se._launch_down()
 
 
+def deferred_shared_lease():
+    """Join current shared work, but retain its output until fold acceptance.
+
+    Only the single-output opaque op opens fold_add. A refusal leaves the
+    original buffer/runner add intact; no global success flag is used.
+    """
+    se = SharedExperts._defer_live
+    if se is None or not se.fold_add or se.enable_dbo:
+        return None
+    se._join_aux()
+    idx = se._output_idx
+    out = se._output[idx]
+    return None if out is None else (se, idx, out)
+
+
+def commit_deferred_shared(lease):
+    se, idx, out = lease
+    if (SharedExperts._defer_live is not se or se._output[idx] is not out
+            or not se.fold_add):
+        raise RuntimeError('shared fold lease changed before commit')
+    se._output[idx] = None
+    se._folded = True
+    SharedExperts._defer_live = None
+
+
 class SharedExperts(torch.nn.Module):
     _early_logged = False
     _pending: "SharedExperts | None" = None
     _pending_h: torch.Tensor | None = None
+    _defer_live: "SharedExperts | None" = None
 
     def __init__(
         self,
@@ -91,6 +117,8 @@ class SharedExperts(torch.nn.Module):
 
         self._mk_can_overlap_shared_experts = mk_can_overlap_shared_experts
         self._aux_open = False
+        self.fold_add = False
+        self._folded = False
 
         # Allow disabling of the separate shared experts stream for
         # debug purposes.
@@ -192,6 +220,7 @@ class SharedExperts(torch.nn.Module):
             with torch.cuda.stream(self._stream):
                 self._pending_h = self._layer.forward_up(shared_experts_input)
             SharedExperts._pending = self
+            SharedExperts._defer_live = self
         else:
             with torch.cuda.stream(self._stream):
                 self._output[idx] = self._layer(shared_experts_input)
@@ -246,7 +275,12 @@ class SharedExperts(torch.nn.Module):
         return dbo_current_ubatch_id() if self.enable_dbo else 0
 
     @property
-    def output(self) -> torch.Tensor:
+    def output(self) -> torch.Tensor | None:
+        if self._folded:
+            self._folded = False
+            return None
+        if SharedExperts._defer_live is self:
+            SharedExperts._defer_live = None
         self._join_aux()
         assert self._output[self._output_idx] is not None
         output = self._output[self._output_idx]
@@ -258,6 +292,8 @@ class SharedExperts(torch.nn.Module):
         shared_experts_input: torch.Tensor,
         order: SharedExpertsOrder,
     ):
+        if self._folded:
+            return None
         experts_order = self._determine_shared_experts_order(shared_experts_input)
 
         if order != experts_order:

@@ -266,6 +266,18 @@
     {
       "file": "model_executor/models/nemotron_h_attn_packed.py",
       "why": "Selectonlygraph-replayadmissiontiming helper frompublicpendingf102bbdb-ebe5-48e5-a1c8-313774419059;24callscycle6real-layerweights,7replaymedian, nohostlaunchbias. Keep4%MIN_GAIN andrankedall-layerexactadmission; paired eagerbaseline/candidatefallback ifreferencegraphunavailable. DoNOTimportdiagnosticstalls,_sleep,stagecodes orMIN_GAIN10. ADFcombined8d/51notealreadycoverednonewmethod; wholecombo remainsunverified,remoteonly."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_packed.py, nemotron_h_mtp_kernels.py, vllm/v1/attention/backends/flashinfer.py, layers/attention/attention.py, vllm/v1/worker/gpu_model_runner.py",
+      "why": "jacklightChen 36efef0d (decode pieces only): native MTP word reads, packed drafter output projection, structural plan reuse. Its prefill-alignment hunks (humming_zskip.py, fused_humming_moe.py, prefill_graph.py) are not carried: the equivalent pieces measured -0.23% on this tree."
+    },
+    {
+      "file": "model_executor/layers/fused_moe/{moe_fused_mul_sum.py,experts/fused_humming_moe.py,runner/shared_experts.py,runner/moe_runner.py}",
+      "why": "Select4386ba36-de9e-450f-b218-71a32de63478 targetshared-add-combine idea, fourpublishedPRblobs verified d78a395ff0c34c4d581e2fe54a68be0da8294e0e; notwholelowerB86baseline orPycs. NEWseparate single-output opaqueop+matchingfake preservesoldtwo-outputschema; explicitauxjoin andlease commitafteradmission; retainoldkernel byteexact andnewoptionalBF16roundedcombine+shared(leftoperand)double-roundingkernel. RemotestickyprivatebitadmissionM1..8/topk6/D2688/3scales+signedzero/subnormal/extrema/inf/NaN patterns, oldinsideopadd fallback. Noisolatedgain orcorrectnessclaim; entire41baseline."
+    },
+    {
+      "file": "v1/spec_decode/nemotron_full_step.py",
+      "why": "NativeMTPfullgraph inheritedthrough7c0c5713-b165-45c3-a839-05742e7350f8 onENTIREhighest41e5657b-0033-489a-b095-6a22fd5edcd8. NEW3slot bounded external-event relay atnativeFlashInfer attention wait, originalgraphretainedfirst, eventneverre-recordedbeforepriorgraphretired.query, graph/privatepool/outputsstrong. Startuporiginalmodel firstrowexactchecksper3slots/changeinputs/gates, unavailable/busy ->actualplan_event orderedfullgraph. Only readinessidea fromown0e8bb4ee-f97f-4e33-bd26-75270404bf78/528c6b75-628b-427b-9dab-07f2e7a9a3c1; theirwholelower/failedbundlesNOTbaseline, NOrouter/Gluon/halfskip orhostplanguards copied. NativePyTorch externalEventAPI source/docs citedinpublicnote. Allruntimeofficialremote; wholecompositionunvalidated."
     }
   ]
 }

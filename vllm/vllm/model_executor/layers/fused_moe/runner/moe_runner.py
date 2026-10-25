@@ -3,6 +3,7 @@
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING
+import os
 
 import torch
 import torch.nn.functional as F
@@ -190,6 +191,19 @@ def _moe_forward_shared_fake(
     return shared_out, fused_out
 
 
+def _moe_forward_shared_combined(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    shared_experts_input: torch.Tensor | None,
+    input_ids: torch.Tensor | None,
+    layer_name: _layer_name_type,
+    hidden_dim_unpadded: int,
+) -> torch.Tensor:
+    layer = get_layer_from_name(_resolve_layer_name(layer_name))
+    return layer._forward_combined_impl(
+        hidden_states, router_logits, shared_experts_input, input_ids)
+
+
 # NOTE: `moe_forward` and `moe_forward_shared` being opaque custom ops is a
 # load-bearing assumption for the MoE-LoRA dual-stream path.
 direct_register_custom_op(
@@ -205,6 +219,14 @@ direct_register_custom_op(
     op_name="moe_forward_shared",
     op_func=_moe_forward_shared,
     fake_impl=_moe_forward_shared_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+direct_register_custom_op(
+    op_name="moe_forward_shared_combined",
+    op_func=_moe_forward_shared_combined,
+    fake_impl=_moe_forward_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
 
@@ -265,6 +287,18 @@ class MoERunner(MoERunnerInterface):
         self.shared_expert_gate = shared_expert_gate
         self.routed_experts = routed_experts
         self.enable_dbo = enable_dbo
+        # This separate single-output op has matching real/fake schemas. The
+        # old two-output moe_forward_shared contract is never weakened.
+        self._shared_combine_enabled = (
+            os.environ.get('VLLM_SHARED_ADD_FOLD', '1') != '0'
+            and shared_experts is not None and not enable_dbo
+            and routed_scaling_factor == 1.0
+            and routed_output_transform is None and shared_expert_gate is None
+            and routed_input_transform is None
+            and not moe_config.is_sequence_parallel
+            and moe_config.tp_size == 1 and moe_config.ep_size == 1
+            and moe_config.dp_size == 1 and moe_config.pcp_size == 1
+        )
 
         # When both gates are present and FSE is enabled, fuse their
         # weight matrices into [num_experts + num_shared, hidden] so one
@@ -733,7 +767,13 @@ class MoERunner(MoERunnerInterface):
             )
         )
 
-        result = self._forward_entry(
+        forward_entry = self._forward_entry
+        if (self._shared_combine_enabled and hidden_states.dtype == torch.bfloat16
+                and hidden_states.is_cuda and hidden_states.shape[-1] == 2688
+                and 0 < hidden_states.shape[0] <= 8
+                and not self._quant_method.has_unpadded_output):
+            forward_entry = torch.ops.vllm.moe_forward_shared_combined
+        result = forward_entry(
             hidden_states,
             router_logits,
             shared_experts_input,
@@ -844,10 +884,29 @@ class MoERunner(MoERunnerInterface):
             hidden_states = get_pcp_group().reduce_scatter(hidden_states, dim=0)
 
         if self.shared_experts is not None:
+            if shared_output is None and self.shared_experts.fold_add:
+                return hidden_states
             assert shared_output is not None
             return shared_output, hidden_states
         else:
             return hidden_states
+
+    def _forward_combined_impl(
+        self, hidden_states, router_logits, shared_experts_input, input_ids=None,
+    ):
+        se = self._shared_experts
+        if se is None or not self._shared_combine_enabled:
+            raise RuntimeError('combined shared op used for an unsupported layer')
+        se.fold_add = True
+        try:
+            result = self._forward_impl(
+                hidden_states, router_logits, shared_experts_input, input_ids)
+            shared, routed = _unpack(result)
+            # A refused kernel/lease is still a single output and performs the
+            # exact original shared + routed BF16 add inside the opaque op.
+            return routed if shared is None else shared + routed
+        finally:
+            se.fold_add = False
 
     def _forward_impl(
         self,

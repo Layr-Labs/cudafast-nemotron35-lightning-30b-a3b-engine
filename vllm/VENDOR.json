@@ -368,8 +368,16 @@
       "why": "Cumulative draft stop. The depth gate's fourth int32 word holds the float32 bits of the running product of kept drafts' top-1 probabilities (1.0 at loop start). The screen's token select multiplies this draft's top-1 into that word and sets the existing stop flag when the product falls below MTP_DEPTH_THETA (0.5). MTP_DEPTH_CUMULATIVE=0 restores the per-draft compare. Same verify-row handoff and the same target rejection; no weight or logit change on a draft the gate still keeps."
     },
     {
+      "file": "v1/spec_decode/nemotron_draft_burst.py; llm_base_proposer.py",
+      "why": "Own substantial native-MTP three-step CUDAgraph on ENTIREhighest391, now with one fused live-input staging and one fused exact-nativeplan/currentKV/position/slot/token/hidden install kernel per tail step. Strongly owned immutable native snapshot pointer tables remove six per-call refresh copies. Exact3plan vectors/scalars, max16categories/512MiB. Original integer eagle semantics and model/screen/4wordgate/targetverify preserved. Official remote whole-model/KV/rawscreen/staging and exactnativeprefix/handoff qualification plus complete-tail latency admission; unknown bindings/modes/categories/noncontiguous hidden fallback beforemutation. No request capture/result cache, no local execution or gain/admission claim."
+    },
+    {
       "file": "harness/kernels/cmp2 (+ vllm/v1/worker/gpu_model_runner.py)",
       "why": "CMP2=1 (default): transparent generic-compression VMM backing for immutable fp8c codes, apk12 planes, shared Marlin weights/scales and target lm_head including its unit-major scale copy. Full load-time storage byte checks precede pointer rebinding and engine capture. Original storages stay alive; unsupported or failed allocations leave ordinary tensors. CMP2=0 disables. Target and drafter formats and arithmetic are unchanged."
+    },
+    {
+      "file": "vllm/v1/worker/gpu_model_runner.py:_prepare_input_ids",
+      "why": "Exact compatible22-line batch1 verify input-ID slice-copy hunk from pending a9a770c9-25ae-4b18-b5df-d2031c5bc22f/PR521, fullblobafdc1dcc46bf91a90f063998f0de7ee356266618. Equal ordered source/destination index lists require exactly the previous sampled token and first L drafts; replace four index uploads/two scatters with two copies. All other cases original. No newline/three-level screen or gate policy imported; whole unverified, no local execution."
     }
   ]
 }

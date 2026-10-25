@@ -254,6 +254,10 @@
     {
       "file": "model_executor/models/nemotron_h_attn_packed.py and nemotron_h_attn_packed_kernel.py (new); model_executor/models/nemotron_h.py; model_executor/layers/attention/attention.py (prefetch target); entrypoints/serve/instrumentator/static/swagger-ui-bundle.js (removed)",
       "why": "the 5-row verify decodes the six attention layers' QKV and output projections from the drafter's lossless 12-bit BF16 codec in registers (one tl.dot chain over K tiles of 128 into fp32, rounded once to BF16) instead of cuBLAS reading 25% more bytes; a child process first compiles and runs the kernel on synthetic planes, every packed layer is compared bit for bit with F.linear and the cold-cache time must beat it at load, else the stock projection runs (ATTN_PACK12=0 disables). Prefill and M=1 keep F.linear. The unused API-docs swagger bundle is dropped to stay inside the editable byte cap Official measurement #2 of this stack (same code)."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_attn_packed.py; model_executor/models/nemotron_h_attn_packed_kernel.py; v1/attention/backends/flashinfer.py",
+      "why": "Three optional variants of the 12-bit attention GEMM read each block's exponent nibbles as aligned 32-bit words (eight K values per load, unpacked in K order) and decode the next K tile before the current tl.dot; the B operand bits and the K0..KB-1 tl.dot chain are unchanged. The new variants compile in their own child probe, so a failure there leaves the original three. Load-time timing now replays a CUDA graph that cycles through all six layers' weights for both F.linear and every configuration; every configuration within the 4% bar is tried fastest first and installed only after the bit-for-bit F.linear check on every real layer, else F.linear stays. ATTN_PACK12_WORDLOAD=0 drops the word variants. FlashInfer: a missing get_seq_lens or a failing fast spec-prefill plan falls back to the full plan."
     }
   ]
 }

@@ -551,7 +551,7 @@ def main():
     ap.add_argument("--windows", type=int, default=2)
     ap.add_argument("--capture", default="", help="'' (none), 'all' or comma-separated sequence names")
     ap.add_argument("--layouts", default="rows,swap")
-    ap.add_argument("--pair", action="store_true", help="also check/time swap2 decode 113 and fused 118")
+    ap.add_argument("--pair", action="store_true", help="also check/time swap2 decode 113, fused 118 and their empty-half skips 114, 119")
     ap.add_argument("--time-ms", default="4")
     ap.add_argument("--time-configs", default="all")
     ap.add_argument("--time-all-dense", action="store_true")
@@ -581,7 +581,7 @@ def main():
     if args.pair:
         assert "swap" in args.layouts.split(","), "--pair needs the original swap layout"
         ctx["pair_configs"] = []
-        for cfg in (113, 118):
+        for cfg in zskip.PAIR_CONFIGS:
             try:
                 log(f"pair config {cfg}: {zskip.config_info(cfg)}")
                 ctx["pair_configs"].append(cfg)

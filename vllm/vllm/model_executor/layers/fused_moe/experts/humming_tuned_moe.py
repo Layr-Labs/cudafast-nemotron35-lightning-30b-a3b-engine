@@ -81,6 +81,25 @@ def _cfg(
     }
 
 
+# LOCAL PATCH (cudafast-nemotron35, shco): with shx (harness/kernels/shco) available the
+# prefill w13 runs a persistent grid of 4 * 36 CTAs, i.e. 3 resident CTAs per SM of the same
+# <= 128-register build, so each SM keeps room for one shx CTA of the shared expert on the
+# aux stream. Only the persistent grid changes; the accumulation chain is the same (see the
+# module docstring). SHCO=0 or SHCO_HUMMING_SMS=48 restores 4 CTAs per SM.
+def _prefill_w13_sms() -> int:
+    if os.environ.get("SHCO", "1") == "0":
+        return 48
+    try:
+        import shco
+
+        ok = shco.available()
+    except ImportError:
+        ok = False
+    return int(os.environ.get("SHCO_HUMMING_SMS", "36")) if ok else 48
+
+
+_PREFILL_W13_SMS = _prefill_w13_sms()
+
 # Tuned on GB10 (48 SMs, ~99 KB smem per block) with
 # harness/tests/humming_moe_exact.py --phase sweep (run hum-sweep3: every
 # candidate bitwise equal to stock; GEMM time per layer over 5 rotating
@@ -98,7 +117,7 @@ TUNED_CONFIGS: dict[tuple[str, int, int, int], list[tuple[int, dict[str, Any]]]]
         (24, _cfg(16, 64, 16, 32, 8, 2)),  # M = 3, 4
         (48, _cfg(16, 64, 16, 32, 8, 2)),  # M = 5..8
         (384, _cfg(16, 64, 16, 32, 6, 4)),
-        (_BIG, _cfg(64, 64, 32, 32, 4, 4)),  # prefill (496 tokens)
+        (_BIG, _cfg(64, 64, 32, 32, 4, 4, _PREFILL_W13_SMS)),  # prefill (496 tokens)
     ],
     ("w2", 2688, 1856, 128): [
         (6, _cfg(16, 128, 16, 32, 3, 4)),

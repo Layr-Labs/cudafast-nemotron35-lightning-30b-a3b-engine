@@ -18,6 +18,7 @@
 # limitations under the License.
 """Inference-only NemotronH model."""
 
+import os
 from collections.abc import Iterable, Mapping
 from itertools import islice
 
@@ -84,6 +85,21 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.nemotron_h import NemotronHConfig
 
 
+# LOCAL PATCH (cudafast-nemotron35): programmatic dependent launch for the Triton kernels
+# inductor generates (the residual/RMSNorm/FP8-quant joins of the verify graph): each kernel
+# waits (gdc_wait) before touching a buffer its predecessor writes and lets its dependent launch
+# after its loads, so the launch and prologue of a PDL-aware successor (fp8small, smallk, zskip,
+# the replay kernel) overlap its tail. Codegen adds only those two instructions: same loads,
+# same arithmetic, same stores. NEMO_INDUCTOR_PDL=0 keeps inductor's default (off).
+if os.environ.get("NEMO_INDUCTOR_PDL", "1") != "0":
+    try:
+        import torch._inductor.config as _inductor_config
+
+        if hasattr(_inductor_config.triton, "enable_pdl"):
+            _inductor_config.triton.enable_pdl = True
+    except Exception:  # inductor unavailable: nothing changes
+        pass
+
 # smallk (harness/kernels/smallk): run the router GEMM inside the MoE custom op, after the shared
 # experts' side stream has forked, so the side stream's GEMMs overlap it. Same kernels on the same
 # fp32 input (the bf16 -> fp32 cast stays in the compiled graph); only the stream schedule changes.
@@ -99,6 +115,13 @@ try:
     import l2pf as _l2pf
 except ImportError:
     _l2pf = None
+
+# shco (harness/kernels/shco): the shared expert at the prefill M (496 rows) on shx,
+# bit-identical to Marlin up -> relu^2 -> Marlin down; absent or ineligible, stock runs.
+try:
+    import shco as _shco
+except ImportError:
+    _shco = None
 
 
 class NemotronHMLP(nn.Module):
@@ -141,6 +164,10 @@ class NemotronHMLP(nn.Module):
     # shared-expert runner can queue the down projection later on its stream
     # (runner/shared_experts.py); forward is exactly forward_down(forward_up(x)).
     def forward_up(self, x: torch.Tensor) -> torch.Tensor:
+        if _shco is not None:
+            out = _shco.maybe_up_relu2(self.up_proj, x)
+            if out is not None:
+                return out
         fused = maybe_shared_up_relu2(self.up_proj, x)
         if fused is None:
             x, _ = self.up_proj(x)
@@ -150,6 +177,10 @@ class NemotronHMLP(nn.Module):
         return x
 
     def forward_down(self, x: torch.Tensor) -> torch.Tensor:
+        if _shco is not None:
+            out = _shco.maybe_down(self.down_proj, x)
+            if out is not None:
+                return out
         x, _ = self.down_proj(x)
         return x
 

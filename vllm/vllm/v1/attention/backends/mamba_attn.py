@@ -5,6 +5,9 @@ import abc
 from dataclasses import dataclass, replace
 from typing import Any, ClassVar, TypeVar
 
+import os
+
+import numpy as np
 import torch
 
 from vllm.config import VllmConfig
@@ -22,6 +25,8 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import MambaSpec
+
+_MM_TRIM = os.environ.get("VLLM_MAMBA_META_TRIM", "1") == "1"
 
 M = TypeVar("M", bound="BaseMambaAttentionMetadata")
 
@@ -168,7 +173,26 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             )
         # ReplaySSM standard-decode CUDA-graph buffers: per-row ring cursor,
         # flush flag, and the k^T q precompute scratch.
-        if self.use_replayssm:
+        if self.use_replayssm and _MM_TRIM:
+            _bs = self.decode_cudagraph_max_bs
+            self._wpf_bytes = 5 * _bs
+            self._wpf_gpu = torch.zeros(
+                (self._wpf_bytes,), dtype=torch.uint8, device=device
+            )
+            self.decode_write_pos_d: torch.Tensor = self._wpf_gpu[: 4 * _bs].view(
+                torch.int32
+            )
+            self.decode_is_flush_d: torch.Tensor = self._wpf_gpu[4 * _bs :].view(
+                torch.int8
+            )
+            self._wpf_cpu = torch.zeros(
+                (self._wpf_bytes,), dtype=torch.uint8, pin_memory=True
+            )
+            _np = self._wpf_cpu.numpy()
+            self._wpf_wp_np = _np[: 4 * _bs].view(np.int32)
+            self._wpf_fl_np = _np[4 * _bs :].view(np.int8)
+            self._wpf_event = None
+        elif self.use_replayssm:
             self.decode_write_pos_d: torch.Tensor = torch.empty(
                 (self.decode_cudagraph_max_bs,),
                 dtype=torch.int32,
@@ -580,10 +604,22 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                     "--use-replayssm requires CPU decode-base and "
                     "computed-token counts to derive decode write positions"
                 )
-            num_computed_d = num_computed_tokens_cpu[:num_decodes]
-            decode_base_d = decode_base_cpu[:num_decodes]
             align_mode = self.vllm_config.cache_config.mamba_cache_mode == "align"
             block_size = self.kv_cache_spec.block_size
+            if _MM_TRIM:
+                write_pos_d, is_flush_d = self._mm_write_pos_flush(
+                    common_attn_metadata,
+                    num_computed_tokens_cpu,
+                    decode_base_cpu,
+                    num_decodes,
+                    num_prefills,
+                    num_reqs,
+                    align_mode,
+                    block_size,
+                )
+        if self.use_replayssm and num_decodes > 0 and not _MM_TRIM:
+            num_computed_d = num_computed_tokens_cpu[:num_decodes]
+            decode_base_d = decode_base_cpu[:num_decodes]
             if align_mode:
                 # After a boundary the align copy leaves an exact checkpoint at
                 # the block start and the new block's ring restarts empty, so
@@ -675,6 +711,66 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
 
         return self._update_metadata_for_cudagraph_capture(metadata)
 
+    def _mm_write_pos_flush(
+        self,
+        common_attn_metadata,
+        num_computed_tokens_cpu,
+        decode_base_cpu,
+        num_decodes,
+        num_prefills,
+        num_reqs,
+        align_mode,
+        block_size,
+    ):
+        num_computed_d = num_computed_tokens_cpu[:num_decodes].numpy()
+        decode_base_d = decode_base_cpu[:num_decodes].numpy()
+        if align_mode:
+            effective_base = np.maximum(
+                decode_base_d, (num_computed_d // block_size) * block_size
+            )
+        else:
+            effective_base = decode_base_d
+        decode_steps = num_computed_d - effective_base
+        qsl = common_attn_metadata.query_start_loc_cpu.numpy()
+        query_lens = qsl[1 : num_decodes + 1] - qsl[:num_decodes]
+        valid = query_lens > 0
+        leftover = valid & (decode_steps < 0)
+        decode_steps = np.where(valid & ~leftover, decode_steps, 0)
+        write_pos = np.remainder(decode_steps, self.replayssm_buffer_len)
+        is_flush = (write_pos == self.replayssm_buffer_len - 1) | leftover
+        if align_mode:
+            is_flush = is_flush | (
+                valid & ((num_computed_d + query_lens) % block_size == 0)
+            )
+        if (
+            num_prefills == 0
+            and num_decodes <= self.decode_cudagraph_max_bs
+            and num_reqs <= self.decode_cudagraph_max_bs
+            and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+        ):
+            # Direct path: _update_metadata_for_cudagraph_capture will use the
+            # persistent buffers; rows num_decodes..num_reqs are its zero pad.
+            if self._wpf_event is not None:
+                self._wpf_event.synchronize()
+            self._wpf_wp_np[:num_decodes] = write_pos
+            self._wpf_wp_np[num_decodes:] = 0
+            self._wpf_fl_np[:num_decodes] = is_flush
+            self._wpf_fl_np[num_decodes:] = 0
+            n = 4 * self.decode_cudagraph_max_bs + num_reqs
+            self._wpf_gpu[:n].copy_(self._wpf_cpu[:n], non_blocking=True)
+            if self._wpf_event is None:
+                self._wpf_event = torch.cuda.Event()
+            self._wpf_event.record()
+            return (
+                self.decode_write_pos_d[:num_decodes],
+                self.decode_is_flush_d[:num_decodes],
+            )
+        device = common_attn_metadata.query_start_loc.device
+        return (
+            async_tensor_h2d(write_pos.astype(np.int32), device=device),
+            async_tensor_h2d(is_flush.astype(np.int8), device=device),
+        )
+
     def _update_metadata_for_cudagraph_capture(
         self,
         metadata: M,
@@ -758,19 +854,22 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             if self.use_replayssm:
                 assert write_pos_d is not None
                 assert is_flush_d is not None
-                self.decode_write_pos_d[: metadata.num_decodes].copy_(
-                    write_pos_d[: metadata.num_decodes],
-                    non_blocking=True,
-                )
+                if not (
+                    _MM_TRIM
+                    and write_pos_d.data_ptr() == self.decode_write_pos_d.data_ptr()
+                ):
+                    self.decode_write_pos_d[: metadata.num_decodes].copy_(
+                        write_pos_d[: metadata.num_decodes],
+                        non_blocking=True,
+                    )
+                    self.decode_write_pos_d[metadata.num_decodes : padded_bs] = 0
+                    self.decode_is_flush_d[: metadata.num_decodes].copy_(
+                        is_flush_d[: metadata.num_decodes],
+                        non_blocking=True,
+                    )
+                    self.decode_is_flush_d[metadata.num_decodes : padded_bs] = 0
                 write_pos_d = self.decode_write_pos_d[:padded_bs]
-                write_pos_d[metadata.num_decodes :] = 0
-
-                self.decode_is_flush_d[: metadata.num_decodes].copy_(
-                    is_flush_d[: metadata.num_decodes],
-                    non_blocking=True,
-                )
                 is_flush_d = self.decode_is_flush_d[:padded_bs]
-                is_flush_d[metadata.num_decodes :] = 0
 
                 if self.decode_bc_pre_scratch is not None:
                     bc_pre_scratch = self.decode_bc_pre_scratch[:padded_bs]

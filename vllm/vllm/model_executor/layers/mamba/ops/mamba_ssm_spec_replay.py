@@ -84,7 +84,7 @@ def _pdl_enabled() -> bool:
 
 
 # Checkpoint period of the lazy anchor (see spec_replay_lazy).
-LAZY_PERIOD = 20
+LAZY_PERIOD = int(os.environ.get("VLLM_MAMBA_LAZY_P", "16"))
 
 
 def spec_replay_lazy() -> bool:
@@ -93,7 +93,8 @@ def spec_replay_lazy() -> bool:
     state), alternately in slots 0 and 2, and a verify replays every token since
     the last checkpoint from the ring, which then also holds token 0. The store
     happens in the verify whose tokens include the next checkpoint position
-    (about one verify in four) instead of in every verify; every state update
+    (about one verify in five at the default period 16; VLLM_MAMBA_LAZY_P sets
+    the period) instead of in every verify; every state update
     is the same per-token fp32 expression in the same order, so the states and
     outputs are the reference's. The prefill writes L into the slot-0 page's
     padding after the SSM state (write_prefill_tag). VLLM_MAMBA_REPLAY_LAZY=0
@@ -229,7 +230,7 @@ def _selective_scan_update_spec_replay_kernel(
     verify_rows_ptr=None,
     PREFIX_LIMIT: tl.constexpr = False,
     LAZY: tl.constexpr = False,
-    LAZY_P: tl.constexpr = 20,
+    LAZY_P: tl.constexpr = 16,
     SLOT_ELEMS: tl.constexpr = 0,
 ):
     # The dt/A of a head are scalars (stride-0 expansion over head_dim); that is

@@ -12,6 +12,8 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.model_executor.layers.mamba.ops.mamba_ssm import softplus as _ssm_softplus
+from vllm.model_executor.layers.mamba.ops.triton_helpers import fast_exp as _ssm_fast_exp
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
 
 
@@ -806,6 +808,22 @@ def _causal_conv1d_update_kernel(
     HAS_NULL_BLOCK: tl.constexpr,
     BLOCK_N: tl.constexpr,
     launch_pdl: tl.constexpr,
+    dt_raw_ptr=None,
+    dt_A_ptr=None,
+    dt_bias_ptr=None,
+    dt_out_ptr=None,
+    DT_TOKEN_STRIDE: tl.constexpr = 0,
+    DT_HEAD_STRIDE: tl.constexpr = 0,
+    FUSED_DT: tl.constexpr = False,
+    history_state_ptr=None,
+    history_ring_ptr=None,
+    history_seq_ptr=None,
+    HISTORY_STATE_STRIDE: tl.constexpr = 0,
+    HISTORY_RING_STRIDE: tl.constexpr = 0,
+    HISTORY_RING_LEN: tl.constexpr = 0,
+    SCALAR_ROWS: tl.constexpr = 5,
+    HISTORY_PERIOD: tl.constexpr = 20,
+    FUSED_HISTORY: tl.constexpr = False,
 ):
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
@@ -1094,6 +1112,57 @@ def _causal_conv1d_update_kernel(
 
         tl.store(o_ptrs, acc, mask=mask_1d)
 
+    if FUSED_DT:
+        scalar_block = tl.program_id(1)
+        if scalar_block < 8:
+            dt_h = scalar_block * 8 + tl.arange(0, 8)
+            if FUSED_HISTORY:
+                dt_t = tl.arange(0, 32)
+            else:
+                dt_t = tl.arange(0, 8)
+            dt_token = query_start_index + dt_t
+            dt_current_valid = ((dt_t[:, None] < seqlen) & (dt_t[:, None] < 5)
+                                & (dt_token[:, None] >= 0) & (dt_token[:, None] < 5))
+            dt_current = tl.load(dt_raw_ptr + dt_token[:, None] * DT_TOKEN_STRIDE
+                                + dt_h[None, :] * DT_HEAD_STRIDE,
+                                mask=dt_current_valid, other=0).to(tl.float32)
+            if FUSED_HISTORY:
+                # Same original slot/tag/position definitions as lazy SSM. The
+                # raw ring is read only here; current SSM writes disjoint slots.
+                history_anchor = conv_states_input_coord
+                history_slot = tl.load(conv_state_indices_ptr
+                                       + idx_seq * stride_state_indices + 1).to(tl.int64)
+                history_tag = (history_state_ptr + history_anchor * HISTORY_STATE_STRIDE
+                               + 524288).to(tl.pointer_type(tl.int32))
+                history_prompt = tl.load(history_tag).to(tl.int64)
+                history_pos0 = tl.load(history_seq_ptr + idx_seq).to(tl.int64) - seqlen
+                history_k = tl.maximum(history_pos0 - history_prompt, 0) // HISTORY_PERIOD
+                history_ckpt = history_prompt - 1 + history_k * HISTORY_PERIOD
+                history_count = tl.minimum(tl.maximum(history_pos0 - 1 - history_ckpt, 0),
+                                           HISTORY_PERIOD - 1)
+                history_i = dt_t - 5
+                history_pos = ((history_pos0 - history_count + history_i) % HISTORY_RING_LEN
+                               + HISTORY_RING_LEN) % HISTORY_RING_LEN
+                history_valid = (dt_t[:, None] >= 5) & (history_i[:, None] < history_count)
+                history_dt_base = (history_ring_ptr + history_slot * HISTORY_RING_STRIDE
+                                   + HISTORY_RING_LEN * (4096 + 1024))
+                history_raw = tl.load(history_dt_base + history_pos[:, None] * 64
+                                      + dt_h[None, :],
+                                      mask=history_valid & (history_slot != null_block_id),
+                                      other=0).to(tl.float32)
+                dt_raw = tl.where(dt_t[:, None] < 5, dt_current, history_raw)
+                dt_valid = dt_current_valid | history_valid
+            else:
+                dt_raw, dt_valid = dt_current, dt_current_valid
+            dt_bias_vec = tl.load(dt_bias_ptr + dt_h).to(tl.float32)
+            dt_processed = _ssm_softplus(dt_raw + dt_bias_vec[None, :])
+            dt_A_vec = tl.load(dt_A_ptr + dt_h).to(tl.float32)
+            dt_decay = _ssm_fast_exp(dt_A_vec[None, :] * dt_processed)
+            dt_store_row = dt_t if FUSED_HISTORY else dt_token
+            tl.store(dt_out_ptr + dt_store_row[:, None] * 64 + dt_h[None, :], dt_processed, dt_valid)
+            tl.store(dt_out_ptr + SCALAR_ROWS * 64 + dt_store_row[:, None] * 64
+                     + dt_h[None, :], dt_decay, dt_valid)
+
 
 @functools.cache
 def _is_sm121() -> bool:
@@ -1115,6 +1184,7 @@ def causal_conv1d_update(
     initial_state_idx: torch.Tensor | None = None,
     validate_data=False,
     out: torch.Tensor | None = None,
+    _dt_preprocess=None,
 ):
     """
     x: Input tensor which can take the following shapes:
@@ -1243,6 +1313,60 @@ def causal_conv1d_update(
             triton.cdiv(dim, META["BLOCK_N"]),
         )
 
+    fused_dt = False
+    raw_dt = scalar_A = scalar_bias = scalar_out = None
+    history_state = history_ring = history_seq = None
+    history_ring_len, history_period, scalar_rows, fused_history = 0, 20, 5, False
+    if _dt_preprocess is not None:
+        raw_dt, scalar_A, scalar_bias, scalar_out = _dt_preprocess[:4]
+        if len(_dt_preprocess) == 7:
+            from .mamba_ssm_spec_replay import LAZY_PERIOD
+            history_state, history_seq, history_ring_len = _dt_preprocess[4:]
+            history_period = LAZY_PERIOD
+            scalar_rows = history_period + 5
+            fused_history = (
+                5 <= history_period <= 24 and history_ring_len >= history_period + 5
+                and history_state.dtype == torch.float32 and history_state.ndim == 4
+                and tuple(history_state.shape[1:]) == (64, 64, 128)
+                and history_state.stride()[1:] == (8192, 128, 1)
+                and history_state.stride(0) >= 524289
+                and history_state.device == x.device
+                and history_seq.shape == (1,) and history_seq.dtype == torch.int32
+                and history_seq.device == x.device and history_seq.is_contiguous()
+            )
+            if fused_history:
+                history_ring = history_state.view(torch.bfloat16)
+        # Caller/consumer engage only if this producer reports True. GPU NULL
+        # and empty-query early returns deliberately leave scratch untouched;
+        # the SSM has the same slot0 and bypasses it for NULL/empty rows.
+        fused_dt = (
+            batch == 1 and dim == 6144 and seqlen == 5 and x.shape == (5, 6144)
+            and query_start_loc is not None and query_start_loc.shape == (2,)
+            and num_accepted_tokens is not None and conv_state_indices is not None
+            and conv_state_indices.shape == (1, 5)
+            and conv_state_indices.stride(1) == 1
+            and block_idx_last_scheduled_token is None and initial_state_idx is None
+            and x.dtype == original_x_dtype == torch.bfloat16 and _is_sm121()
+            and raw_dt.shape == (5, 64) and raw_dt.dtype == torch.bfloat16
+            and raw_dt.stride(1) == 1 and raw_dt.device == x.device
+            and scalar_A.shape == (64,) and scalar_A.dtype == torch.float32
+            and scalar_A.is_contiguous() and scalar_A.device == x.device
+            and scalar_bias.shape == (64,) and scalar_bias.is_contiguous()
+            and scalar_bias.dtype in (torch.float32, torch.bfloat16, torch.float16)
+            and scalar_bias.device == x.device
+            and scalar_out.shape == (2, scalar_rows, 64) and scalar_out.is_contiguous()
+            and scalar_out.dtype == torch.float32 and scalar_out.device == x.device
+            and block_n >= 8 and (len(_dt_preprocess) == 4 or fused_history)
+        )
+        if fused_dt:
+            # This private output must be independent of every source and the
+            # recurrent/conv outputs. Metadata only; no device readback.
+            scratch_storage = scalar_out.untyped_storage().data_ptr()
+            sources = (x, out, conv_state, weight, raw_dt, scalar_A, scalar_bias)
+            if fused_history:
+                sources += (history_state, history_seq)
+            fused_dt = all(scratch_storage != t.untyped_storage().data_ptr() for t in sources)
+
     _causal_conv1d_update_kernel[grid](
         # Pointers to matrices
         x,
@@ -1287,10 +1411,22 @@ def causal_conv1d_update(
         HAS_NULL_BLOCK=null_block_id is not None,
         BLOCK_N=block_n,
         launch_pdl=current_platform.is_arch_support_pdl(),
+        dt_raw_ptr=raw_dt, dt_A_ptr=scalar_A, dt_bias_ptr=scalar_bias, dt_out_ptr=scalar_out,
+        DT_TOKEN_STRIDE=raw_dt.stride(0) if fused_dt else 0,
+        DT_HEAD_STRIDE=raw_dt.stride(1) if fused_dt else 0,
+        FUSED_DT=fused_dt,
+        history_state_ptr=history_state, history_ring_ptr=history_ring,
+        history_seq_ptr=history_seq,
+        HISTORY_STATE_STRIDE=history_state.stride(0) if fused_history else 0,
+        HISTORY_RING_STRIDE=history_ring.stride(0) if fused_history else 0,
+        HISTORY_RING_LEN=history_ring_len,
+        SCALAR_ROWS=scalar_rows, HISTORY_PERIOD=history_period,
+        FUSED_HISTORY=fused_dt and fused_history,
     )
     if unsqueeze:
         out = out.squeeze(-1)
-    return out.to(original_x_dtype)
+    result = out.to(original_x_dtype)
+    return (result, fused_dt) if _dt_preprocess is not None else result
 
 
 if current_platform.is_cpu():

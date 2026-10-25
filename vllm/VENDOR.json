@@ -342,6 +342,29 @@
     {
       "file": "vllm/v1/spec_decode/nemotron_decode_plan.py (+ llm_base_proposer.py, v1/attention/backends/flashinfer.py)",
       "why": "Own native-MTP FA2 planning-state bank on ENTIRE0e71. Remote startup records original native plan vector, integer prefix and scalar state for each EXACT CPU indptr/last-page/options input, across up to128generic page counts with every valid residue, capped64MiB of plan bytes. Integer-tail/float-arena canaries guard actual installed planner writes; no page-invariance or package-source-equality assumption. Changed private model/hidden/token/gate/KV/live indices/CPU metadata and complete side-stream model-step timing admission mandatory. Only then copy native planning state; current indices/last-page buffers still refreshed. Unknown keys/identities/options fall back before mutation. No request capture or inference output cache. NEMO_MTP_NATIVE_PLAN_BANK=0 disables. Private qualification lineage6cafa6b6-8f26-4ef5-86e1-38c061a207d7 andce5aa6bd-15c2-42c2-8a68-4bc2fe65c23b; no lower tailgraph or L1 runtime imported."
+    },
+    {
+      "file": "vllm/model_executor/layers/mamba/ops/mamba_history_dt.py; causal_conv1d.py; mamba_ssm_spec_replay.py; mamba_mixer2.py",
+      "why": "Extend original conv launch scalar fusion from5current tokens to every needed raw-history token (up to period-1) plus5current. One invocation-local FP32scratch2x(period+5)x64; no derived persistent history, no cache-format change. Original metadata/tag/ring mapping, FP32 per-token recurrence/reduction/order preserved. Fixed remote fullchain bytes/scalar exactness/NULL-ring/NULL-anchor/alternate checkpoint/query offset and coldwarm admission mandatory. Fusion refusal retains original scalar arithmetic on the selected checkpoint schedule. Current-only fallback/helper removed after d318 whole loss; no isolated component conclusion. Unexecuted candidate; no correctness, gain or engagement claim.",
+      "material_submissions": [
+        "0b98b133-8c9b-44ec-9e46-6fc8dca3ec10",
+        "d3189214-8a45-4ab3-9faa-39f0a5e2c24a",
+        "ec3bd33d-a938-41f9-9ae1-bc391280419a",
+        "16e4936c-12ef-4356-80bd-2f5ceb500dce",
+        "4df35f29-cf54-40f3-8380-3b37a7c9bf07",
+        "a9d8ea97-a245-4c7b-855c-6cba04c70733"
+      ]
+    },
+    {
+      "file": "vllm/model_executor/layers/mamba/ops/mamba_ssm_spec_replay.py",
+      "why": "Decode-only: lazy SSM anchor checkpoint period 20 -> 5, the depth-4 verify width. Same per-token fp32 update and slot-0/slot-2 alternation. Mean ring replay drops from 9.5 steps to 2. A launch stores at most one checkpoint (assert max_seqlen <= period). Ring length follows LAZY_PERIOD (25 -> 10 at depth 4). VLLM_MAMBA_REPLAY_LAZY=0 restores the every-verify anchor."
+    },
+    {
+      "file": "vllm/model_executor/layers/fused_moe/experts/humming_relu2_epilogue.py; harness/tests/humming_relu2_exact.py",
+      "why": "Carry useful compatible pending34d21409 packed max.NaN.bf16x2 plus mul.rn.bf16x2 epilogue on already-rounded BF16. Both complete source files exact publicPR491 head92fddde120acbe037792d8db9d1deaab262e818e; no arithmetic mainloop/format/schedule change. Author-reported private tests are not our execution or official result. Whole combination unverified; all execution official remote.",
+      "material_submissions": [
+        "34d21409-8c2e-479f-b1cf-d7b02e5e2e53"
+      ]
     }
   ]
 }

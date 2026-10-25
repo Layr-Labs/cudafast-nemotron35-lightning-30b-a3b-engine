@@ -571,6 +571,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
         self.spec_replay_ring_len = spec_replay_ring_len(self.num_spec)
         self._spec_replay_ok: bool | None = None
         self._spec_replay_lazy: bool | None = None
+        self._current_dt_scratch = None
         if self.use_spec_replay:
             logger.info_once(
                 "Mamba2 spec decode: anchor-state replay (ring of %d tokens).",
@@ -1100,7 +1101,17 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 state_indices_tensor_d_output = state_indices_tensor_d
 
             # 2. Convolution sequence transformation
-            hidden_states_B_C_d = causal_conv1d_update(
+            dt_preprocess = None
+            if (self._current_dt_scratch is not None and not is_mamba_cache_all
+                    and not self.use_replayssm and self.use_spec_replay
+                    and num_decodes == 1 and num_decode_tokens == 5 and not has_prefill
+                    and num_accepted_tokens is not None
+                    and state_indices_tensor_d.shape == (1, 5)
+                    and query_start_loc_d is not None
+                    and self._lazy_anchor(ssm_state)):
+                dt_preprocess = (dt_d, self.A, self.dt_bias, self._current_dt_scratch,
+                                 ssm_state, attn_metadata.seq_lens, self.spec_replay_ring_len)
+            conv_result = causal_conv1d_update(
                 hidden_states_B_C_d,
                 conv_state,
                 self.conv_weights,
@@ -1112,7 +1123,13 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 num_accepted_tokens=num_accepted_tokens,
                 query_start_loc=query_start_loc_d,
                 max_query_len=state_indices_tensor_d.size(-1),
+                _dt_preprocess=dt_preprocess,
             )
+            if dt_preprocess is not None:
+                hidden_states_B_C_d, scalar_produced = conv_result
+                prepared_current_dt = self._current_dt_scratch if scalar_produced else None
+            else:
+                hidden_states_B_C_d, prepared_current_dt = conv_result, None
 
             hidden_states_d, B_d, C_d = self.split_hidden_states_B_C_fn(
                 hidden_states_B_C_d
@@ -1205,6 +1222,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     ring_len=self.spec_replay_ring_len,
                     is_blackwell=self.is_blackwell,
                     lazy=self._lazy_anchor(ssm_state),
+                    _current_dt_dA=prepared_current_dt,
                 )
             else:
                 selective_state_update(
@@ -1224,6 +1242,26 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     cu_seqlens=query_start_loc_d,
                     is_blackwell=self.is_blackwell,
                 )
+
+    def prepare_current_dt_fusion(self, enabled: bool = True) -> None:
+        """Fixed private admission after real cache binding, before requests."""
+        self._current_dt_scratch = None
+        if (not enabled or not self.use_spec_replay or self.use_replayssm
+                or self.num_spec != 4 or self.cache_config.mamba_cache_mode != "none"
+                or self.activation not in ("silu", "swish")):
+            return
+        state = self.kv_cache[1]
+        if not self._lazy_anchor(state):
+            return
+        conv = (self.kv_cache[0] if is_conv_state_dim_first()
+                else self.kv_cache[0].transpose(-1, -2))
+        from vllm.model_executor.layers.mamba.ops.mamba_history_dt import prepare
+
+        self._current_dt_scratch = prepare(
+            conv, state, self.model_config.dtype, self.conv_weights,
+            self.conv1d.bias, self.A, self.dt_bias, self.D,
+            self.spec_replay_ring_len, self.is_blackwell,
+        )
 
     def _lazy_anchor(self, ssm_state: torch.Tensor) -> bool:
         """Whether verifies keep the checkpointed anchor (and prefills write the

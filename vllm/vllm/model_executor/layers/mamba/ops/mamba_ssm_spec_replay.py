@@ -84,7 +84,7 @@ def _pdl_enabled() -> bool:
 
 
 # Checkpoint period of the lazy anchor (see spec_replay_lazy).
-LAZY_PERIOD = 20
+LAZY_PERIOD = 5
 
 
 def spec_replay_lazy() -> bool:
@@ -92,8 +92,8 @@ def spec_replay_lazy() -> bool:
     L - 1 + k * LAZY_PERIOD (L: prompt length; k = 0 is the prefill's final
     state), alternately in slots 0 and 2, and a verify replays every token since
     the last checkpoint from the ring, which then also holds token 0. The store
-    happens in the verify whose tokens include the next checkpoint position
-    (about one verify in four) instead of in every verify; every state update
+    happens in the verify whose computed tokens include the next checkpoint
+    position. Period5 bounds the required replay to four tokens; every state update
     is the same per-token fp32 expression in the same order, so the states and
     outputs are the reference's. The prefill writes L into the slot-0 page's
     padding after the SSM state (write_prefill_tag). VLLM_MAMBA_REPLAY_LAZY=0
@@ -229,8 +229,12 @@ def _selective_scan_update_spec_replay_kernel(
     verify_rows_ptr=None,
     PREFIX_LIMIT: tl.constexpr = False,
     LAZY: tl.constexpr = False,
-    LAZY_P: tl.constexpr = 20,
+    LAZY_P: tl.constexpr = 5,
     SLOT_ELEMS: tl.constexpr = 0,
+    current_dt_dA_ptr=None,
+    CURRENT_DT: tl.constexpr = False,
+    CURRENT_DT_ROWS: tl.constexpr = 5,
+    HISTORY_DT: tl.constexpr = False,
 ):
     # The dt/A of a head are scalars (stride-0 expansion over head_dim); that is
     # the only layout the Mamba2 decode path produces and the only one the
@@ -356,15 +360,30 @@ def _selective_scan_update_spec_replay_kernel(
             mask=(offs_m < dim) & ring_ok,
             other=0.0,
         ).to(tl.float32)
-        dt = tl.load(
-            ring_dt_base + ring_pos * ring_stride_dt, mask=ring_ok, other=0.0
-        ).to(tl.float32)
-        if HAS_DT_BIAS:
-            dt += tl.load(dt_bias_ptr).to(tl.float32)
-        if DT_SOFTPLUS:
-            dt = softplus(dt)
-        A = tl.load(A_ptr).to(tl.float32)
-        dA = fast_exp(A * dt)  # scalar, not a matrix
+        if HISTORY_DT:
+            if state_batch_idx != null_block_id:
+                history_scalar = (5 + i_r) * nheads + pid_h
+                dt = tl.load(current_dt_dA_ptr + history_scalar).to(tl.float32)
+                dA = tl.load(current_dt_dA_ptr + CURRENT_DT_ROWS * nheads
+                             + history_scalar).to(tl.float32)
+            else:
+                dt = tl.load(ring_dt_base + ring_pos * ring_stride_dt,
+                             mask=ring_ok, other=0.0).to(tl.float32)
+                if HAS_DT_BIAS:
+                    dt += tl.load(dt_bias_ptr).to(tl.float32)
+                if DT_SOFTPLUS:
+                    dt = softplus(dt)
+                A = tl.load(A_ptr).to(tl.float32)
+                dA = fast_exp(A * dt)
+        else:
+            dt = tl.load(ring_dt_base + ring_pos * ring_stride_dt,
+                         mask=ring_ok, other=0.0).to(tl.float32)
+            if HAS_DT_BIAS:
+                dt += tl.load(dt_bias_ptr).to(tl.float32)
+            if DT_SOFTPLUS:
+                dt = softplus(dt)
+            A = tl.load(A_ptr).to(tl.float32)
+            dA = fast_exp(A * dt)  # scalar, not a matrix
 
         B = tl.load(
             ring_B_base + ring_pos * ring_stride_B + offs_n,
@@ -398,13 +417,30 @@ def _selective_scan_update_spec_replay_kernel(
         x_raw = tl.load(x_ptrs, mask=offs_m < dim, other=0.0)
         x = x_raw.to(tl.float32)
         dt_raw = tl.load(dt_ptr)
-        dt = dt_raw.to(tl.float32)
-        if HAS_DT_BIAS:
-            dt += tl.load(dt_bias_ptr).to(tl.float32)
-        if DT_SOFTPLUS:
-            dt = softplus(dt)
-        A = tl.load(A_ptr).to(tl.float32)
-        dA = fast_exp(A * dt)  # scalar, not a matrix
+        if CURRENT_DT:
+            if state_batch_idx != null_block_id:
+                # The original conv's PDL completion covers this FP32 scratch.
+                # Raw dt is still loaded above for the unchanged raw history.
+                scalar_pos = (i_t if HISTORY_DT else bos + i_t) * nheads + pid_h
+                dt = tl.load(current_dt_dA_ptr + scalar_pos).to(tl.float32)
+                dA = tl.load(current_dt_dA_ptr + CURRENT_DT_ROWS * nheads + scalar_pos).to(tl.float32)
+            else:
+                # Original conv returns before writing scratch on a NULL slot.
+                dt = dt_raw.to(tl.float32)
+                if HAS_DT_BIAS:
+                    dt += tl.load(dt_bias_ptr).to(tl.float32)
+                if DT_SOFTPLUS:
+                    dt = softplus(dt)
+                A = tl.load(A_ptr).to(tl.float32)
+                dA = fast_exp(A * dt)
+        else:
+            dt = dt_raw.to(tl.float32)
+            if HAS_DT_BIAS:
+                dt += tl.load(dt_bias_ptr).to(tl.float32)
+            if DT_SOFTPLUS:
+                dt = softplus(dt)
+            A = tl.load(A_ptr).to(tl.float32)
+            dA = fast_exp(A * dt)  # scalar, not a matrix
 
         B_raw = tl.load(B_ptrs, mask=offs_n < dstate, other=0.0)
         B = B_raw.to(tl.float32)
@@ -566,6 +602,9 @@ def selective_state_update_spec_replay(
     is_blackwell=False,
     replayed_out=None,
     lazy=False,
+    _current_dt_dA=None,
+    _private_verify_rows=None,
+    _private_no_prefix=False,
 ):
     """
     Spec-decode verify update with anchor + input-ring state handling.
@@ -609,6 +648,7 @@ def selective_state_update_spec_replay(
     assert ring_len >= 2 * (max_seqlen - 1) + 1
     if lazy:
         assert max_seqlen >= 3 and ring_len >= LAZY_PERIOD + max_seqlen - 1
+        assert max_seqlen <= LAZY_PERIOD
         assert prefill_tag_view(state) is not None
     assert out.shape == x.shape
     assert num_accepted_tokens.shape == (N,)
@@ -632,6 +672,7 @@ def selective_state_update_spec_replay(
     if (
         N == 1 and max_seqlen == 5 and batch == 5
         and replayed_out is None
+        and _private_verify_rows is None and not _private_no_prefix
         and os.environ.get("VLLM_MAMBA_SPEC_PREFIX", "1") != "0"
     ):
         smallk = sys.modules.get("smallk")
@@ -639,6 +680,17 @@ def selective_state_update_spec_replay(
             # Never import/allocate/rebind the buffer here; its address must
             # already be the same one captured by every router and sampler.
             verify_rows = smallk.live_verify_rows(x.device)
+
+    if _private_verify_rows is not None:
+        verify_rows = _private_verify_rows
+    if _private_no_prefix:
+        verify_rows = None
+    current_dt = (_current_dt_dA is not None and lazy and N == 1 and batch == 5
+                  and max_seqlen == 5 and x.dtype == torch.bfloat16
+                  and dt_softplus and z is None and nheads == 64
+                  and _current_dt_dA.shape in ((2, 5, 64), (2, LAZY_PERIOD + 5, 64))
+                  and _current_dt_dA.dtype == torch.float32
+                  and _current_dt_dA.device == x.device and _current_dt_dA.is_contiguous())
 
     with torch.accelerator.device_index(x.device.index):
         _selective_scan_update_spec_replay_kernel[grid](
@@ -711,4 +763,8 @@ def selective_state_update_spec_replay(
             LAZY=bool(lazy),
             LAZY_P=LAZY_PERIOD,
             SLOT_ELEMS=nheads * dim * dstate,
+            current_dt_dA_ptr=_current_dt_dA,
+            CURRENT_DT=bool(current_dt),
+            CURRENT_DT_ROWS=_current_dt_dA.shape[1] if current_dt else 5,
+            HISTORY_DT=bool(current_dt and _current_dt_dA.shape[1] == LAZY_PERIOD + 5),
         )

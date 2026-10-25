@@ -711,6 +711,24 @@ class NemotronHModel(nn.Module, EagleModelMixin):
                     if name is None:
                         name = f"{prefix}.layers.{i}.mixer.experts"
                     _l2pf.AHEAD_MOE[str(name)] = nxt.mixer.in_proj
+            # The router weight of an MoE layer is read first and by a latency-bound
+            # GEMM: let the layer before it (Mamba or attention, both with an l2pf
+            # window) prefetch it as well. Keyed by that layer's op name.
+            ahead_gate = getattr(_l2pf, "AHEAD_GATE", None)
+            if ahead_gate is None:
+                ahead_gate = {}
+                _l2pf.AHEAD_GATE = ahead_gate
+            for i in range(self.start_layer, self.end_layer - 1):
+                cur, nxt = self.layers[i], self.layers[i + 1]
+                gate = getattr(getattr(nxt, "mixer", None), "gate", None)
+                if not isinstance(nxt, NemotronHMoEDecoderLayer) or gate is None:
+                    continue
+                if isinstance(cur, NemotronHMambaDecoderLayer):
+                    ahead_gate[str(cur.mixer.prefix)] = gate
+                elif isinstance(cur, NemotronHAttentionDecoderLayer):
+                    attn_name = getattr(getattr(cur.mixer, "attn", None), "layer_name", None)
+                    if attn_name is not None:
+                        ahead_gate[str(attn_name)] = gate
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )

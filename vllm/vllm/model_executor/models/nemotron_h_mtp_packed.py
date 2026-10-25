@@ -337,6 +337,17 @@ def _packed_linear_impl(
         if x.stride(1) != 1:
             x = x.contiguous()
         y = x.new_empty((x.shape[0], n))
+        from .nemotron_h_mtp_pkmm import _CONFIGS, packed_mm
+
+        cfg = _CONFIGS.get((n, k))
+        if cfg is not None:
+            # the same ascending MMA chain as packed_small, on more programs
+            bn, wn, bk = cfg
+            packed_mm[(triton.cdiv(n, bn),)](
+                x, *p.planes, y, x.shape[0], n, k, x.stride(0), y.stride(0),
+                BM=16, BN=bn, BK=bk, WN=wn, num_warps=wn, launch_pdl=mtp_pdl(),
+                gate_ptr=gate, GATED=gated, WORD=word_load_enabled(x.device))
+            return y
         packed_small[(triton.cdiv(n, 64),)](
             x, *p.planes, y, x.shape[0], n, k, x.stride(0), y.stride(0), gate,
             GATED=gated, num_warps=4, num_stages=4, launch_pdl=mtp_pdl(),

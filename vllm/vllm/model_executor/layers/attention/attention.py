@@ -866,6 +866,12 @@ def unified_attention_with_output(
         and _l2pf.ATTN_BYTES > 0
         and _prefetch_ahead(ahead, query.shape[0])
     )
+    if pf:
+        # then the router weight of the MoE layer that follows (mamba_mixer2.py)
+        from vllm.model_executor.layers.mamba import mamba_mixer2 as _mm2
+
+        if _mm2._GATE_PF:
+            _l2pf.prefetch(_mm2.l2pf_gate_weight(layer_name))
     self.impl.forward(
         self,
         query,

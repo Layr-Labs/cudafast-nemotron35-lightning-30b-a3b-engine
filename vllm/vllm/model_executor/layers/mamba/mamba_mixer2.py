@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 
 import torch
 from torch import nn
@@ -81,6 +82,22 @@ except ImportError:
 def _out_proj_weight(mixer) -> torch.Tensor:
     packed = getattr(mixer.out_proj, "_fp8small_weight", None)
     return packed if packed is not None else mixer.out_proj.weight
+
+
+def l2pf_gate_weight(layer_name: str) -> torch.Tensor | None:
+    """The router weight the MoE layer after layer_name reads (smallk's bf16 shadow when
+    it has one), or None (no l2pf, no MoE layer next)."""
+    gate = getattr(_l2pf, "AHEAD_GATE", {}).get(layer_name) if _l2pf is not None else None
+    if gate is None:
+        return None
+    w = gate.weight
+    try:
+        import smallk
+
+        w16 = smallk.gate_w16(w)
+    except (ImportError, AttributeError):
+        w16 = None
+    return w16 if w16 is not None else w
 
 # Added by the IBM Team, 2024
 
@@ -1273,6 +1290,10 @@ class MambaMixer2(MambaBase, PluggableLayer):
         return MambaAttentionBackendEnum.MAMBA2
 
 
+# L2PF_GATE=0: no router-weight prefetch for the next MoE layer.
+_GATE_PF = os.environ.get("L2PF_GATE", "1") != "0"
+
+
 def mamba_mixer2(
     projected_states: torch.Tensor,
     output: torch.Tensor,
@@ -1294,6 +1315,10 @@ def mamba_mixer2(
         and _l2pf.MAMBA_BYTES > 0
         and _l2pf.prefetch(_out_proj_weight(self), max_bytes=_l2pf.MAMBA_BYTES)
     )
+    if pf and _GATE_PF:
+        # then the next MoE layer's router weight (0.7 MB), which its
+        # latency-bound router GEMM reads right after this layer
+        _l2pf.prefetch(l2pf_gate_weight(layer_name))
     self.conv_ssm_forward(projected_states=projected_states, output=output)
     if pf:
         _l2pf.join(projected_states.device)

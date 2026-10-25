@@ -26,12 +26,15 @@ __device__ __forceinline__ void load_a(const P&p,int lane,int step,uint32_t(&a)[
  a[2]=row<p.m?lda<NC>(p.a+row*K+kk+16):0;
  a[3]=row+8<p.m?lda<NC>(p.a+(row+8)*K+kk+16):0;
 }
-// Weight half of one ring step (the load-time pack: never written at run time).
+// Weight half of one ring step (the load-time pack: never written at run time). Read once
+// per call: L2 evict_first, so lines prefetched for the next kernels stay. Same bytes.
 template<int N,int K,int W>
 __device__ __forceinline__ void load_b(const P&p,int warp,int lane,int step,uint32_t(&b)[2]) {
  int gw=blockIdx.x*W+warp;
  const uint2* ptr=(const uint2*)p.b+(((gw/4)*(K/32)+step)*128+(gw%4)*32+lane);
- asm volatile("ld.global.nc.L1::no_allocate.v2.u32 {%0,%1}, [%2];\n" : "=r"(b[0]),"=r"(b[1]) : "l"(ptr));
+ uint64_t pol;
+ asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
+ asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint.v2.u32 {%0,%1}, [%2], %3;\n" : "=r"(b[0]),"=r"(b[1]) : "l"(ptr), "l"(pol));
 }
 template<int N,int K,int W,bool NC=true>
 __device__ __forceinline__ void load(const P&p,int warp,int lane,int step,uint32_t(&a)[4],uint32_t(&b)[2]) {

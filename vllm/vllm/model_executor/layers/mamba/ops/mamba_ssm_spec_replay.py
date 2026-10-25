@@ -263,7 +263,8 @@ def _selective_scan_update_spec_replay_kernel(
 
     mask = (offs_m[:, None] < dim) & (offs_n[None, :] < dstate)
     mask &= state_batch_idx != null_block_id
-    state = tl.load(state_ptrs, mask=mask, other=0.0).to(tl.float32)
+    # The anchor state is read and written once per verify: L2 evict_first.
+    state = tl.load(state_ptrs, mask=mask, other=0.0, eviction_policy="evict_first").to(tl.float32)
 
     if HAS_DT_BIAS:
         dt_bias_ptrs = dt_bias_ptr + offs_m * stride_dt_bias_dim
@@ -345,7 +346,8 @@ def _selective_scan_update_spec_replay_kernel(
 
         if i_t == 0:
             # The new anchor: the state after token 0, as the reference's slot 0.
-            tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=mask)
+            tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=mask,
+                     eviction_policy="evict_first")
         else:
             ring_pos = ((pos0 + i_t) % rl + rl) % rl
             tl.store(

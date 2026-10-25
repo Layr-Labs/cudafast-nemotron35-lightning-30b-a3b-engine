@@ -278,6 +278,10 @@
     {
       "file": "harness/kernels/pzskip/csrc/pzskip.cu (+ build.sh)",
       "why": "PZ333 M496/top-6 only: HUMMING_EVICT_PZ defaults on and gives immutable packed B/BS cp.async loads L2 evict-first priority. Loader addresses, bytes, masks, K16 MMA order, negative-zero repair and formats are unchanged. HUMMING_EVICT_PZ=0 restores stock. Separate native template specialization; compile/load failure retains stock PZ333. Stacks independently with the routed-up evf policy; no decode change."
+    },
+    {
+      "file": "harness/kernels/zskip/csrc/zskip.cu, zskip_pair.cuh; harness/kernels/marlinx/csrc/marlinx.cu; harness/kernels/fp8small/csrc/fp8small.cu; model_executor/layers/fused_moe/experts/humming_relu2_epilogue.py; model_executor/models/nemotron_h_attn_packed_kernel.py; model_executor/layers/mamba/ops/mamba_ssm_spec_replay.py; model_executor/layers/mamba/mamba_mixer2.py; model_executor/layers/attention/attention.py; model_executor/models/nemotron_h.py; model_executor/models/nemotron_h_mtp_packed.py; model_executor/models/nemotron_h_mtp_pkmm.py (new)",
+      "why": "(1) The target verify's once-read weight streams load with an L2 evict_first cache policy (createpolicy.fractional.L2::evict_first + .L2::cache_hint on the existing loads, same addresses and widths): zskip weight/scale helpers, marlinx streamed weight words (shared expert, lm_head), fp8small load_b, the derived evict-first Humming routed-up kernel now also for the 1..8-token verify configs (own failure flag, HUMMING_EVICT_SMALL=0 restores stock), the packed attention plane loads, and the spec-replay SSM anchor state load/store. Cache priority only; same bytes, same arithmetic. (2) The l2pf windows of the Mamba mixer and of attention also prefetch the router weight (smallk's bf16 shadow when it has one) of the MoE layer that follows (l2pf.AHEAD_GATE filled by NemotronHModel); L2PF_GATE=0 disables. (3) Drafter: 2..16-row calls of the packed qkv_proj / o_proj run packed_mm (nemotron_h_mtp_pkmm.py): the ascending m16n8k16 chain packed_small runs, on narrower N tiles; WORD loads as packed_small."
     }
   ]
 }

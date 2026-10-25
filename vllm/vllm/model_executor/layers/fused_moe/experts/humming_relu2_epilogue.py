@@ -68,6 +68,9 @@ _CACHE = {}
 # Separate class AND config cache: KernelRuntime interns by class/config.
 _EVICT_CACHE = {}
 _EVICT_FAILED = False
+# The verify-size (1..8 token) kernels: their own switch and failure flag.
+_EVICT_SMALL_FAILED = False
+_EVICT_SMALL = os.environ.get("HUMMING_EVICT_SMALL", "1") != "0"
 _EVICT_PREFIX = r"""
 #include <humming/utils/all.cuh>
 template<bool C, typename T>
@@ -140,12 +143,15 @@ def _prepare_stock(meta, compute_config, tuning_config):
     return configs
 
 
-def prepare(meta, compute_config, tuning_config, evict_first=False):
-    global _EVICT_FAILED
+def prepare(meta, compute_config, tuning_config, evict_first=False, rows=2976):
+    """The launch configs; with evict_first, the kernel of the range holding `rows`
+    (the 496-row prefill, or a 1..8-token verify) reads B and BS with the hint."""
+    global _EVICT_FAILED, _EVICT_SMALL_FAILED
     stock = _prepare_stock(meta, compute_config, tuning_config)
-    if not evict_first or _EVICT_FAILED:
+    small = rows != 2976
+    if not evict_first or (_EVICT_SMALL_FAILED if small else _EVICT_FAILED):
         return stock
-    key = (meta.to_str(), compute_config, tuning_config)
+    key = (meta.to_str(), compute_config, tuning_config, rows if small else None)
     if key in _EVICT_CACHE:
         return _EVICT_CACHE[key]
     try:
@@ -157,11 +163,11 @@ def prepare(meta, compute_config, tuning_config, evict_first=False):
         lc.pop("sublayer_name", None)
         changed = 0
         for i, (lo, hi, config) in enumerate(tc):
-            if not lo < 2976 <= hi:
+            if not lo < rows <= hi:
                 continue
             original = HummingKernel._id2kernel[values[4 * i + 2]]
             assert tuple(original.problem_shape[1:]) == (1856, 2688)
-            assert config["block_shape"] == [64, 64, 32]
+            assert config["block_shape"] == ([16, 64, 32] if small else [64, 64, 32])
             params = lc | json.loads(compute_config) | config
             params.pop("num_sms", None)
             kernel = EvictFirstRelu2HummingKernel(**params)
@@ -179,8 +185,11 @@ def prepare(meta, compute_config, tuning_config, evict_first=False):
         _EVICT_CACHE[key] = configs
         return configs
     except Exception as exc:
-        _EVICT_FAILED = True
-        logger.warning_once("humming evict-first unavailable; using stock: %s", exc)
+        if small:
+            _EVICT_SMALL_FAILED = True
+        else:
+            _EVICT_FAILED = True
+        logger.warning_once("humming evict-first unavailable (rows %d); using stock: %s", rows, exc)
         return stock
 
 
@@ -200,12 +209,16 @@ def forward_relu2(
     meta = layer.humming_metas["w13"]
     assert inputs.dtype == outputs.dtype == torch.bfloat16 and input_scale is None
     assert getattr(layer, meta.bias_name, None) is None
-    configs = prepare(
-        meta, compute_config, tuning_config,
-        evict_first=(inputs.shape[0] == 496 and top_k == 6
-                     and valid_shape_m == 2976
-                     and os.environ.get("HUMMING_EVICT_FIRST", "1") != "0"),
-    )
+    if inputs.shape[0] <= 8 and top_k == 6:
+        configs = prepare(meta, compute_config, tuning_config,
+                          evict_first=_EVICT_SMALL, rows=valid_shape_m)
+    else:
+        configs = prepare(
+            meta, compute_config, tuning_config,
+            evict_first=(inputs.shape[0] == 496 and top_k == 6
+                         and valid_shape_m == 2976
+                         and os.environ.get("HUMMING_EVICT_FIRST", "1") != "0"),
+        )
     return ops.launch_kernel(
         configs=configs,
         inputs=inputs,

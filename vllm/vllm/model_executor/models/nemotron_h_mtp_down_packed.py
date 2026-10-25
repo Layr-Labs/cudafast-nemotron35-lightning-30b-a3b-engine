@@ -12,6 +12,7 @@ from vllm.triton_utils import tl, triton
 
 _ENABLED = os.environ.get("MTP_DOWN_PACK12", "1") != "0"
 _PACKS = {}
+_BROADCAST_DISPATCH = None
 
 
 @triton.jit
@@ -82,6 +83,7 @@ def _new(pw, ps, indices, values, counts, ids, part, bn, word, pdl=False):
 
 @torch.no_grad()
 def prepare(packed):
+    global _BROADCAST_DISPATCH
     if not _ENABLED or torch.cuda.is_current_stream_capturing():
         return
     w, sd = packed
@@ -180,6 +182,14 @@ def prepare(packed):
             best = min(times, key=lambda bn: statistics.median(times[bn]))
             if best and statistics.median(times[best]) < 0.96 * statistics.median(times[0]):
                 flags[(topk, word)] = best
+        # Separate optional admission; the original flags and fallback remain.
+        try:
+            from .nemotron_h_mtp_down_broadcast import prepare as prepare_broadcast
+            from .nemotron_h_mtp_down_broadcast import maybe_slots as maybe_broadcast
+            prepare_broadcast(w, sd, pw, ps, flags, word, pdl)
+            _BROADCAST_DISPATCH = maybe_broadcast
+        except Exception as exc:
+            print(f"MTP_DOWN_BROADCAST original flags retained: {exc!r}", flush=True)
         if flags:
             _PACKS[key] = (w, sd, pw, ps, flags)
         print(f"MTP_DOWN_PACK12 admitted={flags} original_weights_retained=True", flush=True)
@@ -191,6 +201,9 @@ def prepare(packed):
 def maybe_slots(packed, indices, values, counts, ids, part, pdl):
     if not _ENABLED:
         return False
+    if _BROADCAST_DISPATCH is not None and _BROADCAST_DISPATCH(
+            packed, indices, values, counts, ids, part, pdl):
+        return True
     w, sd = packed
     entry = _PACKS.get((w.data_ptr(), sd.data_ptr()))
     if entry is None or entry[0] is not w or entry[1] is not sd:

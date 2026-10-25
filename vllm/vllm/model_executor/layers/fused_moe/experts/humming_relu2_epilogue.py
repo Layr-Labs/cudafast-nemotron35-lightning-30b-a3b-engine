@@ -38,16 +38,13 @@ class EpilogueArithmetic : public UnfusedEpilogueArithmetic<
   static_assert(!TuningConfig::kUseStreamK);
   CUDA_INLINE void may_apply_on_smem_write(uint32_t &regs, uint32_t row, uint32_t col) {
     Base::may_apply_on_smem_write(regs, row, col);
-    // regs already contains the original BF16 output. Use explicit non-FTZ
-    // operations even if Humming enables fast math for unrelated arithmetic.
+    // regs contains the original BF16 output. Packed non-FTZ instructions
+    // retain NaN propagation and the same single BF16 square rounding.
     uint32_t squared;
     asm volatile(
-        "{ .reg .b16 lo, hi; .reg .f32 x, y;\n"
-        "mov.b32 {lo, hi}, %1;\n"
-        "cvt.f32.bf16 x, lo; cvt.f32.bf16 y, hi;\n"
-        "max.NaN.f32 x, x, 0f00000000; max.NaN.f32 y, y, 0f00000000;\n"
-        "mul.rn.f32 x, x, x; mul.rn.f32 y, y, y;\n"
-        "cvt.rn.bf16x2.f32 %0, y, x; }\n"
+        "{ .reg .b32 x, z;\n"
+        "mov.b32 z, 0; max.NaN.bf16x2 x, %1, z;\n"
+        "mul.rn.bf16x2 %0, x, x; }\n"
         : "=r"(squared) : "r"(regs));
     regs = squared;
   }
@@ -219,12 +216,27 @@ class DynEvictFirstRelu2HummingKernel(EvictFirstRelu2HummingKernel):
     dyn_scheduler = True
 
 
+def _w13_k128_enabled():
+    return os.environ.get("HUMMING_W13_K128", "1") != "0"
+
+
+def _w13_k128_params(lo, hi, params):
+    if (_w13_k128_enabled() and (lo, hi) == (24, 48)
+            and params["block_shape"] == [16, 64, 32]
+            and params["warp_shape"] == [16, 32, 32]
+            and params["num_stages"] == 8):
+        return dict(params, block_shape=[16, 64, 128],
+                    warp_shape=[16, 32, 128], num_stages=2)
+    return params
+
+
 def _variant_key(dyn):
     """Cache-key part of the scheduler variant: the claim-when-free kernels'
     persistent grids come from the environment, so they are part of it."""
     if not dyn:
-        return (False,)
-    return (True, _dyn_num_sms(0, 1 << 30, 0), _dyn_num_sms(0, 1, 0))
+        return (False, _w13_k128_enabled())
+    return (True, _dyn_num_sms(0, 1 << 30, 0), _dyn_num_sms(0, 1, 0),
+            _w13_k128_enabled())
 
 
 def _prepare_stock(meta, compute_config, tuning_config, dyn):
@@ -246,7 +258,7 @@ def _prepare_stock(meta, compute_config, tuning_config, dyn):
         assert config["block_shape"][2] == config["warp_shape"][2] == 32
         assert not config.get("use_stream_k", False)
         assert not config.get("use_f16_accum", False)
-        params = lc | cc | config
+        params = _w13_k128_params(lo, hi, lc | cc | config)
         num_sms = params.pop("num_sms", 0)
         if dyn:
             num_sms = _dyn_num_sms(lo, hi, num_sms)

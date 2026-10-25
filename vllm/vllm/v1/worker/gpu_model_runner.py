@@ -301,7 +301,6 @@ def _keep_verify_rows_for(
 # Protect asynchronous H2D sources; switchable for in-process cost screening.
 PINNED_SOURCE_GUARDS = True
 
-# LOCAL PATCH (cudafast-nemotron35): spec-decode metadata cache (_calc_spec_decode_metadata).
 _SPEC_META_CACHE = os.environ.get("VLLM_SPEC_META_CACHE", "1") != "0"
 _SPEC_META_CACHE_CHECK = os.environ.get("VLLM_SPEC_META_CACHE_CHECK", "0") == "1"
 
@@ -1681,11 +1680,6 @@ class GPUModelRunner(
             assert self.num_accepted_tokens_event is not None
             self.num_accepted_tokens_event.record()
         else:
-            # LOCAL PATCH (cudafast-nemotron35): under async scheduling with
-            # mamba_cache_mode "none" nothing reads num_accepted_tokens_cpu (the
-            # _prepare_inputs re-sync is skipped for exactly that case, and
-            # preprocess_mamba runs in "align" mode only), so its D2H copy is
-            # skipped: it sat on the stream between the sampler and the drafter.
             if not (
                 self.use_async_scheduling
                 and self.cache_config.mamba_cache_mode == "none"
@@ -2966,12 +2960,6 @@ class GPUModelRunner(
 
                 xdrope_pos_ptr += completion_part_len
 
-    # LOCAL PATCH (cudafast-nemotron35): the index tensors of a spec-decode verify depend
-    # only on the batch composition (each request's draft count and scheduled-token count),
-    # never on token values. Keep the last composition's device tensors and gather the draft
-    # ids with one composed index (logits_indices[target_logits_indices + 1]); any other
-    # composition recomputes everything. VLLM_SPEC_META_CACHE=0 disables,
-    # VLLM_SPEC_META_CACHE_CHECK=1 also recomputes and compares every step.
     _spec_meta_cache: tuple | None = None
 
     def _calc_spec_decode_metadata(
@@ -3122,7 +3110,6 @@ class GPUModelRunner(
             logits_indices=logits_indices,
         )
         if want_composed:
-            # the same gather as the two above, as one index (spec metadata cache)
             return md, logits_indices_np[target_logits_indices_np + 1]
         return md
 
@@ -3922,12 +3909,6 @@ class GPUModelRunner(
         # which the greedy kernel rejects, emitting row count - 1's own argmax.
         # Then every row is valid again. See nemotron_h_mtp_kernels.py.
         vrows = _verify_rows_buffer(logits)
-        # LOCAL PATCH (cudafast-nemotron35): vsample (harness/kernels/vsample). For a
-        # one-request greedy verify, the depth-gate masking above, the rejection
-        # sampler's greedy-argmax path, the verify-row reset below and the accepted
-        # count of _update_states_after_model_execute run as one kernel with the same
-        # integer results (argmax under torch's NaN/tie order); the stock path runs
-        # whenever its guard refuses. VSAMPLE=0 disables it.
         fused = self._vsample_greedy(
             logits, spec_decode_metadata, sampling_metadata, vrows
         )
@@ -3947,8 +3928,6 @@ class GPUModelRunner(
             vrows.fill_(_smallk_module().VROWS_ALL)
         return sampler_output
 
-    # LOCAL PATCH (cudafast-nemotron35): vsample (see _sample). The output tensor whose
-    # accepted count the fused kernel already wrote to num_accepted_tokens.gpu[0].
     _vsample_counted: torch.Tensor | None = None
 
     def _vsample_greedy(
@@ -3962,7 +3941,7 @@ class GPUModelRunner(
         vsample = sys.modules.get("vsample")
         if vsample is None:
             try:
-                import vsample  # harness/kernels/vsample
+                import vsample
             except ImportError:
                 return None
         rs = self.rejection_sampler

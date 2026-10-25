@@ -764,9 +764,6 @@ class SpecDecodeBaseProposer:
             # loop iterations so we build once and reuse.
             if not self.constant_draft_positions or token_index == 0:
                 # A plan rewrites pinned host buffers that the previous plan's
-                # H2D copies read; wait until those copies have run. With
-                # per-step staging sets (hostfast) this step's plan writes its
-                # own buffers and the set's event orders the reuse instead.
                 order_this_plan = order_draft_plans and self._hostfast_draft_sets() is None
                 if order_this_plan and token_index > 0:
                     assert self._draft_plan_event is not None
@@ -1119,8 +1116,6 @@ class SpecDecodeBaseProposer:
     def build_per_group_and_layer_attn_metadata(
         self, common_attn_metadata: CommonAttentionMetadata, draft_index: int = 0
     ) -> tuple[list[object], dict[str, object]]:
-        # LOCAL PATCH (cudafast-nemotron35): hostfast per-step staging sets, or
-        # the staging guard when they are off.
         sets = self._hostfast_draft_sets()
         guard = None if sets is not None else self._hostfast_staging_guard()
         if sets is not None:
@@ -1147,7 +1142,6 @@ class SpecDecodeBaseProposer:
     # draft tokens of the step being drafted for, on the CPU.
     hostfast_num_rejected_cpu: Any = None
     _hostfast_guard: "hostfast.StagingGuard | None" = None
-    # None: not built yet; False: the drafter's builders do not support sets.
     _hostfast_sets: "hostfast.DraftStagingSets | bool | None" = None
 
     def _hostfast_draft_sets(self) -> "hostfast.DraftStagingSets | None":

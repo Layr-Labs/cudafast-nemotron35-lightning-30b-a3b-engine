@@ -112,23 +112,9 @@ class Mamba2AttentionMetadata(BaseMambaAttentionMetadata):
     seq_idx_p: torch.Tensor | None = None
 
 
-# LOCAL PATCH (cudafast-nemotron35): decode metadata reuse. In a spec-decode verify of a
-# pure-decode batch (no prefilling row, mamba_cache_mode "none", no ReplaySSM, full CUDA
-# graphs), every Mamba2 KV-cache group rebuilt the same metadata each step: the same ints and
-# views of the same persistent buffers (query_start_loc, seq_lens, the builder's state-index
-# and accepted-count buffers). The only per-step device work is copying this group's state
-# indices from its block table and the accepted counts into the buffers the verify graph reads.
-# So a builder whose inputs match its last decode build (same ints, same query_start_loc_cpu
-# values, same tensor storages and shapes) returns that metadata object after those copies,
-# and the Mamba2 groups share one accepted-count buffer that is copied once per step.
-# VLLM_MAMBA2_META_REUSE=0 restores the full build every step; VLLM_MAMBA2_META_REUSE_CHECK=1
-# also runs the full build and compares the two structurally.
 _META_REUSE = os.environ.get("VLLM_MAMBA2_META_REUSE", "1") != "0"
 _META_REUSE_CHECK = os.environ.get("VLLM_MAMBA2_META_REUSE_CHECK", "0") == "1"
-# (device, shape, dtype) -> the accepted-count buffer every Mamba2 group's verify graph reads
 _SHARED_ACCEPTED: dict[tuple, torch.Tensor] = {}
-# Per-step state shared by the groups of one step (keyed by the step's query_start_loc
-# tensor object, which every group's shallow-copied CommonAttentionMetadata shares).
 _STEP: dict[str, Any] = {"qsl": None, "sig": None, "acc_qsl": None}
 
 
@@ -211,7 +197,6 @@ class Mamba2AttentionMetadataBuilder(
             "chunk_size needs to be set in the model config for Mamba2 models"
         )
         self.chunk_size: int = chunk_size
-        # LOCAL PATCH (cudafast-nemotron35): decode metadata reuse (see _META_REUSE).
         self._meta_reuse = (
             _META_REUSE
             and self.use_spec_decode
@@ -290,7 +275,6 @@ class Mamba2AttentionMetadataBuilder(
             == self.state_indices_tensor_d.data_ptr()
         ):
             self._decode_cache = (sig, md)
-            # the full build copied this step's accepted counts into the shared buffer
             _STEP["acc_qsl"] = common_attn_metadata.query_start_loc
         else:
             self._decode_cache = None

@@ -242,10 +242,6 @@
     {
       "file": "vllm/vllm/v1/worker/hostfast.py, vllm/vllm/v1/spec_decode/llm_base_proposer.py, vllm/vllm/v1/worker/gpu_model_runner.py, vllm/vllm/model_executor/layers/fused_moe/runner/shared_experts.py, vllm/vllm/model_executor/models/nemotron_h_mtp_kernels.py",
       "why": "Carried from jacklightChen 09bdbc08-7066-440f-a7aa-ce4f1863 (which selected per-depth pinned plan staging and an integer depth-end kernel from 271fcc12-bfce-400b-9aac-6d99c7585d16 and early sampled-token D2H readiness from 0b3ad523-2891-481a-8956-dee4f4a4431a), applied alone onto 61d40ab. Original text: Compose on ENTIRE highest complete valid AD5 ad5aaec0-2793-418b-bf0d-563b11250a00 (official 2.2171834448539407). Preserve theta0.4, PZ322, exact-order32/64 head,7MB attention/12MB MoE prefetch and deferredshared-down unchanged. Select271fcc12-bfce-400b-9aac-6d99c7585d16 per-depth pinnedplan staging and integer depth-end kernel, omit its other caches. Select0b3ad523-2891-481a-8956-dee4f4a4431a early sampled-token D2H readiness. New pending-shared-down fallback avoids duplicate fullMLP when no routed midpoint hook runs. All execution/bitchecks only officialremote; no isolated or combined gain claimed."
-    },
-    {
-      "file": "model_executor/kernels/linear/nvfp4/marlin.py; model_executor/models/nemotron_h.py; model_executor/layers/fused_moe/runner/shared_experts.py; model_executor/layers/fused_moe/experts/humming_tuned_moe.py",
-      "why": "shco: the shared expert of the 496-token prefill runs on shx (harness/kernels/shco), a small-footprint (1 CTA/SM) NVFP4 W4A16 GEMM bit-identical to Marlin up -> relu^2 -> Marlin down (Marlin's stripe segments, k-warp chains and fp32 fold order), queued on the shared-expert aux stream beside the routed experts; humming's prefill w13 keeps its accumulation chain on a 4 x 36 persistent grid (3 resident CTAs per SM) to leave each SM room for it. Tables built at load; SHCO=0 restores stock."
     }
   ]
 }

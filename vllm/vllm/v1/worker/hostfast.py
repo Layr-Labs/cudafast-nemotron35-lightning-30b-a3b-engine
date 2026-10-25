@@ -230,7 +230,6 @@ class _StagingSet:
             builder.paged_kv_last_page_len.cpu
         ).pin_memory()
         self.last_page_len_np = self.last_page_len_cpu.numpy()
-        # wrapper id -> (wrapper, this set's pinned plan workspace)
         self.workspaces: dict[int, tuple[object, torch.Tensor]] = {}
 
     def install(self, builder) -> None:
@@ -264,8 +263,6 @@ class DraftStagingSets:
 
     def __init__(self, builders: list, num_sets: int) -> None:
         self.builders = builders
-        # Keep every buffer an install replaces alive: copies queued from it
-        # before the replacement may still be pending.
         self.original = [
             (b.paged_kv_indptr.cpu, b.paged_kv_indptr_cpu_buffer, b.paged_kv_last_page_len.cpu)
             for b in builders

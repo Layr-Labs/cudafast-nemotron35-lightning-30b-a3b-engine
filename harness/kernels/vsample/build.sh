@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# vsample: libvsample.so (ctypes, static cudart) plus its Python package, into $KERNELS_OUT/vsample.
 set -euo pipefail
 : "${KERNELS_OUT:?KERNELS_OUT must be set}"
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -8,7 +7,6 @@ mkdir -p "$out"
 nvcc=$(command -v nvcc || true)
 test -n "$nvcc" || nvcc=${CUDA_HOME:-/usr/local/cuda}/bin/nvcc
 test -x "$nvcc" || { echo "vsample: nvcc not found" >&2; exit 1; }
-# TORCH_CUDA_ARCH_LIST=12.1a -> sm_121a
 arch=${TORCH_CUDA_ARCH_LIST:-12.1a}
 arch=${arch%%;*}
 arch=${arch// /}

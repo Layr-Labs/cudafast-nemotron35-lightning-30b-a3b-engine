@@ -16,10 +16,10 @@ ap.add_argument("--bench", action="store_true")
 a = ap.parse_args()
 if a.kernels:
     sys.path.insert(0, a.kernels)
-import vsample  # noqa: E402
-from vllm.v1.sample.rejection_sampler import RejectionSampler  # noqa: E402
-from vllm.v1.spec_decode.metadata import SpecDecodeMetadata  # noqa: E402
-from vllm.v1.worker.gpu_model_runner import _reject_unverified_drafts  # noqa: E402
+import vsample
+from vllm.v1.sample.rejection_sampler import RejectionSampler
+from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.worker.gpu_model_runner import _reject_unverified_drafts
 
 assert vsample.available(), vsample._load_error
 dev = torch.device("cuda")
@@ -74,13 +74,13 @@ def make_logits(kind, rows, V, ld):
         x = torch.randn((rows, ld), generator=g)
         m = torch.rand((rows, ld), generator=g) < 0.0002
         x[m] = float("inf")
-    elif kind == "zeros":  # +0 / -0 at the max
+    elif kind == "zeros":
         x = -torch.rand((rows, ld), generator=g)
         m = torch.rand((rows, ld), generator=g) < 0.001
         x[m] = 0.0
         m2 = torch.rand((rows, ld), generator=g) < 0.5
         x[m & m2] = -0.0
-    elif kind == "bigtie":  # the max sits on many entries far apart (chunk boundaries)
+    elif kind == "bigtie":
         x = torch.randn((rows, ld), generator=g)
         for r in range(rows):
             pos = torch.randint(0, V, (17,), generator=g)
@@ -102,7 +102,6 @@ for it in range(a.iters):
     kind = kinds[(it // len(shapes)) % len(kinds)]
     logits = make_logits(kind, d + 1, V, ld)
     am = logits.argmax(dim=-1).to(torch.int32).cpu()
-    # drafts: accept a random prefix, then a wrong or random token
     k = int(torch.randint(0, d + 1, (1,), generator=g))
     drafts = torch.randint(0, V, (d,), generator=g, dtype=torch.int32)
     drafts[:k] = am[:k]

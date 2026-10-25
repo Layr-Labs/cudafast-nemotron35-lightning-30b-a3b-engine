@@ -27,7 +27,7 @@ _lib = None
 _load_error: str | None = None
 _max_rows = 0
 _max_vocab = 0
-_scratch: dict = {}  # device index -> (pval, pidx, counter)
+_scratch: dict = {}
 
 
 def _load():
@@ -45,7 +45,7 @@ def _load():
         _max_rows = lib.vs_max_rows()
         _max_vocab = lib.vs_max_vocab()
         _lib = lib
-    except OSError as exc:  # library missing: callers keep the stock path
+    except OSError as exc:
         _load_error = str(exc)
     return _lib
 

@@ -22,20 +22,6 @@ from vllm.v1.worker.ubatching import (
 
 logger = init_logger(__name__)
 
-# LOCAL PATCH (cudafast-nemotron35): shco (harness/kernels/shco). When the whole shared
-# expert of a prefill call runs on shx (one small CTA per SM), queue it on the aux stream
-# beside the routed experts even above VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD.
-try:
-    import shco as _shco
-except ImportError:
-    _shco = None
-
-
-def _shx_overlap(layer: torch.nn.Module, x: torch.Tensor) -> bool:
-    if _shco is None:
-        return False
-    return _shco.overlap_ok(getattr(layer, "up_proj", None), getattr(layer, "down_proj", None), x)
-
 
 class SharedExpertsOrder(IntEnum):
     # No shared experts.
@@ -134,11 +120,8 @@ class SharedExperts(torch.nn.Module):
         should_run_shared_in_aux_stream = (
             current_platform.is_cuda()
             and self._stream is not None
-            and (
-                hidden_states.shape[0]
-                <= envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
-                or _shx_overlap(self._layer, hidden_states)
-            )
+            and hidden_states.shape[0]
+            <= envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
         )
 
         if should_run_shared_in_aux_stream:
@@ -263,9 +246,6 @@ class SharedExperts(torch.nn.Module):
         if order != experts_order:
             return None
 
-        # If another routed backend has no midpoint hook, finish the one
-        # pending shared up/down exactly once instead of launching full MLP
-        # again. The same aux/main join remains the output visibility boundary.
         if (order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
                 and self._pending_h is not None):
             self._launch_down()

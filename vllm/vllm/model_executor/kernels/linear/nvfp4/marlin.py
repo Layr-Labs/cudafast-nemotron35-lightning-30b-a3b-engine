@@ -22,14 +22,6 @@ try:
 except ImportError:
     _marlinx = None
 
-# shco (harness/kernels/shco): shx, the Marlin-exact shared expert at the prefill
-# M (496 rows) with a footprint that shares SMs with the routed up projection.
-# prepare() only builds its tables at load time; SHCO=0 disables it.
-try:
-    import shco as _shco
-except ImportError:
-    _shco = None
-
 
 class MarlinNvFp4LinearKernel(NvFp4LinearKernel):
     """NVFP4 weight-only GEMM via Marlin (W4A16)."""
@@ -56,8 +48,6 @@ class MarlinNvFp4LinearKernel(NvFp4LinearKernel):
         prepare_fp4_layer_for_marlin(layer)
         if _marlinx is not None and _marlinx.prepare(layer):
             logger.info_once("marlinx: Marlin-exact NVFP4 GEMM enabled for M <= 8")
-        if _shco is not None and _shco.prepare(layer):
-            logger.info_once("shx: Marlin-exact shared expert enabled for M = 496")
 
     def apply_weights(
         self,

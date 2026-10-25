@@ -329,7 +329,7 @@
     },
     {
       "file": "model_executor/layers/mamba/ops/mamba_ssm_spec_replay.py; model_executor/layers/mamba/mamba_mixer2.py",
-      "why": "Checkpointed anchor for the spec-decode SSM update (extends dadon b9a63f4f): states are stored only at positions L - 1 + 20 k (L: prompt length, k = 0 the prefill's final state), alternately in slots 0 and 2; a verify loads the last checkpoint before its token 0 and replays the tokens since it from the ring (which now also holds token 0) with the existing per-token fp32 update, then stores the next checkpoint when it is among its tokens. The prefill writes L into the slot-0 page padding after the SSM state. Same per-token update order, outputs and launch configuration. VLLM_MAMBA_REPLAY_LAZY=0 restores an anchor store in every verify."
+      "why": "Checkpointed anchor for the spec-decode SSM update (extends dadon b9a63f4f): states are stored only at positions L - 1 + P k (P = LAZY_PERIOD, 16 by default, VLLM_MAMBA_LAZY_P sets it; L: prompt length, k = 0 the prefill's final state), alternately in slots 0 and 2; a verify loads the last checkpoint before its token 0 and replays the tokens since it from the ring (which now also holds token 0) with the existing per-token fp32 update, then stores the next checkpoint when it is among its tokens. The prefill writes L into the slot-0 page padding after the SSM state. Same per-token update order, outputs and launch configuration. VLLM_MAMBA_REPLAY_LAZY=0 restores an anchor store in every verify."
     },
     {
       "file": "harness/kernels/fp8c/csrc/fp8c.cu",
@@ -342,6 +342,34 @@
     {
       "file": "vllm/v1/spec_decode/nemotron_decode_plan.py (+ llm_base_proposer.py, v1/attention/backends/flashinfer.py)",
       "why": "Own native-MTP FA2 planning-state bank on ENTIRE0e71. Remote startup records original native plan vector, integer prefix and scalar state for each EXACT CPU indptr/last-page/options input, across up to128generic page counts with every valid residue, capped64MiB of plan bytes. Integer-tail/float-arena canaries guard actual installed planner writes; no page-invariance or package-source-equality assumption. Changed private model/hidden/token/gate/KV/live indices/CPU metadata and complete side-stream model-step timing admission mandatory. Only then copy native planning state; current indices/last-page buffers still refreshed. Unknown keys/identities/options fall back before mutation. No request capture or inference output cache. NEMO_MTP_NATIVE_PLAN_BANK=0 disables. Private qualification lineage6cafa6b6-8f26-4ef5-86e1-38c061a207d7 andce5aa6bd-15c2-42c2-8a68-4bc2fe65c23b; no lower tailgraph or L1 runtime imported."
+    },
+    {
+      "file": "harness/kernels/l2pf/{csrc/l2pf.cu,py/__init__.py}; model_executor/layers/fused_moe/experts/fused_humming_moe.py",
+      "why": "The same MoE l2pf window also queues an L2 prefetch of the checkpointed SSM state the following Mamba layer's lazy verify loads first (l2pf_prefetch_anchor: checkpoint k = max(pos0 - L, 0) // LAZY_PERIOD, slot 0 for even k and slot 2 for odd k, with L the prompt-length word and pos0 = seq_lens[0] - (query_start_loc[1] - query_start_loc[0]), all read on the device). Moves no value. L2PF_SSM_ANCHOR=0 disables."
+    },
+    {
+      "file": "model_executor/layers/mamba/ops/mamba_ssm_spec_replay.py; mamba_replay_pipeline.py; layers/mamba/mamba_mixer2.py; v1/worker/gpu_model_runner.py",
+      "why": "Own substantial raw-input SSM replay software pipeline on ENTIREhighest0b98 period20; this independent alternative contains no6af conditional/tail/head oranchor-prefetch runtime. Preload next historical raw x/B/dt before dependent scalar/state math; circular index normalized once then add/select; hoist immutable A/bias/D. Exact per-token FP32 expression/reduction and raw ring/checkpoint layout retained; no new cache. Boot-only full guarded backing/output/pre-verify bytes compared on actual loaded parameters, dtype/PDL/prefix/rejection/wrap/checkpoint/empty/null histories; generic private graph timing must improve. Decision reset at real cache binding before compile/capture. Fixture/cache-bind lineage own16e4936c-12ef-4356-80bd-2f5ceb500dce; none of its failed scalar-cache runtime adopted. Combination/admission/whole gain unvalidated, all execution officialremote."
+    },
+    {
+      "file": "model_executor/layers/fused_moe/experts/humming_relu2_epilogue.py; humming_nvsc.py",
+      "why": "Useful pending39b5409c-ab0d-45e4-a9a6-88f936479912 exacttwo-file sourcec85a6beed5349b4d5fd0b079cdda2e8b9f11e7d8. Verify bucket24..48 changesK32/stages8 toK128/stages2, stillserialascendingK16 MMA chain; sixbit scale-loader advances96byteexistingrecord periter_id/2, no new weight format. Exactshape guards andvariantcachekey retained. Author localclaims are not official evidence; combinedwhole/engagementunvalidated."
+    },
+    {
+      "file": "model_executor/layers/mamba/ops/mamba_replay_pipeline.py",
+      "why": "Stack of erc 4226e310 (LAZY_PERIOD 16) with jack a56b1b52: the replay pipeline's layout admission also accepts LAZY_PERIOD 16 (was 20 only). Its boot-time guarded byte comparison against the original replay and its private timing admission are unchanged; any period it cannot reproduce byte for byte falls back to the original replay."
+    },
+    {
+      "file": "model_executor/layers/fused_moe/experts/humming_relu2_epilogue.py",
+      "why": "newjordan 34d21409, carried: the routed-up epilogue's ReLU-square uses packed non-FTZ bf16x2 instructions (max.NaN.bf16x2 with +0, mul.rn.bf16x2) on the original BF16 output instead of widening to fp32; the square of a BF16 value is exact in fp32, so both forms round the same product once to BF16."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_block128.py; nemotron_h_mtp_packed.py; nemotron_h_mtp_kernels.py",
+      "why": "Own block128 immutable decoder metadata sharing on ENTIREhighestf9c1ae5b-a7e8-4896-ac63-6ffc55879a17, including full P16/checkpointprefetch/SSMpipeline/K128/packed source. RI/BASE once per128 BF16 weights,16 EX32 words each reused for8 values, original SM/RAW and exact bits; explicit3D layout converted back to original FP32 arithmetic/reduction layout. Native MTP QKV/output GEMV and routed/shared up, same weights/codec/gates/activation and no extra runtime launch. Original WORD/GROUP8 reference retained. Optional remote weight-load all-realweight decoder bytes, all-expert rawFP32 sum plus actual BF16 kernel checks, guarded changing-input PDL graph/open-stopped gate and cold/warm whole-projection timing. Weak plane identities plus exact shape/mode metadata only, no request data/outputcache. Original fallback on any refusal/exception. MTP_PACK12_BLOCK128=0 disables. Material c0ce642d-0f7b-4c1f-a168-f8edb153aa4e,3d51cab6-7079-4fb2-98e4-f2a238077897,59b3dbb4-6919-44ca-85f1-fcbbc0f1d975 and own d9a38632-da08-43d5-9169-b3ee36e1776f metadata/privatefixture idea. D9 lowerwhole excluded; no downbroadcast runtime. Entire newcombination unverified; no local execution."
+    },
+    {
+      "file": "harness/kernels/l2pf/py/__init__.py; model_executor/models/nemotron_h_mtp.py; model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "Useful 467790ce-fa9d-48b8-a6b3-d56cdd880798 QKV plane L2prefetch in draftscreen latencytail, exact3 full blobs b5a8f1f33c144e1cad94d6bc9c66ee734b502255,e73f91f548c60fdc5efcc559a83b89f6a02e84b1,bf5504ff14cd3a0a14261eaa6d5f8a8d3aae43ea. Immutable SM/EX heads8MiB default, capturedfork/join, no changed math/token choice. Completecorrect2.4649767843658688(-0.0655166pct vsfullf9), within0.1pct; only3-file component composed onENTIREf9, combo unverified. L2PF_DRAFT_NEXT_MB=0 disables. No lower d9 runtime/FP8pre package imported."
     }
   ]
 }

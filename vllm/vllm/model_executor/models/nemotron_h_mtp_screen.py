@@ -607,6 +607,7 @@ class DraftHeadScreen:
         buffer it touches is fixed-address, so the body is capturable as-is."""
         if out is None:
             out = torch.empty((), dtype=torch.int32, device=h.device)
+        next_pf = False
         if self.cascade and self.fused_topk:
             # LOCAL PATCH (cudafast-nemotron35): the same cascade with the two
             # index_select gathers in one launch and each segmented torch.topk
@@ -629,6 +630,12 @@ class DraftHeadScreen:
             _rows_dot(
                 self._hc, self.w_coarse, self.s_coarse, None,
                 self.gscale, self.scores, False, gated,
+            )
+            # LOCAL PATCH (cudafast-nemotron35): the rest of the screen is latency-bound;
+            # queue the next draft pass's qkv head into L2 meanwhile (joined below).
+            next_pf = (
+                _l2pf is not None and bool(getattr(_l2pf, "DRAFT_NEXT", None))
+                and _l2pf.prefetch_many(_l2pf.DRAFT_NEXT)
             )
             nchunk = self.n // SCREEN_CHUNK
             tgate, tok = _gate_args(self.scores)
@@ -737,6 +744,8 @@ class DraftHeadScreen:
             gate_ptr=gate, GATED=gated and ok, THETA=DEPTH_THETA,
             launch_pdl=mtp_pdl(),
         )
+        if self.cascade and self.fused_topk and next_pf:
+            _l2pf.join(h.device)
         return out
 
     def greedy(self, hidden: torch.Tensor) -> torch.Tensor:

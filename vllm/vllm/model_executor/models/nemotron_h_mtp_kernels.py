@@ -783,17 +783,23 @@ def mtp_moe_row(
     topk = ids.numel()
     E, inter, H = w13.shape
     h = torch.empty((topk + n_shared, inter), dtype=x.dtype, device=x.device)
-    from .nemotron_h_mtp_packed import PackedBF16, packed_moe_up, word_load_enabled
+    from .nemotron_h_mtp_packed import (
+        PackedBF16, packed_moe_up, word_load_enabled, maybe_block128_up,
+    )
 
     gate, gated = _gate_args(x)
     if isinstance(w13, PackedBF16):
-        packed_moe_up[(triton.cdiv(inter, _PK_UP_BN), topk + n_shared)](
-            x, *w13.planes, *su.planes, ids, h, inter, H,
-            inter * H, H, H, gate, TOPK=topk, BN=_PK_UP_BN, BK=_MOE_UP_BK,
-            EVICT=_EVICT_W, GATED=gated, num_warps=4 * _PK_UP_WN,
-            num_stages=_MOE_UP_STAGES, launch_pdl=mtp_pdl(), WN=_PK_UP_WN,
-            WORD=word_load_enabled(x.device),
-        )
+        used_block128 = (n_shared == 2 and maybe_block128_up(
+            w13, su, x, ids, h, gate, gated, mtp_pdl(), word_load_enabled(x.device),
+            _EVICT_W, _PK_UP_BN, _MOE_UP_BK, _PK_UP_WN, _MOE_UP_STAGES))
+        if not used_block128:
+            packed_moe_up[(triton.cdiv(inter, _PK_UP_BN), topk + n_shared)](
+                x, *w13.planes, *su.planes, ids, h, inter, H,
+                inter * H, H, H, gate, TOPK=topk, BN=_PK_UP_BN, BK=_MOE_UP_BK,
+                EVICT=_EVICT_W, GATED=gated, num_warps=4 * _PK_UP_WN,
+                num_stages=_MOE_UP_STAGES, launch_pdl=mtp_pdl(), WN=_PK_UP_WN,
+                WORD=word_load_enabled(x.device),
+            )
     else:
         _mtp_moe_up_kernel[(triton.cdiv(inter, _MOE_UP_BN), topk + n_shared)](
             x,

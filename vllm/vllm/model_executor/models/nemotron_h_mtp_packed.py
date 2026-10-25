@@ -20,6 +20,10 @@ from triton.experimental.gluon import language as tl
 from triton.experimental.gluon.language import BlockedLayout, SliceLayout
 
 
+_BLOCK128_LINEAR = None
+_BLOCK128_UP = None
+
+
 _WORD_LOAD = os.environ.get("MTP_PACK12_WORDLOAD", "1") != "0"
 _WORD_OK: dict[int, bool] = {}
 _WORD_KERNEL_OK: set[tuple[int, int]] = set()
@@ -369,6 +373,7 @@ def pack_bf16(w, check_group8=False):
     original tensor for unsupported shapes. No source BF16 storage is retained.
     check_group8 additionally compares the grouped native projection with BYTE.
     """
+    global _BLOCK128_LINEAR
     if (not w.is_cuda or w.dtype != torch.bfloat16 or not w.is_contiguous()
             or w.dim() < 2 or w.shape[-1] % 128):
         return None
@@ -408,6 +413,12 @@ def pack_bf16(w, check_group8=False):
     _admit_word_decode(packed, w, counter)
     if check_group8:
         _admit_group8(packed, w)
+        try:
+            from .nemotron_h_mtp_block128 import prepare_linear, maybe_linear
+            prepare_linear(packed, w)
+            _BLOCK128_LINEAR = maybe_linear
+        except Exception as exc:
+            print(f"MTP_PACK12_BLOCK128 original linear retained: {exc!r}", flush=True)
     print(f"MTP_PACK12 tensor shape={packed.shape} values={n} mismatches=0 "
           f"raw_bytes={2*n} packed_bytes={packed.nbytes} escapes={count}", flush=True)
     return packed
@@ -425,6 +436,10 @@ def _packed_linear_impl(
         if x.stride(1) != 1:
             x = x.contiguous()
         y = x.new_empty((1, n))
+        if _BLOCK128_LINEAR is not None and _BLOCK128_LINEAR(
+                p, x, y, gate, gated, mtp_pdl(),
+                word_load_enabled(x.device), group8_enabled(x.device, n, k)):
+            return y
         packed_gemv[(triton.cdiv(n, 8),)](
             x, *p.planes, y, n, k, k, gate, BN=8, BK=512, EVICT=True,
             GATED=gated, num_warps=4, num_stages=3, launch_pdl=mtp_pdl(),
@@ -511,6 +526,7 @@ _PACK_OPROJ = os.environ.get("MTP_PACK12_OPROJ", "1") != "0"
 @torch.no_grad()
 def prepare_mtp_packed(module):
     """Pack only the screened shapes after original pinned weights are loaded."""
+    global _BLOCK128_UP
     if os.environ.get("MTP_PACK12", "1") == "0":
         return
     from .nemotron_h_mtp_kernels import mtp_moe_weights
@@ -548,6 +564,12 @@ def prepare_mtp_packed(module):
         pu, ps = pack_bf16(up), pack_bf16(su)
         if pu is None or ps is None:
             continue
+        try:
+            from .nemotron_h_mtp_block128 import prepare_up, maybe_up
+            prepare_up(pu, ps, up, su)
+            _BLOCK128_UP = maybe_up
+        except Exception as exc:
+            print(f"MTP_PACK12_BLOCK128 original up retained: {exc!r}", flush=True)
         for original, packed in ((up, pu), (su, ps)):
             raw_bytes += original.numel() * 2
             packed_bytes += packed.nbytes
@@ -593,3 +615,8 @@ def packed_small(x,SM,EX,BASE,RI,RAW,y,M,N,K,sxm,sym,gate_ptr,
     om=tl.arange(0,BM,layout=SliceLayout(1,outlayout))
     on=pid*BN+tl.arange(0,BN,layout=SliceLayout(0,outlayout))
     tl.store(y+om[:,None]*sym+on[None,:],acc.to(y.dtype.element_ty),mask=(om[:,None]<M)&(on[None,:]<N))
+
+
+def maybe_block128_up(p, ps, x, ids, out, gate, gated, pdl, word, evict, bn, bk, wn, stages):
+    return (_BLOCK128_UP is not None and _BLOCK128_UP(
+        p, ps, x, ids, out, gate, gated, pdl, word, evict, bn, bk, wn, stages))

@@ -326,6 +326,14 @@
     {
       "file": "(composition)",
       "why": "e-man07 composition on dadon's record fc04335b-c894-41f9-b73b-aa9b5aac1fb5: ArthurOstapenko 0f958570-4fab-4ffd-8db5-c5a2c37a5439's tree byte for byte, plus jacklightChen b0d0b0b6's apk12 coherent-PDL attention files and i34-9 c3e16bbb's prefill files (pzskip, humming relu2 epilogue / nvsc / tuned_moe / zskip glue) and marlinx unit-major scales, each carried byte for byte from its author's tree. No new arithmetic by us."
+    },
+    {
+      "file": "model_executor/layers/mamba/ops/mamba_ssm_spec_replay.py; model_executor/layers/mamba/mamba_mixer2.py",
+      "why": "Checkpointed anchor for the spec-decode SSM update (extends dadon b9a63f4f): states are stored only at positions L - 1 + 12 k (L: prompt length, k = 0 the prefill's final state), alternately in slots 0 and 2; a verify loads the last checkpoint before its token 0 and replays the tokens since it from the ring (which now also holds token 0) with the existing per-token fp32 update, then stores the next checkpoint when it is among its tokens. The prefill writes L into the slot-0 page padding after the SSM state. Same per-token update order, outputs and launch configuration. VLLM_MAMBA_REPLAY_LAZY=0 restores an anchor store in every verify."
+    },
+    {
+      "file": "harness/kernels/fp8d6/{build.sh,csrc/fp8d6.cu,py/__init__.py}; model_executor/kernels/linear/scaled_mm/fp8c.py",
+      "why": "Carried from submission 422827d4 (GPT 6.1 Sol): exact six-bit per-column FP8 byte dictionary (top 63 bytes plus raw escape) for the Mamba in_proj/out_proj decode stream, behind fp8c's admitted 7-bit buffer. Same e4m3 MMA chain, scales and BF16 epilogue; a layer is selected only if its full decode is byte-equal to the original FP8 weight, its outputs match fp8c for M 1/4/5/8 including graph replay, and its buffer is at least 0.5% smaller; any failure keeps fp8c. A failed optional build leaves fp8c intact."
     }
   ]
 }

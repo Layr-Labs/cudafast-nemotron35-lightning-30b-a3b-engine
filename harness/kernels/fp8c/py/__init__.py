@@ -27,7 +27,7 @@ MAX_WARP_CHUNK = 124  # escapes per (tile, chunk, warp): the 32-lane window hold
 RING = int(os.environ.get("FP8C_RING", "0"))
 if RING not in (0, 3, 4, 6):
     RING = 0
-_RING_DEFAULT = {(10304, 2688): 3, (2688, 4096): 4}
+_RING_DEFAULT = {(10304, 2688): 3, (2688, 4096): 6}
 _PDL_ENABLED = os.environ.get("FP8C_PDL", "1") != "0"
 _lib = None
 _load_failed = False

@@ -397,6 +397,12 @@ def prepare_eh_hidden_packed(layer):
         return
     for suffix, tensor in zip(("sm", "ex", "base", "ri", "raw"), packed.planes):
         layer.register_buffer("_mtp_eh_pk_" + suffix, tensor, persistent=False)
+    layer._mtp_eh_add_ok = False
+    try:
+        from .nemotron_h_mtp_eh_add import prepare
+        layer._mtp_eh_add_ok = prepare(packed, w)
+    except Exception as exc:
+        print(f"MTP_EH_FUSED_ADD preparation refused: {exc!r}", flush=True)
 
 
 _PACK_OPROJ = os.environ.get("MTP_PACK12_OPROJ", "1") != "0"
@@ -440,6 +446,12 @@ def prepare_mtp_packed(module):
         pu, ps = pack_bf16(up), pack_bf16(su)
         if pu is None or ps is None:
             continue
+        # Official remote private admission while the original weights exist.
+        try:
+            from .nemotron_h_mtp_up_group8 import prepare
+            prepare(pu, ps, up, su)
+        except Exception as exc:
+            print(f"MTP_PACK12_UP_GROUP8 preparation refused: {exc!r}", flush=True)
         for original, packed in ((up, pu), (su, ps)):
             raw_bytes += original.numel() * 2
             packed_bytes += packed.nbytes

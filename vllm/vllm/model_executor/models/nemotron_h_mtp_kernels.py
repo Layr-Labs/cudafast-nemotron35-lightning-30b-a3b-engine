@@ -785,13 +785,19 @@ def mtp_moe_row(
 
     gate, gated = _gate_args(x)
     if isinstance(w13, PackedBF16):
-        packed_moe_up[(triton.cdiv(inter, _PK_UP_BN), topk + n_shared)](
-            x, *w13.planes, *su.planes, ids, h, inter, H,
-            inter * H, H, H, gate, TOPK=topk, BN=_PK_UP_BN, BK=_MOE_UP_BK,
-            EVICT=_EVICT_W, GATED=gated, num_warps=4 * _PK_UP_WN,
-            num_stages=_MOE_UP_STAGES, launch_pdl=mtp_pdl(), WN=_PK_UP_WN,
-            WORD=word_load_enabled(x.device),
+        from .nemotron_h_mtp_up_group8 import maybe_run
+        up_done = maybe_run(
+            x, w13, su, ids, h, gate, gated, word_load_enabled(x.device),
+            (_PK_UP_BN, _MOE_UP_BK, _PK_UP_WN, _MOE_UP_STAGES, _EVICT_W), mtp_pdl(),
         )
+        if not up_done:
+            packed_moe_up[(triton.cdiv(inter, _PK_UP_BN), topk + n_shared)](
+                x, *w13.planes, *su.planes, ids, h, inter, H,
+                inter * H, H, H, gate, TOPK=topk, BN=_PK_UP_BN, BK=_MOE_UP_BK,
+                EVICT=_EVICT_W, GATED=gated, num_warps=4 * _PK_UP_WN,
+                num_stages=_MOE_UP_STAGES, launch_pdl=mtp_pdl(), WN=_PK_UP_WN,
+                WORD=word_load_enabled(x.device),
+            )
     else:
         _mtp_moe_up_kernel[(triton.cdiv(inter, _MOE_UP_BN), topk + n_shared)](
             x,

@@ -278,6 +278,14 @@
     {
       "file": "harness/kernels/pzskip/csrc/pzskip.cu (+ build.sh)",
       "why": "PZ333 M496/top-6 only: HUMMING_EVICT_PZ defaults on and gives immutable packed B/BS cp.async loads L2 evict-first priority. Loader addresses, bytes, masks, K16 MMA order, negative-zero repair and formats are unchanged. HUMMING_EVICT_PZ=0 restores stock. Separate native template specialization; compile/load failure retains stock PZ333. Stacks independently with the routed-up evf policy; no decode change."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_up_group8.py; nativeMTPkernels/packedprepare",
+      "why": "NEW optionalrouted/sharedBF16packedup metadataonceper8registervalues fromd33b9c7d-dc8e-4098-9171-96b32402d684 GROUP8helper, generalizedtooriginalBN2BK1024WN2up layout; asserttrivialrestore originalregistershape, originalFP32acc/reduction/ReLU2/PDL/stoppedbody. Actualallweightuint16check, all128routed+2sharedoutputs, changingprivateinput/ids/gatecapturedgraph+compactconsumer rawbits, coldwholeup+consumer4pctfilter. All checks officialremote only; existingweightformat andfallbackretained; no requestcache/newquantization. Combinedsourceunverified."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_eh_add.py; nativeMTPstartprojection/packedprepare",
+      "why": "NEW optionalEH packedGEMV+projectedFP32embedding Add epilogue. OriginalGEMVlayout/FP32acc/reduction/EVICTfalse/WORD preserved; explicitoriginalBF16roundbeforeFP32add.rn thenBF16cast, stopped+0plusactualembedding preserved. Input/embedding/gatebitchecksandchangingcapture replay, cold2launchreferencegraph4pctfilter; originalpost-Addfallback. Doesnotfuse/changehnorm orprecomputedembeddingtable. All execution officialremoteonly; no requestcache/newweights/quantization."
     }
   ]
 }

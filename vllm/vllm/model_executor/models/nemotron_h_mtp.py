@@ -72,6 +72,15 @@ def _start_projection(
         # W_h (14.5 MB) is read by every draft pass of a cycle; ordinary loads
         # let it stay in L2 between passes while the rest stream evict-first.
         if hasattr(layer, "_mtp_eh_pk_sm"):
+            if (getattr(layer, "_mtp_eh_add_ok", False)
+                    and previous_hidden_states_normed.shape == (1, 2688)
+                    and inputs_embeds.shape == (1, 2688)):
+                return torch.ops.vllm.mtp_packed_linear_keep_add(
+                    previous_hidden_states_normed,
+                    layer._mtp_eh_pk_sm, layer._mtp_eh_pk_ex,
+                    layer._mtp_eh_pk_base, layer._mtp_eh_pk_ri, layer._mtp_eh_pk_raw,
+                    inputs_embeds, layer.eh_w_h.shape[0], layer.eh_w_h.shape[1], layer.eh_w_h,
+                )
             h_part = torch.ops.vllm.mtp_packed_linear_keep(
                 previous_hidden_states_normed,
                 layer._mtp_eh_pk_sm, layer._mtp_eh_pk_ex,

@@ -342,6 +342,10 @@
     {
       "file": "vllm/v1/spec_decode/nemotron_decode_plan.py (+ llm_base_proposer.py, v1/attention/backends/flashinfer.py)",
       "why": "Own native-MTP FA2 planning-state bank on ENTIRE0e71. Remote startup records original native plan vector, integer prefix and scalar state for each EXACT CPU indptr/last-page/options input, across up to128generic page counts with every valid residue, capped64MiB of plan bytes. Integer-tail/float-arena canaries guard actual installed planner writes; no page-invariance or package-source-equality assumption. Changed private model/hidden/token/gate/KV/live indices/CPU metadata and complete side-stream model-step timing admission mandatory. Only then copy native planning state; current indices/last-page buffers still refreshed. Unknown keys/identities/options fall back before mutation. No request capture or inference output cache. NEMO_MTP_NATIVE_PLAN_BANK=0 disables. Private qualification lineage6cafa6b6-8f26-4ef5-86e1-38c061a207d7 andce5aa6bd-15c2-42c2-8a68-4bc2fe65c23b; no lower tailgraph or L1 runtime imported."
+    },
+    {
+      "file": "vllm/v1/attention/backends/flashinfer.py (+ gpu_model_runner.py capture_model, nemotron_decode_plan.py _extent max_rows)",
+      "why": "Target-verify native FA2 plan bank. The drafter decode wrapper already restores a boot-recorded FA2 plan (jacklightChen 8182e1fc / nemotron_decode_plan.py). The depth-4 verify round is the spec-prefill wrapper (qo=[0,5]) and still calls _cached_module.plan on the host every round from _fast_plan_spec_prefill_impl. After CUDA graph capture, install_spec_verify_plan_bank records that same native call for each page count up to 128 and every residue, with the integer-tail and float-arena canaries from the drafter bank. A hit copies the recorded integer prefix and kv-lens into the wrapper buffers the captured graph already reads and skips the native planner. A failed canary or a length outside the table keeps the original planner. NEMO_VERIFY_PLAN_BANK=0 disables it. No weight, activation, KV or SSM value changes."
     }
   ]
 }

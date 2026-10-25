@@ -7357,6 +7357,12 @@ class GPUModelRunner(
             elapsed_time,
             cuda_graph_size / (1 << 30),
         )
+        try:
+            from vllm.v1.attention.backends.flashinfer import (
+                install_spec_verify_plan_bank)
+            install_spec_verify_plan_bank(self)
+        except Exception:
+            logger.exception("verify FA2 plan bank was not installed")
         return cuda_graph_size
 
     def _capture_fresh_prefill_graph(self):

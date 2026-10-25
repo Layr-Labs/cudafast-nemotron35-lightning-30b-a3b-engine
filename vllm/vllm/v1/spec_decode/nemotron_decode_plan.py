@@ -27,16 +27,18 @@ def _bytes(t):
     return t.contiguous().view(torch.uint8).flatten().clone()
 
 
-def _extent(plan, capacity):
+def _extent(plan, capacity, max_rows=1):
     """Used integer prefix of the native FA2 PrefillPlanInfo 15-word schema.
 
     Read original native offsets, never synthesize a schedule. Each prefix
     and vector comes from the native planner for its exact CPU structural inputs.
+    ``max_rows`` stays 1 for the drafter decode bank. The target verify bank
+    passes the query-row count the same schema already encodes in word 1.
     """
     if len(plan) != 15 or not all(type(v) is int and v >= 0 for v in plan):
         return None
     padded, rows = plan[:2]
-    if not 1 <= padded <= 4096 or rows != 1 or plan[13] != 1 or plan[14] not in (0, 1):
+    if not 1 <= padded <= 4096 or not 1 <= rows <= max_rows or plan[13] != 1 or plan[14] not in (0, 1):
         return None
     ends = [plan[4] + 4 * padded, plan[5] + 4 * padded, plan[6] + 4 * padded,
             plan[8] + 8, plan[9] + 4, plan[2] + 4]

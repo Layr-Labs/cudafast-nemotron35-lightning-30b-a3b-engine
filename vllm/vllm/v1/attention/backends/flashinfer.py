@@ -2530,6 +2530,21 @@ def _fast_plan_spec_prefill_impl(wrapper, builder, **kw) -> None:
         wrapper._vllm_fast_qo = qo.clone()
         return
     page_size = kw["page_size"]
+    bank = getattr(wrapper, "_vllm_spec_plan_bank", None)
+    if bank is not None and n == 2 and lpl.shape[0] == 1:
+        key = (int(indptr[0]), int(indptr[1]), int(lpl[0]), page_size, total_num_rows)
+        hit = bank.get(key)
+        if hit is not None:
+            plan_info, prefix, kv_lens_dev, max_kv_len, max_q_len = hit
+            wrapper._qo_indptr_last = total_num_rows
+            wrapper._max_q_len = max_q_len
+            wrapper._int_workspace_buffer.view(torch.uint8)[: prefix.numel()].copy_(
+                prefix, non_blocking=True)
+            wrapper._kv_lens_buffer[: kv_lens_dev.numel()].copy_(
+                kv_lens_dev, non_blocking=True)
+            wrapper._max_kv_len = max_kv_len
+            wrapper._plan_info = list(plan_info)
+            return
     wrapper._qo_indptr_last = total_num_rows
     wrapper._max_q_len = max(qo[1:] - qo[:-1]).item()
     kv_lens = get_seq_lens(indptr, lpl, page_size)
@@ -2565,6 +2580,153 @@ def _fast_plan_spec_prefill_impl(wrapper, builder, **kw) -> None:
             0,
             0,
         )
+    if (n == 2 and lpl.shape[0] == 1
+            and getattr(wrapper, "_vllm_spec_plan_template", None) is None):
+        wrapper._vllm_spec_plan_template = (
+            kw["num_qo_heads"], kw["num_kv_heads"], head_dim_qk, head_dim_vo,
+            kw["causal"], kw["window_left"], fixed_split_size or -1,
+            kw.get("disable_split_kv", False), page_size,
+            (int(qo[0]), int(qo[-1])),
+        )
+
+
+def install_spec_verify_plan_bank(runner) -> None:
+    """Precompute the target verify FA2 plan for every page/residue pair.
+
+    The drafter decode wrapper already does this in ``nemotron_decode_plan``.
+    The verify path is the spec-prefill wrapper (q length = 1 + depth), and its
+    ``_cached_module.plan`` still runs on the host every round. Context length
+    only grows, so the entries have to exist before the first request. Any
+    failed canary leaves the wrapper without a bank and the original planner
+    in place. Page indices stay the builder's; only the length-derived plan
+    vector, integer prefix and kv-lens copy are restored.
+    """
+    if os.environ.get("NEMO_VERIFY_PLAN_BANK", "1") == "0":
+        return
+    if getattr(runner, "_verify_plan_bank_attempted", False):
+        return
+    if get_seq_lens is None or torch.cuda.is_current_stream_capturing():
+        return
+    hf = runner.model_config.hf_config
+    parallel = runner.parallel_config
+    if (getattr(hf, "model_type", None) != "nemotron_h"
+            or runner.scheduler_config.max_num_seqs != 1
+            or parallel.tensor_parallel_size != 1
+            or parallel.pipeline_parallel_size != 1
+            or getattr(runner, "num_spec_tokens", 0) != 4):
+        return
+    runner._verify_plan_bank_attempted = True
+    builders = []
+    for groups in getattr(runner, "attn_groups", ()):
+        for group in groups:
+            builder = group.get_metadata_builder()
+            if (type(builder).__name__ == "FlashInferMetadataBuilder"
+                    and getattr(builder, "_spec_prefill_cudagraph", False)):
+                builders.append(builder)
+    if len(builders) != 1:
+        return
+    builder = builders[0]
+    if (builder.use_dcp or builder.use_trtllm_decode_attention
+            or builder.is_kvcache_nvfp4 or not builder.enable_cuda_graph):
+        return
+    if getattr(runner.vllm_config.attention_config, "use_non_causal", False):
+        return
+    wrapper = builder._get_spec_prefill_wrapper(1)
+    total_rows = builder._spec_q_len
+    page_size = builder.page_size
+    fixed_split = builder.prefill_fixed_split_size or -1
+    derived = (
+        builder.num_qo_heads, builder.num_kv_heads, builder.head_dim,
+        builder.head_dim, True, builder.window_left, fixed_split,
+        builder.disable_split_kv, page_size, (0, total_rows),
+    )
+    template = getattr(wrapper, "_vllm_spec_plan_template", None)
+    if template is not None and tuple(template) != derived:
+        return
+    if (not getattr(wrapper, "_vllm_spec_cg", False)
+            or wrapper._backend != "fa2" or wrapper._cached_module is None
+            or wrapper._custom_mask_buf is not None
+            or wrapper._fixed_batch_size != 1):
+        return
+    num_qo, num_kv, head_qk, head_vo, causal, window_left, fixed_split, \
+        disable_split, page_size, qo_pair = derived
+    qo0, total_rows = qo_pair
+    if type(page_size) is not int or page_size <= 0 or total_rows < 1:
+        return
+    if wrapper._max_total_num_rows is None or total_rows > wrapper._max_total_num_rows:
+        return
+    from vllm.v1.spec_decode.nemotron_decode_plan import _extent
+
+    names = (
+        "_int_workspace_buffer", "_float_workspace_buffer",
+        "_pin_memory_int_workspace_buffer", "_kv_lens_buffer", "_qo_indptr_buf",
+        "_paged_kv_indptr_buf", "_paged_kv_last_page_len_buf",
+    )
+    saved = []
+    for name in names:
+        tensor = getattr(wrapper, name, None)
+        if isinstance(tensor, torch.Tensor):
+            saved.append((tensor, tensor.clone()))
+    old_plan = list(wrapper._plan_info) if getattr(wrapper, "_plan_info", None) is not None else None
+    bank = {}
+    try:
+        raw_int = wrapper._int_workspace_buffer.view(torch.uint8)
+        raw_float = wrapper._float_workspace_buffer.view(torch.uint8)
+        raw_float.fill_(0xA5)
+        qo = torch.tensor([qo0, total_rows], dtype=torch.int32)
+        max_pages = min(128, (runner.max_model_len + page_size - 1) // page_size)
+        total_bytes = 0
+        for pages in range(1, max_pages + 1):
+            for residue in range(1, page_size + 1):
+                length = (pages - 1) * page_size + residue
+                if length > runner.max_model_len:
+                    break
+                indptr = torch.tensor([0, pages], dtype=torch.int32)
+                last = torch.tensor([residue], dtype=torch.int32)
+                kv_lens = get_seq_lens(indptr, last, page_size)
+                nk = len(kv_lens)
+                if nk > wrapper._kv_lens_buffer.shape[0]:
+                    raise RuntimeError("kv lens buffer")
+                raw_int.fill_(0xB6)
+                with torch.cuda.device(wrapper.device):
+                    plan = wrapper._cached_module.plan(
+                        wrapper._float_workspace_buffer,
+                        wrapper._int_workspace_buffer,
+                        wrapper._pin_memory_int_workspace_buffer,
+                        qo, indptr, kv_lens,
+                        wrapper._max_total_num_rows,
+                        1, num_qo, num_kv, page_size,
+                        wrapper.is_cuda_graph_enabled,
+                        head_qk, head_vo, causal, window_left,
+                        fixed_split, disable_split, 0, 0,
+                    )
+                wrapper._kv_lens_buffer[:nk].copy_(kv_lens, non_blocking=True)
+                plan_t = tuple(int(v) for v in plan)
+                ext = _extent(plan_t, raw_int.numel(), max_rows=4096)
+                torch.cuda.synchronize(wrapper.device)
+                if ext is None or not bool(torch.all(raw_int[ext:] == 0xB6).item()):
+                    raise RuntimeError("native integer writes exceed captured prefix")
+                total_bytes += ext
+                if total_bytes > 64 * (1 << 20):
+                    raise RuntimeError("verify plan bank exceeds memory budget")
+                bank[(0, pages, residue, page_size, total_rows)] = (
+                    plan_t, raw_int[:ext].clone(),
+                    wrapper._kv_lens_buffer[:nk].clone(),
+                    int(max(kv_lens).item()), int(total_rows),
+                )
+        if not bank or not bool(torch.all(raw_float == 0xA5).item()):
+            raise RuntimeError("native planner mutates uncached float workspace")
+    except Exception:
+        logger.exception("verify FA2 plan bank disabled; original planner stays")
+        bank = None
+    finally:
+        for tensor, original in saved:
+            tensor.copy_(original)
+        if old_plan is not None:
+            wrapper._plan_info = old_plan
+        torch.cuda.synchronize(wrapper.device)
+    if bank:
+        wrapper._vllm_spec_plan_bank = bank
 
 
 def fast_plan_decode(

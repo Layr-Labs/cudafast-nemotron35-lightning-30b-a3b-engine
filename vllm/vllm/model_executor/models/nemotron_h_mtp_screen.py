@@ -179,6 +179,79 @@ def _rows_dot(h, w, s, rows, gscale, out, gather, gated=False):
     )
 
 
+def screen_topk_enabled() -> bool:
+    """Kill switch for the fused exact top-k: VLLM_MTP_SCREEN_TOPK=0."""
+    return os.environ.get("VLLM_MTP_SCREEN_TOPK", "1") != "0"
+
+
+@triton.jit
+def _topk_key(v):
+    # torch's TopKTypeConfig<float>::convert, widened to int64: an order-preserving
+    # unsigned key (-0 below +0) with every NaN mapped to the largest key.
+    x = v.to(tl.int32, bitcast=True)
+    xu = x.to(tl.int64) & 0xFFFFFFFF
+    key = tl.where(x < 0, xu ^ 0xFFFFFFFF, xu ^ 0x80000000)
+    return tl.where(v != v, 0xFFFFFFFF, key)
+
+
+@triton.jit
+def _chunk_topk(
+    scores_ptr,  # [C, N] fp32
+    src_ptr,  # [C, N] int64 ids (GATHER) or unused
+    out_ptr,  # [C, K] int64
+    N: tl.constexpr,
+    K: tl.constexpr,
+    GATHER: tl.constexpr,
+    launch_pdl: tl.constexpr = False,
+):
+    """The indices torch.topk(scores.view(C, N), K, dim=-1, sorted=False) returns,
+    in its order (CUDA sbtopk::gatherTopK: every key above the K-th largest in
+    ascending index order, then the K-th largest's ties in ascending index order
+    until K are taken), written as row-major ids (c * N + i) or, with GATHER, as
+    src[c, i]: the id lists the screen built with topk + chunk offset / gather."""
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    c = tl.program_id(0)
+    i = tl.arange(0, N)
+    key = _topk_key(tl.load(scores_ptr + c * N + i))
+    # The K-th largest key: the largest t with count(key >= t) >= K, bit by bit.
+    t = tl.sum(key * 0, axis=0)
+    for b in tl.static_range(31, -1, -1):
+        trial = t | (1 << b)
+        cnt = tl.sum((key >= trial).to(tl.int32), axis=0)
+        t = tl.where(cnt >= K, trial, t)
+    gt = (key > t).to(tl.int32)
+    eq = (key == t).to(tl.int32)
+    n_gt = tl.sum(gt, axis=0)
+    gt_rank = tl.cumsum(gt, axis=0) - gt
+    eq_rank = tl.cumsum(eq, axis=0) - eq
+    take = (gt != 0) | ((eq != 0) & (eq_rank < K - n_gt))
+    pos = tl.where(gt != 0, gt_rank, n_gt + eq_rank)
+    if GATHER:
+        val = tl.load(src_ptr + c * N + i)
+    else:
+        val = c.to(tl.int64) * N + i
+    tl.store(out_ptr + c * K + pos, val, mask=take)
+
+
+@triton.jit
+def _gather_two(
+    h_ptr, ia_ptr, oa_ptr, ib_ptr, ob_ptr,
+    NA: tl.constexpr, NB: tl.constexpr,
+    launch_pdl: tl.constexpr = False,
+):
+    """oa = h[ia], ob = h[ib] (the two index_select gathers of the cascade) in one
+    launch; pure copies."""
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    a = tl.arange(0, NA)
+    tl.store(oa_ptr + a, tl.load(h_ptr + tl.load(ia_ptr + a)))
+    b = tl.arange(0, NB)
+    tl.store(ob_ptr + b, tl.load(h_ptr + tl.load(ib_ptr + b)))
+
+
 @triton.jit
 def _select_token(
     logits, ids, out, N: tl.constexpr, BLOCK: tl.constexpr,
@@ -278,6 +351,31 @@ class DraftHeadScreen:
                 (n // SCREEN_CHUNK) * CASCADE_PER,
                 dtype=torch.float32, device=device,
             )
+
+        def _pow2(v: int) -> bool:
+            return v > 0 and (v & (v - 1)) == 0
+
+        self.fused_topk = (
+            self.cascade
+            and device.type == "cuda"
+            and screen_topk_enabled()
+            and all(
+                _pow2(v)
+                for v in (SCREEN_CHUNK, CASCADE_PER, SCREEN_PER,
+                          self.coarse_cols.numel(), cols.numel())
+            )
+        )
+        if self.fused_topk:
+            self._coarse_cand = torch.empty(
+                (n // SCREEN_CHUNK) * CASCADE_PER, dtype=torch.int64, device=device
+            )
+            self._cand = torch.empty(
+                (n // SCREEN_CHUNK) * SCREEN_PER, dtype=torch.int64, device=device
+            )
+            self._hc = torch.empty(
+                self.coarse_cols.numel(), dtype=torch.float32, device=device
+            )
+            self._hs = torch.empty(cols.numel(), dtype=torch.float32, device=device)
         self.chunk_off = (
             torch.arange(n // SCREEN_CHUNK, device=device) * SCREEN_CHUNK
         )[:, None]
@@ -314,16 +412,49 @@ class DraftHeadScreen:
             if gate is not None:
                 gate.zero_()  # the warm-up rows above may have counted or stopped
         logger.info(
-            "MTP draft-head screen: %d of %d groups, %d candidates, cascade=%s, graph=%s",
+            "MTP draft-head screen: %d of %d groups, %d candidates, cascade=%s, "
+            "fused_topk=%s, graph=%s",
             SCREEN_FRAC_GROUPS, ng, self.cand_logits.numel(), self.cascade,
-            self.graph is not None,
+            self.fused_topk, self.graph is not None,
         )
 
     def _greedy_row(self, h: torch.Tensor, gated: bool = False) -> torch.Tensor:
         """One row h [K] float32: the cascade (or the single screen) and the
         argmax tie rule. Every buffer it touches is fixed-address, so the body
         is capturable as-is."""
-        if self.cascade:
+        if self.cascade and self.fused_topk:
+            # LOCAL PATCH (cudafast-nemotron35): the same cascade with the two
+            # index_select gathers in one launch and each segmented torch.topk
+            # (+ chunk offset / + gather) in one launch that writes the id list
+            # torch.topk(sorted=False) returns, in torch's order (_chunk_topk).
+            # Same candidate ids in the same order, so every rows_dot, the
+            # selection and the depth gate see identical inputs.
+            _gather_two[(1,)](
+                h, self.coarse_cols, self._hc, self.cols, self._hs,
+                NA=self.coarse_cols.numel(), NB=self.cols.numel(),
+                launch_pdl=mtp_pdl(),
+            )
+            _rows_dot(
+                self._hc, self.w_coarse, self.s_coarse, None,
+                self.gscale, self.scores, False, gated,
+            )
+            nchunk = self.n // SCREEN_CHUNK
+            _chunk_topk[(nchunk,)](
+                self.scores, self.scores, self._coarse_cand,
+                N=SCREEN_CHUNK, K=CASCADE_PER, GATHER=False,
+                num_warps=8, launch_pdl=mtp_pdl(),
+            )
+            _rows_dot(
+                self._hs, self.w_scr, self.s_scr, self._coarse_cand,
+                self.gscale, self.refine_scores, True, gated,
+            )
+            _chunk_topk[(nchunk,)](
+                self.refine_scores, self._coarse_cand, self._cand,
+                N=CASCADE_PER, K=SCREEN_PER, GATHER=True,
+                num_warps=4, launch_pdl=mtp_pdl(),
+            )
+            cand = self._cand
+        elif self.cascade:
             hc = h.index_select(0, self.coarse_cols)
             _rows_dot(
                 hc, self.w_coarse, self.s_coarse, None,

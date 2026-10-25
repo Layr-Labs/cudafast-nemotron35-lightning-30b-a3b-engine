@@ -210,6 +210,11 @@
     {
       "file": "harness/kernels/l2pf/py/__init__.py",
       "why": "Carry useful04706ad7-c4e8-44b9-b8ba-77f14d8b8adf MoE-window immutable prefetch default6to12MB. Its complete official2.19195352041462 is within0.1% of fulla484, but only budget mechanism is combined here on higherfulla484. Prefix pair/SSM combination unverified."
+    },
+    {
+      "piece": "s28-pz333",
+      "file": "harness/kernels/pzskip/csrc/pzskip.cu; vllm/vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
+      "why": "Credit e-man07 submission 51aa1545-b946-46da-bb0f-e0628924c7a1, source 45e5db099d54717fb0a7cce5bb5b667c9ad1bf9e: take only config333 launch_smem4<2,3,6,3,32> and its default selection. Keep theta0.4, top3, depth4 and every decode/prefix path unchanged. No prefill trim. Combined unchanged with Meganpark980320 submission ad5aaec0-2793-418b-bf0d-563b11250a00 (exact fused draft-screen top-k, deferred shared-expert down for decode, L2PF_ATTN_MB 7), credited in full; this archive adds only config333."
     }
   ]
 }

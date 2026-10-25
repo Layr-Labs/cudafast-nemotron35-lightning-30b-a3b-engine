@@ -27,7 +27,7 @@ CHUNK = 1 << 16
 # Bytes prefetched per window: what DRAM can deliver while the latency-bound
 # kernels of that window run (more stalls the rejoin).
 MAMBA_BYTES = int(float(os.environ.get("L2PF_MAMBA_MB", "5")) * (1 << 20))
-ATTN_BYTES = int(float(os.environ.get("L2PF_ATTN_MB", "3")) * (1 << 20))
+ATTN_BYTES = int(float(os.environ.get("L2PF_ATTN_MB", "7")) * (1 << 20))
 # The routed down projection of a small call (zskip) is latency-bound and leaves
 # DRAM about half idle: prefetch the head of the next Mamba layer's in_proj then.
 MOE_BYTES = int(float(os.environ.get("L2PF_MOE_MB", "12")) * (1 << 20))

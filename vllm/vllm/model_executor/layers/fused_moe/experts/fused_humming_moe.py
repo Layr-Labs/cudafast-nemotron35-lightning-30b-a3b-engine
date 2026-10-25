@@ -790,6 +790,16 @@ class HummingIndexedExperts(HummingExpertsBase):
                 output=buffers["activation_output"],
             )
 
+        # LOCAL PATCH (cudafast-nemotron35): the routed up GEMM is queued; let
+        # the shared expert's deferred down projection follow it on the aux
+        # stream (runner/shared_experts.py; nothing pending: no-op).
+        if topk_ids.size(0) <= 8:
+            from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+                launch_pending_shared_down,
+            )
+
+            launch_pending_shared_down()
+
         inputs, input_scale = HummingMethod.may_quant_input(
             layer=self.layer,
             inputs=buffers["activation_output"],

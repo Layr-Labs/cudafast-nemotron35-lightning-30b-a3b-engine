@@ -84,7 +84,7 @@ def _pdl_enabled() -> bool:
 
 
 # Checkpoint period of the lazy anchor (see spec_replay_lazy).
-LAZY_PERIOD = 20
+LAZY_PERIOD = int(os.environ.get("VLLM_MAMBA_LAZY_P", "12"))
 
 
 def spec_replay_lazy() -> bool:
@@ -93,7 +93,8 @@ def spec_replay_lazy() -> bool:
     state), alternately in slots 0 and 2, and a verify replays every token since
     the last checkpoint from the ring, which then also holds token 0. The store
     happens in the verify whose tokens include the next checkpoint position
-    (about one verify in four) instead of in every verify; every state update
+    (about one verify in four at the default period 12; VLLM_MAMBA_LAZY_P sets
+    the period) instead of in every verify; every state update
     is the same per-token fp32 expression in the same order, so the states and
     outputs are the reference's. The prefill writes L into the slot-0 page's
     padding after the SSM state (write_prefill_tag). VLLM_MAMBA_REPLAY_LAZY=0
@@ -118,6 +119,10 @@ def prefill_tag_view(state: torch.Tensor) -> torch.Tensor | None:
         return None
     slot_elems = state.shape[1] * state.shape[2] * state.shape[3]
     if state.stride(0) < slot_elems + 1 or state.stride(1) != state.shape[2] * state.shape[3]:
+        return None
+    # The last slot's word must also lie inside the tensor's storage.
+    end = state.storage_offset() + (state.shape[0] - 1) * state.stride(0) + slot_elems + 1
+    if end * state.element_size() > state.untyped_storage().nbytes():
         return None
     return torch.as_strided(
         state.view(torch.int32), (state.shape[0],), (state.stride(0),),
@@ -229,8 +234,9 @@ def _selective_scan_update_spec_replay_kernel(
     verify_rows_ptr=None,
     PREFIX_LIMIT: tl.constexpr = False,
     LAZY: tl.constexpr = False,
-    LAZY_P: tl.constexpr = 20,
+    LAZY_P: tl.constexpr = 12,
     SLOT_ELEMS: tl.constexpr = 0,
+    PIPELINED: tl.constexpr = False,
 ):
     # The dt/A of a head are scalars (stride-0 expansion over head_dim); that is
     # the only layout the Mamba2 decode path produces and the only one the
@@ -345,36 +351,76 @@ def _selective_scan_update_spec_replay_kernel(
         D_ptr += pid_h * stride_D_head
         D_ptrs = D_ptr + offs_m * stride_D_dim
 
-    # Replay the accepted tokens 1..num_replay of the previous verify: the
-    # reference's state update on the reference's inputs, no outputs.
-    for i_r in range(num_replay):
-        # Non-negative even for garbage metadata (dummy runs), so the address
-        # always stays inside slot 1's ring.
-        ring_pos = ((pos0 - num_replay + i_r) % rl + rl) % rl
-        x = tl.load(
-            ring_x_base + ring_pos * ring_stride_x + offs_m,
-            mask=(offs_m < dim) & ring_ok,
-            other=0.0,
-        ).to(tl.float32)
-        dt = tl.load(
-            ring_dt_base + ring_pos * ring_stride_dt, mask=ring_ok, other=0.0
-        ).to(tl.float32)
+    if PIPELINED:
+        # Loaded weights are immutable for the complete invocation. Hoist them
+        # without changing the update expression or the reduction layout.
+        invariant_A = tl.load(A_ptr).to(tl.float32)
         if HAS_DT_BIAS:
-            dt += tl.load(dt_bias_ptr).to(tl.float32)
-        if DT_SOFTPLUS:
-            dt = softplus(dt)
-        A = tl.load(A_ptr).to(tl.float32)
-        dA = fast_exp(A * dt)  # scalar, not a matrix
+            invariant_bias = tl.load(dt_bias_ptr).to(tl.float32)
+        if HAS_D:
+            invariant_D = tl.load(D_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
+        # Normalize the circular address once, then advance by add/select. The
+        # original modulo formula is retained for the first (possibly negative)
+        # absolute position. All subsequent positions stay in [0, rl).
+        rpos = ((pos0 - num_replay) % rl + rl) % rl
+        live = ring_ok & (num_replay > 0)
+        current_x = tl.load(ring_x_base + rpos * ring_stride_x + offs_m,
+                            mask=(offs_m < dim) & live, other=0.0).to(tl.float32)
+        current_dt = tl.load(ring_dt_base + rpos * ring_stride_dt,
+                             mask=live, other=0.0).to(tl.float32)
+        current_B = tl.load(ring_B_base + rpos * ring_stride_B + offs_n,
+                            mask=(offs_n < dstate) & live, other=0.0).to(tl.float32)
+        for i_r in range(num_replay):
+            next_pos = tl.where(rpos + 1 < rl, rpos + 1, 0)
+            next_live = ring_ok & (i_r + 1 < num_replay)
+            # Issue the next raw input loads before this iteration's dependent
+            # scalar math and FP32 recurrence. No store occurs during replay.
+            next_x = tl.load(ring_x_base + next_pos * ring_stride_x + offs_m,
+                             mask=(offs_m < dim) & next_live, other=0.0).to(tl.float32)
+            next_dt = tl.load(ring_dt_base + next_pos * ring_stride_dt,
+                              mask=next_live, other=0.0).to(tl.float32)
+            next_B = tl.load(ring_B_base + next_pos * ring_stride_B + offs_n,
+                             mask=(offs_n < dstate) & next_live, other=0.0).to(tl.float32)
+            dt = current_dt
+            if HAS_DT_BIAS:
+                dt += invariant_bias
+            if DT_SOFTPLUS:
+                dt = softplus(dt)
+            dA = fast_exp(invariant_A * dt)
+            dB = current_B * dt
+            state = state * dA + dB * current_x[:, None]
+            current_x, current_dt, current_B = next_x, next_dt, next_B
+            rpos = next_pos
+    else:
+        # Replay the accepted tokens 1..num_replay of the previous verify: the
+        # reference's state update on the reference's inputs, no outputs.
+        for i_r in range(num_replay):
+            # Non-negative even for garbage metadata (dummy runs), so the address
+            # always stays inside slot 1's ring.
+            ring_pos = ((pos0 - num_replay + i_r) % rl + rl) % rl
+            x = tl.load(
+                ring_x_base + ring_pos * ring_stride_x + offs_m,
+                mask=(offs_m < dim) & ring_ok,
+                other=0.0,
+            ).to(tl.float32)
+            dt = tl.load(
+                ring_dt_base + ring_pos * ring_stride_dt, mask=ring_ok, other=0.0
+            ).to(tl.float32)
+            if HAS_DT_BIAS:
+                dt += tl.load(dt_bias_ptr).to(tl.float32)
+            if DT_SOFTPLUS:
+                dt = softplus(dt)
+            A = tl.load(A_ptr).to(tl.float32)
+            dA = fast_exp(A * dt)  # scalar, not a matrix
 
-        B = tl.load(
-            ring_B_base + ring_pos * ring_stride_B + offs_n,
-            mask=(offs_n < dstate) & ring_ok,
-            other=0.0,
-        ).to(tl.float32)
+            B = tl.load(
+                ring_B_base + ring_pos * ring_stride_B + offs_n,
+                mask=(offs_n < dstate) & ring_ok,
+                other=0.0,
+            ).to(tl.float32)
 
-        dB = B * dt
-        state = state * dA + dB * x[:, None]
-
+            dB = B * dt
+            state = state * dA + dB * x[:, None]
     if STORE_REPLAYED:
         # Test hook: the state this verify starts from (the reference's slot
         # num_accepted - 1), as a contiguous (N, nheads, dim, dstate) tensor.
@@ -400,17 +446,26 @@ def _selective_scan_update_spec_replay_kernel(
         dt_raw = tl.load(dt_ptr)
         dt = dt_raw.to(tl.float32)
         if HAS_DT_BIAS:
-            dt += tl.load(dt_bias_ptr).to(tl.float32)
+            if PIPELINED:
+                dt += invariant_bias
+            else:
+                dt += tl.load(dt_bias_ptr).to(tl.float32)
         if DT_SOFTPLUS:
             dt = softplus(dt)
-        A = tl.load(A_ptr).to(tl.float32)
+        if PIPELINED:
+            A = invariant_A
+        else:
+            A = tl.load(A_ptr).to(tl.float32)
         dA = fast_exp(A * dt)  # scalar, not a matrix
 
         B_raw = tl.load(B_ptrs, mask=offs_n < dstate, other=0.0)
         B = B_raw.to(tl.float32)
         C = tl.load(C_ptrs, mask=offs_n < dstate, other=0.0).to(tl.float32)
         if HAS_D:
-            D = tl.load(D_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
+            if PIPELINED:
+                D = invariant_D
+            else:
+                D = tl.load(D_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
         if HAS_Z:
             z = tl.load(z_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
 
@@ -566,6 +621,10 @@ def selective_state_update_spec_replay(
     is_blackwell=False,
     replayed_out=None,
     lazy=False,
+    _pipeline=False,
+    _private_verify_rows=None,
+    _private_no_prefix=False,
+    _private_launch_pdl=None,
 ):
     """
     Spec-decode verify update with anchor + input-ring state handling.
@@ -632,6 +691,7 @@ def selective_state_update_spec_replay(
     if (
         N == 1 and max_seqlen == 5 and batch == 5
         and replayed_out is None
+        and _private_verify_rows is None and not _private_no_prefix
         and os.environ.get("VLLM_MAMBA_SPEC_PREFIX", "1") != "0"
     ):
         smallk = sys.modules.get("smallk")
@@ -639,6 +699,11 @@ def selective_state_update_spec_replay(
             # Never import/allocate/rebind the buffer here; its address must
             # already be the same one captured by every router and sampler.
             verify_rows = smallk.live_verify_rows(x.device)
+
+    if _private_verify_rows is not None:
+        verify_rows = _private_verify_rows
+    if _private_no_prefix:
+        verify_rows = None
 
     with torch.accelerator.device_index(x.device.index):
         _selective_scan_update_spec_replay_kernel[grid](
@@ -705,10 +770,13 @@ def selective_state_update_spec_replay(
             HG_RATIO=nheads // ngroups,
             CONST_DIV=_const_div_enabled(),
             num_warps=num_warps,
-            launch_pdl=_pdl_enabled(),
+            launch_pdl=(_pdl_enabled() if _private_launch_pdl is None
+                        else _private_launch_pdl),
             verify_rows_ptr=verify_rows,
             PREFIX_LIMIT=verify_rows is not None,
             LAZY=bool(lazy),
             LAZY_P=LAZY_PERIOD,
             SLOT_ELEMS=nheads * dim * dstate,
+            PIPELINED=bool(_pipeline and lazy and N == 1 and batch == 5
+                           and max_seqlen == 5 and z is None and dt_softplus),
         )

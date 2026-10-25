@@ -5,8 +5,7 @@ decode (<= 8 tokens, valid_shape_m <= 48).
 
 Format. A w13 layer whose FP8 E4M3 block-scale bytes take at most 64 distinct
 values (21 of the 23 routed layers of the pinned checkpoint; layers 6 and 8
-have 106 and 99) gets at load a 64-entry byte table (the sorted distinct
-values) and a 6-bit index per scale, stored tile-major after a 128-byte
+have 106 and 99) gets at load a 64-entry byte table and a 6-bit index per scale, stored tile-major after a 128-byte
 header: for expert e, 64-column tile t and 32-wide K block (one pipeline
 stage: K groups 2kb and 2kb+1, codes c0 and c1) one 96-byte record = 16
 little-endian u32 whose byte i holds the low nibbles of c0 | c1 << 4, then 16
@@ -21,10 +20,10 @@ Kernel. A derived humming kernel (no installed file is edited) defines the two
 B-scale loaders before the pinned headers are included (their include guards
 then skip the stock ones). The global->shared loader issues 6 x 16-byte
 cp.async per stage in the stock pipeline slots and commit groups and, with
-the first tile, 4 more for the table into a static shared array (completed by
+the first tile, 5 more for the table and derived bias into a static shared array (completed by
 the first stage wait). At the first of a stage's two K16 iterations the
-shared->register loader reads the thread's 48 bits, looks both groups' four
-codes up, hands the mainloop the same uint32 of four original E4M3 bytes the
+shared->register loader reads the thread's 48 bits, reconstructs both groups'
+four codes (bytewise integer arithmetic for eligible tables, dictionary otherwise), hands the mainloop the same uint32 of four original E4M3 bytes the
 stock loader reads and keeps the second group's for the next iteration. Dequantization,
 the K16 MMA chain, the epilogue and ReLU^2 are the stock code, so the output
 is bit-identical by construction (harness/tests/nvsc_exact.py checks it
@@ -70,7 +69,7 @@ _LOADERS = r"""
 #include <humming/memory/s2r_loader/loader_bs.cuh>
 #undef S2RMemoryLoaderBS
 
-// nvsc: this layer's 64-entry E4M3 byte table, loaded once per CTA.
+// nvsc: this layer's 64-entry E4M3 table and arithmetic bias at byte 64.
 __shared__ __align__(128) uint8_t nvsc_table[128];
 
 template <class ProblemShape, class BlockShape, class ElementBS,
@@ -121,7 +120,7 @@ class G2SMemoryLoaderBS {
       // Joins the first tile's stage-0 commit group.
       table_pending = false;
       const uint32_t t = threadIdx.x - kLoadThreadOffset;
-      if (t < 4) legacy_load<true>(gmem_ptr_raw + t, reinterpret_cast<int4 *>(&nvsc_table[0]) + t);
+      if (t < 5) legacy_load<true>(gmem_ptr_raw + t, reinterpret_cast<int4 *>(&nvsc_table[0]) + t);
     }
     const uint32_t row =
         (expert_id * kNumTiles + n_block_id) * kProblemNumGroups + k_block_id * kNumGroups;
@@ -141,7 +140,15 @@ class S2RMemoryLoaderBS {
   static_assert(BlockShape::N == 64 && WarpShape::N == 32);
   static_assert(BlockShape::K == 32 && WarpShape::K == 32 && 256 / ElementA::kBits == 16);
 
-  CUDA_INLINE static uint32_t lookup(uint32_t c) {
+  uint32_t arithmetic_bias = 0;
+  bool bias_ready = false;
+
+  CUDA_INLINE uint32_t lookup(uint32_t c) {
+    if (arithmetic_bias) {
+      // Each code byte is <= 63. Adding a replicated 127-cut produces
+      // bit 7 iff that byte exceeds cut, with no carry between bytes.
+      return c | (((c + arithmetic_bias) & 0x80808080u) >> 1);
+    }
     const uint32_t b0 = nvsc_table[c & 0xFFu];
     const uint32_t b1 = nvsc_table[(c >> 8) & 0xFFu];
     const uint32_t b2 = nvsc_table[(c >> 16) & 0xFFu];
@@ -159,6 +166,11 @@ class S2RMemoryLoaderBS {
     if (iter_id % 2 == 1) {
       regs_ptr[0] = second;
       return;
+    }
+    if (!bias_ready) {
+      // Completed by the same stage-0 wait as the existing dictionary.
+      arithmetic_bias = reinterpret_cast<const uint32_t *>(nvsc_table + 64)[0];
+      bias_ready = true;
     }
     // The stock loader's uint32 index in the 64-byte row (two warps per
     // 64-column mini block).
@@ -219,11 +231,23 @@ def encode(ws: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor] | None:
     vals = torch.unique(b)
     if vals.numel() > NUM_CODES:
         return None
-    table = torch.empty(NUM_CODES, dtype=torch.uint8, device=b.device)
-    table[: vals.numel()] = vals
-    table[vals.numel():] = vals[-1]
+    # Map low bytes to themselves, and high positive bytes to value-64,
+    # only when the two code ranges cannot collide. Otherwise retain the
+    # original dictionary codec. This decision uses immutable weights only.
+    values = vals.tolist()
+    cut = max((v for v in values if v < 64), default=0)
+    high = [v for v in values if v >= 64]
+    arithmetic = not high or (max(high) < 128 and min(high) - 64 > cut)
     inv = torch.zeros(256, dtype=torch.int32, device=b.device)
-    inv[vals.long()] = torch.arange(vals.numel(), dtype=torch.int32, device=b.device)
+    if arithmetic:
+        codes = torch.arange(NUM_CODES, dtype=torch.int32, device=b.device)
+        table = torch.where(codes <= cut, codes, codes + 64).to(torch.uint8)
+        inv[vals.long()] = torch.where(vals.long() < 64, vals.long(), vals.long() - 64).int()
+    else:
+        table = torch.empty(NUM_CODES, dtype=torch.uint8, device=b.device)
+        table[: vals.numel()] = vals
+        table[vals.numel():] = vals[-1]
+        inv[vals.long()] = torch.arange(vals.numel(), dtype=torch.int32, device=b.device)
     nt, kb = n // TILE_N, g // 2
     stream = torch.empty(e, nt, kb, STAGE, dtype=torch.uint8, device=b.device)
     step = 16
@@ -290,6 +314,15 @@ def prepare_layer(layer: torch.nn.Module) -> bool:
         assert HEADER + stream.numel() <= size
         buf = torch.zeros(HEADER + stream.numel() + size, dtype=torch.uint8, device=ws.device)
         buf[:NUM_CODES] = table
+        # Recognize the arithmetic table on all 64 possible codes, not just
+        # codes observed in a sample. Zero metadata selects the stock lookup.
+        entries = table.tolist()
+        cut = max((i for i, v in enumerate(entries) if v == i), default=-1)
+        bias = 0
+        if cut >= 0 and entries == [i if i <= cut else i + 64 for i in range(NUM_CODES)]:
+            bias = (127 - cut) * 0x01010101
+        buf[64:68] = torch.tensor([(bias >> (8 * i)) & 255 for i in range(4)],
+                                   dtype=torch.uint8, device=ws.device)
         buf[HEADER : HEADER + stream.numel()] = stream
         buf[HEADER + stream.numel():] = ws.view(torch.uint8).flatten()
         stock = buf[HEADER + stream.numel():].view(torch.float8_e4m3fn).view(e, g, n)
@@ -303,6 +336,8 @@ def prepare_layer(layer: torch.nn.Module) -> bool:
         param.data = stock
         layer.nvsc_w13_bs = buf[:size].view(torch.float8_e4m3fn).view(e, g, n)
         _STATS["packed"].append(name)
+        logger.info("nvsc: %s scale decoder=%s", name,
+                    "arithmetic" if bias else "dictionary")
         return True
     except Exception as exc:  # noqa: BLE001
         _STATS["stock"][name] = f"error {exc}"

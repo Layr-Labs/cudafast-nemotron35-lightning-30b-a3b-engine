@@ -45,7 +45,14 @@ except ImportError:
     _pzskip = None
 PZ_ENABLED = os.environ.get("PZSKIP", "1") != "0"
 # config 322: 32-row expert blocks (sparser union masks than humming's 64-row blocks), 384 columns
-PZ_CONFIG = int(os.environ.get("PZSKIP_CONFIG", "333"))
+_PZ_CONFIG_ENV = os.environ.get("PZSKIP_CONFIG")
+PZ_CONFIG = int(_PZ_CONFIG_ENV or "333")
+# P2 (pzskip config 336: 896-column CTAs, compacted copies of the active rows, padded weight rows;
+# same arithmetic and "swap" repack): per layer it replaces PZ_CONFIG only when its load-time
+# output is bitwise equal to PZ_CONFIG's (which is checked against humming). An explicit
+# PZSKIP_CONFIG, or PZSKIP_P2=0, keeps the single configured config.
+PZ_P2_CONFIG = int(os.environ.get("PZSKIP_P2", "336"))
+PZ_AUTO_P2 = _PZ_CONFIG_ENV is None and PZ_P2_CONFIG not in (0, PZ_CONFIG)
 PZ_BLOCK_M = 64  # humming's prefill bucket that pzskip replaces
 PZ_MAX_TOKENS = 8192
 
@@ -138,10 +145,14 @@ def finalize(layer: torch.nn.Module) -> None:
         logger.info_once("zskip: fused prep config %d for <= 8 tokens", FUSED_CONFIG)
     logger.info_once("zskip: zero-row-skipping routed down projection enabled for <= 8 tokens")
     layer.pzskip_ok = False
+    layer.pz_config = PZ_CONFIG
     if PZ_ENABLED and _pzskip is not None and _pzskip.available():
         _pzskip.scratch(
             gs.device,
-            _pzskip.max_blocks(PZ_MAX_TOKENS * TOP_K, NUM_EXPERTS, _pzskip.block_rows(PZ_CONFIG)),
+            max(
+                _pzskip.max_blocks(PZ_MAX_TOKENS * TOP_K, NUM_EXPERTS, _pzskip.block_rows(c))
+                for c in ((PZ_CONFIG, PZ_P2_CONFIG) if PZ_AUTO_P2 else (PZ_CONFIG,))
+            ),
         )
         if _pz_self_check(layer):
             layer.pzskip_ok = True
@@ -305,6 +316,10 @@ def _pz_self_check(layer: torch.nn.Module) -> bool:
     configs = tuned_moe_configs(layer)
     if configs is None:
         return False
+    if not _pzskip.has_config(PZ_CONFIG):
+        logger.warning("pzskip: config %d is not in this build; humming keeps the prefill down",
+                       PZ_CONFIG)
+        return False
     dev = layer.w2_global_scale.device
     compute_config = json.dumps(
         {
@@ -354,7 +369,56 @@ def _pz_self_check(layer: torch.nn.Module) -> bool:
             "pzskip: load-time check differs from humming on %s; humming keeps the prefill down",
             getattr(layer, "layer_name", "?"),
         )
+        return ok
+    layer.pz_config = PZ_CONFIG
+    if PZ_AUTO_P2 and _pz_p2_check(layer, topk_ids, act, out, (sorted_ids, expert_ids, ntp)):
+        layer.pz_config = PZ_P2_CONFIG
+        logger.info_once("pzskip: P2 config %d replaces config %d (bitwise equal at load)",
+                         PZ_P2_CONFIG, PZ_CONFIG)
     return ok
+
+
+def _pz_p2_check(layer: torch.nn.Module, topk_ids: torch.Tensor, act: torch.Tensor,
+                 base_out: torch.Tensor, base_align: tuple) -> bool:
+    """PZ_P2_CONFIG against the humming-checked PZ_CONFIG, bitwise, on the same 496-token call
+    (base_out) and on a structured-sparse copy of its input: half the k columns zero in every
+    row (sparse union masks), every ninth k16 group empty, and the zeros of odd k columns made
+    -0. A build
+    without P2, a launch error or any differing bit keeps PZ_CONFIG for this layer."""
+    cfg = PZ_P2_CONFIG
+    name = getattr(layer, "layer_name", "?")
+    try:
+        if not _pzskip.has_config(cfg):
+            logger.info_once("pzskip: config %d is not in this build; config %d kept", cfg, PZ_CONFIG)
+            return False
+        bm = _pzskip.block_rows(cfg)
+        align = base_align if bm == _pzskip.block_rows(PZ_CONFIG) else _align(topk_ids, bm)
+        out = torch.empty_like(base_out)
+        _pzskip.down(act, *align, layer.zskip_w2, out, wpc=cfg)
+        if not torch.equal(out.view(torch.int16), base_out.view(torch.int16)):
+            logger.warning("pzskip: config %d differs from config %d on %s; config %d kept",
+                           cfg, PZ_CONFIG, name, PZ_CONFIG)
+            return False
+        gen = torch.Generator(device=act.device)
+        gen.manual_seed(4243)
+        sparse = act.clone()
+        sparse[:, torch.rand(INTER, generator=gen, device=act.device) < 0.5] = 0
+        for g in range(0, INTER // 16, 9):
+            sparse[:, 16 * g:16 * g + 16] = 0
+        odd = sparse.view(torch.int16)[:, 1::2]  # zeros in odd k columns become -0
+        odd[odd == 0] = -32768
+        ref = torch.empty_like(base_out)
+        _pzskip.down(sparse, *base_align, layer.zskip_w2, ref, wpc=PZ_CONFIG)
+        _pzskip.down(sparse, *align, layer.zskip_w2, out, wpc=cfg)
+        if not torch.equal(out.view(torch.int16), ref.view(torch.int16)):
+            logger.warning("pzskip: config %d differs from config %d on sparse input on %s; "
+                           "config %d kept", cfg, PZ_CONFIG, name, PZ_CONFIG)
+            return False
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("pzskip: config %d unavailable on %s (%r); config %d kept",
+                       cfg, name, exc, PZ_CONFIG)
+        return False
 
 
 def _layer_index(layer: torch.nn.Module) -> int:
@@ -600,7 +664,8 @@ def _pz_down(
         or outputs.stride(0) % 2
     ):
         return False
-    bm = _pzskip.block_rows(PZ_CONFIG)
+    config = getattr(layer, "pz_config", PZ_CONFIG)
+    bm = _pzskip.block_rows(config)
     if bm == PZ_BLOCK_M:
         sorted_ids = moe_kwargs["sorted_ids"]
         expert_ids = moe_kwargs["expert_ids"]
@@ -609,5 +674,5 @@ def _pz_down(
         sorted_ids, expert_ids, ntp = _align(topk_ids, bm)
     else:
         return False
-    _pzskip.down(inputs, sorted_ids, expert_ids, ntp, layer.zskip_w2, outputs, wpc=PZ_CONFIG)
+    _pzskip.down(inputs, sorted_ids, expert_ids, ntp, layer.zskip_w2, outputs, wpc=config)
     return True

@@ -715,7 +715,7 @@ static int launch_smem4(const Params& p, cudaStream_t st) {
   static int attr = 0;
   if (sm > attr) {
     cudaError_t e = cudaFuncSetAttribute(smem4_kernel<KG, NS, NTL, MINB, BMT, POLICY>, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
-    if (e != cudaSuccess) return (int)e;
+    if (e != cudaSuccess) { cudaGetLastError(); return (int)e; }  // clear it: a pending error would surface at the next unrelated launch
     attr = sm;
   }
   dim3 grid(N / (64 * NTL), p.max_blocks);
@@ -730,13 +730,287 @@ static int launch_smem(const Params& p, cudaStream_t st) {
   static int attr = 0;
   if (sm > attr) {
     cudaError_t e = cudaFuncSetAttribute(smem_kernel<KG, NS, NTL, MINB>, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
-    if (e != cudaSuccess) return (int)e;
+    if (e != cudaSuccess) { cudaGetLastError(); return (int)e; }  // clear it: a pending error would surface at the next unrelated launch
     attr = sm;
   }
   dim3 grid(N / (64 * NTL), p.max_blocks);
   smem_kernel<KG, NS, NTL, MINB><<<grid, 64 * NTL, sm, st>>>(p);
   return (int)cudaGetLastError();
 }
+
+#ifndef PZSKIP_NO_P2
+// ---------------------------------------------------------------------------
+// P2 (configs 336-338): smem4_kernel's 32-row path (BMT 32: one warp per 64-column tile, all
+// 4 token tiles of the block) with a load phase built for longer DRAM runs, on the same "swap"
+// repack (no new weight copy).
+//  * Wider CTAs (336: 14 tiles = 896 columns): in "swap" every k row of an expert is 1344
+//    contiguous bytes, so a CTA's run per active k row is 32 * NTL bytes: 448 B instead of
+//    333's 192 B, and an expert block's rows are read by 3 CTAs instead of 7. (dadon's "swap2"
+//    only permutes bytes inside each 64-byte, 128-column span of a k row, so for a CTA covering
+//    whole tile pairs it touches exactly the same global bytes as "swap": it cannot lengthen a
+//    run, and it exists only when the paired decode checks pass. Hence "swap".)
+//  * Compacted copy schedule: the cp.async slots enumerate only the active k rows of a group
+//    (thread q -> the (q / WP)-th set bit of the row mask), so no lanes are predicated off and
+//    a warp's 32 x 16 B copies cover at most two runs of active rows. Same bytes, same shared
+//    memory destinations as smem4_kernel; skipped rows stay stale and are masked to +0.
+//  * Weight rows padded by 16 B in shared memory (32 * NTL + 16): the four k rows a lane reads
+//    (2t, 2t+1, 2t+8, 2t+9) fall in distinct banks (333's 192 B stride is a 4-way conflict).
+//  * 336 keeps 3 stages of 2 k16 groups in flight (NS 4); one CTA of 14 warps per SM.
+// Arithmetic, operand roles, ascending group order, +0 start, union masks (prep_kernel<32>),
+// the -0 -> dense recompute rule and the epilogue are smem4_kernel's, line for line; only which
+// CTA/warp owns a column and the copy schedule differ. Weights use the record's evict-first L2
+// hint (POLICY 1) unless HUMMING_EVICT_PZ=0; scales are copied without it (see the copy loop).
+constexpr int P2_BMT = 32;
+
+template <int KG, int NTL>
+struct P2Stage {
+  static constexpr int WROW = 32 * NTL + 16;  // padded weight row (bytes); a multiple of 16
+  uint8_t w[KG][16][WROW];
+  uint8_t s[KG][64 * NTL];
+  uint8_t x[KG][P2_BMT][XS];
+};
+
+// position of the a-th (0-based) set bit of the 16-bit mask m; requires 0 <= a < popc(m)
+__device__ __forceinline__ int nth_set_bit16(uint32_t m, int a) {
+  int r = 0;
+  int c = __popc(m & 0xFFu);
+  if (a >= c) { a -= c; m >>= 8; r += 8; }
+  c = __popc(m & 0xFu);
+  if (a >= c) { a -= c; m >>= 4; r += 4; }
+  c = __popc(m & 0x3u);
+  if (a >= c) { a -= c; m >>= 2; r += 2; }
+  c = static_cast<int>(m & 1u);
+  if (a >= c) r += 1;
+  return r;
+}
+
+template <int KG, int NS, int NTL, int MINB, int POLICY>
+__global__ void __launch_bounds__(32 * NTL, MINB) p2_kernel(const Params p) {
+  constexpr int BMT = P2_BMT;
+  constexpr int HALVES = 1;
+  constexpr int TTW = BMT / 8;  // token tiles per warp: the whole 32-row block
+  constexpr int NTH = 32 * NTL * HALVES;
+  extern __shared__ __align__(16) uint8_t smem_raw[];
+  using Stage = P2Stage<KG, NTL>;
+  Stage* stg = reinterpret_cast<Stage*>(smem_raw);
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int g8 = lane >> 2, t = lane & 3;
+  const int P = blockIdx.x;  // tile of 64 * NTL columns
+  const int mb = blockIdx.y;
+  if (mb * BMT >= *p.num_tokens_padded) return;
+  const uint8_t* bi = p.ws + (long long)mb * BI_BYTES;
+  const int nrows = *reinterpret_cast<const int*>(bi + BI_NROWS);
+  const int e = *reinterpret_cast<const int*>(bi + BI_EXPERT);
+  if (e < 0 || nrows == 0) return;
+  // the block's lists in shared memory: no dependent global loads in the issue loop
+  __shared__ int rows[BMT];
+  __shared__ uint16_t gmask[128];
+  __shared__ uint16_t gact[128];
+  for (int q = tid; q < 128; q += NTH) {
+    if (q < BMT) rows[q] = reinterpret_cast<const int*>(bi + BI_ROWS)[q];
+    gmask[q] = reinterpret_cast<const uint16_t*>(bi + BI_MASK)[q];
+    gact[q] = reinterpret_cast<const uint16_t*>(bi + BI_ACTG)[q];
+  }
+  const int nag = *reinterpret_cast<const int*>(bi + BI_NAG);
+  __syncthreads();
+  const int ntt = (nrows + 7) >> 3;
+  const int Tl = warp / HALVES;      // which 64-column tile of the CTA
+  const int rh = warp % HALVES;      // always 0 (BMT 32)
+  const int c0 = 0;
+  const int tt0 = TTW * rh;
+  const bool active = 32 * rh < nrows;
+  const uint8_t* wexp = p.W + e * p.w_expert + (long long)(NTL * P) * 32;
+  const uint8_t* sexp = p.S + e * p.s_expert + (long long)(NTL * P) * 64;
+  const int kr[4] = {2 * t, 2 * t + 1, 2 * t + 8, 2 * t + 9};
+
+  float acc[TTW][4][4];
+  bool dense = p.dense == 1;
+  const bool loadonly = p.dense == 2;
+  const bool computeonly = p.dense == 3;
+  for (int pass = 0; pass < 2; ++pass) {
+    const int nsteps = dense ? G : nag;
+    const int nst = (nsteps + KG - 1) / KG;
+    auto issue = [&](int st) {
+      if (computeonly) return;
+      Stage& S = stg[st % NS];
+      for (int gi = 0; gi < KG; ++gi) {
+        const int j = st * KG + gi;
+        if (j >= nsteps) break;
+        const int grp = dense ? j : gact[j];
+        const uint32_t m = dense ? 0xFFFFu : gmask[grp];
+        // weights: the active rows of 16, 32 * NTL bytes each (WP pieces); scales: 64 * NTL
+        // bytes (SP pieces); activations: nrows x 32 bytes (2 pieces)
+        constexpr int WP = 2 * NTL;   // 16-byte pieces per weight row
+        constexpr int SP = 4 * NTL;   // 16-byte pieces of scales
+        const int NW = __popc(m) * WP;
+        for (int q = tid; q < NW + SP + 2 * nrows; q += NTH) {
+          if (q < NW) {
+            const int a = q / WP, piece = q - a * WP;
+            const int r = nth_set_bit16(m, a);
+            cp16_weight<POLICY>(&S.w[gi][r][16 * piece], wexp + (long long)(16 * grp + r) * p.w_k + 16 * piece);
+          } else if (q < NW + SP) {
+            const int piece = q - NW;
+            // scales: no L2 hint. ptxas (12.8, sm_120a) put these copies' cache-policy descriptor on
+            // the odd uniform register UR1 in 336/337 -> illegal instruction at run time.
+            cp16(&S.s[gi][16 * piece], sexp + (long long)grp * p.s_g + 16 * piece);
+          } else {
+            const int r = (q - NW - SP) >> 1, piece = (q - NW - SP) & 1;
+            cp16(&S.x[gi][r][16 * piece], p.A + (long long)rows[r] * p.lda + 16 * grp + 8 * piece);
+          }
+        }
+      }
+    };
+#pragma unroll
+    for (int tt = 0; tt < TTW; ++tt)
+#pragma unroll
+      for (int c = 0; c < 4; ++c)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) acc[tt][c][i] = 0.0f;
+#pragma unroll
+    for (int st = 0; st < NS - 1; ++st) {
+      if (st < nst) issue(st);
+      cp_commit();
+    }
+    bool neg0 = false;
+    for (int st = 0; st < nst; ++st) {
+      cp_wait<NS - 2>();
+      __syncthreads();
+      if (st + NS - 1 < nst) issue(st + NS - 1);
+      cp_commit();
+      const Stage& S = stg[st % NS];
+      if (loadonly || !active) continue;
+      for (int gi = 0; gi < KG; ++gi) {
+        const int j = st * KG + gi;
+        if (j >= nsteps) break;
+        const int grp = dense ? j : gact[j];
+        const uint32_t m = dense ? 0xFFFFu : gmask[grp];
+        const uint32_t w0 = *reinterpret_cast<const uint32_t*>(&S.w[gi][kr[0]][Tl * 32 + g8 * 4]);
+        const uint32_t w1 = *reinterpret_cast<const uint32_t*>(&S.w[gi][kr[1]][Tl * 32 + g8 * 4]);
+        const uint32_t w2 = *reinterpret_cast<const uint32_t*>(&S.w[gi][kr[2]][Tl * 32 + g8 * 4]);
+        const uint32_t w3 = *reinterpret_cast<const uint32_t*>(&S.w[gi][kr[3]][Tl * 32 + g8 * 4]);
+        const uint2 sc = *reinterpret_cast<const uint2*>(&S.s[gi][Tl * 64 + g8 * 8]);
+        const uint32_t m01 = (m >> (2 * t)) & 3u;
+        const uint32_t m23 = (m >> (2 * t + 8)) & 3u;
+        const uint32_t keep01 = ((m01 & 1u) ? 0x0000FFFFu : 0u) | ((m01 & 2u) ? 0xFFFF0000u : 0u);
+        const uint32_t keep23 = ((m23 & 1u) ? 0x0000FFFFu : 0u) | ((m23 & 2u) ? 0xFFFF0000u : 0u);
+        uint32_t xb[TTW][2];
+#pragma unroll
+        for (int tt = 0; tt < TTW; ++tt) {
+          if (tt0 + tt < ntt) {
+            const uint8_t* xr = &S.x[gi][8 * (tt0 + tt) + g8][0];
+            xb[tt][0] = *reinterpret_cast<const uint32_t*>(xr + 4 * t);
+            xb[tt][1] = *reinterpret_cast<const uint32_t*>(xr + 16 + 4 * t);
+          } else {
+            xb[tt][0] = xb[tt][1] = 0u;
+          }
+        }
+#pragma unroll
+        for (int ci = 0; ci < 4; ++ci) {
+          const int c = c0 + ci;
+          const uint32_t sx = (c < 2) ? sc.x : sc.y;
+          const uint32_t sp = hmul2_u32(
+              fp8_to_bf16x2(((c & 1) == 0) ? (((sx << 8) & 0x0000FF00u) | ((sx << 16) & 0xFF000000u))
+                                           : (((sx >> 8) & 0x0000FF00u) | (sx & 0xFF000000u))),
+              kExp120);
+          const uint32_t slo = __byte_perm(sp, 0, 0x1010);
+          const uint32_t shi = __byte_perm(sp, 0, 0x3232);
+          const uint32_t sel = c | (c << 4) | ((c + 4) << 8) | ((c + 4) << 12);
+          const uint32_t x01 = __byte_perm(w0, w1, sel);
+          const uint32_t x23 = __byte_perm(w2, w3, sel);
+          const uint32_t a0 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x01 << 12), kExp124), slo) & keep01;
+          const uint32_t a1 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x01 << 8), kExp124), shi) & keep01;
+          const uint32_t a2 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x23 << 12), kExp124), slo) & keep23;
+          const uint32_t a3 = hmul2_u32(hmul2_u32(fp4_to_bf16x2(x23 << 8), kExp124), shi) & keep23;
+#pragma unroll
+          for (int tt = 0; tt < TTW; ++tt)
+            if (tt0 + tt < ntt) mma_bf16(acc[tt][ci], a0, a1, a2, a3, xb[tt][0], xb[tt][1]);
+        }
+      }
+    }
+    // A chain starts at +0 and round-to-nearest never yields -0 from it, so a -0 can only be a
+    // final value; the insurance check (dense recompute) runs once on the final accumulators.
+    if (!dense) {
+#pragma unroll
+      for (int tt = 0; tt < TTW; ++tt)
+#pragma unroll
+        for (int ci = 0; ci < 4; ++ci)
+#pragma unroll
+          for (int q = 0; q < 4; ++q) neg0 |= __float_as_uint(acc[tt][ci][q]) == 0x80000000u;
+    }
+    cp_wait<0>();
+    const bool redo = __syncthreads_or(neg0 ? 1 : 0) != 0;
+    if (!redo || dense) break;
+    if (tid == 0 && p.stats) atomicAdd(p.stats + 0, 1);
+    dense = true;
+  }
+  const float gs4 = mul_ftz(p.GS[e], 4.0f);
+#pragma unroll
+  for (int tt = 0; tt < TTW; ++tt) {
+#pragma unroll
+    for (int ci = 0; ci < 4; ++ci) {
+      const int col = (NTL * P + Tl) * 64 + 16 * (c0 + ci) + g8;
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        const int r = 8 * (tt0 + tt) + 2 * t + (q & 1);
+        const int cc = col + ((q >> 1) ? 8 : 0);
+        if (r < nrows) {
+          const uint32_t v = to_bf16x2(mul_ftz(acc[tt][ci][q], gs4), 0.0f);
+          reinterpret_cast<uint16_t*>(p.C)[(long long)rows[r] * p.ldc + cc] = static_cast<uint16_t>(v);
+        }
+      }
+    }
+  }
+}
+
+template <int KG, int NS, int NTL, int MINB, int POLICY>
+static int launch_p2(const Params& p, cudaStream_t st) {
+  static_assert(N % (64 * NTL) == 0, "the column tile must divide N");
+  static_assert((32 * NTL + 16) % 16 == 0 && sizeof(P2Stage<KG, NTL>) % 16 == 0, "16-byte cp.async");
+  prep_kernel<P2_BMT><<<p.max_blocks, 128, 0, st>>>(p);
+  cudaError_t e0 = cudaGetLastError();
+  if (e0 != cudaSuccess) return (int)e0;
+  const int sm = (int)sizeof(P2Stage<KG, NTL>) * NS;
+  static int attr = 0;
+  if (sm > attr) {
+    cudaError_t e = cudaFuncSetAttribute(p2_kernel<KG, NS, NTL, MINB, POLICY>, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
+    if (e != cudaSuccess) { cudaGetLastError(); return (int)e; }  // clear it: a pending error would surface at the next unrelated launch
+    attr = sm;
+  }
+  dim3 grid(N / (64 * NTL), p.max_blocks);
+  p2_kernel<KG, NS, NTL, MINB, POLICY><<<grid, 32 * NTL, sm, st>>>(p);
+  return (int)cudaGetLastError();
+}
+
+// The evict-first specialisation for every call unless HUMMING_EVICT_PZ=0; if it cannot be
+// loaded or launched, the same config without the hint (as config 333 does). -DPZSKIP_P2_NO_HINT
+// (build.sh, when its SASS guard rejects the hinted build) never instantiates the hinted kernels.
+template <int KG, int NS, int NTL, int MINB>
+static int launch_p2_policy(const Params& p, cudaStream_t st) {
+#if !defined(PZSKIP_NO_CACHE_POLICY) && !defined(PZSKIP_P2_NO_HINT)
+  const char* enabled = std::getenv("HUMMING_EVICT_PZ");
+  if (!enabled || enabled[0] != '0') {
+    static int loaded = -1;
+    if (loaded < 0) {
+      cudaFuncAttributes attr;
+      cudaError_t e = cudaFuncGetAttributes(&attr, p2_kernel<KG, NS, NTL, MINB, 1>);
+      loaded = e == cudaSuccess;
+      if (!loaded) {
+        cudaGetLastError();
+        std::fprintf(stderr, "pzskip: P2 L2 evict-first load unavailable; P2 without the hint\n");
+      }
+    }
+    if (loaded) {
+      int rc = launch_p2<KG, NS, NTL, MINB, 1>(p, st);
+      if (!rc) return 0;
+      loaded = 0;
+      cudaGetLastError();
+      std::fprintf(stderr, "pzskip: P2 L2 evict-first launch unavailable; P2 without the hint\n");
+    }
+  }
+#endif
+  return launch_p2<KG, NS, NTL, MINB, 0>(p, st);
+}
+#endif  // PZSKIP_NO_P2
 
 }  // namespace pzskip
 
@@ -788,8 +1062,8 @@ int pzskip_down(const void* A, long long lda, int shape_m, const int* sorted_ids
     case 333: {
 #ifndef PZSKIP_NO_CACHE_POLICY
       const char* enabled = std::getenv("HUMMING_EVICT_PZ");
-      // Fixed target top-6: 496 prompt rows become 2976 routed slots.
-      if (p.shape_m == 2976 && (!enabled || enabled[0] != '0')) {
+      // Every pzskip call (pzskip only serves prefill-sized calls): same copies, L2 priority only.
+      if (!enabled || enabled[0] != '0') {
         static int loaded = -1;
         if (loaded < 0) {
           cudaFuncAttributes attr;
@@ -811,6 +1085,12 @@ int pzskip_down(const void* A, long long lda, int shape_m, const int* sorted_ids
 #endif
       return pzskip::launch_smem4<2, 3, 6, 3, 32, 0>(p, st);
     }   // 384 columns, 2 k16 groups per stage, 3 stages
+#ifndef PZSKIP_NO_P2
+    // P2 (32-row blocks, compacted copies, padded weight rows): see p2_kernel
+    case 336: return pzskip::launch_p2_policy<2, 4, 14, 1>(p, st);  // 896 columns, 14 warps, 448 B runs
+    case 337: return pzskip::launch_p2_policy<2, 4, 7, 2>(p, st);   // 448 columns, 7 warps, 2 CTAs/SM
+    case 338: return pzskip::launch_p2_policy<2, 3, 6, 3>(p, st);   // 333's geometry
+#endif
     // 16-row blocks: one warp per 64-column tile, 2 token tiles
     case 340: return pzskip::launch_smem4<1, 4, 2, 8, 16>(p, st);
     case 341: return pzskip::launch_smem4<1, 4, 3, 6, 16>(p, st);
@@ -906,5 +1186,14 @@ int pzskip_down(const void* A, long long lda, int shape_m, const int* sorted_ids
 }
 
 int pzskip_bi_bytes(void) { return pzskip::BI_BYTES; }
+
+// 1 when the P2 configs (336-338) are compiled in (not built with -DPZSKIP_NO_P2)
+int pzskip_has_p2(void) {
+#ifndef PZSKIP_NO_P2
+  return 1;
+#else
+  return 0;
+#endif
+}
 
 }  // extern "C"

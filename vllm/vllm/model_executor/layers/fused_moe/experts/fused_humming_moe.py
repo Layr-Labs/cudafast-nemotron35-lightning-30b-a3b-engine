@@ -49,6 +49,10 @@ def _l2pf_next_layer(layer, num_tokens: int) -> bool:
     if nxt is None:
         return False
     w = getattr(nxt, "_fp8c_weight", None)  # fp8c buffer: tile-major, read order
+    if w is not None and 1 <= num_tokens <= 8:
+        tiled = getattr(_l2pf, "prefetch_fp8c_in", None)
+        if tiled is not None:
+            return tiled(w, max_bytes=_l2pf.MOE_BYTES)
     if w is None:
         w = getattr(nxt, "_fp8small_weight", None)
     if w is None:

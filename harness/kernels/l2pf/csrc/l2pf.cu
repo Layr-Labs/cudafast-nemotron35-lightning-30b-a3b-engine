@@ -37,6 +37,47 @@ __global__ void prefetch3_kernel(const uint8_t* p0, size_t b0,
     if (n) asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" :: "l"(p + off), "r"(n));
   }
 }
+
+#ifndef L2PF_NO_FP8C_TILES
+// One fp8c output tile is consumed by one projection CTA. Distribute the
+// existing budget over each tile's header/main prefix AND exception tail.
+// All ranges are immutable checkpoint encodings. No value is written.
+__global__ void prefetch_fp8c_out_kernel(
+    const uint8_t* gate, size_t gate_bytes, const uint8_t* buffer,
+    size_t tile_bytes, size_t prefix_bytes, size_t tail_offset,
+    size_t tail_bytes, int tiles, uint32_t chunk) {
+  const size_t gate_chunks = (gate_bytes + chunk - 1) / chunk;
+  const size_t head_chunks = (prefix_bytes + chunk - 1) / chunk;
+  const size_t tail_chunks = (tail_bytes + chunk - 1) / chunk;
+  const size_t per_tile = head_chunks + tail_chunks;
+  const size_t total = gate_chunks + (size_t)tiles * per_tile;
+  for (size_t i = threadIdx.x; i < total; i += blockDim.x) {
+    const uint8_t* ptr;
+    size_t bytes, offset;
+    if (i < gate_chunks) {
+      ptr = gate;
+      bytes = gate_bytes;
+      offset = i * chunk;
+    } else {
+      const size_t item = i - gate_chunks;
+      const size_t tile = item / per_tile;
+      const size_t part = item % per_tile;
+      ptr = buffer + tile * tile_bytes;
+      if (part < head_chunks) {
+        bytes = prefix_bytes;
+        offset = part * chunk;
+      } else {
+        ptr += tail_offset;
+        bytes = tail_bytes;
+        offset = (part - head_chunks) * chunk;
+      }
+    }
+    const uint32_t count = (uint32_t)(bytes - offset < chunk ? bytes - offset : chunk);
+    if (count) asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n"
+                            :: "l"(ptr + offset), "r"(count));
+  }
+}
+#endif
 }  // namespace l2pf
 
 // 0 on success; -1 for a misaligned range or chunk.
@@ -59,3 +100,42 @@ extern "C" int l2pf_prefetch3(const void* p0, size_t b0,
       (const uint8_t*)p2, b2, (uint32_t)chunk);
   return (int)cudaGetLastError();
 }
+
+#ifndef L2PF_NO_FP8C_TILES
+// Additive ABI: old libraries or fallback builds retain contiguous prefetch.
+extern "C" int l2pf_prefetch_fp8c_out(
+    const void* gate, size_t gate_bytes, const void* buffer, size_t tile_bytes,
+    size_t prefix_bytes, size_t tail_offset, size_t tail_bytes,
+    int tiles, int chunk, void* stream) {
+  if (!buffer || reinterpret_cast<uintptr_t>(buffer) % 128 ||
+      (gate_bytes && !gate) || reinterpret_cast<uintptr_t>(gate) % 16 ||
+      gate_bytes % 16 || chunk < 16 || chunk > 65536 || chunk % 16 ||
+      tiles != 84 || tile_bytes % 128 || tile_bytes > 121856 ||
+      tail_offset != 115072 || tile_bytes <= tail_offset ||
+      tail_bytes != tile_bytes - tail_offset || prefix_bytes % 128 ||
+      prefix_bytes < 384 + 6 * 3584 || prefix_bytes > tail_offset)
+    return -1;
+  l2pf::prefetch_fp8c_out_kernel<<<1, 128, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+      (const uint8_t*)gate, gate_bytes, (const uint8_t*)buffer,
+      tile_bytes, prefix_bytes, tail_offset, tail_bytes, tiles, (uint32_t)chunk);
+  return (int)cudaGetLastError();
+}
+
+// The input window has its own shape and budget, with no router reservation.
+// Reuse the same immutable-range kernel, passing no router range.
+extern "C" int l2pf_prefetch_fp8c_in(
+    const void* buffer, size_t tile_bytes, size_t prefix_bytes,
+    size_t tail_offset, size_t tail_bytes, int tiles, int chunk, void* stream) {
+  if (!buffer || reinterpret_cast<uintptr_t>(buffer) % 128 ||
+      chunk < 16 || chunk > 65536 || chunk % 16 || tiles != 322 ||
+      tile_bytes % 128 || tile_bytes > 79872 || tail_offset != 75520 ||
+      tile_bytes <= tail_offset || tail_bytes != tile_bytes - tail_offset ||
+      prefix_bytes % 128 || prefix_bytes < 256 + 6 * 3584 ||
+      prefix_bytes > tail_offset)
+    return -1;
+  l2pf::prefetch_fp8c_out_kernel<<<1, 128, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+      nullptr, 0, (const uint8_t*)buffer, tile_bytes, prefix_bytes,
+      tail_offset, tail_bytes, tiles, (uint32_t)chunk);
+  return (int)cudaGetLastError();
+}
+#endif

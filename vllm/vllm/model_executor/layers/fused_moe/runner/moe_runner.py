@@ -48,6 +48,12 @@ from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExpertsOrder,
 )
 from vllm.platforms import current_platform
+
+# shco (harness/kernels/shco); absent, the lite keep-m path is off.
+try:
+    import shco as _shco
+except ImportError:
+    _shco = None
 from vllm.utils.torch_utils import (
     _USE_LAYERNAME,
     LayerName,
@@ -290,6 +296,10 @@ class MoERunner(MoERunnerInterface):
         # A 1-element GPU index tensor while only that row of this layer's
         # output is read; None (the default) routes every row on its own.
         self.keep_m_row_src: torch.Tensor | None = None
+        # LOCAL PATCH (cudafast-nemotron35): with keep_m_row_src set, also compute
+        # only that row (see _apply_quant_method); set for a prefill whose request
+        # samples one token and drafts nothing (prefill_graph.py).
+        self.keep_m_lite = False
 
         self._forward_entry = self._select_forward()
 
@@ -611,24 +621,42 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
             row_src = self.keep_m_row_src
-            if row_src is not None:
-                # Only row `row_src` of this layer's output is read (set by
-                # the model runner, see NemotronHForCausalLM.set_last_moe_row_src
-                # and vllm/v1/worker/prefill_graph.py): every row takes that
-                # row's experts and weights. M, and so valid_shape_m = M *
-                # top_k and the kernel config, stay the same, and that row's
-                # own ids, weights, input and K order are unchanged.
-                rows = row_src.expand(topk_ids.size(0)).contiguous()
-                topk_ids = topk_ids.index_select(0, rows)
-                topk_weights = topk_weights.index_select(0, rows)
+            if row_src is not None and self.keep_m_lite and _shco is not None:
+                # LOCAL PATCH (cudafast-nemotron35): only row `row_src` of this
+                # layer's output is read and no draft follows, so the routed
+                # experts run for that row alone. Humming's up chain does not
+                # depend on the block size, and zskip's and pzskip's down chains
+                # are both humming's, so the row's routed output is the one the
+                # full call gives; the other rows stay zero (the shared expert
+                # runs only the Marlin launch holding the row, shco.TAIL_ONLY).
+                one = self.routed_experts.forward_modular(
+                    x=hidden_states.index_select(0, row_src),
+                    topk_weights=topk_weights.index_select(0, row_src),
+                    topk_ids=topk_ids.index_select(0, row_src),
+                    shared_experts=self._shared_experts,
+                    shared_experts_input=shared_experts_input,
+                )
+                fused_out = one.new_zeros((hidden_states.size(0), one.size(1)))
+                fused_out.index_copy_(0, row_src, one)
+            else:
+                if row_src is not None:
+                    # Only row `row_src` of this layer's output is read (set by
+                    # the model runner, see NemotronHForCausalLM.set_last_moe_row_src
+                    # and vllm/v1/worker/prefill_graph.py): every row takes that
+                    # row's experts and weights. M, and so valid_shape_m = M *
+                    # top_k and the kernel config, stay the same, and that row's
+                    # own ids, weights, input and K order are unchanged.
+                    rows = row_src.expand(topk_ids.size(0)).contiguous()
+                    topk_ids = topk_ids.index_select(0, rows)
+                    topk_weights = topk_weights.index_select(0, rows)
 
-            fused_out = self.routed_experts.forward_modular(
-                x=hidden_states,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                shared_experts=self._shared_experts,
-                shared_experts_input=shared_experts_input,
-            )
+                fused_out = self.routed_experts.forward_modular(
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts=self._shared_experts,
+                    shared_experts_input=shared_experts_input,
+                )
 
         self._maybe_apply_shared_experts(
             shared_experts_input,
@@ -871,6 +899,24 @@ class MoERunner(MoERunnerInterface):
         # TODO(bnell): this can be removed after MK migration is complete.
         self.routed_experts._ensure_moe_quant_config_init()
 
+        lite = self.keep_m_row_src is not None and self.keep_m_lite and _shco is not None
+        if lite:
+            _shco.TAIL_ONLY = True
+        try:
+            return self._forward_impl_body(
+                hidden_states, router_logits, shared_experts_input, input_ids
+            )
+        finally:
+            if lite:
+                _shco.TAIL_ONLY = False
+
+    def _forward_impl_body(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # Sync aux and main stream for shared expert multi-stream overlap.
         self._maybe_sync_shared_experts_stream(shared_experts_input)
 

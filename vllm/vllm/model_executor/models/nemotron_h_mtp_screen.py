@@ -113,7 +113,18 @@ def _nvfp4_rows_dot(
     gate_ptr=None,
     GATED: tl.constexpr = False,
     launch_pdl: tl.constexpr = False,
+    hcols_ptr=None,  # [2 * NBYTES] int64 columns of h to read, when HCOLS
+    HCOLS: tl.constexpr = False,
+    ref_ptr=None,  # [R] int64 second-stage top-k indices, when RMODE == 2
+    RMODE: tl.constexpr = 0,
+    CHUNK: tl.constexpr = 1,
+    CPER: tl.constexpr = 1,
+    SPER: tl.constexpr = 1,
 ):
+    """RMODE 0: rows from GATHER as before. 1: rows = rows_ptr[r] + (r // CPER) * CHUNK
+    (first-stage top-k indices within their chunk). 2: rows = rows_ptr[c * CPER + ref_ptr[r]]
+    + c * CHUNK with c = r // SPER (the second stage's picks among them). HCOLS reads
+    h[hcols_ptr[j]] where h[j] was read: the same elements a gathered copy holds."""
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
         tl.extra.cuda.gdc_launch_dependents()
@@ -124,7 +135,21 @@ def _nvfp4_rows_dot(
     wr = rmask
     if GATED:
         wr = rmask & (tl.load(gate_ptr) == 0)
-    if GATHER:
+    if RMODE == 1:
+        rows = tl.load(rows_ptr + r, mask=rmask, other=0) + (r // CPER) * CHUNK
+        if INDEX32:
+            rows = rows.to(tl.int32)
+        else:
+            rows = rows.to(tl.int64)
+    elif RMODE == 2:
+        c = r // SPER
+        sel = tl.load(ref_ptr + r, mask=rmask, other=0)
+        rows = tl.load(rows_ptr + c * CPER + sel, mask=rmask, other=0) + c * CHUNK
+        if INDEX32:
+            rows = rows.to(tl.int32)
+        else:
+            rows = rows.to(tl.int64)
+    elif GATHER:
         if INDEX32:
             rows = tl.load(rows_ptr + r, mask=rmask, other=0).to(tl.int32)
         else:
@@ -149,8 +174,12 @@ def _nvfp4_rows_dot(
             mask=wr[:, None],
             other=0.0,
         ).to(tl.float32)
-        hl = tl.load(h_ptr + 2 * ob)
-        hh = tl.load(h_ptr + 2 * ob + 1)
+        if HCOLS:
+            hl = tl.load(h_ptr + tl.load(hcols_ptr + 2 * ob))
+            hh = tl.load(h_ptr + tl.load(hcols_ptr + 2 * ob + 1))
+        else:
+            hl = tl.load(h_ptr + 2 * ob)
+            hh = tl.load(h_ptr + 2 * ob + 1)
         lo, hi = _e2m1_pair(wb)
         part = lo * hl[None, :] + hi * hh[None, :]
         part = tl.reshape(part, (BR, BB // 8, 8))
@@ -158,9 +187,11 @@ def _nvfp4_rows_dot(
     tl.store(out_ptr + r, acc * gscale, mask=rmask)
 
 
-def _rows_dot(h, w, s, rows, gscale, out, gather, gated=False):
+def _rows_dot(h, w, s, rows, gscale, out, gather, gated=False, hcols=None, ref=None,
+              rmode=0, cper=1, sper=1):
     n_out = out.numel()
     nbytes = w.shape[1]
+    gather = gather or rmode != 0
     br = 64 if not gather else 16
     max_rows = max(w.shape[0], n_out) + br - 1
     index32 = (
@@ -176,7 +207,82 @@ def _rows_dot(h, w, s, rows, gscale, out, gather, gated=False):
         gate_ptr=gate, GATED=gated,
         num_warps=4, num_stages=2,
         launch_pdl=mtp_pdl(),
+        hcols_ptr=hcols, HCOLS=hcols is not None,
+        ref_ptr=ref, RMODE=rmode, CHUNK=SCREEN_CHUNK, CPER=cper, SPER=sper,
     )
+
+
+def screen_topk_enabled() -> bool:
+    """Kill switch for the fused exact top-k: VLLM_MTP_SCREEN_TOPK=0."""
+    return os.environ.get("VLLM_MTP_SCREEN_TOPK", "1") != "0"
+
+
+@triton.jit
+def _topk_key(v):
+    # torch's TopKTypeConfig<float>::convert, widened to int64: an order-preserving
+    # unsigned key (-0 below +0) with every NaN mapped to the largest key.
+    x = v.to(tl.int32, bitcast=True)
+    xu = x.to(tl.int64) & 0xFFFFFFFF
+    key = tl.where(x < 0, xu ^ 0xFFFFFFFF, xu ^ 0x80000000)
+    return tl.where(v != v, 0xFFFFFFFF, key)
+
+
+@triton.jit
+def _chunk_topk(
+    scores_ptr,  # [C, N] fp32
+    src_ptr,  # [C, N] int64 ids (GATHER) or unused
+    out_ptr,  # [C, K] int64
+    N: tl.constexpr,
+    K: tl.constexpr,
+    GATHER: tl.constexpr,
+    launch_pdl: tl.constexpr = False,
+):
+    """The indices torch.topk(scores.view(C, N), K, dim=-1, sorted=False) returns,
+    in its order (CUDA sbtopk::gatherTopK: every key above the K-th largest in
+    ascending index order, then the K-th largest's ties in ascending index order
+    until K are taken), written as row-major ids (c * N + i) or, with GATHER, as
+    src[c, i]: the id lists the screen built with topk + chunk offset / gather."""
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    c = tl.program_id(0)
+    i = tl.arange(0, N)
+    key = _topk_key(tl.load(scores_ptr + c * N + i))
+    # The K-th largest key: the largest t with count(key >= t) >= K, bit by bit.
+    t = tl.sum(key * 0, axis=0)
+    for b in tl.static_range(31, -1, -1):
+        trial = t | (1 << b)
+        cnt = tl.sum((key >= trial).to(tl.int32), axis=0)
+        t = tl.where(cnt >= K, trial, t)
+    gt = (key > t).to(tl.int32)
+    eq = (key == t).to(tl.int32)
+    n_gt = tl.sum(gt, axis=0)
+    gt_rank = tl.cumsum(gt, axis=0) - gt
+    eq_rank = tl.cumsum(eq, axis=0) - eq
+    take = (gt != 0) | ((eq != 0) & (eq_rank < K - n_gt))
+    pos = tl.where(gt != 0, gt_rank, n_gt + eq_rank)
+    if GATHER:
+        val = tl.load(src_ptr + c * N + i)
+    else:
+        val = c.to(tl.int64) * N + i
+    tl.store(out_ptr + c * K + pos, val, mask=take)
+
+
+@triton.jit
+def _gather_two(
+    h_ptr, ia_ptr, oa_ptr, ib_ptr, ob_ptr,
+    NA: tl.constexpr, NB: tl.constexpr,
+    launch_pdl: tl.constexpr = False,
+):
+    """oa = h[ia], ob = h[ib] (the two index_select gathers of the cascade) in one
+    launch; pure copies."""
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    a = tl.arange(0, NA)
+    tl.store(oa_ptr + a, tl.load(h_ptr + tl.load(ia_ptr + a)))
+    b = tl.arange(0, NB)
+    tl.store(ob_ptr + b, tl.load(h_ptr + tl.load(ib_ptr + b)))
 
 
 @triton.jit
@@ -186,8 +292,14 @@ def _select_token(
     GATED: tl.constexpr = False,
     THETA: tl.constexpr = 0.0,
     launch_pdl: tl.constexpr = False,
+    ref=None,
+    TWO_LEVEL: tl.constexpr = False,
+    CHUNK: tl.constexpr = 1,
+    CPER: tl.constexpr = 1,
+    SPER: tl.constexpr = 1,
 ):
-    """Stock BF16 maximum, then minimum token id among ties, in one launch."""
+    """Stock BF16 maximum, then minimum token id among ties, in one launch.
+    TWO_LEVEL: the token ids are ids[c * CPER + ref[i]] + c * CHUNK, c = i // SPER."""
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
         tl.extra.cuda.gdc_launch_dependents()
@@ -195,7 +307,13 @@ def _select_token(
     # Round before reduction: FP32 logit differences can disappear in BF16.
     v = tl.load(logits + i, mask=i < N, other=-float("inf"))
     v = v.to(tl.bfloat16).to(tl.float32)
-    token = tl.load(ids + i, mask=i < N, other=1 << 30)
+    if TWO_LEVEL:
+        c = i // SPER
+        sel = tl.load(ref + i, mask=i < N, other=0)
+        token = tl.load(ids + c * CPER + sel, mask=i < N, other=0) + c * CHUNK
+        token = tl.where(i < N, token, 1 << 30)
+    else:
+        token = tl.load(ids + i, mask=i < N, other=1 << 30)
     best = tl.max(v, axis=0)
     # torch.max propagates NaNs; its subsequent equality tests all fail.
     any_nan = tl.max(((i < N) & (v != v)).to(tl.int32), axis=0)
@@ -238,6 +356,8 @@ class DraftHeadScreen:
         assert w.dtype == torch.uint8 and s.shape == (n, ng), (w.shape, s.shape)
         assert n % SCREEN_CHUNK == 0
         self.cascade = os.environ.get("VLLM_MTP_SCREEN_CASCADE", "1") != "0"
+        # VLLM_MTP_SCREEN_FOLD=0 keeps the cascade's separate gather kernels.
+        self.fold = os.environ.get("VLLM_MTP_SCREEN_FOLD", "1") != "0"
         if self.cascade:
             assert 0 < CASCADE_FRAC_GROUPS < SCREEN_FRAC_GROUPS <= ng
             assert SCREEN_PER <= CASCADE_PER <= SCREEN_CHUNK
@@ -278,6 +398,31 @@ class DraftHeadScreen:
                 (n // SCREEN_CHUNK) * CASCADE_PER,
                 dtype=torch.float32, device=device,
             )
+
+        def _pow2(v: int) -> bool:
+            return v > 0 and (v & (v - 1)) == 0
+
+        self.fused_topk = (
+            self.cascade
+            and device.type == "cuda"
+            and screen_topk_enabled()
+            and all(
+                _pow2(v)
+                for v in (SCREEN_CHUNK, CASCADE_PER, SCREEN_PER,
+                          self.coarse_cols.numel(), cols.numel())
+            )
+        )
+        if self.fused_topk:
+            self._coarse_cand = torch.empty(
+                (n // SCREEN_CHUNK) * CASCADE_PER, dtype=torch.int64, device=device
+            )
+            self._cand = torch.empty(
+                (n // SCREEN_CHUNK) * SCREEN_PER, dtype=torch.int64, device=device
+            )
+            self._hc = torch.empty(
+                self.coarse_cols.numel(), dtype=torch.float32, device=device
+            )
+            self._hs = torch.empty(cols.numel(), dtype=torch.float32, device=device)
         self.chunk_off = (
             torch.arange(n // SCREEN_CHUNK, device=device) * SCREEN_CHUNK
         )[:, None]
@@ -293,6 +438,8 @@ class DraftHeadScreen:
         self.graph = None
         self._h = torch.empty(k, dtype=torch.float32, device=device)
         self._out = torch.empty(1, dtype=torch.int32, device=device)
+        if device.type == "cuda" and self.cascade and self.fold:
+            self.fold = self._fold_matches(k, device)
         if device.type == "cuda" and screen_graph_enabled():
             # The captured one-row screen is the gated one (depth gate): allocate
             # the gate first so the graph captures its address.
@@ -300,13 +447,13 @@ class DraftHeadScreen:
             try:
                 self._h.zero_()
                 for _ in range(2):
-                    self._out.copy_(self._greedy_row(self._h, gated=True))
+                    self._greedy_row(self._h, gated=True, out=self._out)
                 torch.cuda.synchronize(device)
                 self.graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(
                     self.graph, pool=torch.cuda.graph_pool_handle()
                 ):
-                    self._out.copy_(self._greedy_row(self._h, gated=True))
+                    self._greedy_row(self._h, gated=True, out=self._out)
                 torch.cuda.synchronize(device)
             except Exception as exc:
                 self.graph = None
@@ -314,16 +461,111 @@ class DraftHeadScreen:
             if gate is not None:
                 gate.zero_()  # the warm-up rows above may have counted or stopped
         logger.info(
-            "MTP draft-head screen: %d of %d groups, %d candidates, cascade=%s, graph=%s",
+            "MTP draft-head screen: %d of %d groups, %d candidates, cascade=%s, "
+            "fused_topk=%s, graph=%s",
             SCREEN_FRAC_GROUPS, ng, self.cand_logits.numel(), self.cascade,
-            self.graph is not None,
+            self.fused_topk, self.graph is not None,
         )
 
-    def _greedy_row(self, h: torch.Tensor, gated: bool = False) -> torch.Tensor:
+    def _fold_matches(self, k: int, device: torch.device) -> bool:
+        """Load time, before capture: the folded cascade against the unfolded one on
+        random rows, bitwise on every stage's scores and on the token."""
+        try:
+            gen = torch.Generator(device=device)
+            gen.manual_seed(1234)
+            for _ in range(3):
+                h = torch.randn(k, generator=gen, device=device) * 2.0
+                outs = []
+                for fold in (True, False):
+                    self.fold = fold
+                    tok = self._greedy_row(h)
+                    outs.append([tok.clone(), self.scores.clone(),
+                                 self.refine_scores.clone(), self.cand_logits.clone()])
+                for a, b in zip(*outs):
+                    if not torch.equal(a.view(torch.int32), b.view(torch.int32)):
+                        logger.warning("MTP screen: folded gathers differ; unfolded path kept")
+                        return False
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("MTP screen: folded gathers unavailable (%r)", exc)
+            return False
+        finally:
+            self.fold = True
+
+    def _greedy_row(
+        self, h: torch.Tensor, gated: bool = False, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """One row h [K] float32: the cascade (or the single screen) and the
-        argmax tie rule. Every buffer it touches is fixed-address, so the body
-        is capturable as-is."""
-        if self.cascade:
+        argmax tie rule, written to out (a fresh int32 scalar when None). Every
+        buffer it touches is fixed-address, so the body is capturable as-is."""
+        if out is None:
+            out = torch.empty((), dtype=torch.int32, device=h.device)
+        if self.cascade and self.fused_topk:
+            # LOCAL PATCH (cudafast-nemotron35): the same cascade with the two
+            # index_select gathers in one launch and each segmented torch.topk
+            # (+ chunk offset / + gather) in one launch that writes the id list
+            # torch.topk(sorted=False) returns, in torch's order (_chunk_topk).
+            # Same candidate ids in the same order, so every rows_dot, the
+            # selection and the depth gate see identical inputs.
+            _gather_two[(1,)](
+                h, self.coarse_cols, self._hc, self.cols, self._hs,
+                NA=self.coarse_cols.numel(), NB=self.cols.numel(),
+                launch_pdl=mtp_pdl(),
+            )
+            _rows_dot(
+                self._hc, self.w_coarse, self.s_coarse, None,
+                self.gscale, self.scores, False, gated,
+            )
+            nchunk = self.n // SCREEN_CHUNK
+            _chunk_topk[(nchunk,)](
+                self.scores, self.scores, self._coarse_cand,
+                N=SCREEN_CHUNK, K=CASCADE_PER, GATHER=False,
+                num_warps=8, launch_pdl=mtp_pdl(),
+            )
+            _rows_dot(
+                self._hs, self.w_scr, self.s_scr, self._coarse_cand,
+                self.gscale, self.refine_scores, True, gated,
+            )
+            _chunk_topk[(nchunk,)](
+                self.refine_scores, self._coarse_cand, self._cand,
+                N=CASCADE_PER, K=SCREEN_PER, GATHER=True,
+                num_warps=4, launch_pdl=mtp_pdl(),
+            )
+            cand = self._cand
+        elif self.cascade and self.fold:
+            # The same arithmetic as the unfolded cascade below, with the column
+            # gathers of h, the chunk offsets and the candidate gather done as
+            # index arithmetic inside the dot and select kernels.
+            _rows_dot(
+                h, self.w_coarse, self.s_coarse, None,
+                self.gscale, self.scores, False, gated, hcols=self.coarse_cols,
+            )
+            coarse_idx = self.scores.view(-1, SCREEN_CHUNK).topk(
+                CASCADE_PER, dim=-1, sorted=False
+            ).indices
+            _rows_dot(
+                h, self.w_scr, self.s_scr, coarse_idx,
+                self.gscale, self.refine_scores, True, gated, hcols=self.cols,
+                rmode=1, cper=CASCADE_PER,
+            )
+            refined = self.refine_scores.view(-1, CASCADE_PER).topk(
+                SCREEN_PER, dim=-1, sorted=False
+            ).indices
+            _rows_dot(
+                h, self.w_full, self.s_full, coarse_idx, self.gscale, self.cand_logits,
+                True, gated, ref=refined, rmode=2, cper=CASCADE_PER, sper=SCREEN_PER,
+            )
+            gate, ok = _gate_args(out)
+            _select_token[(1,)](
+                self.cand_logits, coarse_idx, out, N=self.cand_logits.numel(),
+                BLOCK=triton.next_power_of_2(self.cand_logits.numel()),
+                gate_ptr=gate, GATED=gated and ok, THETA=DEPTH_THETA,
+                launch_pdl=mtp_pdl(),
+                ref=refined, TWO_LEVEL=True, CHUNK=SCREEN_CHUNK, CPER=CASCADE_PER,
+                SPER=SCREEN_PER,
+            )
+            return out
+        elif self.cascade:
             hc = h.index_select(0, self.coarse_cols)
             _rows_dot(
                 hc, self.w_coarse, self.s_coarse, None,
@@ -360,7 +602,6 @@ class DraftHeadScreen:
         _rows_dot(
             h, self.w_full, self.s_full, cand, self.gscale, self.cand_logits, True, gated
         )
-        out = torch.empty((), dtype=torch.int32, device=h.device)
         gate, ok = _gate_args(out)
         _select_token[(1,)](
             self.cand_logits, cand, out, N=self.cand_logits.numel(),

@@ -135,12 +135,21 @@ class NemotronHMLP(nn.Module):
         self.act_fn = ReLUSquaredActivation()
 
     def forward(self, x: torch.Tensor):
+        return self.forward_down(self.forward_up(x))
+
+    # LOCAL PATCH (cudafast-nemotron35): the two halves of forward, so the
+    # shared-expert runner can queue the down projection later on its stream
+    # (runner/shared_experts.py); forward is exactly forward_down(forward_up(x)).
+    def forward_up(self, x: torch.Tensor) -> torch.Tensor:
         fused = maybe_shared_up_relu2(self.up_proj, x)
         if fused is None:
             x, _ = self.up_proj(x)
             x = self.act_fn(x)
         else:
             x = fused
+        return x
+
+    def forward_down(self, x: torch.Tensor) -> torch.Tensor:
         x, _ = self.down_proj(x)
         return x
 

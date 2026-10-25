@@ -33,6 +33,7 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_update,
 )
 from vllm.model_executor.layers.mamba.ops.layernorm_gated import rms_norm_gated
+from vllm.model_executor.layers.mamba.ops.gated_norm_fp8 import maybe_gated_norm_fp8
 from vllm.model_executor.layers.mamba.ops.mamba_ssm_spec_replay import (
     selective_state_update_spec_replay,
     spec_replay_enabled,
@@ -620,7 +621,11 @@ class MambaMixer2(MambaBase, PluggableLayer):
         # SiLU is applied internally before normalization, unlike standard
         # norm usage
         gate = projected_states[..., : self.tped_intermediate_size]
-        hidden_states = self.norm(ssm_output, gate)
+        hidden_states = maybe_gated_norm_fp8(
+            self.norm, self.out_proj, ssm_output, gate
+        )
+        if hidden_states is None:
+            hidden_states = self.norm(ssm_output, gate)
 
         # 5. Final linear projection
         output, _ = self.out_proj(hidden_states)

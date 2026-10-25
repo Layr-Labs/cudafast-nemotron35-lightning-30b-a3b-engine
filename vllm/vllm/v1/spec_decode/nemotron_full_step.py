@@ -42,6 +42,27 @@ def _metadata(p, metadata):
     return tuple(result), buffers
 
 
+def _launch_ready_slot(p, slot, relay, kwargs, metadata, padded, events):
+    """Relay current plan readiness without blocking the graph's EH/QKV prefix.
+
+    The caller owns a retired slot: its external event cannot be re-recorded
+    while an earlier launch could still reach the captured attention wait.
+    No request tensors are read or copied by the relay stream.
+    """
+    main = torch.cuda.current_stream()
+    relay.wait_stream(main)
+    for event in events:
+        relay.wait_event(event)
+    slot['ready'].record(relay)
+    with set_forward_context(metadata, p.vllm_config, num_tokens=padded,
+                             cudagraph_runtime_mode=CUDAGraphMode.FULL,
+                             slot_mapping=p._get_slot_mapping(padded)):
+        outputs = slot['graph'](**kwargs)
+    slot['retired'].record(main)
+    slot['busy'] = True
+    return outputs
+
+
 def prepare(p):
     """Build the graph outside requests, preserving the existing padded model shape."""
     if getattr(p, '_nemo_full_attempted', False):
@@ -154,6 +175,9 @@ def prepare(p):
         p._nemo_full = (graph, padded, signature, _inputs(kwargs),
                         (outputs, private, metadata, zero_row))
         logger.info('Native MTP full-step graph prepared at padded=%d', padded)
+        from vllm.v1.spec_decode.nemotron_full_head import prepare as prepare_head
+        prepare_head(p, kwargs, metadata, slots, padded, used_rows,
+                     original_mode, gate)
     except Exception as exc:
         logger.warning('Native MTP full-step graph unavailable: %r', exc)
     finally:
@@ -164,12 +188,22 @@ def prepare(p):
 
 def maybe_run(p, kwargs, metadata, padded, batch_size):
     state = getattr(p, '_nemo_full', None)
-    if state is None or batch_size != 1 or padded != state[1]:
+    if (state is None or batch_size != 1 or padded != state[1]
+            or torch.cuda.is_current_stream_capturing()):
         return None
     graph, _, signature, inputs, _outputs = state
     if (BatchDescriptor(num_tokens=padded) not in graph.concrete_cudagraph_entries
             or _inputs(kwargs) != inputs or _metadata(p, metadata) != signature):
         return None
+    events = {}
+    for md in metadata.values():
+        event = getattr(md, "plan_ready_event", None)
+        if event is not None:
+            events[id(event)] = event
+    # Preserve the original full graph when the optional model+head is unavailable,
+    # with explicit ordering on the actual current plan event(s).
+    for event in events.values():
+        torch.cuda.current_stream().wait_event(event)
     with set_forward_context(metadata, p.vllm_config, num_tokens=padded,
                              cudagraph_runtime_mode=CUDAGraphMode.FULL,
                              slot_mapping=p._get_slot_mapping(padded)):

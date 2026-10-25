@@ -824,6 +824,12 @@ def _prefetch_ahead(ahead, rows: int) -> bool:
     """Queue the L2 prefetch of the projection that follows the attention kernel: the
     packed planes the 5-row verify reads (nemotron_h_attn_packed.py) when the
     projection has them, else its weight."""
+    native_sm = getattr(ahead, "_mtp_pk_sm", None)
+    if native_sm is not None:
+        queued = _l2pf.prefetch(native_sm, max_bytes=_l2pf.ATTN_BYTES * 2 // 3)
+        return _l2pf.prefetch(
+            ahead._mtp_pk_ex, max_bytes=_l2pf.ATTN_BYTES // 3
+        ) or queued
     planes = getattr(ahead, "_apk_planes", None)
     if planes is None or rows != 5:
         return _l2pf.prefetch(ahead.weight, max_bytes=_l2pf.ATTN_BYTES)

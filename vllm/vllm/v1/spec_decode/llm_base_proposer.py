@@ -840,7 +840,18 @@ class SpecDecodeBaseProposer:
                 slot_mapping=self._get_slot_mapping(input_batch_size),
             ):
                 ret_hidden_states = None
-                if getattr(self, "_nemo_full", None) is not None:
+                precomputed_draft_ids = None
+                if getattr(self, "_nemo_full_head", None) is not None:
+                    from vllm.v1.spec_decode.nemotron_full_head import maybe_run as run_head
+                    combined = run_head(
+                        self, model_kwargs, per_layer_attn_metadata,
+                        input_batch_size, batch_size,
+                        not self._enable_probabilistic_draft_probs
+                        or sampling_metadata.all_greedy)
+                    if combined is not None:
+                        ret_hidden_states, precomputed_draft_ids = combined
+                if (ret_hidden_states is None
+                        and getattr(self, "_nemo_full", None) is not None):
                     from vllm.v1.spec_decode.nemotron_full_step import maybe_run
                     ret_hidden_states = maybe_run(
                         self, model_kwargs, per_layer_attn_metadata,
@@ -854,9 +865,12 @@ class SpecDecodeBaseProposer:
                     last_hidden_states, hidden_states = ret_hidden_states
 
             hidden_states = hidden_states[:batch_size]
-            draft_token_ids, draft_probs = self._sample_draft_tokens(
-                last_hidden_states[:batch_size], sampling_metadata
-            )
+            if precomputed_draft_ids is not None:
+                draft_token_ids, draft_probs = precomputed_draft_ids, None
+            else:
+                draft_token_ids, draft_probs = self._sample_draft_tokens(
+                    last_hidden_states[:batch_size], sampling_metadata
+                )
             if draft_probs is not None:
                 assert draft_probs_list is not None
                 draft_probs_list.append(draft_probs)

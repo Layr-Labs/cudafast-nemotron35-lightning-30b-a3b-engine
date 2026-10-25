@@ -700,14 +700,21 @@ __global__ void __launch_bounds__(W * 32) down3_kernel(const Params p) {
 // loaded: one k row of a tile is one 32-byte sector), its 8 scale bytes and its two activation
 // words, through a register ring of R active groups.
 
+// Weight and scale streams are read once per verify: L2 evict_first, so the lines the l2pf
+// windows prefetch for the next kernels are not displaced by them. Same bytes.
+__device__ __forceinline__ uint64_t ef_policy() {
+  uint64_t pol;
+  asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
+  return pol;
+}
 __device__ __forceinline__ uint32_t ldg_u32(const void* p) {
   uint32_t v;
-  asm volatile("ld.global.nc.L1::no_allocate.u32 %0, [%1];\n" : "=r"(v) : "l"(p));
+  asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint.u32 %0, [%1], %2;\n" : "=r"(v) : "l"(p), "l"(ef_policy()));
   return v;
 }
 __device__ __forceinline__ uint2 ldg_u64(const void* p) {
   uint2 v;
-  asm volatile("ld.global.nc.L1::no_allocate.v2.u32 {%0,%1}, [%2];\n" : "=r"(v.x), "=r"(v.y) : "l"(p));
+  asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint.v2.u32 {%0,%1}, [%2], %3;\n" : "=r"(v.x), "=r"(v.y) : "l"(p), "l"(ef_policy()));
   return v;
 }
 __device__ __forceinline__ uint32_t ldg_u32_l1(const void* p) {  // activations: L2 resident, reused
@@ -1336,7 +1343,7 @@ __global__ void __launch_bounds__(WPC * 32) down7_kernel(const Params p) {
 // redistributes them through shared memory into down4's per-lane words. Same fragments and order.
 __device__ __forceinline__ uint4 ldg_v4(const void* p) {
   uint4 v;
-  asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];\n" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
+  asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint.v4.u32 {%0,%1,%2,%3}, [%4], %5;\n" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p), "l"(ef_policy()));
   return v;
 }
 template <int WPC, int R, int NH, int BM>

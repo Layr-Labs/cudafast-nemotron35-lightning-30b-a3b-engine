@@ -711,6 +711,19 @@ class NemotronHModel(nn.Module, EagleModelMixin):
                     if name is None:
                         name = f"{prefix}.layers.{i}.mixer.experts"
                     _l2pf.AHEAD_MOE[str(name)] = nxt.mixer.in_proj
+            # Source idea: 297e3412-dc4a-45ae-a0f1-b6c3afd76c1b. The
+            # prefetcher shares the existing window budget with this router.
+            for i in range(self.start_layer, self.end_layer - 1):
+                cur, nxt = self.layers[i], self.layers[i + 1]
+                gate = getattr(getattr(nxt, "mixer", None), "gate", None)
+                if not isinstance(nxt, NemotronHMoEDecoderLayer) or gate is None:
+                    continue
+                if isinstance(cur, NemotronHMambaDecoderLayer):
+                    _l2pf.AHEAD_GATE[str(cur.mixer.prefix)] = gate
+                elif isinstance(cur, NemotronHAttentionDecoderLayer):
+                    name = getattr(getattr(cur.mixer, "attn", None), "layer_name", None)
+                    if name is not None:
+                        _l2pf.AHEAD_GATE[str(name)] = gate
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
@@ -997,7 +1010,7 @@ class NemotronHForCausalLM(
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
-    def set_last_moe_row_src(self, row_src: torch.Tensor | None) -> bool:
+    def set_last_moe_row_src(self, row_src: torch.Tensor | None, lite: bool = False) -> bool:
         """Route every row of the last layer's MoE through row `row_src` (a
         1-element GPU index tensor), or restore per-row routing with None.
 
@@ -1022,6 +1035,9 @@ class NemotronHForCausalLM(
         if runner is None:
             return False
         runner.keep_m_row_src = row_src
+        # lite (a forward that samples one token and drafts nothing): that row is the
+        # only one computed (moe_runner._apply_quant_method).
+        runner.keep_m_lite = bool(lite) and row_src is not None
         return True
 
     def forward(

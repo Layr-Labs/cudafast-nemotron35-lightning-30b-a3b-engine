@@ -64,14 +64,15 @@ def _decode_word_ahead(sm_ptr, ex_ptr, base_ptr, ri_ptr, raw_ptr,
     coded = valid & (rid < 0)
     bs = tl.load(base_ptr + blk, mask=coded, other=0).to(tl.int32)
     flat = blk[None, :] * BK + kk[:, None]
-    sm = tl.load(sm_ptr + flat, mask=coded[None, :], other=0).to(tl.int32)
+    sm = tl.load(sm_ptr + flat, mask=coded[None, :], other=0,
+                 eviction_policy="evict_first").to(tl.int32)
     # Four bytes carry eight consecutive K nibbles. Each group loads one
     # aligned u32 and expands its eight nibbles locally, in original K order.
     group = tl.arange(0, BK // 8)
     nibble = tl.arange(0, 8)
     words = tl.load(ex_ptr.to(tl.pointer_type(tl.uint32))
                     + blk[None, :] * (BK // 8) + group[:, None],
-                    mask=coded[None, :], other=0)
+                    mask=coded[None, :], other=0, eviction_policy="evict_first")
     code = ((words[:, None, :] >> (4 * nibble[None, :, None])) & 15)
     code = tl.reshape(code, (BK, BN)).to(tl.int32)
     e = tl.where(code == 0, 0, bs[None, :] + code - 1)

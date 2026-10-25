@@ -45,17 +45,25 @@ struct Params {
   int iters;               // Marlin stripe length (k-tiles per block) in part 2
 };
 
+// Streamed weights are read once per call: L2 evict_first, so the lines the l2pf windows
+// prefetch for the next kernels are not displaced by them. Same bytes.
+__device__ __forceinline__ uint64_t ef_policy() {
+  uint64_t pol;
+  asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
+  return pol;
+}
+
 __device__ __forceinline__ uint4 ld_stream_v4(const uint4* p) {
   uint4 r;
-  asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];\n"
+  asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint.v4.u32 {%0,%1,%2,%3}, [%4], %5;\n"
                : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w)
-               : "l"(p));
+               : "l"(p), "l"(ef_policy()));
   return r;
 }
 
 __device__ __forceinline__ uint32_t ld_stream_u32(const uint32_t* p) {
   uint32_t r;
-  asm volatile("ld.global.nc.L1::no_allocate.u32 %0, [%1];\n" : "=r"(r) : "l"(p));
+  asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint.u32 %0, [%1], %2;\n" : "=r"(r) : "l"(p), "l"(ef_policy()));
   return r;
 }
 

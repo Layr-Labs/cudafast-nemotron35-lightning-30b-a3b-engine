@@ -538,6 +538,23 @@ class NemotronHMTP(nn.Module, SupportsPP):
 
         if not screen_enabled():
             return None
+        # LOCAL PATCH (cudafast-nemotron35): the screen's latency-bound tail prefetches the
+        # head of the next draft pass's packed qkv planes (l2pf DRAFT_NEXT); registered
+        # before the screen captures its graph.
+        try:
+            import l2pf as _l2pf
+        except ImportError:
+            _l2pf = None
+        if _l2pf is not None and getattr(_l2pf, "DRAFT_NEXT_BYTES", 0) > 0:
+            qkv = None
+            for name, module in self.model.named_modules():
+                if name.endswith("mixer.qkv_proj") and hasattr(module, "_mtp_pk_sm"):
+                    qkv = module
+                    break
+            if qkv is not None:
+                budget = _l2pf.DRAFT_NEXT_BYTES
+                _l2pf.DRAFT_NEXT[:] = [(qkv._mtp_pk_sm, budget * 2 // 3),
+                                       (qkv._mtp_pk_ex, budget - budget * 2 // 3)]
         try:
             return DraftHeadScreen(
                 self.vllm_config.model_config.model, self.lm_head.weight.device

@@ -843,12 +843,32 @@ def unified_attention_with_output(
     # of the following projection's weight into L2 on a side stream while the
     # (latency-bound) attention kernel runs, then rejoin. Moves no value.
     ahead = _l2pf.AHEAD.get(layer_name) if _l2pf is not None else None
-    pf = (
+    if (
         ahead is not None
         and query.shape[0] <= 8
-        and _l2pf.ATTN_BYTES > 0
-        and _l2pf.prefetch(ahead.weight, max_bytes=_l2pf.ATTN_BYTES)
-    )
+        and (hasattr(ahead, "_tgt_pk_sm") or hasattr(ahead, "_mtp_pk_sm"))
+    ):
+        # the projection reads its lossless 12-bit planes (nemotron_h_packed_attn.py):
+        # prefetch the same rows of both instead of the BF16 weight
+        from vllm.model_executor.models.nemotron_h_packed_attn import prefetch_planes
+
+        pf = False
+        if _l2pf.ATTN_BYTES > 0:
+            for plane, nbytes in prefetch_planes(ahead, _l2pf.ATTN_BYTES):
+                pf = _l2pf.prefetch(plane, max_bytes=nbytes) or pf
+    else:
+        pf = (
+            ahead is not None
+            and query.shape[0] <= 8
+            and _l2pf.ATTN_BYTES > 0
+            and _l2pf.prefetch(ahead.weight, max_bytes=_l2pf.ATTN_BYTES)
+        )
+    if pf:
+        # then the router weight of the MoE layer that follows (mamba_mixer2.py)
+        from vllm.model_executor.layers.mamba import mamba_mixer2 as _mm2
+
+        if _mm2._GATE_PF:
+            _l2pf.prefetch(_mm2.l2pf_gate_weight(layer_name))
     self.impl.forward(
         self,
         query,

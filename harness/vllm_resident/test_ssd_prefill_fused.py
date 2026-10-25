@@ -411,6 +411,11 @@ def fused_result(q, tl):
         LAST=q.last,
         INIT=q.initial,
         OUT=state,
+        FINAL_CACHE=None,
+        FINAL_INDEX=None,
+        WRITE_FINAL=False,
+        FS=(0, 0, 0, 0),
+        CACHE_SLOTS=0,
         H=q.h,
         N=q.n,
         RATIO=q.heads // q.groups,
@@ -664,7 +669,7 @@ class DispatchTests(unittest.TestCase):
         torch = torch_double()
         torch.empty = lambda shape, dtype, device: Tensor(np.empty(shape, np.float32))
         torch.accelerator = NS(device_index=lambda index: nullcontext())
-        ns.update(torch=torch, triton=NS(cdiv=lambda a, b: (a + b - 1) // b))
+        ns.update(torch=torch, os=os, triton=NS(cdiv=lambda a, b: (a + b - 1) // b))
         function(FUSED, "fused_prefill", ns)(
             q.x,
             q.b,

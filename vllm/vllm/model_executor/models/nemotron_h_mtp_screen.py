@@ -206,9 +206,12 @@ def _select_token(
         # not stopped, count this draft as kept, then stop the loop if its top-1
         # probability over the candidate logits is below THETA (NaN never stops it).
         if (tl.load(gate_ptr + 2) != 0) & (tl.load(gate_ptr) == 0):
-            tl.store(gate_ptr + 1, tl.load(gate_ptr + 1) + 1)
+            kept = tl.load(gate_ptr + 1)
+            tl.store(gate_ptr + 1, kept + 1)
             denom = tl.sum(tl.where(i < N, tl.exp(v - best), 0.0), axis=0)
-            if 1.0 / denom < THETA:
+            # Amortize each target verify over at least two proposal attempts.
+            # The stop threshold and target verifier are otherwise unchanged.
+            if (kept >= 1) & (1.0 / denom < THETA):
                 tl.store(gate_ptr, 1)
 
 

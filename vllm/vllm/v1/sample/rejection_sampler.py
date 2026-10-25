@@ -239,6 +239,57 @@ class RejectionSampler(nn.Module):
                 return False
         return True
 
+    def greedy_one_request(
+        self,
+        metadata: SpecDecodeMetadata,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        num_accepted: torch.Tensor,
+        verify_rows: torch.Tensor | None,
+        verify_rows_all: int,
+    ) -> SamplerOutput | None:
+        """LOCAL PATCH (cudafast-nemotron35): forward()'s greedy-argmax path for
+        one request with drafts, fused with the runner's draft masking at
+        verify_rows, its accepted-token count (written to num_accepted[0]) and
+        the verify_rows reset (rejection_greedy_one_request_kernel). Returns
+        None when the general path applies."""
+        if len(metadata.num_draft_tokens) != 1:
+            return None
+        k = metadata.num_draft_tokens[0]
+        if (
+            k < 1
+            or k != metadata.max_spec_len
+            or metadata.max_spec_len > MAX_SPEC_LEN
+            or logits.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+            or metadata.draft_token_ids.dtype != torch.int32
+            or metadata.draft_token_ids.numel() != k
+            or num_accepted.dtype != torch.int32
+            or (
+                verify_rows is not None
+                and (verify_rows.dtype != torch.int32 or verify_rows.numel() != 1)
+            )
+            or not self._can_use_greedy_argmax(sampling_metadata)
+        ):
+            return None
+        row_argmax = logits.argmax(dim=-1)
+        output_token_ids = torch.empty(
+            (1, k + 1), dtype=torch.int32, device=logits.device
+        )
+        rejection_greedy_one_request_kernel[(1,)](
+            output_token_ids,
+            num_accepted,
+            row_argmax,
+            metadata.target_logits_indices,
+            metadata.bonus_logits_indices,
+            metadata.draft_token_ids,
+            verify_rows if verify_rows is not None else output_token_ids,
+            K=k,
+            K_POW2=triton.next_power_of_2(k + 1),
+            HAS_VERIFY_ROWS=verify_rows is not None,
+            VERIFY_ROWS_ALL=verify_rows_all if verify_rows is not None else 0,
+        )
+        return SamplerOutput(sampled_token_ids=output_token_ids, logprobs_tensors=None)
+
     def _greedy_argmax_sample(
         self, logits: torch.Tensor, metadata: SpecDecodeMetadata
     ) -> SamplerOutput:
@@ -846,6 +897,57 @@ def rejection_greedy_sample_kernel(
             output_token_ids_ptr + req_idx * (max_spec_len + 1) + num_draft_tokens,
             bonus_token_id,
         )
+
+
+@triton.jit
+def rejection_greedy_one_request_kernel(
+    output_token_ids_ptr,  # [1, K + 1] int32
+    num_accepted_ptr,  # [>= 1] int32: number of output tokens
+    row_argmax_ptr,  # [num_logits_rows] int64
+    target_logits_indices_ptr,  # [K]
+    bonus_logits_indices_ptr,  # [1]
+    draft_token_ids_ptr,  # [K] int32
+    verify_rows_ptr,  # [1] int32 (HAS_VERIFY_ROWS)
+    K: tl.constexpr,
+    K_POW2: tl.constexpr,
+    HAS_VERIFY_ROWS: tl.constexpr,
+    VERIFY_ROWS_ALL: tl.constexpr,
+):
+    """LOCAL PATCH (cudafast-nemotron35): one greedy request in one launch.
+
+    The same values as the batch path for one request: the placeholder row,
+    draft slots at or past verify_rows - 1 read as -1 (the runner's
+    _reject_unverified_drafts), rejection_greedy_sample_kernel's
+    accept-until-mismatch loop and bonus token, the accepted-token count
+    (_update_states_after_model_execute's count of non-placeholder outputs),
+    and verify_rows reset to "every row valid"."""
+    offs = tl.arange(0, K_POW2)
+    tl.store(
+        output_token_ids_ptr + offs,
+        tl.full([K_POW2], -1, tl.int32),  # PLACEHOLDER_TOKEN_ID
+        mask=offs < K + 1,
+    )
+    if HAS_VERIFY_ROWS:
+        verify_rows = tl.load(verify_rows_ptr)
+    rejected = False
+    num_out = 0
+    for pos in tl.static_range(K):
+        if not rejected:
+            draft_token_id = tl.load(draft_token_ids_ptr + pos)
+            if HAS_VERIFY_ROWS:
+                draft_token_id = tl.where(pos >= verify_rows - 1, -1, draft_token_id)
+            row = tl.load(target_logits_indices_ptr + pos)
+            target_argmax_id = tl.load(row_argmax_ptr + row).to(tl.int32)
+            tl.store(output_token_ids_ptr + pos, target_argmax_id)
+            num_out += 1
+            rejected = draft_token_id != target_argmax_id
+    if not rejected:
+        row = tl.load(bonus_logits_indices_ptr)
+        tl.store(output_token_ids_ptr + K, tl.load(row_argmax_ptr + row).to(tl.int32))
+        num_out += 1
+    tl.store(num_accepted_ptr, num_out)
+    if HAS_VERIFY_ROWS:
+        tl.store(verify_rows_ptr, VERIFY_ROWS_ALL)
 
 
 # NOTE(woosuk): Avoid specialization to prevent unnecessary recompilation.

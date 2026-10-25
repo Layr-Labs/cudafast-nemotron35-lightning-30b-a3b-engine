@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashInfer."""
 
+import os
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
@@ -81,6 +82,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.utils import CpuGpuBuffer
+from vllm.v1.worker import block_table as _block_table
 
 FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT = 2048 * 1024 * 1024
 FLASHINFER_PREFILL_WORKSPACE_BYTES_PER_ELEM = 16
@@ -89,6 +91,9 @@ FP8_DTYPE = current_platform.fp8_dtype()
 FP4_DTYPE = torch.uint8
 
 logger = init_logger(__name__)
+
+# LOCAL PATCH (cudafast-nemotron35): see _compute_flashinfer_kv_metadata.
+_KV_INDICES_ON_CHANGE = os.environ.get("VLLM_FLASHINFER_KV_INDICES_ON_CHANGE", "1") != "0"
 
 # FULL CUDA graphs for uniform spec-decode verify batches on archs without
 # trtllm-gen attention (SM12x, e.g. GB10). The verify rows (1 + k per request)
@@ -643,6 +648,9 @@ class FlashInferMetadata:
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     kv_cache_spec: AttentionSpec
     reorder_batch_threshold: int = 1
+    # LOCAL PATCH (cudafast-nemotron35): inputs of the last device indptr and
+    # page-indices write (_compute_flashinfer_kv_metadata).
+    _kv_indices_key: tuple | None = None
 
     def __init__(
         self,
@@ -1148,27 +1156,46 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             dtype=np.int32,
             out=self.paged_kv_indptr.np[1 : num_reqs + 1],
         )
-        # NOTE(woosuk): Because self.paged_kv_indptr_cpu can be modified
-        # after this line (e.g., for cuda graphs), we need to copy the data to
-        # self.paged_kv_indptr_buffer to avoid race condition.
-        self.paged_kv_indptr_cpu_buffer[: num_reqs + 1] = self.paged_kv_indptr.cpu[
-            : num_reqs + 1
-        ]
-        paged_kv_indptr = self.paged_kv_indptr.gpu[: num_reqs + 1]
-        paged_kv_indptr.copy_(
-            self.paged_kv_indptr_cpu_buffer[: num_reqs + 1], non_blocking=True
-        )
-
-        # write self.paged_kv_indices inplace
         num_actual_pages = self.paged_kv_indptr.np[num_reqs]
-        paged_kv_indices = self.paged_kv_indices.gpu[:num_actual_pages]
-        _copy_page_indices_kernel[(num_reqs,)](
-            paged_kv_indices,
-            block_table_tensor,
-            block_table_tensor.stride(0),
-            paged_kv_indptr,
-            BLOCK_SIZE=1024,
-        )
+        # LOCAL PATCH (cudafast-nemotron35): the device indptr and page indices
+        # are a function of the per-request block counts and the block table
+        # rows. When the counts and the table's write generation
+        # (block_table.TABLE_GENERATION) equal this builder's previous build,
+        # both device buffers already hold these values (only this method
+        # writes them): skip their upload and gather.
+        # VLLM_FLASHINFER_KV_INDICES_ON_CHANGE=0 rebuilds them every time.
+        kv_key = None
+        if _KV_INDICES_ON_CHANGE and not torch.cuda.is_current_stream_capturing():
+            kv_key = (
+                _block_table.TABLE_GENERATION,
+                num_blocks_np.tobytes(),
+                block_table_tensor.data_ptr(),
+                tuple(block_table_tensor.stride()),
+            )
+        if kv_key is not None and kv_key == self._kv_indices_key:
+            paged_kv_indices = self.paged_kv_indices.gpu[:num_actual_pages]
+        else:
+            self._kv_indices_key = kv_key
+            # NOTE(woosuk): Because self.paged_kv_indptr_cpu can be modified
+            # after this line (e.g., for cuda graphs), we need to copy the data to
+            # self.paged_kv_indptr_buffer to avoid race condition.
+            self.paged_kv_indptr_cpu_buffer[: num_reqs + 1] = self.paged_kv_indptr.cpu[
+                : num_reqs + 1
+            ]
+            paged_kv_indptr = self.paged_kv_indptr.gpu[: num_reqs + 1]
+            paged_kv_indptr.copy_(
+                self.paged_kv_indptr_cpu_buffer[: num_reqs + 1], non_blocking=True
+            )
+
+            # write self.paged_kv_indices inplace
+            paged_kv_indices = self.paged_kv_indices.gpu[:num_actual_pages]
+            _copy_page_indices_kernel[(num_reqs,)](
+                paged_kv_indices,
+                block_table_tensor,
+                block_table_tensor.stride(0),
+                paged_kv_indptr,
+                BLOCK_SIZE=1024,
+            )
 
         # write self.paged_kv_last_page_len_cpu inplace
         paged_kv_last_page_len_np = seq_lens_np % page_size
@@ -1436,6 +1463,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     prefill_start : num_reqs + 1
                 ]
                 # Assign to slice to avoid cpu sync.
+                self._kv_indices_key = None  # this path rewrites the device indptr
                 paged_kv_indptr_prefill_gpu[:1] = 0
                 torch.cumsum(
                     num_blocks_per_req,

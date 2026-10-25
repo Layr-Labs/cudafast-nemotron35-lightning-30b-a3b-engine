@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
+import os
 from enum import Enum
 
 import numpy as np
@@ -15,6 +16,19 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.utils import CpuGpuBuffer
 
 logger = init_logger(__name__)
+
+# LOCAL PATCH (cudafast-nemotron35): commit_block_table sends the rows only when
+# they differ from the rows it last sent (the device table is written by nothing
+# else), and counts every device-table write in TABLE_GENERATION so a consumer
+# can tell that its earlier reads of the table are still current.
+# VLLM_BLOCK_TABLE_COMMIT_ON_CHANGE=0 sends the rows every step.
+_COMMIT_ON_CHANGE = os.environ.get("VLLM_BLOCK_TABLE_COMMIT_ON_CHANGE", "1") != "0"
+TABLE_GENERATION = 0
+
+
+def _table_written() -> None:
+    global TABLE_GENERATION
+    TABLE_GENERATION += 1
 
 
 def get_block_table_width(
@@ -211,9 +225,20 @@ class BlockTable:
         )
 
     def commit_block_table(self, num_reqs: int) -> None:
+        rows = self.block_table.np[:num_reqs]
+        if _COMMIT_ON_CHANGE and not torch.cuda.is_current_stream_capturing():
+            sent = getattr(self, "_committed_rows", None)
+            if sent is not None and sent.shape == rows.shape and np.array_equal(sent, rows):
+                return
+            self._committed_rows = rows.copy()
+        else:
+            self._committed_rows = None
+        _table_written()
         self.block_table.copy_to_gpu(num_reqs)
 
     def clear(self) -> None:
+        self._committed_rows = None
+        _table_written()
         self.block_table.gpu.fill_(0)
         self.block_table.cpu.fill_(0)
 

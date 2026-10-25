@@ -122,6 +122,20 @@ def depth_gate_begin(batch_size: int, all_greedy: bool) -> torch.Tensor | None:
     return g
 
 
+@triton.jit
+def _depth_gate_end_kernel(gate_ptr, vrows_ptr, VROWS_ALL: tl.constexpr, HAS_VROWS: tl.constexpr):
+    kept = tl.load(gate_ptr + 1)
+    if HAS_VROWS:
+        tl.store(vrows_ptr, tl.where(kept > 0, kept + 1, VROWS_ALL))
+    tl.store(gate_ptr, 0)
+    tl.store(gate_ptr + 2, 0)
+
+
+# One launch for depth_gate_end's integer updates (default on); 0 keeps the
+# five-op torch form. Same int32 values either way.
+_GATE_END_FUSED = os.environ.get("MTP_GATE_END_FUSED", "1") != "0"
+
+
 def depth_gate_end(gate: torch.Tensor) -> None:
     """End of the draft loop: verify rows = kept drafts + 1 (every row when nothing
     was counted), then the stop flag and the active mark cleared."""
@@ -130,6 +144,19 @@ def depth_gate_end(gate: torch.Tensor) -> None:
     except ImportError:
         smallk = None
     vrows = smallk.live_verify_rows(gate.device) if smallk is not None else None
+    if (
+        _GATE_END_FUSED
+        and gate.dtype == torch.int32
+        and gate.is_contiguous()
+        and (vrows is None or (vrows.dtype == torch.int32 and vrows.numel() == 1))
+    ):
+        _depth_gate_end_kernel[(1,)](
+            gate,
+            gate if vrows is None else vrows,
+            VROWS_ALL=0 if vrows is None else smallk.VROWS_ALL,
+            HAS_VROWS=vrows is not None,
+        )
+        return
     if vrows is not None:
         kept = gate[1:2]
         vrows.copy_(

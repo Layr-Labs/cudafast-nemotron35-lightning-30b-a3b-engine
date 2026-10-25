@@ -2,7 +2,6 @@
 """Exact BF16 small-M attention projections streamed from the lossless 12-bit codec planes."""
 
 import ctypes
-import os
 from pathlib import Path
 
 import torch
@@ -11,8 +10,6 @@ SHAPES = {(4608, 2688), (2688, 4096)}
 _lib = None
 _load_failed = False
 _ready_devices = set()
-_pdl_devices = set()
-_PDL = os.environ.get("APK12_PDL", "1") != "0"
 # Codec plane [n, k] -> (n/32, 4 warps, 8 columns, k/64, step j, half h, t, pair p) ->
 # (tile, group, warp, lane = 4 * column + t, byte 4j + 2h + p): K = 64G + 16j + 8h + 2t + p.
 _ORDER = (0, 3, 1, 2, 6, 4, 5, 7)
@@ -28,11 +25,6 @@ def _load():
         lib.apk12_init.restype = ctypes.c_int
         lib.apk12_run.argtypes = [ctypes.c_void_p] * 7 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
         lib.apk12_run.restype = ctypes.c_int
-        if hasattr(lib, "apk12_init_pdl") and hasattr(lib, "apk12_run_pdl"):
-            lib.apk12_init_pdl.argtypes = []
-            lib.apk12_init_pdl.restype = ctypes.c_int
-            lib.apk12_run_pdl.argtypes = [ctypes.c_void_p] * 7 + [ctypes.c_int] * 5 + [ctypes.c_void_p]
-            lib.apk12_run_pdl.restype = ctypes.c_int
         lib.apk12_check.argtypes = [ctypes.c_void_p] * 7 + [ctypes.c_int] * 2 + [ctypes.c_void_p]
         lib.apk12_check.restype = ctypes.c_int
         _lib = lib
@@ -52,19 +44,6 @@ def ready(device) -> bool:
             if _lib.apk12_init():
                 return False
             _ready_devices.add(index)
-    return True
-
-
-def ready_pdl(device) -> bool:
-    """Optional ABI loaded before capture; the parent separately probes it in a child."""
-    if not _PDL or not ready(device) or not hasattr(_lib, "apk12_init_pdl"):
-        return False
-    with torch.cuda.device(device):
-        index = torch.cuda.current_device()
-        if index not in _pdl_devices:
-            if _lib.apk12_init_pdl():
-                return False
-            _pdl_devices.add(index)
     return True
 
 
@@ -94,17 +73,13 @@ def check(cp, w: torch.Tensor, n: int, k: int) -> int:
     return int(bad.item())
 
 
-def gemm(x: torch.Tensor, cp, n: int, k: int, pdl: bool = False, ring: int = 4) -> torch.Tensor:
+def gemm(x: torch.Tensor, cp, n: int, k: int) -> torch.Tensor:
     """x @ W.T for the W that pack() laid out in cp; x is [1..8, k] BF16 with unit K stride."""
     if x.stride(0) % 2 or x.data_ptr() % 4:
         x = x.clone(memory_format=torch.contiguous_format)
     y = torch.empty((x.shape[0], n), device=x.device, dtype=torch.bfloat16)
-    if pdl and (not _PDL or x.device.index not in _pdl_devices):
-        raise RuntimeError("apk12 PDL was not admitted before capture")
-    op = _lib.apk12_run_pdl if pdl else _lib.apk12_run
-    args = (x.data_ptr(), *(t.data_ptr() for t in cp), y.data_ptr(),
-            x.shape[0], n, k, x.stride(0))
-    rc = op(*args, ring, _stream(x)) if pdl else op(*args, _stream(x))
+    rc = _lib.apk12_run(x.data_ptr(), *(t.data_ptr() for t in cp), y.data_ptr(),
+                        x.shape[0], n, k, x.stride(0), _stream(x))
     if rc:
         raise RuntimeError(f"apk12 launch failed: {rc}, M={x.shape[0]}, N={n}, K={k}")
     return y

@@ -16,18 +16,9 @@ arch=${arch%+PTX}
 sm=${arch/./}
 "$nvcc" --version | tail -n 2
 # No --use_fast_math: the reduction must stay the MMA's fp32 accumulation and one RN rounding.
-# Only the official worker executes this build. Keep the original reference ABI if
-# this toolchain cannot compile the optional PDL ABI; production then keeps record Triton.
-rm -f "$out/libapk12.so"
-for flags in "" "-DAPK12_NO_PDL"; do
-  # shellcheck disable=SC2086
-  if "$nvcc" -O3 -std=c++17 -shared -Xcompiler -fPIC -lineinfo $flags \
-    -gencode "arch=compute_${sm},code=sm_${sm}" \
-    -Xptxas -v -o "$out/libapk12.so" "$here/csrc/apk12.cu"; then
-    break
-  fi
-  rm -f "$out/libapk12.so"
-done
-test -f "$out/libapk12.so" || { echo "apk12: build failed" >&2; exit 1; }
+"$nvcc" -O3 -std=c++17 -shared -Xcompiler -fPIC -lineinfo \
+  -gencode "arch=compute_${sm},code=sm_${sm}" \
+  -Xptxas -v \
+  -o "$out/libapk12.so" "$here/csrc/apk12.cu"
 cp "$here/py/__init__.py" "$out/__init__.py"
 echo "apk12: built $out/libapk12.so for sm_${sm}"

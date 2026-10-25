@@ -137,23 +137,3 @@ Scales, dequant, MMA operands, segments and every fp32 add are unchanged.
 `MARLINX_ZS=0` disables it. `tests/marlinx_zs_exact.py` compares against stock
 Marlin and marlinx on all 23 layers (M = 1..8, synthetic and real dumped
 activations, signed zeros, CUDA graph replay with in-place inputs).
-
-## Unit-major scale copy for lm_head (MARLINX_SU)
-
-Marlin's scale tensor is `[K/16][N]` bytes, so a 64-feature half column reads 64 bytes
-per k16 block at an N-byte stride. For lm_head (N = 131072) that is 22 MB of 64-byte
-requests: a loads-only variant of the kernel streams the 176 MB of weights alone in
-750 us but needs ~890 us with the scale reads (cold, M = 5, isolated). `prepare()` makes a
-`[N/64][K/16][64]` byte copy of the scales (`su_repack`, a byte permutation, +22 MB) and
-the kernel stages its half column's 10.75 KB of scales in shared memory with coalesced
-reads at CTA start (before `griddepcontrol.wait` under PDL: scales are weights), then
-reads them from shared memory. Values, operand placement and every fp32 operation are
-unchanged. `MARLINX_SU` is a comma list (`lm` default; `down`, `up` also supported;
-`0` disables). For the shared expert (one wave of 42-58 CTAs) the staging latency is not
-hidden and it is slower in isolation (up 31.1 -> 33.3 us, down 37.0 -> 39.6-43 us), so it
-stays off there.
-
-Isolated lm_head M = 5 cold: 893-909 -> 836-844 us; in a profiled decode step 0.868 ->
-0.809 ms. `tests/marlinx_su_exact.py`: lm_head and all 23 shared down (with and without
-the zero-row skip copy) and up (relu2) projections, M = 1..8, three activation kinds,
-PDL and ordinary launch, bitwise equal to stock Marlin / marlinx (4096 cases).

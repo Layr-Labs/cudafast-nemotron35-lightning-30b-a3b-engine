@@ -55,118 +55,19 @@ class EpilogueArithmetic : public UnfusedEpilogueArithmetic<
 """
 
 
-# LOCAL PATCH (cudafast-nemotron35, bw-humming): address-local claim-when-free
-# tile scheduler for the w13 kernels. Upstream humming hands CTA c the output
-# tiles c, c + G, c + 2G, ... of the persistent grid G (a static schedule: a CTA
-# that starts late, e.g. beside the shared expert, or that drew more tiles,
-# leaves a tail). Here every CTA claims its next tile from one atomic counter
-# when it becomes free, in the same global order (m block major, i.e. expert by
-# expert in ascending weight address, n block minor, so the CTAs in flight
-# stream the same K rows of a few adjacent experts). Only WHICH CTA computes a
-# tile and WHEN changes: every tile is still computed by exactly one CTA over
-# all K blocks in ascending order with the same epilogue (no stream-K), so each
-# output element's fp32 chain and its rounding are unchanged.
-# The counters are module globals: the last CTA to finish claiming resets them,
-# so every launch (eager or graph replay) starts from zero.
-_DYN_SCHEDULER = r"""
-#define Scheduler HummingStaticScheduler
-#include <humming/scheduler.cuh>
-#undef Scheduler
-
-__device__ uint32_t hm_dyn_claim = 0;
-__device__ uint32_t hm_dyn_done = 0;
-
-template <
-    class SharedStorage,
-    class ProblemShape, class BlockShape,
-    class LayerConfig, class ComputeConfig, class TuningConfig>
-class Scheduler : public HummingStaticScheduler<
-    SharedStorage, ProblemShape, BlockShape, LayerConfig, ComputeConfig, TuningConfig> {
-  using Base = HummingStaticScheduler<
-      SharedStorage, ProblemShape, BlockShape, LayerConfig, ComputeConfig, TuningConfig>;
-  static_assert(!TuningConfig::kUseStreamK);
-  static_assert(!TuningConfig::kUseWarpSpec);
-  static_assert(TuningConfig::kMultiCastSizeA * TuningConfig::kMultiCastSizeB == 1);
-  static_assert(ComputeConfig::kGemmType == GemmType::INDEXED);
-  static constexpr uint32_t N_BLOCKS = ProblemShape::N / BlockShape::N;
-  static constexpr uint32_t K_BLOCKS = ProblemShape::K / BlockShape::K;
-  uint32_t total_tiles;
-
- public:
-  CUDA_INLINE
-  Scheduler(
-      SharedStorage &smem, const void *output_ptr, CUtensorMap *tensor_map_buffer,
-      uint32_t shape_m, uint32_t top_k, const uint32_t *row_index_blocks, const uint32_t *expert_ids,
-      const uint32_t *num_tokens_padded_ptr, const uint32_t *expert_layout_ptr, bool use_int64_expert_layout)
-      : Base(smem, output_ptr, tensor_map_buffer, shape_m, top_k, row_index_blocks, expert_ids,
-             num_tokens_padded_ptr, expert_layout_ptr, use_int64_expert_layout) {
-    total_tiles = CEIL_DIV(num_tokens_padded_ptr[0], BlockShape::M) * N_BLOCKS;
-  }
-
-  CUDA_INLINE
-  bool get_next_block() {
-    // The claim is broadcast through the row-index staging slot that
-    // fetch_moe_index_block refills right after (no static shared memory: it
-    // would shift the dynamic shared memory base off its 128-byte alignment).
-    uint32_t *slot = this->smem.wr_row_index;
-    if (threadIdx.x == 0) slot[0] = atomicAdd(&hm_dyn_claim, 1u);
-    __syncthreads();
-    const uint32_t tile = slot[0];
-    __syncthreads();
-    if (tile >= total_tiles) {
-      if (threadIdx.x == 0) {
-        if (atomicAdd(&hm_dyn_done, 1u) == gridDim.x - 1) {
-          atomicExch(&hm_dyn_claim, 0u);
-          atomicExch(&hm_dyn_done, 0u);
-        }
-      }
-      return false;
-    }
-    this->m_block_id = tile / N_BLOCKS;
-    this->n_block_id = tile % N_BLOCKS;
-    this->k_block_id = 0;
-    this->slice_iters = K_BLOCKS;
-    this->fetch_moe_index_block();
-    return true;
-  }
-};
-"""
-
-
-def _dyn_enabled() -> bool:
-    return os.environ.get("HUMMING_W13_DYN", "1") != "0"
-
-
-def _dyn_num_sms(lo: int, hi: int, num_sms: int) -> int:
-    """Persistent grid (SMs x CTAs per SM) of the claim-when-free kernels: the
-    prefill entry may take every SM's slots, since a CTA that only becomes
-    resident once the shared expert's CTA leaves just claims fewer tiles."""
-    if hi >= (1 << 29):
-        return int(os.environ.get("HUMMING_W13_DYN_PF_SMS", "48"))
-    return int(os.environ.get("HUMMING_W13_DYN_DEC_SMS", "44"))
-
-
 class Relu2HummingKernel(HummingKernel):
-    dyn_scheduler = False
-
     def prepare(self):
         marker = "#if "
         at = self.code.index(marker)
-        extra = _DYN_SCHEDULER if self.dyn_scheduler else ""
-        self.code = self.code[:at] + extra + _EPILOGUE + self.code[at:]
+        self.code = self.code[:at] + _EPILOGUE + self.code[at:]
         super().prepare()
-
-
-class DynRelu2HummingKernel(Relu2HummingKernel):
-    dyn_scheduler = True
 
 
 _CACHE = {}
 
 # Separate class AND config cache: KernelRuntime interns by class/config.
 _EVICT_CACHE = {}
-# Scheduler variants (_variant_key) whose evict-first kernel failed: stock retained.
-_EVICT_FAILED = set()
+_EVICT_FAILED = False
 _EVICT_PREFIX = r"""
 #include <humming/utils/all.cuh>
 template<bool C, typename T>
@@ -210,25 +111,8 @@ class EvictFirstRelu2HummingKernel(Relu2HummingKernel):
         super().prepare()
 
 
-# Both the claim-when-free scheduler and the evict-first B/BS loader: the
-# evict-first loader text is inserted first, then Relu2HummingKernel.prepare
-# adds the scheduler and epilogue right before the kernel header (each piece
-# is the same text as in its single-feature class). Its own class name keeps
-# KernelRuntime's interning (class name + config) apart from the other three.
-class DynEvictFirstRelu2HummingKernel(EvictFirstRelu2HummingKernel):
-    dyn_scheduler = True
-
-
-def _variant_key(dyn):
-    """Cache-key part of the scheduler variant: the claim-when-free kernels'
-    persistent grids come from the environment, so they are part of it."""
-    if not dyn:
-        return (False,)
-    return (True, _dyn_num_sms(0, 1 << 30, 0), _dyn_num_sms(0, 1, 0))
-
-
-def _prepare_stock(meta, compute_config, tuning_config, dyn):
-    key = (meta.to_str(), compute_config, tuning_config) + _variant_key(dyn)
+def _prepare_stock(meta, compute_config, tuning_config):
+    key = (meta.to_str(), compute_config, tuning_config)
     if key in _CACHE:
         return _CACHE[key]
     assert meta.a_dtype == dtypes.bfloat16 and meta.c_dtype == dtypes.bfloat16
@@ -248,9 +132,7 @@ def _prepare_stock(meta, compute_config, tuning_config, dyn):
         assert not config.get("use_f16_accum", False)
         params = lc | cc | config
         num_sms = params.pop("num_sms", 0)
-        if dyn:
-            num_sms = _dyn_num_sms(lo, hi, num_sms)
-        kernel = (DynRelu2HummingKernel if dyn else Relu2HummingKernel)(**params)
+        kernel = Relu2HummingKernel(**params)
         kernel.load_cubin()
         result.extend([lo, hi, kernel.kernel_id, num_sms])
     configs = torch.tensor(result, dtype=torch.int64, device="cpu")
@@ -258,15 +140,12 @@ def _prepare_stock(meta, compute_config, tuning_config, dyn):
     return configs
 
 
-def prepare(meta, compute_config, tuning_config, evict_first=False, dyn=None):
-    dyn = _dyn_enabled() if dyn is None else bool(dyn)
-    # The evict-first entry keeps the stock entry's num_sms (with dyn: the
-    # claim-when-free prefill grid) and replaces only its kernel id.
-    stock = _prepare_stock(meta, compute_config, tuning_config, dyn)
-    variant = _variant_key(dyn)
-    if not evict_first or variant in _EVICT_FAILED:
+def prepare(meta, compute_config, tuning_config, evict_first=False):
+    global _EVICT_FAILED
+    stock = _prepare_stock(meta, compute_config, tuning_config)
+    if not evict_first or _EVICT_FAILED:
         return stock
-    key = (meta.to_str(), compute_config, tuning_config) + variant
+    key = (meta.to_str(), compute_config, tuning_config)
     if key in _EVICT_CACHE:
         return _EVICT_CACHE[key]
     try:
@@ -285,14 +164,10 @@ def prepare(meta, compute_config, tuning_config, evict_first=False, dyn=None):
             assert config["block_shape"] == [64, 64, 32]
             params = lc | json.loads(compute_config) | config
             params.pop("num_sms", None)
-            kernel_cls = (DynEvictFirstRelu2HummingKernel if dyn
-                          else EvictFirstRelu2HummingKernel)
-            kernel = kernel_cls(**params)
+            kernel = EvictFirstRelu2HummingKernel(**params)
             kernel.load_cubin()
             # Exclude the stock-cubin singleton no-op before admitting the hint.
-            assert type(kernel) is kernel_cls
-            assert type(original) is (DynRelu2HummingKernel if dyn else Relu2HummingKernel)
-            assert ("hm_dyn_claim" in kernel.code) == dyn
+            assert type(kernel) is EvictFirstRelu2HummingKernel
             assert "createpolicy.fractional.L2::evict_first" in kernel.code
             assert "cp.async.cg.shared.global.L2::cache_hint" in kernel.code
             assert kernel.kernel_filename != original.kernel_filename
@@ -304,8 +179,8 @@ def prepare(meta, compute_config, tuning_config, evict_first=False, dyn=None):
         _EVICT_CACHE[key] = configs
         return configs
     except Exception as exc:
-        _EVICT_FAILED.add(variant)
-        logger.warning_once("humming evict-first unavailable (dyn=%s); using stock: %s", dyn, exc)
+        _EVICT_FAILED = True
+        logger.warning_once("humming evict-first unavailable; using stock: %s", exc)
         return stock
 
 
@@ -322,7 +197,6 @@ def forward_relu2(
     valid_shape_m,
     input_scale=None,
     nvsc=None,
-    dyn=None,
 ):
     meta = layer.humming_metas["w13"]
     assert inputs.dtype == outputs.dtype == torch.bfloat16 and input_scale is None
@@ -334,7 +208,7 @@ def forward_relu2(
 
         if humming_nvsc.launch(
             layer, inputs, outputs, compute_config, tuning_config, sorted_ids,
-            expert_ids, num_tokens_padded, top_k, valid_shape_m, dyn=dyn,
+            expert_ids, num_tokens_padded, top_k, valid_shape_m,
         ):
             return outputs
     configs = prepare(
@@ -342,7 +216,6 @@ def forward_relu2(
         evict_first=(inputs.shape[0] == 496 and top_k == 6
                      and valid_shape_m == 2976
                      and os.environ.get("HUMMING_EVICT_FIRST", "1") != "0"),
-        dyn=dyn,
     )
     return ops.launch_kernel(
         configs=configs,

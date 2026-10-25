@@ -1959,6 +1959,28 @@ class GPUModelRunner(
                 non_blocking=True,
             )
             return
+        # LOCAL PATCH (cudafast-nemotron35): one request continuing from the previous
+        # step with its drafts right after its sampled token (the batch-1 decode
+        # loop): the scatters below write input_ids[0] = prev sampled token and
+        # input_ids[1 : 1 + L] = its L drafts; two slice copies write the same
+        # values without uploading four index tensors.
+        if (
+            num_reqs == 1
+            and prev_indices == [0]
+            and sample_flattened_indices == [0]
+            and spec_flattened_indices == list(range(1, 1 + len(spec_flattened_indices)))
+            and prev_draft_token_indices == list(range(len(spec_flattened_indices)))
+            and (self._draft_token_ids is None or isinstance(self._draft_token_ids, torch.Tensor))
+        ):
+            self.input_ids.gpu[:1].copy_(
+                self.input_batch.prev_sampled_token_ids[:1, 0], non_blocking=True
+            )
+            n_spec = len(spec_flattened_indices)
+            if self._draft_token_ids is not None and n_spec:
+                self.input_ids.gpu[1 : 1 + n_spec].copy_(
+                    self._draft_token_ids.flatten()[:n_spec], non_blocking=True
+                )
+            return
         # Upload the index tensors asynchronously so the scatter can be non-blocking.
         sampled_tokens_index_tensor = torch.tensor(
             sample_flattened_indices, dtype=torch.int64, pin_memory=PIN_MEMORY

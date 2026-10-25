@@ -41,12 +41,9 @@ def activation(src, dst, N: tl.constexpr):
     i = tl.program_id(0) * 256 + tl.arange(0, 256)
     v = tl.load(src + i, mask=i < N, other=0)
     y = tl.inline_asm_elementwise(
-        """{ .reg .b16 lo, hi; .reg .f32 x, y;
- mov.b32 {lo, hi}, $1;
- cvt.f32.bf16 x, lo; cvt.f32.bf16 y, hi;
- max.NaN.f32 x, x, 0f00000000; max.NaN.f32 y, y, 0f00000000;
- mul.rn.f32 x, x, x; mul.rn.f32 y, y, y;
- cvt.rn.bf16x2.f32 $0, y, x; }""",
+        """{ .reg .b32 x, z;
+ mov.b32 z, 0; max.NaN.bf16x2 x, $1, z;
+ mul.rn.bf16x2 $0, x, x; }""",
         constraints="=r,r",
         args=[v],
         dtype=tl.int32,

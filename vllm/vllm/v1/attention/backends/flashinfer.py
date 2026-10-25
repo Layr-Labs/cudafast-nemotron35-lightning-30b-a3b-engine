@@ -23,7 +23,11 @@ from flashinfer import (
     BatchPrefillWithRaggedKVCacheWrapper,
     MultiLevelCascadeAttentionWrapper,
 )
-from flashinfer.page import get_seq_lens
+try:
+    from flashinfer.page import get_seq_lens
+except ImportError:
+    get_seq_lens = None
+    _FI_FAST_SPEC_PLAN = False
 from flashinfer.decode import fast_decode_plan, trtllm_batch_decode_with_kv_cache
 from flashinfer.prefill import trtllm_batch_context_with_kv_cache
 from flashinfer.utils import FP4Tensor
@@ -2417,6 +2421,14 @@ class FlashInferImpl(AttentionImpl):
 
 
 def _fast_plan_spec_prefill(wrapper, builder, **kw) -> None:
+    try:
+        _fast_plan_spec_prefill_impl(wrapper, builder, **kw)
+    except (AttributeError, TypeError, KeyError, ValueError, RuntimeError):
+        wrapper._vllm_fast_const = None
+        wrapper.plan(**kw)
+
+
+def _fast_plan_spec_prefill_impl(wrapper, builder, **kw) -> None:
     """plan() for a CUDA-graph spec prefill wrapper whose index buffers are
     the builder's persistent ones (see module patch note in the header of
     _FI_FAST_SPEC_PLAN). Falls back to the full plan when anything differs."""

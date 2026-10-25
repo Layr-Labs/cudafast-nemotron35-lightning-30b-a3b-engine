@@ -48,6 +48,8 @@ PZ_ENABLED = os.environ.get("PZSKIP", "1") != "0"
 PZ_CONFIG = int(os.environ.get("PZSKIP_CONFIG", "333"))
 PZ_BLOCK_M = 64  # humming's prefill bucket that pzskip replaces
 PZ_MAX_TOKENS = 8192
+PZ_PREALIGN = os.environ.get("PZSKIP_PREALIGN", "1") != "0"
+_side_streams: dict[int, torch.cuda.Stream] = {}
 
 ENABLED = os.environ.get("ZSKIP", "1") != "0"
 # kernel v4 (warp per 64-column tile, weights as the MMA A operand) on the "swap" repack
@@ -347,6 +349,60 @@ def _align(topk_ids: torch.Tensor, block_size: int):
     )
 
 
+def _side_stream(device: torch.device) -> torch.cuda.Stream:
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    st = _side_streams.get(idx)
+    if st is None:
+        st = _side_streams[idx] = torch.cuda.Stream(device=device)
+    return st
+
+
+def prealign(
+    layer: torch.nn.Module,
+    topk_ids: torch.Tensor,
+    num_tokens: int,
+    block_m: int | None,
+) -> tuple | None:
+    """Queues pzskip's alignment of topk_ids (block_rows(PZ_CONFIG) rows per expert block) on a
+    side stream and returns (stream, block, (sorted_ids, expert_ids, num_tokens_padded)), or
+    None when maybe_down would not use it (it then aligns in place as before). Decided from
+    shapes, the layer's load-time flags and the environment only."""
+    if not (PZ_PREALIGN and ENABLED and PZ_ENABLED and _pzskip is not None):
+        return None
+    if (
+        getattr(layer, "zskip_w2", None) is None
+        or not getattr(layer, "pzskip_ok", False)
+        or not (MAX_TOKENS < num_tokens <= PZ_MAX_TOKENS)
+        or block_m != PZ_BLOCK_M
+        or topk_ids.dim() != 2
+        or topk_ids.size(1) != TOP_K
+        or not topk_ids.is_cuda
+        or torch.compiler.is_compiling()
+    ):
+        return None
+    bm = _pzskip.block_rows(PZ_CONFIG)
+    if bm == PZ_BLOCK_M:
+        return None
+    cur = torch.cuda.current_stream(topk_ids.device)
+    side = _side_stream(topk_ids.device)
+    side.wait_stream(cur)
+    with torch.cuda.stream(side):
+        aligned = _align(topk_ids, bm)
+    return (side, bm, aligned)
+
+
+def _join_prealign(pre: tuple | None, device: torch.device) -> tuple[int, tuple] | None:
+    if pre is None:
+        return None
+    side, bm, aligned = pre
+    cur = torch.cuda.current_stream(device)
+    cur.wait_stream(side)
+    for t in aligned:
+        if isinstance(t, torch.Tensor):
+            t.record_stream(cur)
+    return bm, aligned
+
+
 def _fused_check(layer: torch.nn.Module) -> bool:
     """Decode-sized load-time check of FUSED_CONFIG. False keeps CONFIG (prefill already checked)."""
     try:
@@ -461,8 +517,11 @@ def maybe_down(
     block_m: int | None,
     moe_kwargs: dict[str, Any],
     topk_ids: torch.Tensor | None = None,
+    pre: tuple | None = None,
 ) -> bool:
-    """Runs the w2 GEMM with zskip and returns True, or returns False (caller runs humming)."""
+    """Runs the w2 GEMM with zskip and returns True, or returns False (caller runs humming).
+    pre: prealign()'s handle for this call; joined first, whatever path runs."""
+    pre = _join_prealign(pre, outputs.device)
     packed = getattr(layer, "zskip_w2", None)
     if packed is None or not ENABLED:
         return False
@@ -472,7 +531,7 @@ def maybe_down(
         and num_tokens <= PZ_MAX_TOKENS
         and block_m == PZ_BLOCK_M
         and getattr(layer, "pzskip_ok", False)
-        and _pz_down(layer, inputs, input_scale, outputs, num_tokens, top_k, moe_kwargs, topk_ids)
+        and _pz_down(layer, inputs, input_scale, outputs, num_tokens, top_k, moe_kwargs, topk_ids, pre)
     ):
         return True
     if prefill:
@@ -503,7 +562,10 @@ def maybe_down(
     ):
         return False
     if prefill:
-        sorted_ids, expert_ids, ntp = _align(topk_ids, PREFILL_BM)
+        if pre is not None and pre[0] == PREFILL_BM:
+            sorted_ids, expert_ids, ntp = pre[1]
+        else:
+            sorted_ids, expert_ids, ntp = _align(topk_ids, PREFILL_BM)
         _zskip.down(
             inputs,
             sorted_ids,
@@ -548,6 +610,7 @@ def _pz_down(
     top_k: int,
     moe_kwargs: dict[str, Any],
     topk_ids: torch.Tensor | None = None,
+    pre: tuple[int, tuple] | None = None,
 ) -> bool:
     """Prefill-sized w2 with pzskip (humming's block_m 64 calls); False: caller runs humming."""
     if top_k != TOP_K or input_scale is not None:
@@ -574,6 +637,8 @@ def _pz_down(
         sorted_ids = moe_kwargs["sorted_ids"]
         expert_ids = moe_kwargs["expert_ids"]
         ntp = moe_kwargs["num_tokens_padded"]
+    elif pre is not None and pre[0] == bm:
+        sorted_ids, expert_ids, ntp = pre[1]
     elif topk_ids is not None:
         sorted_ids, expert_ids, ntp = _align(topk_ids, bm)
     else:

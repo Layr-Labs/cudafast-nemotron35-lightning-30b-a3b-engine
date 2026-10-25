@@ -234,13 +234,15 @@ class VllmBackend:
             if out.request_id != self._live:
                 continue
             comp = out.outputs[0]
-            lps = comp.logprobs or [None] * len(comp.token_ids)
-            for token, lp in zip(comp.token_ids, lps):
-                top: tuple[tuple[int, float], ...] = ()
-                if lp:
-                    ranked = sorted(lp.items(), key=lambda kv: kv[1].logprob, reverse=True)
-                    top = tuple((int(t), float(v.logprob)) for t, v in ranked[:TOP_K])
-                emitted.append(Emit(int(token), top))
+            if comp.logprobs:
+                for token, lp in zip(comp.token_ids, comp.logprobs):
+                    top: tuple[tuple[int, float], ...] = ()
+                    if lp:
+                        ranked = sorted(lp.items(), key=lambda kv: kv[1].logprob, reverse=True)
+                        top = tuple((int(t), float(v.logprob)) for t, v in ranked[:TOP_K])
+                    emitted.append(Emit(int(token), top))
+            else:
+                emitted.extend(Emit(int(token), ()) for token in comp.token_ids)
         return emitted
 
     def start(

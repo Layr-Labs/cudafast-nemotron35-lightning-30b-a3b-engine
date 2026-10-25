@@ -17,6 +17,14 @@ APK_HD uint32_t apk_bits(uint32_t s, uint32_t c, uint32_t b) {
   return ((s & 0x80u) << 8) | (e << 7) | (s & 0x7Fu);
 }
 
+APK_HD int apk_group_batches(int groups, int width) {
+  return groups / width + (groups % width != 0);
+}
+
+APK_HD int apk_group_index(int batch, int offset, int width) {
+  return batch * width + offset;
+}
+
 // One lane's eight bf16x2 B registers for one 64-wide K group, lane t = lane % 4.
 // Register 2j+h holds K = 16j + 8h + 2t (low half) and that K + 1 (high half), the
 // .col B fragment of the group's k16 step j. Its two weights are byte 4j+2h and

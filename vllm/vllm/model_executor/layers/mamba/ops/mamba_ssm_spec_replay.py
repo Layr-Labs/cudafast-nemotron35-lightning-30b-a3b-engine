@@ -102,6 +102,14 @@ def spec_replay_lazy() -> bool:
     return value not in ("0", "false", "off", "no")
 
 
+def spec_replay_pipeline() -> bool:
+    """Issue the next replay token's ring loads before the current token's
+    update. Same fp32 expression and the same order on the state; A and dt_bias
+    are loop-invariant. VLLM_MAMBA_REPLAY_PIPELINE=0 restores the serial loads."""
+    value = os.environ.get("VLLM_MAMBA_REPLAY_PIPELINE", "1").strip().lower()
+    return value not in ("0", "false", "off", "no")
+
+
 def spec_replay_ring_len(num_spec: int) -> int:
     """Ring entries per request: any value >= 2 * num_spec + 1 is hazard-free;
     the lazy anchor replays up to LAZY_PERIOD - 1 tokens before the num_spec + 1
@@ -231,6 +239,7 @@ def _selective_scan_update_spec_replay_kernel(
     LAZY: tl.constexpr = False,
     LAZY_P: tl.constexpr = 20,
     SLOT_ELEMS: tl.constexpr = 0,
+    PIPELINE: tl.constexpr = False,
 ):
     # The dt/A of a head are scalars (stride-0 expansion over head_dim); that is
     # the only layout the Mamba2 decode path produces and the only one the
@@ -347,33 +356,71 @@ def _selective_scan_update_spec_replay_kernel(
 
     # Replay the accepted tokens 1..num_replay of the previous verify: the
     # reference's state update on the reference's inputs, no outputs.
-    for i_r in range(num_replay):
-        # Non-negative even for garbage metadata (dummy runs), so the address
-        # always stays inside slot 1's ring.
-        ring_pos = ((pos0 - num_replay + i_r) % rl + rl) % rl
-        x = tl.load(
-            ring_x_base + ring_pos * ring_stride_x + offs_m,
-            mask=(offs_m < dim) & ring_ok,
-            other=0.0,
-        ).to(tl.float32)
-        dt = tl.load(
-            ring_dt_base + ring_pos * ring_stride_dt, mask=ring_ok, other=0.0
-        ).to(tl.float32)
+    if PIPELINE:
+        A_s = tl.load(A_ptr).to(tl.float32)
         if HAS_DT_BIAS:
-            dt += tl.load(dt_bias_ptr).to(tl.float32)
-        if DT_SOFTPLUS:
-            dt = softplus(dt)
-        A = tl.load(A_ptr).to(tl.float32)
-        dA = fast_exp(A * dt)  # scalar, not a matrix
+            dt_bias_s = tl.load(dt_bias_ptr).to(tl.float32)
+        rmask_x = (offs_m < dim) & ring_ok
+        rmask_B = (offs_n < dstate) & ring_ok
+        live = num_replay > 0
+        ring_pos = ((pos0 - num_replay) % rl + rl) % rl
+        x_nx = tl.load(
+            ring_x_base + ring_pos * ring_stride_x + offs_m, mask=rmask_x & live, other=0.0
+        )
+        dt_nx = tl.load(ring_dt_base + ring_pos * ring_stride_dt, mask=ring_ok & live, other=0.0)
+        B_nx = tl.load(
+            ring_B_base + ring_pos * ring_stride_B + offs_n, mask=rmask_B & live, other=0.0
+        )
+        for i_r in range(num_replay):
+            x = x_nx.to(tl.float32)
+            dt = dt_nx.to(tl.float32)
+            B = B_nx.to(tl.float32)
+            more = i_r + 1 < num_replay
+            ring_pos = ((pos0 - num_replay + i_r + 1) % rl + rl) % rl
+            x_nx = tl.load(
+                ring_x_base + ring_pos * ring_stride_x + offs_m, mask=rmask_x & more, other=0.0
+            )
+            dt_nx = tl.load(
+                ring_dt_base + ring_pos * ring_stride_dt, mask=ring_ok & more, other=0.0
+            )
+            B_nx = tl.load(
+                ring_B_base + ring_pos * ring_stride_B + offs_n, mask=rmask_B & more, other=0.0
+            )
+            if HAS_DT_BIAS:
+                dt += dt_bias_s
+            if DT_SOFTPLUS:
+                dt = softplus(dt)
+            dA = fast_exp(A_s * dt)
+            dB = B * dt
+            state = state * dA + dB * x[:, None]
+    else:
+        for i_r in range(num_replay):
+            # Non-negative even for garbage metadata (dummy runs), so the address
+            # always stays inside slot 1's ring.
+            ring_pos = ((pos0 - num_replay + i_r) % rl + rl) % rl
+            x = tl.load(
+                ring_x_base + ring_pos * ring_stride_x + offs_m,
+                mask=(offs_m < dim) & ring_ok,
+                other=0.0,
+            ).to(tl.float32)
+            dt = tl.load(
+                ring_dt_base + ring_pos * ring_stride_dt, mask=ring_ok, other=0.0
+            ).to(tl.float32)
+            if HAS_DT_BIAS:
+                dt += tl.load(dt_bias_ptr).to(tl.float32)
+            if DT_SOFTPLUS:
+                dt = softplus(dt)
+            A = tl.load(A_ptr).to(tl.float32)
+            dA = fast_exp(A * dt)  # scalar, not a matrix
 
-        B = tl.load(
-            ring_B_base + ring_pos * ring_stride_B + offs_n,
-            mask=(offs_n < dstate) & ring_ok,
-            other=0.0,
-        ).to(tl.float32)
+            B = tl.load(
+                ring_B_base + ring_pos * ring_stride_B + offs_n,
+                mask=(offs_n < dstate) & ring_ok,
+                other=0.0,
+            ).to(tl.float32)
 
-        dB = B * dt
-        state = state * dA + dB * x[:, None]
+            dB = B * dt
+            state = state * dA + dB * x[:, None]
 
     if STORE_REPLAYED:
         # Test hook: the state this verify starts from (the reference's slot
@@ -711,4 +758,5 @@ def selective_state_update_spec_replay(
             LAZY=bool(lazy),
             LAZY_P=LAZY_PERIOD,
             SLOT_ELEMS=nheads * dim * dstate,
+            PIPELINE=spec_replay_pipeline(),
         )

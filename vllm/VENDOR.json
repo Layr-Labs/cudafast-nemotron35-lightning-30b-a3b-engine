@@ -246,6 +246,18 @@
     {
       "file": "model_executor/kernels/linear/nvfp4/marlin.py; model_executor/models/nemotron_h.py; model_executor/layers/fused_moe/runner/shared_experts.py; model_executor/layers/fused_moe/experts/humming_tuned_moe.py",
       "why": "shco: the shared expert of the 496-token prefill runs on shx (harness/kernels/shco), a small-footprint (1 CTA/SM) NVFP4 W4A16 GEMM bit-identical to Marlin up -> relu^2 -> Marlin down (Marlin's stripe segments, k-warp chains and fp32 fold order), queued on the shared-expert aux stream beside the routed experts; humming's prefill w13 keeps its accumulation chain on a 4 x 36 persistent grid (3 resident CTAs per SM) to leave each SM room for it. Tables built at load; SHCO=0 restores stock."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_screen.py:_chunk_topk/DraftHeadScreen",
+      "why": "On ENTIRE promoted adab284a-bf1d-4ce2-8e90-6720fa0f5435, preserve original AD5 torch-order floatkey and survivor/tie scatter; replace32 serial threshold reductions with8 masked4bit histograms and4warp coarse geometry. Uniformkeys fastpath uses exactmin/max threshold and stillwritesallK ids, especiallygateddrafts. Originalbinaryselector retained; officialremote model-load pairedold/new admission beforecapture, fallback onmismatch/unavailable, VLLM_MTP_RADIX_TOPK=0. No targetor draftscore arithmetic, groupcounts, policy, formats or localexecution changed. Performance and wholecorrectnessunverified."
+    },
+    {
+      "file": "v1/spec_decode/nemotron_full_step.py; llm_base_proposer.py",
+      "why": "On ENTIRE highest valid a549b8de-06b7-4f9a-bfd6-60a8ffd8f623 (2.269641928502321), prepare a complete later MTP-step model/attention graph only at startup. Preserve existing padded shape and per-step metadata planning; private real FIDecode warmup, input/slot/KV/wrapper signatures, private pool/strong output ownership, two private input cases compared to original execution, runtime replay only matching ready graph. Seed and screen graph unchanged; all execution officialremote."
+    },
+    {
+      "file": "harness/kernels/upskip; layers/fused_moe/experts/humming_upskip.py; fused_humming_moe.py; quantization/utils/humming_utils.py",
+      "why": "Select useful unscored e33865a7-9a79-4f65-aa02-48a547214e7a routed-up native load/MMA schedule, exactpublic200ea3f6f5a67ea677ec3403bc5125e6f3d63030. Preserve per-layer actualweight M1/4/5/8 equality and separate-timing 8% gate; remove unused preliminary pair timings. No source gain claimed; original failedstatic size, no numerical result. Optional standalone zskip tests preserved outside archive for bytecap; all production code and remote runtime selfchecks retained."
     }
   ]
 }

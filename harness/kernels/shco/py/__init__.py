@@ -1,8 +1,4 @@
-"""shco: probes (and later the replica) for co-running the shared expert beside the routed up.
-
-dummy(...) launches a compute-bound stand-in with the shared expert's MMA count on the current
-torch stream (see csrc/shco.cu for the modes). Nothing here is used by the engine.
-"""
+"""SHX shared-expert prefill. Unused standalone dummy-probe helpers omitted for source budget."""
 
 from __future__ import annotations
 
@@ -11,14 +7,7 @@ import os
 
 import torch
 
-__all__ = ["available", "load_error", "dummy", "dummy_attrs", "dummy_occupancy", "steps_for",
-           "marlin_units", "units_tensor", "shx_gemm", "shx_attrs", "shx2_attrs", "Shx"]
-
 LIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "libshco.so")
-
-# shared expert at M = 496: 2 GEMMs of 2 * 496 * 3712 * 2688 FLOP
-SHARED_FLOP_PER_LAYER = 2 * 2 * 496 * 3712 * 2688
-FLOP_PER_STEP = 8 * 2 * 16 * 8 * 16  # 8 mma.m16n8k16 per k16 step
 
 _lib = None
 _load_error: str | None = None
@@ -62,44 +51,6 @@ def available() -> bool:
 def load_error() -> str | None:
     _load()
     return _load_error
-
-
-def dummy_attrs(mode: int) -> dict:
-    lib = _load()
-    assert lib is not None, _load_error
-    out = (ctypes.c_int * 6)()
-    rc = lib.shco_dummy_attrs(mode, out)
-    if rc != 0:
-        raise RuntimeError(f"shco_dummy_attrs({mode}) failed: {rc}")
-    return {"regs": out[0], "static_smem": out[1], "max_threads": out[2], "local_bytes": out[3],
-            "binary_version": out[4], "max_dynamic_smem": out[5]}
-
-
-def dummy_occupancy(mode: int, threads: int) -> int:
-    lib = _load()
-    assert lib is not None, _load_error
-    n = ctypes.c_int(0)
-    rc = lib.shco_dummy_occupancy(mode, threads, ctypes.byref(n))
-    if rc != 0:
-        raise RuntimeError(f"shco_dummy_occupancy failed: {rc}")
-    return n.value
-
-
-def steps_for(grid: int, threads: int, flop: int = SHARED_FLOP_PER_LAYER) -> int:
-    nwarps = grid * (threads // 32)
-    return -(-flop // (FLOP_PER_STEP * nwarps))
-
-
-def dummy(mode: int, grid: int, threads: int, steps: int, seed: torch.Tensor, out: torch.Tensor,
-          wbuf: torch.Tensor | None = None, ld_every: int = 1) -> None:
-    lib = _load()
-    assert lib is not None, _load_error
-    assert seed.dtype == torch.int32 and seed.numel() >= 1024 and out.dtype == torch.float32
-    wptr, wvecs = (None, 0) if wbuf is None else (wbuf.data_ptr(), wbuf.numel() * wbuf.element_size() // 16)
-    rc = lib.shco_dummy(mode, grid, threads, steps, ld_every, wptr, wvecs, seed.data_ptr(), out.data_ptr(),
-                        torch.cuda.current_stream().cuda_stream)
-    if rc != 0:
-        raise RuntimeError(f"shco_dummy failed: {rc}")
 
 
 # ---------------------------------------------------------------------------------------- shx

@@ -87,6 +87,80 @@ def moe_fused_mul_sum_kernel(
     )
 
 
+@triton.jit
+def moe_fused_mul_sum_shared_kernel(
+    inputs_ptr,
+    topk_weights_ptr,
+    outputs_ptr,
+    top_ids_ptr,
+    expert_map_ptr,
+    num_tokens,
+    stride_m,
+    shared_ptr,
+    has_expert_map: tl.constexpr,
+    top_k: tl.constexpr,
+    size: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    launch_pdl: tl.constexpr = False,
+    add_shared: tl.constexpr = False,
+):
+    # LOCAL PATCH (cudafast-nemotron35): programmatic dependent launch. Wait for the
+    # producer grid before any load; signal dependents once every load is issued.
+    # Same loads, same fp32 accumulation order, same store.
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+    pid_k = tl.program_id(0)
+    pid_m = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+
+    m_mask = offs_m < num_tokens
+    k_mask = offs_k < size
+    mask = m_mask[:, None] & k_mask[None, :]
+
+    a_base = inputs_ptr + (offs_m * stride_m)[:, None] + offs_k[None, :]
+    b_base = topk_weights_ptr + offs_m * top_k
+
+    acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+
+    for n in tl.static_range(top_k):
+        b_val = tl.load(b_base + n, mask=m_mask, other=0.0).to(tl.float32)
+        if has_expert_map:
+            id_val = tl.load(top_ids_ptr + offs_m * top_k + n, mask=m_mask, other=0)
+            expert_mask = tl.load(expert_map_ptr + id_val) >= 0
+            a_vec = tl.load(
+                a_base + n * size,
+                mask=mask & expert_mask[:, None],
+                other=0.0,
+            ).to(tl.float32)
+        else:
+            a_vec = tl.load(
+                a_base + n * size,
+                mask=mask,
+                other=0.0,
+            ).to(tl.float32)
+        acc += a_vec * b_val[:, None]
+
+    rounded = acc.to(outputs_ptr.dtype.element_ty)
+    if add_shared:
+        shared = tl.load(shared_ptr + (offs_m * size)[:, None] + offs_k[None, :],
+                         mask=mask, other=0.0)
+        # Preserve both BF16 roundings AND the original shared + routed order.
+        rounded = (shared.to(tl.float32) + rounded.to(tl.float32)).to(
+            outputs_ptr.dtype.element_ty)
+    out_ptrs = outputs_ptr + (offs_m * size)[:, None] + offs_k[None, :]
+    if add_shared:
+        tl.store(out_ptrs, rounded, mask=mask)
+        if launch_pdl:
+            tl.extra.cuda.gdc_launch_dependents()
+    else:
+        if launch_pdl:
+            tl.extra.cuda.gdc_launch_dependents()
+        tl.store(out_ptrs, rounded, mask=mask)
+
+
 def _heuristic_config(
     num_tokens: int,
     top_k: int,
@@ -156,12 +230,77 @@ def _heuristic_config(
     return BLOCK_M, BLOCK_K, num_warps, num_stages
 
 
+_SHARED_FOLD_CHECKED: dict = {}
+
+
+def can_fold_shared(inputs, outputs, shared, expert_map=None):
+    """Metadata-only gate plus sticky private remote admission, never request data."""
+    if (os.environ.get('VLLM_SHARED_ADD_FOLD', '1') == '0'
+            or isinstance(inputs, FakeTensor) or shared is None
+            or expert_map is not None or not inputs.is_cuda
+            or inputs.dtype != torch.bfloat16 or outputs.dtype != inputs.dtype
+            or shared.dtype != inputs.dtype or inputs.ndim != 3
+            or shared.shape != outputs.shape
+            or shared.shape != (inputs.shape[0], inputs.shape[2])
+            or not shared.is_contiguous() or not outputs.is_contiguous()
+            or shared.device != inputs.device or outputs.device != inputs.device
+            or inputs.shape[0] > 8 or inputs.shape[1:] != (6, 2688)):
+        return False
+    key = (inputs.device, inputs.dtype, inputs.shape[1], inputs.shape[2])
+    if key in _SHARED_FOLD_CHECKED:
+        return _SHARED_FOLD_CHECKED[key]
+    if torch.cuda.is_current_stream_capturing():
+        return False
+    # No prompt/model activation is inspected. Failed admission stays failed;
+    # unsupported configurations keep the original combine and separate add.
+    _SHARED_FOLD_CHECKED[key] = False
+    try:
+        gen = torch.Generator(device=inputs.device).manual_seed(4386528)
+        for m in range(1, 9):
+            for case in range(4):
+                a = torch.randn((m, 6, 2688), generator=gen,
+                                device=inputs.device, dtype=torch.float32)
+                b = torch.randn((m, 6), generator=gen,
+                                device=inputs.device, dtype=torch.float32)
+                s = torch.randn((m, 2688), generator=gen,
+                                device=inputs.device, dtype=torch.float32)
+                if case < 3:
+                    scale = (0.001, 1.0, 32.0)[case]
+                    a = (a * scale).to(torch.bfloat16)
+                    s = (s * scale).to(torch.bfloat16)
+                else:
+                    bits = torch.tensor([0, -32768, 1, -32767, 0x3f80, -16512,
+                                         0x7f7f, -129, 0x7f80, -128,
+                                         0x7fc0, -64],
+                                        dtype=torch.int16, device=inputs.device)
+                    a = bits.repeat((m * 6 * 2688 + 11) // 12)
+                    a = a[:m * 6 * 2688].view(torch.bfloat16).reshape(m, 6, 2688)
+                    s = bits.flip(0).repeat((m * 2688 + 11) // 12)
+                    s = s[:m * 2688].view(torch.bfloat16).reshape(m, 2688)
+                original = moe_fused_mul_sum(a, b)
+                reference = s + original
+                actual = torch.empty_like(reference)
+                bm, bk, nw, ns = _heuristic_config(m, 6, 2688, a.element_size())
+                moe_fused_mul_sum_shared_kernel[(triton.cdiv(2688, bk), triton.cdiv(m, bm))](
+                    a, b, actual, None, None, m, 6 * 2688, s,
+                    False, 6, 2688, bm, bk, num_warps=nw, num_stages=ns,
+                    launch_pdl=_pdl_enabled(), add_shared=True)
+                if not torch.equal(actual.view(torch.int16), reference.view(torch.int16)):
+                    raise RuntimeError('shared add differs from original BF16 sum + add')
+        _SHARED_FOLD_CHECKED[key] = True
+        return True
+    except Exception as exc:
+        print(f'SHARED_ADD_FOLD rejected; original add retained: {exc!r}', flush=True)
+        return False
+
+
 def moe_fused_mul_sum(
     inputs: torch.Tensor,
     topk_weights: torch.Tensor,
     outputs: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
     expert_map: torch.Tensor | None = None,
+    shared: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Fused kernel for MoE (Mixture of Experts) to perform weighted summation
@@ -197,6 +336,15 @@ def moe_fused_mul_sum(
 
     assert outputs.shape == output_shape
     assert topk_weights.shape == (num_tokens, top_k)
+
+    if can_fold_shared(inputs, outputs, shared, expert_map):
+        bm, bk, nw, ns = _heuristic_config(
+            num_tokens, top_k, size, inputs.element_size())
+        moe_fused_mul_sum_shared_kernel[(triton.cdiv(size, bk), triton.cdiv(num_tokens, bm))](
+            inputs, topk_weights, outputs, topk_ids, expert_map,
+            num_tokens, top_k * size, shared, False, top_k, size, bm, bk,
+            num_warps=nw, num_stages=ns, launch_pdl=_pdl_enabled(), add_shared=True)
+        return outputs
 
     if not isinstance(inputs, FakeTensor):
         BLOCK_M, BLOCK_K, num_warps, num_stages = _heuristic_config(

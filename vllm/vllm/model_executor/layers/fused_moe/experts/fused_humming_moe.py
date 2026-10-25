@@ -849,13 +849,36 @@ class HummingIndexedExperts(HummingExpertsBase):
         if l2pf_pending:
             _l2pf.join(down_output.device)
 
+        # Optional ordered shared add: the lease keeps the original buffer
+        # owned until metadata/private admission accepts the combined store.
+        lease = None
+        shared = None
+        if expert_map is None and topk_ids.size(0) <= 8:
+            from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+                deferred_shared_lease,
+            )
+            from vllm.model_executor.layers.fused_moe.moe_fused_mul_sum import (
+                can_fold_shared,
+            )
+            lease = deferred_shared_lease()
+            if lease is not None and can_fold_shared(
+                    buffers["down_output"].view(*topk_ids.shape, -1),
+                    output, lease[2], expert_map):
+                shared = lease[2]
+
         moe_fused_mul_sum(
             inputs=buffers["down_output"].view(*topk_ids.shape, -1),
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             expert_map=expert_map,
             outputs=output,
+            shared=shared,
         )
+        if shared is not None:
+            from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+                commit_deferred_shared,
+            )
+            commit_deferred_shared(lease)
 
 
 class HummingGroupedExperts(HummingExpertsBase):

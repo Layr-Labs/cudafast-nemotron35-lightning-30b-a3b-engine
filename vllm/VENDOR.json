@@ -342,6 +342,10 @@
     {
       "file": "vllm/v1/spec_decode/nemotron_decode_plan.py (+ llm_base_proposer.py, v1/attention/backends/flashinfer.py)",
       "why": "Own native-MTP FA2 planning-state bank on ENTIRE0e71. Remote startup records original native plan vector, integer prefix and scalar state for each EXACT CPU indptr/last-page/options input, across up to128generic page counts with every valid residue, capped64MiB of plan bytes. Integer-tail/float-arena canaries guard actual installed planner writes; no page-invariance or package-source-equality assumption. Changed private model/hidden/token/gate/KV/live indices/CPU metadata and complete side-stream model-step timing admission mandatory. Only then copy native planning state; current indices/last-page buffers still refreshed. Unknown keys/identities/options fall back before mutation. No request capture or inference output cache. NEMO_MTP_NATIVE_PLAN_BANK=0 disables. Private qualification lineage6cafa6b6-8f26-4ef5-86e1-38c061a207d7 andce5aa6bd-15c2-42c2-8a68-4bc2fe65c23b; no lower tailgraph or L1 runtime imported."
+    },
+    {
+      "file": "harness/kernels/l2pf/{csrc/l2pf.cu,py/__init__.py}; model_executor/layers/fused_moe/experts/fused_humming_moe.py",
+      "why": "The same MoE l2pf window also queues an L2 prefetch of the checkpointed SSM state the following Mamba layer's lazy verify loads first (l2pf_prefetch_anchor: checkpoint k = max(pos0 - L, 0) // LAZY_PERIOD, slot 0 for even k and slot 2 for odd k, with L the prompt-length word and pos0 = seq_lens[0] - (query_start_loc[1] - query_start_loc[0]), all read on the device). Moves no value. L2PF_SSM_ANCHOR=0 disables."
     }
   ]
 }

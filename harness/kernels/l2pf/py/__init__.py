@@ -18,7 +18,7 @@ import torch
 __all__ = [
     "LIB_PATH", "ENABLED", "MAMBA_BYTES", "ATTN_BYTES", "MOE_BYTES", "DRAFT_BYTES",
     "AHEAD", "AHEAD_MOE", "DRAFT_SCREEN",
-    "prefetch", "join",
+    "prefetch", "join", "prefetch_fp8c_out",
 ]
 
 LIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "libl2pf.so")
@@ -44,6 +44,7 @@ AHEAD_MOE: dict[str, torch.nn.Module] = {}
 # Previous Mamba/attention op -> the actual following target MoE router.
 AHEAD_GATE: dict[str, torch.nn.Module] = {}
 _GATE_PREFETCH = os.environ.get("L2PF_GATE", "1") != "0"
+_FP8C_TILE_PREFETCH = os.environ.get("L2PF_FP8C_TILES", "1") != "0"
 
 _lib = None
 _side: dict[int, torch.cuda.Stream] = {}
@@ -65,6 +66,14 @@ def _load():
         lib.l2pf_prefetch3.restype = ctypes.c_int
     except AttributeError:
         pass  # Older library: retain the original per-range launch ABI.
+    tiled = getattr(lib, "l2pf_prefetch_fp8c_out", None)
+    if tiled is not None:
+        tiled.argtypes = [
+            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p,
+            ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,
+            ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+        ]
+        tiled.restype = ctypes.c_int
     _lib = lib
     return lib
 
@@ -125,6 +134,81 @@ def gate_weight(layer_name: str, budget: int) -> tuple[torch.Tensor | None, int]
     if reserved <= 0:
         return None, 0
     return weight, reserved
+
+
+def _fp8c_out_plan(t: torch.Tensor | None, budget: int):
+    """Bounded immutable ranges for each verified fp8c out-projection tile.
+
+    The marker is installed by fp8c.prepare only after its exhaustive native
+    byte check. Cover every tile's header, at least six main chunks (all
+    supported ring depths), and its entire exception tail, within the same
+    total projection-byte budget as the old contiguous-head prefetch.
+    """
+    if (
+        t is None or not isinstance(budget, int) or budget <= 0
+        or not t.is_cuda or t.dtype != torch.uint8 or t.ndim != 2
+        or t.shape[0] != 84 or not t.is_contiguous()
+        or t.data_ptr() % 128
+        or getattr(t, "_fp8c_prefetch_layout", None)
+        != (1, 2688, 4096, 384, 3584, 32, t.data_ptr())
+    ):
+        return None
+    tiles, stride = t.shape
+    tail_offset = 384 + 32 * 3584
+    # The producer admits <=93% of 32*4096 raw bytes per tile; both the
+    # complete tile and its tail are 128-byte aligned after encoding.
+    if stride % 128 or not tail_offset < stride <= 121856:
+        return None
+    storage = t.untyped_storage()
+    if storage.data_ptr() != t.data_ptr() or storage.nbytes() != tiles * stride:
+        return None
+    tail_bytes = stride - tail_offset
+    per_tile = min(budget, tiles * stride) // tiles // 128 * 128
+    chunks = min(32, (per_tile - tail_bytes - 384) // 3584)
+    if chunks < 6:
+        return None
+    prefix_bytes = 384 + chunks * 3584
+    return tiles, stride, prefix_bytes, tail_offset, tail_bytes
+
+
+def prefetch_fp8c_out(
+    t: torch.Tensor | None, gate: torch.Tensor | None = None,
+    gate_bytes: int = 0, max_bytes: int = 0,
+) -> bool:
+    """Distribute the existing out-projection budget across all 84 CTAs.
+
+    Header/main prefix and the disjoint raw-exception tail are both needed
+    by the decoder's initial ring. The router keeps its existing reservation,
+    and one side-stream fork, one 128-thread launch and the caller's join are
+    preserved. Unsupported metadata/old libraries keep the original policy.
+    """
+    fallback = ((gate, gate_bytes), (t, max_bytes))
+    tiled = getattr(_lib, "l2pf_prefetch_fp8c_out", None) if _lib is not None else None
+    if not ENABLED or not _FP8C_TILE_PREFETCH or tiled is None:
+        return prefetch_many(fallback)
+    plan = _fp8c_out_plan(t, max_bytes)
+    if plan is None:
+        return prefetch_many(fallback)
+    gate_ptr, gate_size = 0, 0
+    if gate is not None and gate_bytes > 0:
+        if not gate.is_cuda or gate.device != t.device:
+            return prefetch_many(fallback)
+        storage = gate.untyped_storage()
+        gate_ptr = storage.data_ptr()
+        gate_size = min(storage.nbytes(), gate_bytes)
+        if gate_ptr % 16 or gate_size % 16:
+            return prefetch_many(fallback)
+    tiles, stride, prefix_bytes, tail_offset, tail_bytes = plan
+    main = torch.cuda.current_stream(t.device)
+    side = _side_stream(t.device)
+    side.wait_stream(main)
+    rc = tiled(
+        gate_ptr, gate_size, t.data_ptr(), stride, prefix_bytes,
+        tail_offset, tail_bytes, tiles, CHUNK, side.cuda_stream,
+    )
+    if rc != 0:
+        raise RuntimeError(f"l2pf_prefetch_fp8c_out failed: {rc}")
+    return True
 
 
 def prefetch_many(ranges) -> bool:

@@ -20,16 +20,104 @@ from triton.experimental.gluon import language as tl
 from triton.experimental.gluon.language import BlockedLayout, SliceLayout
 
 
+_WORD_LOAD = os.environ.get("MTP_PACK12_WORDLOAD", "1") != "0"
+_WORD_OK: dict[int, bool] = {}
+_WORD_KERNEL_OK: set[tuple[int, int]] = set()
+
+
+def _device_index(device):
+    return device.index if device.index is not None else torch.cuda.current_device()
+
+
+def word_load_enabled(device):
+    return _WORD_LOAD and _WORD_OK.get(_device_index(device), False)
+
+
+def _admit_word_decode(packed, original, counter):
+    """Official remote load only: exhaustive real-weight bits and kernel samples.
+
+    Any ordinary compiler/runtime/check failure disables this optional word
+    specialization for this device. No original BF16 tensor is newly retained.
+    """
+    if not _WORD_LOAD:
+        return
+    dev = _device_index(original.device)
+    if _WORD_OK.get(dev) is False:
+        return
+    try:
+        counter.zero_()
+        n = original.numel()
+        verify_decoded[(triton.cdiv(n, 4096),)](
+            *packed.planes, original.view(torch.uint16), counter, n, 4096,
+            WORD=True, num_warps=4,
+        )
+        if int(counter.item()) != 0:
+            raise RuntimeError("word decoder differs from original BF16 bits")
+        kernel_key = (dev, packed.shape[-1])
+        if kernel_key not in _WORD_KERNEL_OK:
+            _word_kernel_probe(packed, original)
+            _WORD_KERNEL_OK.add(kernel_key)
+        _WORD_OK[dev] = True
+    except Exception as exc:
+        _WORD_OK[dev] = False
+        print(f"MTP_PACK12_WORDLOAD unavailable, original byte loader kept: {exc!r}",
+              flush=True)
+
+
+def _word_kernel_probe(packed, original):
+    """Same layout/order, private real-weight prefix, bytewise old/new kernels."""
+    k = packed.shape[-1]
+    n = min(64, original.numel() // k)
+    if n < 8:
+        raise RuntimeError("insufficient rows for optional word-kernel admission")
+    gen = torch.Generator(device=original.device).manual_seed(56103)
+    gate = torch.zeros(3, dtype=torch.int32, device=original.device)
+    ids = torch.zeros(1, dtype=torch.int32, device=original.device)
+    for scale in (0.001, 1.0, 32.0):
+        x = (torch.randn((5, k), dtype=torch.float32, generator=gen,
+                         device=original.device) * scale).to(torch.bfloat16)
+        outputs = []
+        for word in (False, True):
+            a = x.new_empty((1, n))
+            packed_gemv[(triton.cdiv(n, 8),)](
+                x, *packed.planes, a, n, k, k, gate, BN=8, BK=512,
+                EVICT=True, WORD=word, num_warps=4, num_stages=3,
+            )
+            b = x.new_empty((5, n))
+            packed_small[(triton.cdiv(n, 64),)](
+                x, *packed.planes, b, 5, n, k, x.stride(0), b.stride(0), gate,
+                WORD=word, num_warps=4, num_stages=4,
+            )
+            c = x.new_empty((2, 2))
+            packed_moe_up[(1, 2)](
+                x, *packed.planes, *packed.planes, ids, c, 2, k,
+                2 * k, k, k, gate, TOPK=1, BN=2, BK=1024, EVICT=True,
+                WN=2, WORD=word, num_warps=8, num_stages=3,
+            )
+            outputs.append((a, b, c))
+        if any(not torch.equal(a.view(torch.int16), b.view(torch.int16))
+               for a, b in zip(*outputs)):
+            raise RuntimeError("word specialization differs from original kernel")
+
+
 @gluon.jit
-def load_packed(SM, EX, BASE, RI, RAW, index, mask, EVICT:tl.constexpr=True):
+def load_packed(SM, EX, BASE, RI, RAW, index, mask, EVICT:tl.constexpr=True,
+                WORD:tl.constexpr=False):
     bid = index // 128
     # Escape blocks are supplied entirely by RAW. Read their metadata first,
     # so they do not also stream unused sign/mantissa and exponent planes.
     rawid = tl.load(RI + bid, mask=mask, other=-1, eviction_policy='evict_first' if EVICT else '')
     coded = mask & (rawid < 0)
     sm = tl.load(SM + index, mask=coded, other=0, eviction_policy='evict_first' if EVICT else '').to(tl.uint16)
-    nib = tl.load(EX + index // 2, mask=coded, other=0, eviction_policy='evict_first' if EVICT else '').to(tl.uint16)
-    code = (nib >> ((index % 2)*4)) & 15
+    if WORD:
+        words = EX.to(tl.pointer_type(tl.uint32))
+        word = tl.load(words + index // 8, mask=coded, other=0,
+                       eviction_policy='evict_first' if EVICT else '')
+        code = ((word >> ((index % 8).to(tl.uint32) * 4)) & 15).to(tl.uint16)
+    else:
+        nib = tl.load(EX + index // 2, mask=coded, other=0,
+                      eviction_policy='evict_first' if EVICT else '').to(tl.uint16)
+        code = (nib >> ((index % 2)*4)) & 15
     base = tl.load(BASE + bid, mask=coded, other=1, eviction_policy='evict_first' if EVICT else '').to(tl.uint16)
     exp = tl.where(code == 0, 0, base + code - 1)
     bits = ((sm & 128) << 8) | (exp << 7) | (sm & 127)
@@ -56,7 +144,8 @@ def stopped_zero(ptrs, mask, lay:tl.constexpr, BN:tl.constexpr):
 @gluon.jit
 def packed_gemv(x_ptr, SM, EX, BASE, RI, RAW, y_ptr, N, K, stride_wn,
                 gate_ptr, BN:tl.constexpr, BK:tl.constexpr, EVICT:tl.constexpr,
-                GATED:tl.constexpr=False, launch_pdl:tl.constexpr=False):
+                GATED:tl.constexpr=False, launch_pdl:tl.constexpr=False,
+                WORD:tl.constexpr=False):
     if launch_pdl:
         pdl_prologue()
     layout:tl.constexpr=BlockedLayout([1,8],[1,32],[2,2],[1,0])
@@ -74,7 +163,7 @@ def packed_gemv(x_ptr, SM, EX, BASE, RI, RAW, y_ptr, N, K, stride_wn,
     for k0 in range(0,K,BK):
         kk=k0+offs_k
         kmask=kk<K
-        w=load_packed(SM,EX,BASE,RI,RAW,offs_n[:,None]*stride_wn+kk[None,:],wn[:,None]&kmask[None,:],EVICT=EVICT)
+        w=load_packed(SM,EX,BASE,RI,RAW,offs_n[:,None]*stride_wn+kk[None,:],wn[:,None]&kmask[None,:],EVICT=EVICT,WORD=WORD)
         x=tl.load(x_ptr+kk,mask=kmask,other=0.0)
         acc+=w.to(tl.float32)*x[None,:].to(tl.float32)
     y=tl.sum(acc,axis=1)
@@ -86,7 +175,7 @@ def packed_moe_up(x_ptr, SM, EX, BASE, RI, RAW, SSM, SEX, SBASE, SRI, SRAW,
                    ids_ptr,h_ptr,I,K,stride_we,stride_wn,stride_wsn,gate_ptr,
                    TOPK:tl.constexpr,BN:tl.constexpr,BK:tl.constexpr,EVICT:tl.constexpr,
                    GATED:tl.constexpr=False, launch_pdl:tl.constexpr=False,
-                   WN:tl.constexpr=2):
+                   WN:tl.constexpr=2, WORD:tl.constexpr=False):
     if launch_pdl:
         pdl_prologue()
     # WN warps along N, 4 along K: the K layout (8 x 32 x 4), and with it every
@@ -114,9 +203,9 @@ def packed_moe_up(x_ptr, SM, EX, BASE, RI, RAW, SSM, SEX, SBASE, SRI, SRAW,
         kk=k0+offs_k
         kmask=kk<K
         if j<TOPK:
-            w=load_packed(SM,EX,BASE,RI,RAW,wbase+kk[None,:],wn[:,None]&kmask[None,:],EVICT=EVICT)
+            w=load_packed(SM,EX,BASE,RI,RAW,wbase+kk[None,:],wn[:,None]&kmask[None,:],EVICT=EVICT,WORD=WORD)
         else:
-            w=load_packed(SSM,SEX,SBASE,SRI,SRAW,wbase+kk[None,:],wn[:,None]&kmask[None,:],EVICT=EVICT)
+            w=load_packed(SSM,SEX,SBASE,SRI,SRAW,wbase+kk[None,:],wn[:,None]&kmask[None,:],EVICT=EVICT,WORD=WORD)
         x=tl.load(x_ptr+kk,mask=kmask,other=0.0)
         acc+=w.to(tl.float32)*x[None,:].to(tl.float32)
     h=tl.maximum(tl.sum(acc,axis=1),0.0)
@@ -125,9 +214,10 @@ def packed_moe_up(x_ptr, SM, EX, BASE, RI, RAW, SSM, SEX, SBASE, SRI, SRAW,
 
 
 @gluon.jit
-def verify_decoded(SM,EX,BASE,RI,RAW,W,COUNTER,N:tl.constexpr,B:tl.constexpr):
+def verify_decoded(SM,EX,BASE,RI,RAW,W,COUNTER,N:tl.constexpr,B:tl.constexpr,
+                   WORD:tl.constexpr=False):
     ix=tl.program_id(0)*B+tl.arange(0,B,layout=BlockedLayout([1],[32],[4],[0]))
-    actual=load_packed(SM,EX,BASE,RI,RAW,ix,ix<N).to(tl.uint16,bitcast=True)
+    actual=load_packed(SM,EX,BASE,RI,RAW,ix,ix<N,WORD=WORD).to(tl.uint16,bitcast=True)
     expected=tl.load(W+ix,mask=ix<N,other=0)
     bad=tl.sum(((actual!=expected)&(ix<N)).to(tl.int32),axis=0)
     tl.atomic_add(COUNTER,bad,sem='relaxed')
@@ -215,6 +305,7 @@ def pack_bf16(w):
     bad = int(counter.item())
     if bad:
         raise RuntimeError(f"MTP lossless pack failed: {bad}/{n} decoded BF16 bits differ")
+    _admit_word_decode(packed, w, counter)
     print(f"MTP_PACK12 tensor shape={packed.shape} values={n} mismatches=0 "
           f"raw_bytes={2*n} packed_bytes={packed.nbytes} escapes={count}", flush=True)
     return packed
@@ -234,7 +325,8 @@ def _packed_linear_impl(
         y = x.new_empty((1, n))
         packed_gemv[(triton.cdiv(n, 8),)](
             x, *p.planes, y, n, k, k, gate, BN=8, BK=512, EVICT=True,
-            GATED=gated, num_warps=4, num_stages=3, launch_pdl=mtp_pdl())
+            GATED=gated, num_warps=4, num_stages=3, launch_pdl=mtp_pdl(),
+            WORD=word_load_enabled(x.device))
         return y
     if fallback.numel():
         return mtp_small_linear_impl(x, fallback)
@@ -245,9 +337,21 @@ def _packed_linear_impl(
         if x.stride(1) != 1:
             x = x.contiguous()
         y = x.new_empty((x.shape[0], n))
+        from .nemotron_h_mtp_pkmm import _CONFIGS, packed_mm
+
+        cfg = _CONFIGS.get((n, k))
+        if cfg is not None:
+            # the same ascending MMA chain as packed_small, on more programs
+            bn, wn, bk = cfg
+            packed_mm[(triton.cdiv(n, bn),)](
+                x, *p.planes, y, x.shape[0], n, k, x.stride(0), y.stride(0),
+                BM=16, BN=bn, BK=bk, WN=wn, num_warps=wn, launch_pdl=mtp_pdl(),
+                gate_ptr=gate, GATED=gated, WORD=word_load_enabled(x.device))
+            return y
         packed_small[(triton.cdiv(n, 64),)](
             x, *p.planes, y, x.shape[0], n, k, x.stride(0), y.stride(0), gate,
-            GATED=gated, num_warps=4, num_stages=4, launch_pdl=mtp_pdl())
+            GATED=gated, num_warps=4, num_stages=4, launch_pdl=mtp_pdl(),
+            WORD=word_load_enabled(x.device))
         return y
     return mtp_small_linear_impl(x, p.decode())
 
@@ -279,7 +383,8 @@ def _packed_linear_keep_impl(
         packed_gemv[(triton.cdiv(n, 8),)](
             x, sm, ex, base, ri, raw, y, n, k, k, gate,
             BN=8, BK=512, EVICT=False, GATED=gated,
-            num_warps=4, num_stages=3, launch_pdl=mtp_pdl())
+            num_warps=4, num_stages=3, launch_pdl=mtp_pdl(),
+            WORD=word_load_enabled(x.device))
         return y
     return torch.ops.vllm.mtp_small_linear_keep(x, fallback)
 
@@ -305,6 +410,9 @@ def prepare_eh_hidden_packed(layer):
         layer.register_buffer("_mtp_eh_pk_" + suffix, tensor, persistent=False)
 
 
+_PACK_OPROJ = os.environ.get("MTP_PACK12_OPROJ", "1") != "0"
+
+
 @torch.no_grad()
 def prepare_mtp_packed(module):
     """Pack only the screened shapes after original pinned weights are loaded."""
@@ -318,7 +426,9 @@ def prepare_mtp_packed(module):
     for name, layer in module.named_modules():
         w = getattr(layer, "weight", None)
         if (w is not None
-                and name.endswith("qkv_proj") and tuple(w.shape) == (4608, 2688)
+                and ((name.endswith("qkv_proj") and tuple(w.shape) == (4608, 2688))
+                     or (_PACK_OPROJ and name.endswith("o_proj")
+                         and tuple(w.shape) == (2688, 4096)))
                 and type(getattr(layer, "quant_method", None)).__name__ == "MTPSmallLinearMethod"):
             p = pack_bf16(w)
             if p is None:
@@ -360,7 +470,8 @@ from triton.experimental.gluon.language.nvidia.ampere import mma_v2
 @gluon.jit
 def packed_small(x,SM,EX,BASE,RI,RAW,y,M,N,K,sxm,sym,gate_ptr,
                  BM:tl.constexpr=16,BN:tl.constexpr=64,BK:tl.constexpr=128,
-                 GATED:tl.constexpr=False, launch_pdl:tl.constexpr=False):
+                 GATED:tl.constexpr=False, launch_pdl:tl.constexpr=False,
+                 WORD:tl.constexpr=False):
     if launch_pdl:
         pdl_prologue()
     ld:tl.constexpr=BlockedLayout([1,8],[2,16],[4,1],[1,0])
@@ -375,7 +486,7 @@ def packed_small(x,SM,EX,BASE,RI,RAW,y,M,N,K,sxm,sym,gate_ptr,
         wmask=(nn[:,None]<N)&(kk[None,:]<K)
         if GATED:
             wmask=wmask & (tl.load(gate_ptr)==0)
-        w=load_packed(SM,EX,BASE,RI,RAW,nn[:,None]*K+kk[None,:],wmask)
+        w=load_packed(SM,EX,BASE,RI,RAW,nn[:,None]*K+kk[None,:],wmask,WORD=WORD)
         a=tl.load(x+mm[:,None]*sxm+kk[None,:],mask=(mm[:,None]<M)&(kk[None,:]<K),other=0.)
         a=tl.convert_layout(a,DotOperandLayout(0,mma,2))
         b=tl.convert_layout(tl.permute(w,(1,0)),DotOperandLayout(1,mma,2))

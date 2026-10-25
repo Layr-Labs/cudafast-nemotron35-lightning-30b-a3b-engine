@@ -1740,7 +1740,7 @@ static int launch4f(const Params& p, cudaStream_t stream) {
 #endif
 
 #ifndef ZSKIP_NO_PAIR
-template <bool Fused>
+template <bool Fused, bool HalfSkip = false>
 static int launch_pair(const Params& p, cudaStream_t stream) {
   constexpr int SM = Fused ? BI_BYTES : 0;
 #ifndef ZSKIP_NO_PDL
@@ -1749,7 +1749,7 @@ static int launch_pair(const Params& p, cudaStream_t stream) {
     if constexpr (!Fused)
       e = launch_pdl(prep_kernel<16, 8>, dim3(p.max_blocks), dim3(128), stream, p);
     if (e == cudaSuccess)
-      e = launch_pdl(down_pair_kernel<Fused>, dim3(21, p.max_blocks), dim3(32), stream, p, SM);
+      e = launch_pdl(down_pair_kernel<Fused, HalfSkip>, dim3(21, p.max_blocks), dim3(32), stream, p, SM);
     if (e != cudaSuccess) {
       cudaGetLastError();
       return (int)e;
@@ -1758,7 +1758,7 @@ static int launch_pair(const Params& p, cudaStream_t stream) {
   }
 #endif
   if constexpr (!Fused) prep_kernel<16, 8><<<p.max_blocks, 128, 0, stream>>>(p);
-  down_pair_kernel<Fused><<<dim3(21, p.max_blocks), 32, SM, stream>>>(p);
+  down_pair_kernel<Fused, HalfSkip><<<dim3(21, p.max_blocks), 32, SM, stream>>>(p);
   return (int)cudaGetLastError();
 }
 #endif
@@ -1911,18 +1911,20 @@ int zskip_config(int id, int* info) {
 #undef X4F
 #endif
 #ifndef ZSKIP_NO_PAIR
-#define PAIR_INFO(ID, FUSED) \
+#define PAIR_INFO(ID, FUSED, HSKIP) \
   if (id == ID) { \
     constexpr int SM = FUSED ? BI_BYTES : 0; \
-    if (cudaFuncGetAttributes(&attr, down_pair_kernel<FUSED>) != cudaSuccess) return -1; \
+    if (cudaFuncGetAttributes(&attr, down_pair_kernel<FUSED, HSKIP>) != cudaSuccess) return -1; \
     info[0] = attr.numRegs; info[1] = SM; info[2] = 1; \
-    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&info[3], down_pair_kernel<FUSED>, 32, SM) != cudaSuccess) \
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&info[3], down_pair_kernel<FUSED, HSKIP>, 32, SM) != cudaSuccess) \
       return -1; \
     return 0; \
   }
-  PAIR_INFO(113, false)
+  PAIR_INFO(113, false, false)
+  PAIR_INFO(114, false, true)
 #ifndef ZSKIP_NO_FUSED
-  PAIR_INFO(118, true)
+  PAIR_INFO(118, true, false)
+  PAIR_INFO(119, true, true)
 #endif
 #undef PAIR_INFO
 #endif
@@ -1935,7 +1937,7 @@ static int zskip_down_impl(const void* A, long long lda, int shape_m, const int*
                long long s_tile, long long s_g, int mode, int* stats, int config, void* ws, int* queue,
                int ctas_per_sm, void* trace, void* stream, const int* verify_rows) {
   if (verify_rows != nullptr && (shape_m != 30 || mode != SKIP ||
-      (config != 113 && config != 118))) return -5;
+      (config != 113 && config != 114 && config != 118 && config != 119))) return -5;
   Params p;
   p.verify_rows = verify_rows;
   p.A = reinterpret_cast<const __nv_bfloat16*>(A);
@@ -1996,8 +1998,10 @@ static int zskip_down_impl(const void* A, long long lda, int shape_m, const int*
 #undef X8
 #ifndef ZSKIP_NO_PAIR
   if (config == 113) return launch_pair<false>(p, st);
+  if (config == 114) return launch_pair<false, true>(p, st);
 #ifndef ZSKIP_NO_FUSED
   if (config == 118) return launch_pair<true>(p, st);
+  if (config == 119) return launch_pair<true, true>(p, st);
 #endif
 #endif
   return -2;

@@ -40,6 +40,7 @@ struct Params {
   long long ldc;           // elements
   int N, K;
   int n_tiles, k_tiles;    // N/128, K/128
+  const int* vrows;        // optional MTP confidence prefix (rows past it are never accepted)
   const uint32_t* Z;       // zero-row skip: k-row-major copy of B, [K/16][16][N/64][8] u32 (or null)
   int part1_cols;          // columns reduced by a single Marlin block
   int iters;               // Marlin stripe length (k-tiles per block) in part 2
@@ -345,7 +346,15 @@ __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
   if constexpr (ZS) {
     for (int kb = threadIdx.x; kb < (p.K >> 4); kb += 128) {
       uint32_t m = 0;
-      for (int r = 0; r < p.M; ++r) {
+      // Rows at or past the depth gate's verify-row count are unverified drafts
+      // (rejected by the sampler, pruned by the SSM and zskip paths): their
+      // nonzeros do not widen the mask. Rows below it are computed exactly.
+      int rows = p.M;
+      if (p.vrows != nullptr) {
+        const int v = *p.vrows;
+        rows = v >= p.M ? p.M : (v < 1 ? 1 : v);
+      }
+      for (int r = 0; r < rows; ++r) {
         const uint4* ar = reinterpret_cast<const uint4*>(p.A + (long long)r * p.lda + 16 * kb);
         const uint4 v0 = ld_activation_v4<PDL>(ar), v1 = ld_activation_v4<PDL>(ar + 1);
         const uint32_t v[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
@@ -476,6 +485,16 @@ static int launch(const Params& p, cudaStream_t stream, bool pdl) {
 
 extern "C" {
 
+static const int* g_marlinx_vrows = nullptr;
+
+// Registers the depth gate's device verify-row count (int32[1]) for zero-row-skip
+// calls; nullptr disables. Call outside graph capture.
+int marlinx_set_vrows(const void* p) {
+  g_marlinx_vrows = static_cast<const int*>(p);
+  return 0;
+}
+
+
 // Forces the kernels to load (call outside CUDA graph capture). Returns 0 or a
 // cudaError_t value.
 int marlinx_init(void) {
@@ -541,6 +560,7 @@ static int marlinx_gemm_impl(const void* A, long long lda, int M, const void* B,
   p.n_tiles = N / 128;
   p.k_tiles = K / 128;
   p.Z = static_cast<const uint32_t*>(Z);
+  p.vrows = Z != nullptr ? g_marlinx_vrows : nullptr;
   // Marlin's stripe partition with parallel = 1 and grid = sms.
   int part2 = p.n_tiles;
   if (p.n_tiles > sms) {

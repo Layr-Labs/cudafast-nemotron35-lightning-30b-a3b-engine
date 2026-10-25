@@ -167,6 +167,9 @@ def prepare(layer) -> bool:
 # mostly exact zeros): a k-row-major copy of the Marlin weight lets the kernel
 # read only the k rows whose activation is nonzero in some row (see csrc).
 ZS_ENABLED = os.environ.get("MARLINX_ZS", "1") != "0"
+# Limit the zero-row mask to the depth gate's verified rows (smallk verify-row count).
+ZS_VROWS = os.environ.get("MARLINX_ZS_VROWS", "1") != "0"
+_vrows_set = False
 ZS_SHAPE = (2688, 3712)
 # bit offsets inside Marlin's word for k = 2t, 2t+1, 2t+8, 2t+9: (feature g, feature g+8)
 _ZS_POS = ((0, 8), (16, 24), (4, 12), (20, 28))
@@ -219,6 +222,24 @@ def gemm(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
     return out
 
 
+def _register_vrows(device: torch.device) -> None:
+    """Once, outside graph capture: point zero-row-skip calls at smallk's verify-row
+    count (the MTP depth gate's confidence prefix); absent, every row is masked."""
+    global _vrows_set
+    if torch.cuda.is_current_stream_capturing() or not hasattr(_lib, "marlinx_set_vrows"):
+        return
+    import sys
+
+    smallk = sys.modules.get("smallk")
+    buf = smallk.live_verify_rows(device) if smallk is not None and hasattr(smallk, "live_verify_rows") else None
+    if buf is None:
+        return
+    _lib.marlinx_set_vrows.argtypes = [ctypes.c_void_p]
+    _lib.marlinx_set_vrows.restype = ctypes.c_int
+    _lib.marlinx_set_vrows(buf.data_ptr())
+    _vrows_set = True
+
+
 def maybe_apply(layer, x: torch.Tensor) -> torch.Tensor | None:
     """Marlin-exact output for an eligible layer and input, or None (caller runs Marlin)."""
     if not ENABLED or not getattr(layer, "_marlinx_ok", False):
@@ -240,8 +261,10 @@ def maybe_apply(layer, x: torch.Tensor) -> torch.Tensor | None:
     if not _ready and not _init():
         return None
     n = layer.output_size_per_partition
-    out = gemm(x2, layer.weight, layer.weight_scale, layer.weight_global_scale, n, k,
-               zs=getattr(layer, "_marlinx_zs", None))
+    zs = getattr(layer, "_marlinx_zs", None)
+    if zs is not None and ZS_VROWS and not _vrows_set:
+        _register_vrows(x2.device)
+    out = gemm(x2, layer.weight, layer.weight_scale, layer.weight_global_scale, n, k, zs=zs)
     return out.reshape(*x.shape[:-1], n)
 
 

@@ -203,9 +203,6 @@ class Session:
         rounds: list[list[int]] = []
         frontiers: list[int] = []
         pending, produced = first, 0
-        # The run is done once the engine has emitted the tokens up to the
-        # count-th one after the frontier: the context, the frontier and count
-        # more. The engine may then stop drafting past that point.
         set_target = getattr(self.b, "set_emit_target", None)
         if set_target is not None and self.frontier is not None:
             set_target(len(self.ctx) + 1 + count)

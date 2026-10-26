@@ -82,6 +82,7 @@ struct Params {
   int max_blocks;           // expert blocks covered (grid of prep_kernel)
   unsigned long long* trace;  // optional timing trace: 8 words per item (see down3_kernel)
   const int* verify_rows;  // optional confidence prefix, paired M5 only
+  int c3lpt;
 };
 
 __device__ __forceinline__ int prefix_row_limit(const Params& p) {
@@ -291,6 +292,30 @@ __device__ __forceinline__ void build_lists(uint8_t* dst, int nrows_valid, const
     h->nag = s_tot[1];
   }
   __syncthreads();
+}
+
+__global__ void __launch_bounds__(32) c3lpt_order_kernel(const Params p) {
+#ifndef ZSKIP_NO_PDL
+  pdl_wait();
+  pdl_launch_dependents();
+#endif
+  const int lane = threadIdx.x;
+  int key = -1;
+  if (lane < p.max_blocks) {
+    const BlockHdr* h = reinterpret_cast<const BlockHdr*>(p.ws + (long long)lane * BI_BYTES);
+    key = (h->nag << 5) | (31 - lane);
+  }
+#pragma unroll
+  for (int k = 2; k <= 32; k *= 2) {
+#pragma unroll
+    for (int j = k / 2; j > 0; j /= 2) {
+      const int other = __shfl_xor_sync(0xFFFFFFFFu, key, j);
+      const bool high = ((lane & j) == 0) == ((lane & k) == 0);
+      key = high ? max(key, other) : min(key, other);
+    }
+  }
+  if (lane < p.max_blocks)
+    p.queue[4 + lane] = 31 - (key & 31);
 }
 
 // one CTA per expert block (grid = max_blocks): rows, masks and lists into p.ws; block 0 also
@@ -1679,6 +1704,7 @@ __global__ void epi_kernel(const uint32_t* x, int n, float gs, uint32_t* out_bf1
 using namespace zskip;
 
 static int g_sms = 0;
+static int g_c3lpt = 1;
 static int g_rds_ring2 = 0;  // old Python/new library remains stock until explicit init
 static int g_pdl = 0;  // zskip_set_pdl: launch the v4 pair with programmatic dependent launch
 
@@ -1749,6 +1775,8 @@ static int launch_pair_impl(const Params& p, cudaStream_t stream) {
     cudaError_t e = cudaSuccess;
     if constexpr (!Fused)
       e = launch_pdl(prep_kernel<16, 8>, dim3(p.max_blocks), dim3(128), stream, p);
+    if (e == cudaSuccess && p.c3lpt)
+      e = launch_pdl(c3lpt_order_kernel, dim3(1), dim3(32), stream, p);
     if (e == cudaSuccess)
       e = launch_pdl(down_pair_kernel<Fused, HalfSkip, R>, dim3(21, p.max_blocks), dim3(32), stream, p, SM);
     if (e != cudaSuccess) {
@@ -1759,6 +1787,7 @@ static int launch_pair_impl(const Params& p, cudaStream_t stream) {
   }
 #endif
   if constexpr (!Fused) prep_kernel<16, 8><<<p.max_blocks, 128, 0, stream>>>(p);
+  if (p.c3lpt) c3lpt_order_kernel<<<1, 32, 0, stream>>>(p);
   down_pair_kernel<Fused, HalfSkip, R><<<dim3(21, p.max_blocks), 32, SM, stream>>>(p);
   return (int)cudaGetLastError();
 }
@@ -1855,6 +1884,8 @@ static int launch3(const Params& p, cudaStream_t stream, int ctas_per_sm) {
   X(8, 7, 32, 3, 8, 4) X(9, 3, 32, 4, 8, 6)
 
 extern "C" {
+
+int zskip_set_c3lpt(int on) { g_c3lpt = on ? 1 : 0; return 0; }
 
 int zskip_set_rds_ring2(int on) { g_rds_ring2 = on ? 1 : 0; return 0; }
 
@@ -1963,6 +1994,7 @@ static int zskip_down_impl(const void* A, long long lda, int shape_m, const int*
       (config != 113 && config != 114 && config != 118 && config != 119))) return -5;
   Params p;
   p.verify_rows = verify_rows;
+  p.c3lpt = g_c3lpt && shape_m == 30 && max_blocks == 30 && config == 113 && mode == SKIP;
   p.A = reinterpret_cast<const __nv_bfloat16*>(A);
   p.lda = lda;
   p.shape_m = shape_m;

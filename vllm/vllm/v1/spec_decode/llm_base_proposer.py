@@ -68,7 +68,6 @@ from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
 
-# LOCAL PATCH (cudafast-nemotron35): free-run emit budget (_emit_budget_drafts).
 _EMIT_BUDGET = os.environ.get("VLLM_MTP_EMIT_BUDGET", "1") != "0"
 
 
@@ -940,8 +939,6 @@ class SpecDecodeBaseProposer:
                 depth_gate, max_rows=None if budget_drafts is None else budget_drafts + 1
             )
         if budget_drafts is not None:
-            # Draft slots past the budget keep the step's shape; the verify-row
-            # cap written above (budget + 1 rows) leaves them unverified.
             while len(draft_token_ids_list) < self.num_speculative_tokens:
                 draft_token_ids_list.append(draft_token_ids_list[-1])
                 if draft_probs_list is not None:

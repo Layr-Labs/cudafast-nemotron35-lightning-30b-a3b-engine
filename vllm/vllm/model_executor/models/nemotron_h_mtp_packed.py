@@ -548,6 +548,11 @@ def prepare_mtp_packed(module):
         pu, ps = pack_bf16(up), pack_bf16(su)
         if pu is None or ps is None:
             continue
+        try:
+            from .nemotron_h_mtp_up_mma import prepare as prepare_up_mma
+            prepare_up_mma(pu, ps)
+        except Exception as exc:
+            print(f"MTP_UP_ROW_MMA original GEMV retained at load: {exc!r}", flush=True)
         for original, packed in ((up, pu), (su, ps)):
             raw_bytes += original.numel() * 2
             packed_bytes += packed.nbytes

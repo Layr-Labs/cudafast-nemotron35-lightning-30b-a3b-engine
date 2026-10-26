@@ -240,7 +240,8 @@ def prepare(p):
 
         # Bound boot work and memory independently of request tokens. Plans for
         # pages outside this generic prefix use the original planner.
-        max_pages = min(blocks, 128)
+        timed_pages = min(blocks, 128)
+        fill_pages = min(blocks, 512)
         raw_float = wrapper._float_workspace_buffer.view(torch.uint8)
         raw_int = wrapper._int_workspace_buffer.view(torch.uint8)
         # Actual installed planner, not a version-string assumption: no
@@ -249,7 +250,11 @@ def prepare(p):
         # inside the native 15-word schema's copied prefix.
         raw_float.fill_(0xA5)
         total_plan_bytes = 0
-        for pages in range(1, max_pages + 1):
+        plan_budget = 64 * (1 << 20)
+        stop_fill = False
+        for pages in range(1, fill_pages + 1):
+            if stop_fill:
+                break
             for residue in range(1, p.block_size + 1):
                 length = (pages - 1) * p.block_size + residue
                 if length > p.max_model_len:
@@ -261,9 +266,11 @@ def prepare(p):
                 torch.cuda.synchronize(p.device)
                 if not bool(torch.all(raw_int[current[1].numel():] == 0xB6).item()):
                     raise ValueError("native integer writes exceed captured prefix")
-                total_plan_bytes += current[1].numel()
-                if total_plan_bytes > 64 * (1 << 20):
-                    raise ValueError("native plan bank exceeds private memory budget")
+                nbytes = current[1].numel()
+                if total_plan_bytes + nbytes > plan_budget:
+                    stop_fill = True
+                    break
+                total_plan_bytes += nbytes
                 bank.entries[bank.last_native_key] = current
         if not bank.entries:
             raise ValueError("no native plans")
@@ -272,7 +279,7 @@ def prepare(p):
         bank.enabled = True
         kwargs = dict(input_ids=p.input_ids[:padded], positions=p._get_positions(padded),
                       inputs_embeds=None, hidden_states=p.hidden_states[:padded])
-        sample_pages = sorted({1, min(2, max_pages), max(1, max_pages // 2), max_pages})
+        sample_pages = sorted({1, min(2, timed_pages), max(1, timed_pages // 2), timed_pages})
         residues = sorted({1, max(1, p.block_size // 2), p.block_size})
         ratios = []
         # Warm the original stream/event control before either timed arm.

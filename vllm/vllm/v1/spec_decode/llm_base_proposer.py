@@ -722,7 +722,19 @@ class SpecDecodeBaseProposer:
             # The draft plan reads seq_lens_cpu; deriving it from the copied
             # counts waits for the first pass to start, not to finish. The
             # bound keeps the step kernel's seq_lens update an exact +1.
-            if (
+            # The runner already copied the sampler's valid counts on its
+            # side stream. Prefer that earlier event to the later main-stream
+            # rejected-count copy. Per-step staging sets independently own the
+            # pinned H2D buffers; retain the old fence when sets are unavailable.
+            host_seq_lens = None
+            if seq_lens_cpu is not None and self._hostfast_draft_sets() is not None:
+                host_seq_lens = self._hostfast_draft_seq_lens(
+                    seq_lens_cpu, batch_size, common_attn_metadata.seq_lens
+                )
+            if host_seq_lens is not None:
+                common_attn_metadata._seq_lens_cpu = host_seq_lens
+                order_draft_plans = True
+            elif (
                 num_rejected_cpu is not None
                 and seq_lens_cpu is not None
                 and seq_lens_cpu.shape == num_rejected_cpu.shape

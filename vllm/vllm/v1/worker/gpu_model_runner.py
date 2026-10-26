@@ -300,6 +300,10 @@ def _keep_verify_rows_for(
 
 # Protect asynchronous H2D sources; switchable for in-process cost screening.
 PINNED_SOURCE_GUARDS = True
+# LOCAL PATCH (cudafast-nemotron35): pacing of the drafter's first-weight L2
+# prefetch (_l2pf_prefetch("draft")); 0 issues every piece at once.
+_L2PF_DRAFT_PACE_NS = int(os.environ.get("L2PF_DRAFT_PACE_NS", "400"))
+_L2PF_DRAFT_PACE_BURST = int(os.environ.get("L2PF_DRAFT_PACE_BURST", "2"))
 
 # LOCAL PATCH (cudafast-nemotron35): spec-decode metadata cache (_calc_spec_decode_metadata).
 _SPEC_META_CACHE = os.environ.get("VLLM_SPEC_META_CACHE", "1") != "0"
@@ -310,6 +314,11 @@ _SPEC_META_CACHE_CHECK = os.environ.get("VLLM_SPEC_META_CACHE_CHECK", "0") == "1
 # it the ordinary way and compares inputs and outputs.
 _PREFILL_EARLY = os.environ.get("VLLM_PREFILL_EARLY", "1") != "0"
 _PREFILL_EARLY_CHECK = os.environ.get("VLLM_PREFILL_EARLY_CHECK", "0") == "1"
+# LOCAL PATCH (cudafast-nemotron35): verify-step output copy right after sampling.
+_OUTPUT_COPY_AFTER_SAMPLE = os.environ.get("VLLM_OUTPUT_COPY_AFTER_SAMPLE", "1") != "0"
+# LOCAL PATCH (cudafast-nemotron35): the same early launch from the backend's request
+# entry, before add_request and scheduling (GPUModelRunner.pre_launch_prefill).
+_PREFILL_PRELAUNCH = os.environ.get("VLLM_PREFILL_PRELAUNCH", "1") != "0"
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -4982,6 +4991,9 @@ class GPUModelRunner(
         and the wrappers' plan state are still the ones checked here). Same
         kernels, same inputs, same outputs. VLLM_PREFILL_EARLY=0 disables."""
         self._fresh_early = None
+        pre, self._fresh_pre = getattr(self, "_fresh_pre", None), None
+        pool_free, self._fresh_pre_pool_free = (
+            getattr(self, "_fresh_pre_pool_free", False), False)
         fresh_graph = getattr(self, "_fresh_prefill_graph", None)
         if (
             not _PREFILL_EARLY
@@ -5022,7 +5034,30 @@ class GPUModelRunner(
             return
         sig = self._fresh_prefill_sig(scheduler_output)
         plan_state = fresh_graph.plan_state()
+        zero = list(scheduler_output.new_block_ids_to_zero or ())
+        if pool_free:
+            # This request was allocated from a fully free pool (canonical head):
+            # its block ids are the ones the next such request gets.
+            if getattr(self, "_fresh_pre_hint", None) != (sig, zero):
+                logger.info("prefill pre-launch: hint recorded (%d blocks to zero)", len(zero))
+            self._fresh_pre_hint = (sig, zero)
+            self._capture_zero_graph(zero)
         if fresh_graph.early_sig != (sig, plan_state):
+            return
+        lite = params.max_tokens == 1
+        if (
+            pre is not None
+            and pre[2] == lite
+            and pre[3] == sig
+            and pre[4] == plan_state
+            and pre[5] == tuple(new.prompt_token_ids)
+            and pre[6] == zero
+        ):
+            # pre_launch_prefill already zeroed these blocks and replayed the graph
+            # for this request's prompt ids, block ids and plan state.
+            scheduler_output.new_block_ids_to_zero = None
+            self._fresh_early = (pre[0], pre[1], lite, sig, plan_state)
+            logger.info_once("prefill pre-launch: adopted")
             return
         ids = getattr(self, "_fresh_early_ids", None)
         if ids is None:
@@ -5036,7 +5071,6 @@ class GPUModelRunner(
         if scheduler_output.new_block_ids_to_zero:
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
             scheduler_output.new_block_ids_to_zero = None
-        lite = params.max_tokens == 1
         if getattr(self, "_fresh_early_side", None) is None:
             self._fresh_early_side = torch.cuda.Stream()
             self._fresh_early_start = torch.cuda.Event()
@@ -5044,6 +5078,108 @@ class GPUModelRunner(
         hidden, logits = fresh_graph.replay_early(ids, lite)
         self._fresh_early_event.record()
         self._fresh_early = (hidden, logits, lite, sig, plan_state)
+
+    def pre_launch_prefill(self, tokens: list[int], lite: bool, pool_free: bool) -> bool:
+        """LOCAL PATCH (cudafast-nemotron35): _fresh_prefill_early's launch, issued
+        from the backend's request entry before add_request and scheduling.
+
+        pool_free says the scheduler's block pool is fully free with its canonical
+        head in place (BlockPool._canonical_head), so the new request gets the block
+        ids the last request allocated from a fully free pool got
+        (_fresh_pre_hint). When the fresh graph's request tensors were last written
+        for those block ids and the wrappers' plan state is unchanged
+        (FreshPrefillGraph.early_sig), this zeroes those blocks, uploads the prompt
+        ids and replays the graph now. _fresh_prefill_early adopts the launch only
+        if the scheduled request has exactly these prompt ids, block ids, blocks to
+        zero, plan state and lite flag; otherwise the ordinary early or forward
+        replay runs as before (the blocks written here were free). Same kernels,
+        same inputs, same outputs. VLLM_PREFILL_PRELAUNCH=0 disables."""
+        self._fresh_pre = None
+        self._fresh_pre_pool_free = bool(pool_free)
+        fresh_graph = getattr(self, "_fresh_prefill_graph", None)
+        hint = getattr(self, "_fresh_pre_hint", None)
+        if (
+            not (_PREFILL_EARLY and _PREFILL_PRELAUNCH)
+            or not pool_free
+            or fresh_graph is None
+            or fresh_graph.early_sig is None
+            or hint is None
+            or len(tokens) != 496
+            or self.speculative_config is None
+            or self.routed_experts_initialized
+            or self.use_aux_hidden_state_outputs
+            or self.num_prompt_logprobs
+        ):
+            return False
+        sig, zero = hint
+        plan_state = fresh_graph.plan_state()
+        if fresh_graph.early_sig != (sig, plan_state):
+            return False
+        ids = getattr(self, "_fresh_early_ids", None)
+        if ids is None:
+            ids = torch.empty(496, dtype=fresh_graph.input_ids.dtype, pin_memory=True)
+            self._fresh_early_ids = ids
+            self._fresh_early_event = torch.cuda.Event()
+        else:
+            # The previous early upload read this pinned buffer.
+            self._fresh_early_event.synchronize()
+        ids.numpy()[:] = tokens
+        if zero:
+            graph = getattr(self, "_zero_graphs", {}).get(tuple(zero))
+            if graph:
+                graph[0].replay()
+            else:
+                self._zero_block_ids(zero)
+        if getattr(self, "_fresh_early_side", None) is None:
+            self._fresh_early_side = torch.cuda.Stream()
+            self._fresh_early_start = torch.cuda.Event()
+        self._fresh_early_start.record()
+        hidden, logits = fresh_graph.replay_early(ids, lite)
+        self._fresh_early_event.record()
+        self._fresh_pre = (hidden, logits, lite, sig, plan_state, tuple(tokens), list(zero))
+        return True
+
+    def _capture_zero_graph(self, block_ids: list[int]) -> None:
+        """LOCAL PATCH (cudafast-nemotron35): a CUDA graph of the KV-block zeroing
+        kernel for one fixed block-id list (the canonical head a fully free pool
+        hands out), captured once on a request that zeroes the same blocks the
+        ordinary way, so pre_launch_prefill replays it instead of rebuilding the
+        index upload and the Triton launch. Same kernel, same blocks, same bytes."""
+        zeroer = getattr(self, "_kv_block_zeroer", None)
+        key = tuple(block_ids)
+        graphs = self.__dict__.setdefault("_zero_graphs", {})
+        if (not key or key in graphs or zeroer is None or zeroer._meta is None
+                or torch.cuda.is_current_stream_capturing()):
+            return
+        try:
+            from vllm.v1.worker.utils import _zero_kv_blocks_kernel
+
+            seg_addrs, seg_page_sizes, max_chunks, blk_size, n_segs = zeroer._meta
+            idx = torch.tensor(list(key), dtype=torch.int64, device=self.device)
+            grid = (len(key) * n_segs * max_chunks,)
+            graph = torch.cuda.CUDAGraph()
+            # capture_begin/end on a side stream: no device synchronize, gc pass
+            # or allocator cache release (torch.cuda.graph's __enter__ does those).
+            main = torch.cuda.current_stream()
+            side = torch.cuda.Stream()
+            side.wait_stream(main)
+            with torch.cuda.stream(side):
+                # thread_local: CUDA calls other host threads make meanwhile
+                # (async output copies) are not part of this capture.
+                graph.capture_begin(capture_error_mode="thread_local")
+                try:
+                    _zero_kv_blocks_kernel[grid](
+                        seg_addrs, seg_page_sizes, idx, len(key),
+                        N_SEGS=n_segs, MAX_CHUNKS=max_chunks, BLOCK_SIZE=blk_size,
+                    )
+                finally:
+                    graph.capture_end()
+            main.wait_stream(side)
+            graphs[key] = (graph, idx)
+            logger.info("prefill pre-launch: zero graph captured for %d blocks", len(key))
+        except Exception as exc:  # noqa: BLE001 - the ordinary zeroing stays
+            graphs[key] = None
+            logger.warning("prefill pre-launch: zero graph unavailable (%r)", exc)
 
     @contextmanager
     def _fresh_prefill_early_prep(self):
@@ -5171,6 +5307,16 @@ class GPUModelRunner(
         else:
             routed_experts_snapshot = None
             copy_ready_event = None
+            if spec_decode_metadata is not None and _OUTPUT_COPY_AFTER_SAMPLE:
+                # LOCAL PATCH (cudafast-nemotron35): a verify step's sampled ids
+                # are final once the sampler has run; the device-to-host copy
+                # waits for that point instead of for every operation queued
+                # before it, which includes the next draft loop queued below.
+                # A prefill step (no spec metadata) keeps waiting for its draft
+                # pass, so the seed token still returns after the whole seed
+                # work. The copy reads only sampled_token_ids.
+                copy_ready_event = torch.cuda.Event(enable_timing=False)
+                copy_ready_event.record()
 
         self._draft_token_ids = None
         self._draft_probs = None
@@ -5654,7 +5800,16 @@ class GPUModelRunner(
                         if name.endswith("eh_proj.weight"):
                             found["draft"] = p
             self._l2pf_tensors = found
-        l2pf.prefetch(self._l2pf_tensors.get(which), max_bytes=20 << 20)
+        t = self._l2pf_tensors.get(which)
+        if which == "draft" and _L2PF_DRAFT_PACE_NS > 0 and hasattr(l2pf, "prefetch_paced"):
+            # LOCAL PATCH (cudafast-nemotron35): the drafter's first weight is
+            # prefetched at a fixed rate (L2PF_DRAFT_PACE_NS per 64 KB piece after
+            # the first L2PF_DRAFT_PACE_BURST), so the sampler and draft-input
+            # kernels it overlaps are not queued behind the whole range.
+            # Prefetches move no value. L2PF_DRAFT_PACE_NS=0 issues them at once.
+            l2pf.prefetch_paced(t, 20 << 20, _L2PF_DRAFT_PACE_NS, _L2PF_DRAFT_PACE_BURST)
+            return
+        l2pf.prefetch(t, max_bytes=20 << 20)
 
     def propose_draft_token_ids(
         self,

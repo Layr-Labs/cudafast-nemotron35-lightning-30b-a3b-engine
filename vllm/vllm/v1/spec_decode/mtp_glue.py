@@ -123,6 +123,25 @@ def step_ok(tok, ids_buf, hidden_src, hidden_buf, positions_1d, batch_size) -> b
 
 
 @triton.jit
+def _store_host_i32_kernel(src, dst, n, BLOCK: tl.constexpr):
+    # dst (pinned host memory, device-accessible) [:n] = src[:n]
+    o = tl.arange(0, BLOCK)
+    tl.store(dst + o, tl.load(src + o, mask=o < n), mask=o < n)
+
+
+def store_host_i32(src: torch.Tensor, dst: torch.Tensor) -> bool:
+    """dst.copy_(src) for a few int32 values into pinned host memory, written by
+    one kernel in place of a device-to-host copy (False: not applicable)."""
+    n = src.numel()
+    if not (ENABLED and 0 < n <= 64 and src.is_cuda and not dst.is_cuda
+            and src.dtype == dst.dtype == torch.int32 and dst.numel() == n
+            and src.is_contiguous() and dst.is_contiguous() and dst.is_pinned()):
+        return False
+    _store_host_i32_kernel[(1,)](src, dst, n, BLOCK=64, num_warps=1)
+    return True
+
+
+@triton.jit
 def _first_pass_inputs_kernel(tgt_ids, next_ids, idx_ptr, ids_dst, tgt_pos, pos_dst,
                               tgt_hidden, hid_dst, hid_stride, num_tokens, batch_size,
                               HID: tl.constexpr, BLOCK: tl.constexpr):

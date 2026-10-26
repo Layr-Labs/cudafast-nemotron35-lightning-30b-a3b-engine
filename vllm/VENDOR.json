@@ -432,16 +432,16 @@
       "why": "terrapinelf: the MTP draft loop's small input moves in one launch each: the first pass's shifted ids, next-token write, positions and hidden rows; the sampled-row gathers after it; and before every later pass the drafted-token cast, the hidden-row copy and eagle_step_slot_mapping_metadata_kernel's arithmetic. Integer casts, integer adds and byte copies into the same buffers. VLLM_MTP_FUSED_GLUE=0 keeps the stock operations."
     },
     {
-      "file": "vllm/v1/engine/core.py (+ harness/vllm_resident/resident.py, backends.py)",
-      "why": "Ours (C57): a synchronous single-stream caller passes the number of tokens it still wants to one engine step. When that budget is at most num_spec_tokens + 1 and a batch is queued, the core first takes the queued batch's result (which the caller waits for either way); if its tokens already cover the budget it returns that output without scheduling another speculative round whose output the caller cannot need, and otherwise it schedules ahead exactly as before, so the next batch is always scheduled before the previous output is applied. A sequence drained this way is restarted from its context if it is ever continued. No target computation, sampling, draft decision, request limit or numerical format changes; the budget is scoped to that one step. C57_LASTDRAFT=0 restores the main's scheduling."
-    },
-    {
       "file": "harness/vllm_resident/resident.py; harness/vllm_resident/backends.py; vllm/v1/spec_decode/llm_base_proposer.py; vllm/model_executor/models/nemotron_h_mtp_kernels.py",
-      "why": "terrapinelf (first submitted as 9bbf6217-46dc-4ab2-aa31-a61ad5025483): free-run emit budget. Session.spec_run(first, count) tells the engine the prompt + emitted token count at which the run is done (len(ctx) + 1 + count; VllmBackend.set_emit_target sets drafter.emit_target, cleared when the run returns and when a new request starts). Once a step's rejection is known on the host, the drafter computes how many drafts the next verify can still use (target - (seq_lens_after_rejection + 1) - 1); when that is below the depth it stops the draft loop after that many passes, pads the step's draft slots with the last draft and caps the verify-row count (depth_gate_end max_rows) at drafts + 1, so the padded slots are never verified. The drafts that are computed are the unlimited loop's; the verify rows that run are the same rows the depth gate already varies. Independent of ArthurOstapenko's C57 tail drain in engine/core.py (which stops the core from speculating a round past the caller's budget); the two touch different code. VLLM_MTP_EMIT_BUDGET=0 disables."
+      "why": "terrapinelf: free-run emit budget. Session.spec_run(first, count) tells the engine the prompt + emitted token count at which the run is done (len(ctx) + 1 + count; VllmBackend.set_emit_target sets drafter.emit_target, cleared when the run returns and when a new request starts). Once a step's rejection is known on the host, the drafter computes how many drafts the next verify can still use (target - (seq_lens_after_rejection + 1) - 1); when that is below the depth it stops the draft loop after that many passes, pads the step's draft slots with the last draft and caps the verify-row count (depth_gate_end max_rows) at drafts + 1, so the padded slots are never verified. The drafts that are computed are the unlimited loop's; the verify rows that run are the same rows the depth gate already varies. VLLM_MTP_EMIT_BUDGET=0 disables."
     },
     {
       "file": "(composition)",
-      "why": "terrapinelf on the record 88455a30-3e21-4da9-b718-9b6809502858 (ArthurOstapenko, commit 27e68ae): the record's files byte for byte plus terrapinelf's free-run emit budget (the entry above), the same files as terrapinelf 1d565812-f993-401a-a5a8-3c5a7c1a6435 (second measurement)."
+      "why": "terrapinelf on the record e19e73d6-0b9e-4eea-9fae-c058e7b98884 (ArthurOstapenko, commit 3c37484, the code of ercumentyildirim d1ce8ee7-b204-4819-9923-72af7c0c7b8b): the record's files byte for byte plus terrapinelf's prefill early launch, canonical block head, resident request path, parallel copy-batch flush and fused MTP draft-loop input moves (first measured in 0c93e284-ad2b-4c27-94d7-be1fa525d637 and 1a480c2b-fc0c-4e7d-8e8a-b09f18049b8b) and the free-run emit budget (the entry above)."
+    },
+    {
+      "file": "vllm/v1/engine/core.py (+ harness/vllm_resident/resident.py, backends.py)",
+      "why": "ArthurOstapenko 88455a30 (C57), carried: a synchronous single-stream caller passes the number of tokens it still wants to one engine step. When that budget is at most num_spec_tokens + 1 and a batch is queued, the core first takes the queued batch's result (which the caller waits for either way); if its tokens already cover the budget it returns that output without scheduling another speculative round whose output the caller cannot need, and otherwise it schedules ahead exactly as before, so the next batch is always scheduled before the previous output is applied. A sequence drained this way is restarted from its context if it is ever continued. No target computation, sampling, draft decision, request limit or numerical format changes; the budget is scoped to that one step. C57_LASTDRAFT=0 restores the main's scheduling."
     },
     {
       "file": "harness/kernels/zskip/csrc/zskip.cu; harness/kernels/zskip/csrc/zskip_pair.cuh; harness/kernels/zskip/py/__init__.py",
@@ -449,7 +449,31 @@
     },
     {
       "file": "model_executor/layers/mamba/ops/mamba_ssm_spec_replay.py (PIPELINED branches only)",
+      "why": "ArthurOstapenko 20c2a640 (C2FMA), carried: the raw-input replay software pipeline (NEMO_MAMBA_REPLAY_PIPELINE, admitted per boot only if its outputs, replayed state and both checkpoint slots are byte-identical to the ordinary kernel) never qualified because the compiler contracted the other product into the FMA: pipeline RN(RN(B*dt)*x + state*dA) vs ordinary RN(state*dA + RN(RN(B*dt)*x)), a 1-ULP fp32 state difference. The pipelined replay and compute loops now spell the ordinary order explicitly with tl.fma(state, dA, dB*x). The ordinary kernel's code is unchanged (the change sits under the PIPELINED constexpr). The boot-time byte comparison and timing admission are unchanged; NEMO_MAMBA_REPLAY_PIPELINE=0 keeps the ordinary path."
+    },
+    {
+      "file": "harness/kernels/sctopk/{csrc/sctopk.cu,py/__init__.py,build.sh}; vllm/model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "Ours: the three-level draft-head screen's per-chunk top-k selections (_chunk_topk, RADIX) run as one CUDA kernel each: an exact 8-bit radix select of the K-th largest key (torch's TopKTypeConfig order key, NaN largest, -0 below +0) over four shared-memory histograms, then every key above it in ascending index order followed by its ties in ascending index order until K are taken, through two block-wide exclusive scans; a stopped draft pass writes the first K ids in index order. Integer operations only, so the id lists equal _chunk_topk's. The screen admits it at load only after comparing both on the cascade's three shapes (ties, signed zeros, NaNs, gated and not); otherwise _chunk_topk stays. VLLM_MTP_SCREEN_SCTOPK=0 (or SCTOPK=0) keeps _chunk_topk."
+    },
+    {
+      "file": "harness/kernels/shco/py/__init__.py",
+      "why": "Ours: SHX_GRID (unset by default, so the half grid stays) sets the prefill shared-expert persistent worker count directly; the unit tables keep Marlin's partition over all SMs and each unit is summed whole by one CTA, so the outputs are unchanged."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_down_packed.py",
+      "why": "Ours: MTP_DOWN_PACK12_FORCE (default on) admits the packed (inherited lossless 12-bit BF16 codec) compact-down slots for a draft top-k whose load-time comparison with the original BF16 slots is bitwise equal on every probe even when that private timing (sparse probe densities) does not show the 4% margin; the fastest bit-identical block width is used. The admission's exhaustive bit comparison is unchanged, the original weights stay retained, and a failed comparison keeps the original slots. MTP_DOWN_PACK12_FORCE=0 restores the timing gate."
+    },
+    {
+      "file": "model_executor/layers/mamba/ops/mamba_ssm_spec_replay.py (PIPELINED branches only)",
       "why": "C2FMA: the raw-input replay software pipeline (NEMO_MAMBA_REPLAY_PIPELINE, admitted per boot only if its outputs, replayed state and both checkpoint slots are byte-identical to the ordinary kernel) never qualified because the compiler contracted the other product into the FMA: pipeline RN(RN(B*dt)*x + state*dA) vs ordinary RN(state*dA + RN(RN(B*dt)*x)), a 1-ULP fp32 state difference. The pipelined replay and compute loops now spell the ordinary order explicitly with tl.fma(state, dA, dB*x). The ordinary kernel's code is unchanged (the change sits under the PIPELINED constexpr). The boot-time byte comparison and timing admission are unchanged; NEMO_MAMBA_REPLAY_PIPELINE=0 keeps the ordinary path."
+    },
+    {
+      "file": "vllm/v1/worker/gpu_model_runner.py",
+      "why": "terrapinelf: a verify step's AsyncGPUModelRunnerOutput copy of the sampled token ids waits on an event recorded right after the sampler (and _update_states_after_model_execute) instead of on the whole default stream, which by then also holds the next draft loop queued by propose_draft_token_ids. The copy reads only sampled_token_ids, which the sampler has finished writing. Prefill steps (no spec-decode metadata) keep waiting for the whole stream, so the seed token still returns after the seed's draft work. VLLM_OUTPUT_COPY_AFTER_SAMPLE=0 restores the stream wait."
+    },
+    {
+      "file": "(composition)",
+      "why": "terrapinelf on the record 1cb833a7-a22f-416c-b659-aa84adea762f (ArthurOstapenko, commit de290fa): the record's files byte for byte plus the verify-step output copy entry above; the same files as terrapinelf 9843ad8f-71de-4ecb-8ab8-fa9bc8a389e6 (second measurement)."
     }
   ]
 }

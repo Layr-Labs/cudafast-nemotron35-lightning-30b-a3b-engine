@@ -72,6 +72,37 @@ def _select(models, torch):
     return selected
 
 
+def _select_mtp(models, torch):
+    selected, seen = [], set()
+
+    def add(name, t):
+        if isinstance(t, torch.Tensor) and t.is_cuda and t.numel() and id(t) not in seen:
+            seen.add(id(t))
+            selected.append((name, t))
+
+    for owner, model in zip(("target", "drafter"), models):
+        if model is None:
+            continue
+        for name, layer in model.named_modules():
+            prefix = owner + "." + name
+            # Preserve SM addresses: packed-matrix admission keys name that
+            # first plane. Other planes keep the same objects and exact bytes.
+            for field, tensor in layer.named_buffers(recurse=False):
+                if (field.startswith(("_mtp_pk_", "_mtp_eh_pk_"))
+                        and field.rsplit("_", 1)[-1] in ("ex", "base", "ri", "raw")):
+                    add(prefix + "." + field, tensor)
+            weights = getattr(layer, "_fast_moe_weights", None)
+            if isinstance(weights, tuple):
+                for slot in (0, 2):
+                    if slot < len(weights):
+                        packed = weights[slot]
+                        planes = getattr(packed, "planes", ())
+                        if type(packed).__name__ == "PackedBF16" and len(planes) == 5:
+                            for i in (1, 2, 3, 4):
+                                add(prefix + f".packed{slot}.plane{i}", planes[i])
+    return selected
+
+
 def prepare(models):
     """One load-time transaction; every fallback precedes any pointer change."""
     global _PREPARED
@@ -83,9 +114,50 @@ def prepare(models):
         return
     import torch
 
+    try:
+        selected = _select(models, torch)
+    except Exception as exc:
+        _LOG.warning("CMP2 original selection declined: %r", exc)
+        return
+    _relocate(selected, "model")
+    if os.environ.get("CMP2_MTP_PLANES", "1") != "0":
+        # An added-family failure cannot roll back the parent's successful
+        # model-family transaction. Bound extra physical backing independently.
+        try:
+            selected_mtp = _select_mtp(models, torch)
+        except Exception as exc:
+            _LOG.warning("CMP2 mtp-metadata ordinary: %r", exc)
+        else:
+            _relocate(selected_mtp, "mtp-metadata", 512 * (1 << 20))
+
+
+def prepare_screen(screen):
+    """Checkpoint-only screen matrices, before its fold check/graph capture."""
+    if getattr(screen, "_cmp_prepared", False):
+        return
+    screen._cmp_prepared = True
+    if os.environ.get("CMP2", "1") == "0" or os.environ.get("CMP2_MTP_SCREEN", "1") == "0":
+        return
+    import torch
+
+    # Positive immutable matrix list; never scores, candidate IDs, inputs,
+    # outputs, gates or any other request-written operational buffer.
+    names = ("w_full", "s_full", "w_scr", "s_scr", "w_coarse", "s_coarse",
+             "w_rest", "s_rest", "w_pre", "s_pre", "w_mid", "s_mid")
+    selected = [("mtp_screen." + n, getattr(screen, n)) for n in names
+                if isinstance(getattr(screen, n, None), torch.Tensor)
+                and getattr(screen, n).is_cuda and getattr(screen, n).numel()]
+    _relocate(selected, "mtp-screen", 512 * (1 << 20))
+
+
+def _relocate(selected, label, budget_bytes=None):
+    """Original full-storage transaction, shared by independently bound owners."""
+    import torch
+
     changes, originals, compressed = [], [], []
     labels = []
     checked_bytes = 0
+    allocated_bytes = 0
     try:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("load-time allocation requested during capture")
@@ -97,7 +169,7 @@ def prepare(models):
         capsule_new.restype = ctypes.py_object
         # Gather all aliases before rebinding even one of them.
         storages = {}
-        for name, tensor in _select(models, torch):
+        for name, tensor in selected:
             storage = tensor.untyped_storage()
             key = (tensor.device.index, storage.data_ptr(), storage.nbytes())
             storages.setdefault(key, []).append((name, tensor))
@@ -111,6 +183,9 @@ def prepare(models):
             if not ptr:
                 raise RuntimeError(lib.cmp_last_error().decode())
             raw = torch.from_dlpack(capsule_new(ptr, b"dltensor", None))
+            allocated_bytes += allocated.value
+            if budget_bytes is not None and allocated_bytes > budget_bytes:
+                raise RuntimeError("additional compressed backing budget exceeded")
             if actual.value != 1 or raw.data_ptr() % 2097152:
                 raise RuntimeError("compression type or 2 MiB alignment check failed")
             raw.copy_(host)
@@ -142,10 +217,10 @@ def prepare(models):
         _ORIGINALS.extend(originals)
         _COMPRESSED.extend(compressed)
     except Exception as exc:
-        _LOG.warning("CMP2 compressed=none reason=%r ordinary_tensors_retained=True", exc)
+        _LOG.warning("CMP2 owner=%s compressed=none reason=%r ordinary_tensors_retained=True", label, exc)
         return
     _LOG.info(
-        "CMP2 compressed=[%s] storages=%d full_byte_checks=%d checked_bytes=%d "
+        "CMP2 owner=%s compressed=[%s] storages=%d full_byte_checks=%d checked_bytes=%d "
         "original_storages_retained=True",
-        ",".join(labels), len(compressed), len(compressed), checked_bytes,
+        label, ",".join(labels), len(compressed), len(compressed), checked_bytes,
     )

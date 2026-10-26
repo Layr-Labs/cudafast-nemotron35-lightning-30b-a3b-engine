@@ -1,6 +1,10 @@
-"""Draft-only BF16 exact-zero compaction; original target kernels are untouched.
+"""Draft-only BF16 compaction and optional routed activation budget.
 
-Keep every nonzero ReLU2 activation, including NaNs, in original K order.
+The default kernel interface keeps every nonzero activation, including NaNs.
+The native top-three runtime may omit weak finite routed activations below
+their expert's peak/64; shared slots and nonfinite experts keep original values.
+This intentionally changes draft numerics and may shift compact reduction lanes.
+Original target kernels are untouched.
 The compact reduction has a different FP32 tree from the existing drafter.
 Supports one to six routed experts plus the original two shared experts;
 this includes the current top-three draft policy.
@@ -19,12 +23,14 @@ logger = init_logger(__name__)
 from .nemotron_h_mtp_kernels import mtp_pdl
 
 _ENABLED = os.environ.get("MTP_RELU2_COMPACT", "1") != "0"
+_ROUTED_BUDGET = os.environ.get("MTP_ACTIVATION_BUDGET", "1") != "0"
 
 
 @triton.jit
 def _compact(
     h, indices, values, counts, I: tl.constexpr, BLOCK: tl.constexpr,
     launch_pdl: tl.constexpr = False,
+    ROUTED_BUDGET: tl.constexpr = 0,
 ):
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
@@ -33,6 +39,17 @@ def _compact(
     k = tl.arange(0, BLOCK)
     value = tl.load(h + slot * I + k, mask=k < I, other=0.0)
     live = (k < I) & (value != 0.0)
+    if ROUTED_BUDGET:
+        if slot < ROUTED_BUDGET:
+            magnitude = tl.abs(value.to(tl.float32))
+            finite = (value == value) & (magnitude < float("inf"))
+            all_finite = tl.sum(((k < I) & ~finite).to(tl.int32), axis=0) == 0
+            peak = tl.max(tl.where((k < I) & finite, magnitude, 0.0), axis=0)
+            # Native-MTP numerical budget, not exact-zero elimination. Keep
+            # all original values if this expert has any NaN/Inf. Shared slots
+            # never enter this branch. Retained values keep their BF16 bits.
+            cutoff = peak * 0.015625  # 1/64, fixed generic per-expert policy.
+            live &= ~all_finite | (magnitude >= cutoff)
     position = tl.cumsum(live.to(tl.int32), axis=0) - 1
     tl.store(indices + slot * I + position, k, mask=live)
     tl.store(values + slot * I + position, value, mask=live)
@@ -239,6 +256,7 @@ def maybe_down(h, packed, ids, weights, y, routed_scale, residual=None):
     _compact[(slots,)](
         h, indices, values, counts, I=1856, BLOCK=2048, num_warps=4,
         launch_pdl=mtp_pdl(),
+        ROUTED_BUDGET=topk if _ROUTED_BUDGET and topk == 3 else 0,
     )
     if _SLOTS:
         # The slots' sums in parallel programs, then _down's epilogue: the same

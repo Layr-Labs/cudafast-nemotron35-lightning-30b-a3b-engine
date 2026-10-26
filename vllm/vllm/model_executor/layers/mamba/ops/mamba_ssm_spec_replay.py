@@ -120,6 +120,10 @@ def prefill_tag_view(state: torch.Tensor) -> torch.Tensor | None:
     slot_elems = state.shape[1] * state.shape[2] * state.shape[3]
     if state.stride(0) < slot_elems + 1 or state.stride(1) != state.shape[2] * state.shape[3]:
         return None
+    # The last slot's word must also lie inside the tensor's storage.
+    end = state.storage_offset() + (state.shape[0] - 1) * state.stride(0) + slot_elems + 1
+    if end * state.element_size() > state.untyped_storage().nbytes():
+        return None
     return torch.as_strided(
         state.view(torch.int32), (state.shape[0],), (state.stride(0),),
         state.storage_offset() + slot_elems,

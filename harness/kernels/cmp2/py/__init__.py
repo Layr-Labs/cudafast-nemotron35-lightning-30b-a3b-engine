@@ -17,6 +17,16 @@ _ORIGINALS = []
 _PREPARED = False
 
 
+def _routed_on():
+    """Target routed up-projection only. CMP2_ROUTED=0 keeps it ordinary.
+
+    Decode reads ``w13_weight``. The down projection reads the zskip repack,
+    not ``w2_weight``. ``w13_weight_scale`` aliases ``nvsc_w13_bs``; rebinding
+    only the parameter would split that pair.
+    """
+    return os.environ.get("CMP2_ROUTED", "1") != "0"
+
+
 def _library():
     global _LIB
     if _LIB is None:
@@ -31,8 +41,13 @@ def _library():
     return _LIB
 
 
-def _select(models, torch):
-    """Resolved positive frozen-weight families; no mutable cache or scratch."""
+def _select(models, torch, *, legacy=True):
+    """Resolved positive frozen-weight families; no mutable cache or scratch.
+
+    ``legacy`` is the pre-routed set (fp8c, apk, shared Marlin, lm_head,
+    drafter planes). Expandable segments already back those; the scoring
+    path passes ``legacy=False`` and keeps only target ``w13_weight``.
+    """
     selected = []
     seen = set()
 
@@ -47,42 +62,47 @@ def _select(models, torch):
             continue
         for name, layer in model.named_modules():
             prefix = owner + "." + name
-            # Both module buffers and FP8 kernel objects refer to these SAME
-            # Tensor objects. Preserve their identity, shape, stride and offset.
-            add(prefix + "._fp8c_weight", getattr(layer, "_fp8c_weight", None))
-            # The attention registry and projection hold the same plane objects.
-            for i, plane in enumerate(getattr(layer, "_apk_planes", ())):
-                add(prefix + f"._apk_planes.{i}", plane)
             method = type(getattr(layer, "quant_method", None)).__name__
-            if "NvFp4" in method and ("shared_experts" in name or name == "lm_head"):
-                zs = getattr(layer, "_marlinx_zs", None)
-                add(prefix + "._marlinx_zs", zs)
-                su = getattr(layer, "_marlinx_su", None)
-                add(prefix + "._marlinx_su", su)
-                for field, tensor in layer.named_parameters(recurse=False):
-                    # Decode reads the existing zero-skip repack. The ordinary
-                    # fallback matrix remains ordinary for its prefill path.
-                    if field == "weight" and zs is not None:
-                        continue
-                    if field == "weight_scale" and su is not None:
-                        continue
-                    if any(tag in field.lower() for tag in ("workspace", "scratch", "lock")):
-                        continue
-                    add(prefix + "." + field, tensor)
-            if owner == "drafter":
-                # Drafter packed BF16 planes read by every draft pass: the
-                # attention projections' and the eh hidden half's registered
-                # planes, and the shared-expert up planes; the routed-up packs
-                # contribute only their small base/index/raw planes.
-                for field in ("_mtp_pk_", "_mtp_eh_pk_"):
-                    for part in ("sm", "ex", "base", "ri", "raw"):
-                        add(prefix + "." + field + part, getattr(layer, field + part, None))
-                fast = getattr(layer, "_fast_moe_weights", None)
-                if isinstance(fast, tuple) and len(fast) == 6:
-                    for idx, first in ((0, 2), (2, 0)):
-                        for j, plane in enumerate(getattr(fast[idx], "planes", ())[first:]):
-                            add(prefix + f"._fast_moe_weights.{idx}.planes.{first + j}", plane)
-    if models and models[-1] is not None:
+            if legacy:
+                # Both module buffers and FP8 kernel objects refer to these SAME
+                # Tensor objects. Preserve their identity, shape, stride and offset.
+                add(prefix + "._fp8c_weight", getattr(layer, "_fp8c_weight", None))
+                # The attention registry and projection hold the same plane objects.
+                for i, plane in enumerate(getattr(layer, "_apk_planes", ())):
+                    add(prefix + f"._apk_planes.{i}", plane)
+                if "NvFp4" in method and ("shared_experts" in name or name == "lm_head"):
+                    zs = getattr(layer, "_marlinx_zs", None)
+                    add(prefix + "._marlinx_zs", zs)
+                    su = getattr(layer, "_marlinx_su", None)
+                    add(prefix + "._marlinx_su", su)
+                    for field, tensor in layer.named_parameters(recurse=False):
+                        # Decode reads the existing zero-skip repack. The ordinary
+                        # fallback matrix remains ordinary for its prefill path.
+                        if field == "weight" and zs is not None:
+                            continue
+                        if field == "weight_scale" and su is not None:
+                            continue
+                        if any(tag in field.lower() for tag in ("workspace", "scratch", "lock")):
+                            continue
+                        add(prefix + "." + field, tensor)
+                if owner == "drafter":
+                    # Drafter packed BF16 planes read by every draft pass: the
+                    # attention projections' and the eh hidden half's registered
+                    # planes, and the shared-expert up planes; the routed-up packs
+                    # contribute only their small base/index/raw planes.
+                    for field in ("_mtp_pk_", "_mtp_eh_pk_"):
+                        for part in ("sm", "ex", "base", "ri", "raw"):
+                            add(prefix + "." + field + part, getattr(layer, field + part, None))
+                    fast = getattr(layer, "_fast_moe_weights", None)
+                    if isinstance(fast, tuple) and len(fast) == 6:
+                        for idx, first in ((0, 2), (2, 0)):
+                            for j, plane in enumerate(getattr(fast[idx], "planes", ())[first:]):
+                                add(prefix + f"._fast_moe_weights.{idx}.planes.{first + j}", plane)
+            if (_routed_on() and owner == "target" and "NvFp4" in method
+                    and isinstance(getattr(layer, "w13_weight", None), torch.Tensor)
+                    and isinstance(getattr(layer, "w2_weight", None), torch.Tensor)):
+                add(prefix + ".w13_weight", layer.w13_weight)
+    if legacy and models and models[-1] is not None:
         # The drafter's packed down projections live in the down-pack registry,
         # keyed by the BF16 sources (which stay ordinary); move their planes:
         # the shared slice whole, the routed one's small planes.
@@ -121,8 +141,8 @@ def prepare(models):
     if os.environ.get("CMP2", "1") == "0":
         _LOG.info("CMP2 compressed=none reason=disabled")
         return
-    if os.environ.get("VLLM_EXPANDABLE_SEGMENTS_ACTIVE") == "1":
-        # The weights already sit in VMM-backed expandable segments.
+    expandable = os.environ.get("VLLM_EXPANDABLE_SEGMENTS_ACTIVE") == "1"
+    if expandable and not _routed_on():
         _LOG.info("CMP2 compressed=none reason=expandable_segments")
         return
     import torch
@@ -141,7 +161,7 @@ def prepare(models):
         capsule_new.restype = ctypes.py_object
         # Gather all aliases before rebinding even one of them.
         storages = {}
-        for name, tensor in _select(models, torch):
+        for name, tensor in _select(models, torch, legacy=not expandable):
             storage = tensor.untyped_storage()
             key = (tensor.device.index, storage.data_ptr(), storage.nbytes())
             storages.setdefault(key, []).append((name, tensor))
@@ -162,6 +182,23 @@ def prepare(models):
             if not torch.equal(host, raw.cpu()):
                 raise RuntimeError("full storage byte roundtrip failed")
             checked_bytes += nbytes
+            # New routed family: byte equality alone is not performance
+            # evidence. Qualify the actual production up kernel on both backing
+            # addresses before committing even this one immutable storage.
+            if any(name.endswith(".w13_weight") for name, _ in aliases):
+                if len(aliases) != 1:
+                    _LOG.info("CMP2 routed storage refused: multiple aliases")
+                    continue
+                from vllm.model_executor.layers.fused_moe.experts.humming_cmp2 import (
+                    qualify,
+                )
+                value = aliases[0][1]
+                view = raw.view(value.dtype).as_strided(
+                    value.shape, value.stride(), value.storage_offset())
+                if not qualify(models, value, view):
+                    _LOG.info("CMP2 routed ordinary backing retained: %s",
+                              aliases[0][0])
+                    continue
             originals.append(source)
             compressed.append(raw)
             for name, value in aliases:

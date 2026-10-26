@@ -442,6 +442,14 @@
     {
       "file": "(composition)",
       "why": "terrapinelf on the record 88455a30-3e21-4da9-b718-9b6809502858 (ArthurOstapenko, commit 27e68ae): the record's files byte for byte plus terrapinelf's free-run emit budget (the entry above), the same files as terrapinelf 1d565812-f993-401a-a5a8-3c5a7c1a6435 (second measurement)."
+    },
+    {
+      "file": "harness/kernels/zskip/csrc/zskip.cu; harness/kernels/zskip/csrc/zskip_pair.cuh; harness/kernels/zskip/py/__init__.py",
+      "why": "C3LPT defaults on: for the decode verify routed-down call (shape 30, max_blocks 30, config 113, SKIP) one extra one-warp kernel between prep and down_pair sorts the 30 expert blocks by descending active-K16 count (ties keep index order) into same-call queue scratch queue[4..33] (the queue grows from 4 to 36 int32, +128 B per device); down_pair reads its expert block from that order after the PDL wait. Only the order in which CTAs start changes: each output keeps its CTA-local ascending K accumulation chain, no two CTAs write the same output, and the kernel body from the workspace read to the final store is unchanged. All other shapes/configs run as before. C3LPT=0 restores the original order (no sort launch)."
+    },
+    {
+      "file": "model_executor/layers/mamba/ops/mamba_ssm_spec_replay.py (PIPELINED branches only)",
+      "why": "C2FMA: the raw-input replay software pipeline (NEMO_MAMBA_REPLAY_PIPELINE, admitted per boot only if its outputs, replayed state and both checkpoint slots are byte-identical to the ordinary kernel) never qualified because the compiler contracted the other product into the FMA: pipeline RN(RN(B*dt)*x + state*dA) vs ordinary RN(state*dA + RN(RN(B*dt)*x)), a 1-ULP fp32 state difference. The pipelined replay and compute loops now spell the ordinary order explicitly with tl.fma(state, dA, dB*x). The ordinary kernel's code is unchanged (the change sits under the PIPELINED constexpr). The boot-time byte comparison and timing admission are unchanged; NEMO_MAMBA_REPLAY_PIPELINE=0 keeps the ordinary path."
     }
   ]
 }

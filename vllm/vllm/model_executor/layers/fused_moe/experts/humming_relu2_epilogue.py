@@ -139,7 +139,9 @@ def _dyn_num_sms(lo: int, hi: int, num_sms: int) -> int:
     prefill entry may take every SM's slots, since a CTA that only becomes
     resident once the shared expert's CTA leaves just claims fewer tiles."""
     if hi >= (1 << 29):
-        return int(os.environ.get("HUMMING_W13_DYN_PF_SMS", "48"))
+        # LOCAL PATCH (cudafast-nemotron35): 40 workers for the prefill entry,
+        # which runs beside the half-grid shx shared expert on the aux stream.
+        return int(os.environ.get("HUMMING_W13_DYN_PF_SMS", "40"))
     return int(os.environ.get("HUMMING_W13_DYN_DEC_SMS", "44"))
 
 

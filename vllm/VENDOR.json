@@ -368,8 +368,8 @@
       "why": "Cumulative draft stop. The depth gate's fourth int32 word holds the float32 bits of the running product of kept drafts' top-1 probabilities (1.0 at loop start). The screen's token select multiplies this draft's top-1 into that word and sets the existing stop flag when the product falls below MTP_DEPTH_THETA (0.5). MTP_DEPTH_CUMULATIVE=0 restores the per-draft compare. Same verify-row handoff and the same target rejection; no weight or logit change on a draft the gate still keeps."
     },
     {
-      "file": "harness/kernels/cmp2 (+ vllm/v1/worker/gpu_model_runner.py)",
-      "why": "CMP2=1 (default): transparent generic-compression VMM backing for immutable fp8c codes, apk12 planes, shared Marlin weights/scales and target lm_head including its unit-major scale copy. Full load-time storage byte checks precede pointer rebinding and engine capture. Original storages stay alive; unsupported or failed allocations leave ordinary tensors. CMP2=0 disables. Target and drafter formats and arithmetic are unchanged."
+      "file": "harness/kernels/marlinx/csrc/marlinx.cu; harness/kernels/shco/csrc/shx.cu",
+      "why": "fkiene 798532d4, carried: the shared-expert up epilogues of marlinx (verify) and shx (prefill) apply ReLU-square to the rounded BF16 pair with packed non-FTZ max.NaN.bf16x2 against +0 and mul.rn.bf16x2 (round_output2_relu2), the same single rounding of the exact square as the scalar path; round_output<false> is unchanged."
     }
   ]
 }

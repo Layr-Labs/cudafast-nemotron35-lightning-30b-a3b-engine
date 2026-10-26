@@ -121,6 +121,10 @@ def prepare(models):
     if os.environ.get("CMP2", "1") == "0":
         _LOG.info("CMP2 compressed=none reason=disabled")
         return
+    if os.environ.get("VLLM_EXPANDABLE_SEGMENTS_ACTIVE") == "1":
+        # The weights already sit in VMM-backed expandable segments.
+        _LOG.info("CMP2 compressed=none reason=expandable_segments")
+        return
     import torch
 
     changes, originals, compressed = [], [], []

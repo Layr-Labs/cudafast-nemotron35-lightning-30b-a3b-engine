@@ -570,6 +570,10 @@
     {
       "file": "harness/kernels/l2pf/py/__init__.py; model_executor/models/nemotron_h_mtp_packed.py (load_packed); model_executor/models/nemotron_h_mtp_screen.py; v1/spec_decode/llm_base_proposer.py; v1/worker/gpu_model_runner.py; model_executor/layers/fused_moe/experts/humming_nvsc.py",
       "why": "terrapinelf composition: dadon c5d82720-0817-4e93-be60-21f9d18038e5 merged into terrapinelf 8b419137-21fd-4c28-97a3-ce2ba73fa278 (ercumentyildirim 77315793 + prefill pre-launch), merge base de290fa. Files both changed: l2pf __all__ carries both sides' names; load_packed loads its planes under the bounds mask (77315793) with the three-valued EVICT policy (c5d82720); the screen admits 8-bit Triton digits (c5d82720) and then sctopk (77315793), launches c5d82720's next-pass prefetch pieces before each cascade top-k and runs each top-k through DraftHeadScreen._topk, whose Triton fallback uses _radix_for; the proposer keeps both sides' switches, uses 77315793's first-pass copy batch (c5d82720's side-stream plan, default off, only without it) and c5d82720's launch-argument backup token for one request outside stream capture, else 77315793's zero-copy read; the runner's draft-window prefetch launches c5d82720's gated table when present, else 77315793's paced prefetch, else the plain one, then c5d82720's follow-up table. humming_nvsc._prefill_configs asserts isinstance (not type identity) for the record entry, which humming_pfup.build now derives, so the 6-bit-scale prefill class is admitted with pfup's scheduler text as c5d82720 builds it. Third measurement of this composition (earlier: 906311d3-040f-4e14-a595-655d80fb7ec7, d02971ba-1983-4dd5-9755-3ccd20dec6b7)."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_kernels.py (DEPTH_THETA)",
+      "why": "Depth gate threshold 0.6 instead of 0.5: the draft loop stops once the cumulative top-1 confidence of the drafted tokens falls below 0.6, so fewer drafter passes and verify rows are spent on drafts the verify is likely to reject. MTP_DEPTH_THETA=0.5 restores the earlier gate."
     }
   ]
 }

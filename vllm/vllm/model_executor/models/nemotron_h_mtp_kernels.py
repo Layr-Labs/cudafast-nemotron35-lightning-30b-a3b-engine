@@ -69,7 +69,11 @@ def mtp_pdl() -> bool:
 # Confidence-gated draft depth
 # --------------------------------------------------------------------------- #
 DEPTH_GATE = os.environ.get("MTP_DEPTH_GATE", "1") != "0"
-DEPTH_THETA = float(os.environ.get("MTP_DEPTH_THETA", "0.5"))
+# LOCAL PATCH (cudafast-nemotron35): stop the draft loop once the cumulative top-1
+# confidence falls below 0.6 instead of 0.5, so fewer drafter passes (and fewer
+# verify rows, each of which can pull in new routed experts) are spent on drafts
+# the verify is likely to reject. MTP_DEPTH_THETA=0.5 restores the earlier gate.
+DEPTH_THETA = float(os.environ.get("MTP_DEPTH_THETA", "0.6"))
 DEPTH_CUMULATIVE = os.environ.get("MTP_DEPTH_CUMULATIVE", "1") != "0"
 GATE_PROD_ONE = 0x3F800000
 _GATE: torch.Tensor | None = None

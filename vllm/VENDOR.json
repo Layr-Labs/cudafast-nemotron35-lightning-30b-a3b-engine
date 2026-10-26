@@ -450,6 +450,30 @@
     {
       "file": "model_executor/layers/mamba/ops/mamba_ssm_spec_replay.py (PIPELINED branches only)",
       "why": "C2FMA: the raw-input replay software pipeline (NEMO_MAMBA_REPLAY_PIPELINE, admitted per boot only if its outputs, replayed state and both checkpoint slots are byte-identical to the ordinary kernel) never qualified because the compiler contracted the other product into the FMA: pipeline RN(RN(B*dt)*x + state*dA) vs ordinary RN(state*dA + RN(RN(B*dt)*x)), a 1-ULP fp32 state difference. The pipelined replay and compute loops now spell the ordinary order explicitly with tl.fma(state, dA, dB*x). The ordinary kernel's code is unchanged (the change sits under the PIPELINED constexpr). The boot-time byte comparison and timing admission are unchanged; NEMO_MAMBA_REPLAY_PIPELINE=0 keeps the ordinary path."
+    },
+    {
+      "file": "models/nemotron_h_mtp_kernels.py; layers/attention/attention.py (MTP packed branch only)",
+      "why": "DRX_GATED_PREFETCH defaults on: one read-only multi-range kernel replaces each native MTP o-projection/coarse-screen L2 prefetch launch. The existing device depth-stop flag suppresses only MTP-owned bytes; the fused router range remains unconditional. Original side-stream fork/join and target path are unchanged. Missing l2pf/gate, unsupported buffers/ranges or DRX_GATED_PREFETCH=0 retain the original l2pf path. No numeric, format or per-request work changes."
+    },
+    {
+      "file": "vllm/v1/spec_decode/llm_base_proposer.py; harness/vllm_resident/backends.py",
+      "why": "jacklightChen (6ee1778c-07ee-4eee-9dd5-a43b6f39059b), carried byte for byte: On ENTIRE highest1e1c2581-e506-4ca4-9341-5f08ffceec86, group later native-MTP page metadata and exact native-plan integer-prefix publication into one ordered copy kernel before original staging and plan-ready events. Preserve immutable owners through completion, event after kernel in both staging modes, and materialize on opaque planner/cache-miss fallbacks. Reuses selected993copykernel plus ownPR544lifetime safeguards; no failedPR538producer/stoppedGEMM, no BBFscale-selection delta, no DEBdtypeguard imported. New whole, activation and gain remain unverified."
+    },
+    {
+      "file": "harness/kernels/sctopk/{csrc/sctopk.cu,py/__init__.py,build.sh}; vllm/model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "ercumentyildirim (04a39307-60ca-4f16-bc6d-78b8e024c1bf), carried byte for byte: the three-level draft-head screen's per-chunk top-k selections (_chunk_topk, RADIX) run as one CUDA kernel each: an exact 8-bit radix select of the K-th largest key (torch's TopKTypeConfig order key, NaN largest, -0 below +0) over four shared-memory histograms, then every key above it in ascending index order followed by its ties in ascending index order until K are taken, through two block-wide exclusive scans; a stopped draft pass writes the first K ids in index order. Integer operations only, so the id lists equal _chunk_topk's. The screen admits it at load only after comparing both on the cascade's three shapes (ties, signed zeros, NaNs, gated and not); otherwise _chunk_topk stays. VLLM_MTP_SCREEN_SCTOPK=0 (or SCTOPK=0) keeps _chunk_topk."
+    },
+    {
+      "file": "harness/kernels/zskip/csrc/zskip_lean.cuh; harness/kernels/zskip/csrc/zskip.cu; harness/kernels/zskip/py/__init__.py; harness/kernels/marlinx/csrc/marlinx.cu; harness/kernels/marlinx/py/__init__.py; vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
+      "why": "i34-9 (f0fcab75-b0b3-4a4c-893d-850ef447c110), carried byte for byte: (1) zskip configuration 653, a lean paired decode kernel for the 5-row verify routed-down projection with the same per-output arithmetic, accumulation order and epilogue as the checked configurations and a shorter per-group instruction stream; humming_zskip checks it bitwise at boot against the configuration the record selects and against the reference kernel for M 1..8 and the verify-prefix mode, and any mismatch keeps the record's choice (ZSKIP_LEAN=0 off; when 653 is selected the C3LPT ordering for configuration 113 does not apply to that call). (2) marlinx lean shared-expert down projection at M <= 8, same grid, warp chains, segment folds, operands and epilogue, with a nibble-permuted skip copy of the same size built at load (MARLINX_LEAN=0 off)."
+    },
+    {
+      "file": "vllm/v1/spec_decode/nemotron_compound_loop.py; vllm/v1/spec_decode/llm_base_proposer.py (compound hunks); vllm/v1/spec_decode/nemotron_decode_plan.py; vllm/v1/spec_decode/nemotron_full_step.py",
+      "why": "jacklightChen (581daccd-f77c-4adf-accd-9eeb4a857f73), carried byte for byte (llm_base_proposer.py: its hunks only, beside BONUS's): after the original first MTP pass, first head screen and first later-pass input/plan build, a boot-qualified parent CUDA graph runs the remaining three native MTP model+head child graphs; between passes one device stage does the original token/hidden copy, position/slot step, current-page metadata and selection of an original native FA2 integer-plan prefix whose plan_info and scalars equal the captured graph's. Admitted at boot only after stage, token, gate, KV, canary and CPU-shadow comparisons against the original loop and a latency check; budget-limited tails and unsupported states keep the original loop. NEMO_MTP_COMPOUND_LOOP=0 disables it."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_down_packed.py",
+      "why": "ercumentyildirim (1be68d28-7f3d-4dbd-be34-09da36462e24), carried byte for byte: MTP_DOWN_PACK12_FORCE (default on) admits the packed (lossless 12-bit BF16 codec) compact-down slots for a draft top-k whose load-time comparison with the original BF16 slots is bitwise equal on every probe even when the private timing probe does not show the 4% margin; the fastest bit-identical block width is used. The exhaustive bit comparison is unchanged, the original weights stay retained, and a failed comparison keeps the original slots. MTP_DOWN_PACK12_FORCE=0 restores the timing gate."
     }
   ]
 }

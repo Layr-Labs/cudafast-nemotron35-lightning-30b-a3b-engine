@@ -279,6 +279,11 @@ class VllmBackend:
         except AttributeError:
             return
         if drafter is not None:
+            if target is None and getattr(drafter, "_emit_tail_omitted", False):
+                # This free run omitted MTP KV writes. Its queued target
+                # output may finish normally; any subsequent continuation
+                # must prefill again from the resident's committed context.
+                self._mtp_tail_restart_required = True
             drafter.emit_target = target
 
     def step(self) -> list[Emit]:
@@ -319,11 +324,23 @@ class VllmBackend:
         """The live request's queue was drained at a budget's end, so no batch
         of it is in flight. The engine never continues such a request ahead;
         the session restarts it from its context instead."""
-        return self._live is not None and getattr(self, "_c57_tail_drained", False)
+        return self._live is not None and (
+            getattr(self, "_c57_tail_drained", False)
+            or getattr(self, "_mtp_tail_restart_required", False)
+        )
 
     def abort(self) -> bool:
         running = False
         self._c57_tail_drained = False
+        self._mtp_tail_restart_required = False
+        try:
+            runner = self._engine.engine_core.engine_core.model_executor.driver_worker.worker.model_runner
+            drafter = getattr(runner, "drafter", None)
+        except AttributeError:
+            drafter = None
+        if drafter is not None:
+            drafter.emit_target = None
+            drafter._emit_tail_omitted = False
         if self._live is not None:
             running = self._engine.has_unfinished_requests()
             self._engine.abort_request([self._live])

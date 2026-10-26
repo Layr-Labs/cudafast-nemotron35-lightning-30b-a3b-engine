@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import signal
 import socket
 import sys
@@ -76,6 +77,13 @@ SKIP_LOGPROBS = os.environ.get("VLLM_HOSTFAST_SKIP_LOGPROBS", "1") != "0"
 # the model. Every phase of one leg reports the same value, and two legs never
 # share one. (A pid would not do: inside the container every resident is pid 7.)
 LOAD_EPOCH = int(time.time() * 1000)
+# Hot waits (adapter src/hotwait.rs): before each blocking read of the next
+# request, poll the socket with a 1 ms timeout for up to HOT_WAIT_S, so the
+# read starts when the bytes land instead of after the core wakes from deep
+# idle. Only WHEN the read starts changes; bytes, framing and the phase timeout
+# are the same. RESIDENT_HOT_WAIT=0 restores the plain blocking read.
+HOT_WAIT = os.environ.get("RESIDENT_HOT_WAIT", "1") != "0"
+HOT_WAIT_S = 2.0
 
 
 def log(msg: str) -> None:
@@ -325,9 +333,37 @@ class Session:
         raise RefusedError(f'unknown op "{op}"')
 
 
+def _hot_wait(poller: "select.poll", hot_s: float) -> None:
+    """Return once the socket is readable (or hung up), or after hot_s."""
+    deadline = time.monotonic() + hot_s
+    while not poller.poll(1) and time.monotonic() < deadline:
+        pass
+
+
+def _request_lines(conn: socket.socket):
+    """The connection's request lines, as `conn.makefile("rb")` yields them."""
+    poller = select.poll()
+    poller.register(conn, select.POLLIN | select.POLLHUP | select.POLLERR)
+    buf = bytearray()
+    while True:
+        end = buf.find(b"\n")
+        if end >= 0:
+            line = bytes(buf[: end + 1])
+            del buf[: end + 1]
+            yield line
+            continue
+        _hot_wait(poller, HOT_WAIT_S)
+        chunk = conn.recv(1 << 16)
+        if not chunk:
+            if buf:
+                yield bytes(buf)
+            return
+        buf += chunk
+
+
 def serve_connection(session: Session, conn: socket.socket, timeout_s: float) -> None:
     conn.settimeout(timeout_s)
-    reader = conn.makefile("rb")
+    reader = _request_lines(conn) if HOT_WAIT else conn.makefile("rb")
     try:
         for raw in reader:
             try:

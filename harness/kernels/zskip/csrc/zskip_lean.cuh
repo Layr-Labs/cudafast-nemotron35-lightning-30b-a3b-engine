@@ -25,6 +25,13 @@
 #ifndef ZSKIP_NO_PAIR
 
 constexpr int F_ZHALF = 1, F_NOSPLIT = 2, F_BPF = 4, F_RPF = 8, F_WPF = 16;
+// F_S6: the scale plane holds each e4m3 scale byte as a 6-bit offset from S6_BASE (to_s6() in
+// py/__init__.py): per expert, k16 group and 128-column tile pair a 96-byte block, the 8 bytes of
+// lane group g8's 16 low nibbles at 8 * g8 (scale i in bits 4i..4i+3 of the little-endian u64),
+// then at 64 + 4 * g8 the u32 of their high 2-bit parts (bits 2i..2i+1). s6_decode rebuilds the
+// same 16 bytes the 8-bit plane's 16-byte load gives, before any use.
+constexpr int F_S6 = 32;
+constexpr uint32_t S6_BASE = 62u;
 // F_WPF: with group j's loads, each lane requests its own pieces of group j + R + D into L2 (the
 // k rows of its mask bits, 8 bytes each, and its 16 scale bytes)
 // prefetch distance code in F bits 8..11: 0 none, 1..7 -> 2 * code groups, 8 -> nag / 16, 9 -> nag / 8,
@@ -57,6 +64,24 @@ __device__ __forceinline__ void ldg32l1_z(uint32_t& x, const void* ptr, uint32_t
 __device__ __forceinline__ void ldg128_na(uint32_t (&v)[4], const void* ptr) {
   asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];\n"
                : "=r"(v[0]), "=r"(v[1]), "=r"(v[2]), "=r"(v[3]) : "l"(ptr));
+}
+__device__ __forceinline__ void ldg64_na(uint32_t& x, uint32_t& y, const void* ptr) {
+  asm volatile("ld.global.nc.L1::no_allocate.v2.u32 {%0,%1}, [%2];\n" : "=r"(x), "=r"(y) : "l"(ptr));
+}
+__device__ __forceinline__ void ldg32_na(uint32_t& x, const void* ptr) {
+  asm volatile("ld.global.nc.L1::no_allocate.u32 %0, [%1];\n" : "=r"(x) : "l"(ptr));
+}
+// F_S6: the 16 scale bytes from their 6-bit codes (s[0], s[1]: low nibbles; s[2]: high 2-bit parts).
+// Byte b of word q is scale 4q + b = S6_BASE + code (code <= 63 and S6_BASE + 63 < 256: no carry).
+__device__ __forceinline__ void s6_decode(const uint32_t (&s)[4], uint32_t (&out)[4]) {
+#pragma unroll
+  for (int q = 0; q < 4; ++q) {
+    const uint32_t nib = (q < 2 ? s[0] : s[1]) >> (16 * (q & 1));
+    const uint32_t two = s[2] >> (8 * q);
+    const uint32_t lo = (nib & 0xFu) | ((nib & 0xF0u) << 4) | ((nib & 0xF00u) << 8) | ((nib & 0xF000u) << 12);
+    const uint32_t hi = (two & 0x3u) | ((two & 0xCu) << 6) | ((two & 0x30u) << 12) | ((two & 0xC0u) << 18);
+    out[q] = (lo | (hi << 4)) + S6_BASE * 0x01010101u;
+  }
 }
 
 constexpr int COMPUTEONLY = 5;  // timing probe: lean kernel without the weight/scale/activation loads
@@ -163,7 +188,8 @@ template <int R, bool NR1, int F>
 __device__ __forceinline__ void lean_main(float (&acc)[8][4], const Params& p, const uint32_t* list, int nag,
                                           const uint8_t* const (&wr)[4], const uint8_t* sb, const uint8_t* xb,
                                           unsigned gw, unsigned sg, uint32_t xok, int t, bool dense,
-                                          const uint8_t* wexp, const uint8_t* sexp, int P) {
+                                          const uint8_t* wexp, const uint8_t* sexp, int P, const uint8_t* sb2) {
+  constexpr bool S6 = (F & F_S6) != 0;
   const bool math = p.mode == DENSE || p.mode == SKIP || p.mode == COMPUTEONLY;
   const bool loads = p.mode != COMPUTEONLY;
   constexpr bool PF = (F & (F_BPF | F_RPF)) != 0 && ((F >> 8) & 15) != 0;
@@ -192,7 +218,12 @@ __device__ __forceinline__ void lean_main(float (&acc)[8][4], const Params& p, c
       ldg64_z(W_[slot][2], W_[slot][3], wr[1] + go, mm & 2u);
       ldg64_z(W_[slot][4], W_[slot][5], wr[2] + go, mm & 0x100u);
       ldg64_z(W_[slot][6], W_[slot][7], wr[3] + go, mm & 0x200u);
-      ldg128_na(S_[slot], sb + grp * sg);
+      if constexpr (S6) {
+        ldg64_na(S_[slot][0], S_[slot][1], sb + grp * sg);
+        ldg32_na(S_[slot][2], sb2 + grp * sg);
+      } else {
+        ldg128_na(S_[slot], sb + grp * sg);
+      }
       ldg32l1_z(X_[slot][0], xb + 32u * grp, xok);
       ldg32l1_z(X_[slot][1], xb + 32u * grp + 16u, xok);
     };
@@ -222,8 +253,12 @@ __device__ __forceinline__ void lean_main(float (&acc)[8][4], const Params& p, c
           const uint32_t m_ = M_[i];
 #pragma unroll
           for (int q = 0; q < 8; ++q) w_[q] = W_[i][q];
+          if constexpr (S6) {
+            s6_decode(S_[i], s_);
+          } else {
 #pragma unroll
-          for (int q = 0; q < 4; ++q) s_[q] = S_[i][q];
+            for (int q = 0; q < 4; ++q) s_[q] = S_[i][q];
+          }
           x_[0] = X_[i][0];
           x_[1] = X_[i][1];
           if constexpr (PF) {
@@ -242,6 +277,7 @@ __device__ __forceinline__ void lean_main(float (&acc)[8][4], const Params& p, c
               prefetch_l2_pred(wr[2] + go, mm & 0x100u);
               prefetch_l2_pred(wr[3] + go, mm & 0x200u);
               prefetch_l2_pred(sb + grp * sg, t == 0);
+              if constexpr (S6) prefetch_l2_pred(sb2 + grp * sg, t == 0);
             }
           }
           // refill before the math: the loads of group j + R start before group j's math
@@ -365,7 +401,8 @@ __global__ void __launch_bounds__(WPC * 32) down_lean_kernel(const Params p) {
   wr[1] = wr[0] + p.w_k;
   wr[2] = wr[0] + 8 * p.w_k;
   wr[3] = wr[2] + p.w_k;
-  const uint8_t* sb = p.S + e * p.s_expert + P * p.s_tile + g8 * 16;
+  const uint8_t* sb = p.S + e * p.s_expert + P * p.s_tile + ((F & F_S6) != 0 ? g8 * 8 : g8 * 16);
+  const uint8_t* sb2 = p.S + e * p.s_expert + P * p.s_tile + 64 + g8 * 4;  // F_S6 only
   const unsigned sg = static_cast<unsigned>(p.s_g);
   const unsigned gw = static_cast<unsigned>(16 * p.w_k);
   const int xrow_i = g8 < nrows ? s_rows[g8] : -1;
@@ -376,9 +413,9 @@ __global__ void __launch_bounds__(WPC * 32) down_lean_kernel(const Params p) {
   const uint8_t* wexp = p.W + e * p.w_expert;
   const uint8_t* sexp = p.S + e * p.s_expert;
   if (!(F & F_NOSPLIT) && nrows == 1)
-    lean_main<R, true, F>(acc, p, list, nag, wr, sb, xb, gw, sg, xok, t, dense0, wexp, sexp, P);
+    lean_main<R, true, F>(acc, p, list, nag, wr, sb, xb, gw, sg, xok, t, dense0, wexp, sexp, P, sb2);
   else
-    lean_main<R, false, F>(acc, p, list, nag, wr, sb, xb, gw, sg, xok, t, dense0, wexp, sexp, P);
+    lean_main<R, false, F>(acc, p, list, nag, wr, sb, xb, gw, sg, xok, t, dense0, wexp, sexp, P, sb2);
   if (p.trace && lane == 0) {
     unsigned long long* tr = p.trace + 4ull * (mb * 21 + P);
     tr[0] = t0;

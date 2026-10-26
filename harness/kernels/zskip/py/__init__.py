@@ -51,7 +51,10 @@ CONFIGS4.update({500: (2, 2, 4, 32), 501: (6, 2, 4, 32), 502: (6, 4, 4, 32), 503
 CONFIGS4[108] = (2, 4, 1, 16)
 # swap2 decode pairs: 113/118 (unfused/fused prep) and their empty-half dequant skips 114/119
 # lean paired decode (csrc/zskip_lean.cuh): config -> (warps per CTA, ring depth, flags); default 653
-LEAN_CONFIGS = {604: (1, 2, 260), 613: (1, 2, 2820), 616: (1, 2, 2824), 630: (1, 2, 0), 640: (1, 3, 272), 645: (1, 4, 272), 653: (1, 3, 274), 656: (1, 4, 274), 658: (1, 2, 274)}
+LEAN_CONFIGS = {604: (1, 2, 260), 613: (1, 2, 2820), 616: (1, 2, 2824), 630: (1, 2, 0), 640: (1, 3, 272), 645: (1, 4, 272), 653: (1, 3, 274), 656: (1, 4, 274), 658: (1, 2, 274), 663: (1, 3, 306)}
+# 663: config 653 reading the 6-bit scale plane of to_s6() (S6_BASE must match csrc/zskip_lean.cuh)
+S6_CONFIGS = (663,)
+S6_BASE = 62
 PAIR_CONFIGS = (113, 114, 118, 119) + tuple(LEAN_CONFIGS)
 COMPUTEONLY = 5     # timing probe (lean configs): no weight/scale/activation loads
 DEFAULT_CONFIG = int(os.environ.get("ZSKIP_CONFIG", "0"))
@@ -261,6 +264,62 @@ def to_swap2(pk: Packed, chunk: int = 16) -> Packed:
         S[e0:e1] = pk.s[e0:e1].reshape(e1-e0, G, N//128, 2, 8, 8).permute(
             0, 1, 2, 4, 3, 5).reshape(e1-e0, G, N)
     return Packed(W, S, pk.gs, "swap2", (K*(N//2), 64, N//2, G*N, 128, N))
+
+
+@torch.no_grad()
+def to_s6(pk: Packed) -> Packed | None:
+    """swap2 -> the same nibbles with each scale byte as a 6-bit offset from S6_BASE, for the S6
+    lean configs: per expert, k16 group and 128-column tile pair a 96-byte block, lane group g8's
+    16 low nibbles as 8 bytes at 8 * g8 (scale i of the 8-bit plane's 16 bytes at g8 * 16 in
+    bits 4i..4i+3) and their high 2-bit parts as a u32 at 64 + 4 * g8 (bits 2i..2i+1). None when a
+    scale byte lies outside [S6_BASE, S6_BASE + 63]; the result is checked by decoding every byte
+    back (on the device, the kernel's own arithmetic) against pk.s."""
+    assert pk.layout == "swap2"
+    E = pk.w.shape[0]
+    s = pk.s.view(E, G, NUM_TILES, 8, 16).to(torch.int32)
+    if bool((s < S6_BASE).any()) or bool((s > S6_BASE + 63).any()):
+        return None
+    code = s - S6_BASE
+    nib = code & 15
+    lo = nib[..., 0::2] | (nib[..., 1::2] << 4)                       # [E, G, 21, 8, 8] bytes
+    two = code >> 4
+    hi = two[..., 0::4] | (two[..., 1::4] << 2) | (two[..., 2::4] << 4) | (two[..., 3::4] << 6)  # [E, G, 21, 8, 4]
+    S = torch.cat([lo.reshape(E, G, NUM_TILES, 64), hi.reshape(E, G, NUM_TILES, 32)], dim=-1)
+    S = S.to(torch.uint8).contiguous().view(E, G * NUM_TILES * 96)
+    # decode back with the kernel's formula and compare every byte
+    lo_b = S.view(E, G, NUM_TILES, 96)[..., :64].reshape(E, G, NUM_TILES, 8, 8).to(torch.int32)
+    hi_b = S.view(E, G, NUM_TILES, 96)[..., 64:].reshape(E, G, NUM_TILES, 8, 4).to(torch.int32)
+    n16 = torch.stack([lo_b & 15, lo_b >> 4], dim=-1).reshape(E, G, NUM_TILES, 8, 16)
+    t16 = torch.stack([(hi_b >> (2 * j)) & 3 for j in range(4)], dim=-1).reshape(E, G, NUM_TILES, 8, 16)
+    if not torch.equal(n16 + (t16 << 4) + S6_BASE, s):
+        return None
+    return Packed(pk.w, S, pk.gs, "swap2", (pk.w_expert, pk.w_tile, pk.w_k, G * NUM_TILES * 96, 96, NUM_TILES * 96))
+
+
+@torch.no_grad()
+def to_s6_swap(pk: Packed) -> Packed | None:
+    """swap -> the same nibbles with each scale byte as a 6-bit offset from S6_BASE, for pzskip
+    config 379: per expert, k16 group and 64-column tile a 48-byte block, lane group g8's 8 low
+    nibbles as a u32 at 4 * g8 (scale j of the 8-bit plane's 8 bytes at 8 * g8 in bits 4j..4j+3)
+    and their high 2-bit parts as a u16 at 32 + 2 * g8 (bits 2j..2j+1). None when a scale byte lies
+    outside [S6_BASE, S6_BASE + 63]; every byte is decoded back and compared."""
+    assert pk.layout == "swap"
+    E = pk.w.shape[0]
+    s = pk.s.view(E, G, N // 64, 8, 8).to(torch.int32)
+    if bool((s < S6_BASE).any()) or bool((s > S6_BASE + 63).any()):
+        return None
+    code = s - S6_BASE
+    nib = (code[..., 0::2] & 15) | ((code[..., 1::2] & 15) << 4)            # [E, G, 42, 8, 4]
+    two = code >> 4
+    hi = two[..., 0::4] | (two[..., 1::4] << 2) | (two[..., 2::4] << 4) | (two[..., 3::4] << 6)  # [E, G, 42, 8, 2]
+    S = torch.cat([nib.reshape(E, G, N // 64, 32), hi.reshape(E, G, N // 64, 16)], dim=-1)
+    S = S.to(torch.uint8).contiguous().view(E, G * (N // 64) * 48)
+    b = S.view(E, G, N // 64, 48).to(torch.int32)
+    n8 = torch.stack([b[..., :32] & 15, b[..., :32] >> 4], -1).reshape(E, G, N // 64, 8, 8)
+    t8 = torch.stack([(b[..., 32:] >> (2 * j)) & 3 for j in range(4)], -1).reshape(E, G, N // 64, 8, 8)
+    if not torch.equal(n8 + (t8 << 4) + S6_BASE, s):
+        return None
+    return Packed(pk.w, S, pk.gs, "swap", (pk.w_expert, pk.w_tile, pk.w_k, G * (N // 64) * 48, 48, (N // 64) * 48))
 
 
 @torch.no_grad()

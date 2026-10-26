@@ -825,8 +825,27 @@ __global__ void __launch_bounds__(128) prep2_kernel(const Params p) {
   }
 }
 
+// S6 (config 379): the swap scale plane as 6-bit offsets from S6_BASE (zskip py to_s6_swap):
+// per expert, k16 group and 64-column tile 48 bytes, lane group g8's 8 low nibbles as a u32 at
+// 4 g8 (scale j in bits 4j..4j+3) and their high 2-bit parts as a u16 at 32 + 2 g8 (bits 2j..2j+1).
+// s6_pair rebuilds the 8 bytes the 8-bit plane's uint2 at 8 g8 holds.
+constexpr uint32_t PZ_S6_BASE = 62u;
+__device__ __forceinline__ uint2 s6_pair(const uint8_t* s, int Tl, int g8) {
+  const uint32_t nib = *reinterpret_cast<const uint32_t*>(s + Tl * 48 + g8 * 4);
+  const uint32_t two = *reinterpret_cast<const uint16_t*>(s + Tl * 48 + 32 + g8 * 2);
+  uint32_t r[2];
+#pragma unroll
+  for (int q = 0; q < 2; ++q) {
+    const uint32_t n4 = nib >> (16 * q), t4 = two >> (8 * q);
+    const uint32_t lo = (n4 & 0xFu) | ((n4 & 0xF0u) << 4) | ((n4 & 0xF00u) << 8) | ((n4 & 0xF000u) << 12);
+    const uint32_t hi = (t4 & 0x3u) | ((t4 & 0xCu) << 6) | ((t4 & 0x30u) << 12) | ((t4 & 0xC0u) << 18);
+    r[q] = (lo | (hi << 4)) + PZ_S6_BASE * 0x01010101u;
+  }
+  return make_uint2(r[0], r[1]);
+}
+
 // one k16 group of a warp's 64-column tile for NT token tiles of 8 rows
-template <int NT>
+template <int NT, bool S6 = false>
 __device__ __forceinline__ void s5_group(float (&acc)[4][4][4], const uint8_t (*w)[192], const uint8_t* s,
                                          const uint8_t (*x)[XS], int lane, int Tl) {
   const int g8 = lane >> 2, t = lane & 3;
@@ -834,7 +853,7 @@ __device__ __forceinline__ void s5_group(float (&acc)[4][4][4], const uint8_t (*
   const uint32_t w1 = *reinterpret_cast<const uint32_t*>(&w[2 * t + 1][Tl * 32 + g8 * 4]);
   const uint32_t w2 = *reinterpret_cast<const uint32_t*>(&w[2 * t + 8][Tl * 32 + g8 * 4]);
   const uint32_t w3 = *reinterpret_cast<const uint32_t*>(&w[2 * t + 9][Tl * 32 + g8 * 4]);
-  const uint2 sc = *reinterpret_cast<const uint2*>(&s[Tl * 64 + g8 * 8]);
+  const uint2 sc = S6 ? s6_pair(s, Tl, g8) : *reinterpret_cast<const uint2*>(&s[Tl * 64 + g8 * 8]);
   uint32_t xb[NT][2];
 #pragma unroll
   for (int tt = 0; tt < NT; ++tt) {
@@ -861,7 +880,7 @@ __device__ __forceinline__ void s5_group(float (&acc)[4][4][4], const uint8_t (*
   }
 }
 
-template <int KG, int NS, int MINB, int POLICY = 0>
+template <int KG, int NS, int MINB, int POLICY = 0, bool S6 = false>
 __global__ void __launch_bounds__(192, MINB) smem5_kernel(const Params p) {
   constexpr int BMT = 32, NTL = 6;
   extern __shared__ __align__(128) uint8_t s5_smem[];
@@ -892,7 +911,7 @@ __global__ void __launch_bounds__(192, MINB) smem5_kernel(const Params p) {
   __syncthreads();
   const int ntt = (nrows + 7) >> 3;
   const uint8_t* wexp = p.W + e * p.w_expert + (long long)(NTL * P) * 32;
-  const uint8_t* sexp = p.S + e * p.s_expert + (long long)(NTL * P) * 64;
+  const uint8_t* sexp = p.S + e * p.s_expert + (long long)(NTL * P) * (S6 ? 48 : 64);
   // fixed cp.async roles: weight piece (tid / 12, tid % 12) of each group; an extra piece: scales
   // (tid < 24) or activation row (tid - 24) / 2, half (tid - 24) % 2 (tid - 24 < 2 nrows)
   const unsigned woff = static_cast<unsigned>((tid / 12) * p.w_k + 16 * (tid % 12));
@@ -918,9 +937,10 @@ __global__ void __launch_bounds__(192, MINB) smem5_kernel(const Params p) {
           const int wr = tid / 12, wpc = tid - 12 * wr;
           if ((m >> wr) & 1u)
             cp16_weight<POLICY>(&S.w[gi][wr][16 * wpc], wexp + (woff + grp * (unsigned)(16 * p.w_k)));
-          if (tid < 24)
-            cp16_weight<POLICY>(&S.s[gi][16 * tid], sexp + (unsigned)(grp * p.s_g + 16 * tid));
-          else if (tid - 24 < 2 * nrows)
+          if (tid < 24) {
+            if (!S6 || tid < 18)
+              cp16_weight<POLICY>(&S.s[gi][16 * tid], sexp + (unsigned)(grp * p.s_g + 16 * tid));
+          } else if (tid - 24 < 2 * nrows)
             cp16(&S.x[gi][(tid - 24) >> 1][16 * ((tid - 24) & 1)], reinterpret_cast<const uint8_t*>(p.A) + (xoff + 32u * grp));
         }
       }
@@ -960,10 +980,10 @@ __global__ void __launch_bounds__(192, MINB) smem5_kernel(const Params p) {
       for (int gi = 0; gi < KG; ++gi) {
         if (st * KG + gi >= nsteps) continue;
         switch (ntt) {
-          case 1: s5_group<1>(acc, S.w[gi], S.s[gi], S.x[gi], lane, warp); break;
-          case 2: s5_group<2>(acc, S.w[gi], S.s[gi], S.x[gi], lane, warp); break;
-          case 3: s5_group<3>(acc, S.w[gi], S.s[gi], S.x[gi], lane, warp); break;
-          default: s5_group<4>(acc, S.w[gi], S.s[gi], S.x[gi], lane, warp); break;
+          case 1: s5_group<1, S6>(acc, S.w[gi], S.s[gi], S.x[gi], lane, warp); break;
+          case 2: s5_group<2, S6>(acc, S.w[gi], S.s[gi], S.x[gi], lane, warp); break;
+          case 3: s5_group<3, S6>(acc, S.w[gi], S.s[gi], S.x[gi], lane, warp); break;
+          default: s5_group<4, S6>(acc, S.w[gi], S.s[gi], S.x[gi], lane, warp); break;
         }
       }
     }
@@ -1000,7 +1020,7 @@ __global__ void __launch_bounds__(192, MINB) smem5_kernel(const Params p) {
   }
 }
 
-template <int KG, int NS, int MINB, int POLICY = 0>
+template <int KG, int NS, int MINB, int POLICY = 0, bool S6 = false>
 static int launch_smem5(const Params& p, cudaStream_t st) {
   prep2_kernel<<<p.max_blocks, 128, 0, st>>>(p);
   cudaError_t e0 = cudaGetLastError();
@@ -1008,12 +1028,12 @@ static int launch_smem5(const Params& p, cudaStream_t st) {
   const int sm = (int)sizeof(SmemStage<KG, NS, 6, 32>) * NS;
   static int attr = 0;
   if (sm > attr) {
-    cudaError_t e = cudaFuncSetAttribute(smem5_kernel<KG, NS, MINB, POLICY>, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
+    cudaError_t e = cudaFuncSetAttribute(smem5_kernel<KG, NS, MINB, POLICY, S6>, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
     if (e != cudaSuccess) return (int)e;
     attr = sm;
   }
   dim3 grid(N / 384, p.max_blocks);
-  smem5_kernel<KG, NS, MINB, POLICY><<<grid, 192, sm, st>>>(p);
+  smem5_kernel<KG, NS, MINB, POLICY, S6><<<grid, 192, sm, st>>>(p);
   return (int)cudaGetLastError();
 }
 
@@ -1137,6 +1157,21 @@ int pzskip_down(const void* A, long long lda, int shape_m, const int* sorted_ids
       }
 #endif
       return pzskip::launch_smem5<1, 4, 3, 0>(q, st);
+    }
+    // LOCAL PATCH (cudafast-nemotron35, pz S6): 369 reading the 6-bit swap scale plane
+    // (zskip py to_s6_swap; p.S / s_expert / s_g describe that plane). Same blocks, same arithmetic.
+    case 379: {
+      pzskip::Params q = p;
+      q.half64 = 1;
+#ifndef PZSKIP_NO_CACHE_POLICY
+      const char* enabled = std::getenv("HUMMING_EVICT_PZ");
+      if (q.shape_m == 2976 && (!enabled || enabled[0] != '0')) {
+        int rc = pzskip::launch_smem5<1, 4, 3, 1, true>(q, st);
+        if (!rc) return 0;
+        cudaGetLastError();
+      }
+#endif
+      return pzskip::launch_smem5<1, 4, 3, 0, true>(q, st);
     }
     // 16-row blocks: one warp per 64-column tile, 2 token tiles
     case 340: return pzskip::launch_smem4<1, 4, 2, 8, 16>(p, st);

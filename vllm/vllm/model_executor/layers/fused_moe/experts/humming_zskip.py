@@ -48,6 +48,11 @@ PZ_ENABLED = os.environ.get("PZSKIP", "1") != "0"
 # config 333's arithmetic with a leaner per-group instruction stream; PZSKIP_CONFIG=333 restores 333
 # LOCAL PATCH (cudafast-nemotron35, pzhalf): config 369 = 356 reading humming's 64-row prefill
 # layout as 32-row halves, so the 32-row moe_align is not run; PZSKIP_HALF64=0 keeps 356.
+# LOCAL PATCH (cudafast-nemotron35, pz S6): the prefill routed down (pzskip 369) reads the
+# 6-bit swap scale plane (zskip to_s6_swap, config 379) when its load-time check is bitwise
+# equal to humming; PZSKIP_S6=0 keeps 369 and the 8-bit plane.
+PZ_S6_ENABLED = os.environ.get("PZSKIP_S6", "1") != "0"
+PZ_S6_CONFIG = 379
 PZ_CONFIG = int(os.environ.get(
     "PZSKIP_CONFIG", "369" if os.environ.get("PZSKIP_HALF64", "1") != "0" else "356"))
 PZ_BLOCK_M = 64  # humming's prefill bucket that pzskip replaces
@@ -72,6 +77,11 @@ PAIR_HALFSKIP_CONFIG = {PAIR_CONFIG: 114, PAIR_FUSED_CONFIG: 119}
 # default; ZSKIP_LEAN=0 keeps the pair config): -14 us per call alone, -5 us in situ.
 LEAN_ENABLED = os.environ.get("ZSKIP_LEAN", "1") == "1"
 LEAN_CONFIG = int(os.environ.get("ZSKIP_LEAN_CONFIG", "653"))
+# LOCAL PATCH (cudafast-nemotron35, zskip S6): the lean config's scale plane as 6-bit offsets
+# (harness/kernels/zskip to_s6, config 663 = 653 with the 6-bit plane decoded to the same bytes
+# in registers). ZSKIP_S6=0 keeps 653 and the 8-bit plane.
+S6_ENABLED = os.environ.get("ZSKIP_S6", "1") != "0"
+S6_CONFIG = 663
 # Prefill: MoE layers whose relu^2 activations are sparse enough for the skip to beat humming's
 # 64-row blocks on GB10 (measured per layer on prefill-length calls; the others lose). Layer 51,
 # the last, is left out: the boot prefill graph routes all its rows through one row's experts.
@@ -156,6 +166,9 @@ def finalize(layer: torch.nn.Module) -> None:
         if _pz_self_check(layer):
             layer.pzskip_ok = True
             logger.info_once("pzskip: zero-row-skipping routed down projection enabled for prefill")
+            layer.pz_s6 = None
+            if PZ_S6_ENABLED and PZ_CONFIG == 369 and PZ_S6_CONFIG in getattr(_pzskip, "S6_CONFIGS", ()):
+                _prepare_pz_s6(layer)
     if layer.zskip_prefill:
         logger.info_once(
             "zskip: prefill routed down projection enabled on layers %s",
@@ -169,6 +182,8 @@ def finalize(layer: torch.nn.Module) -> None:
         _prepare_pair(layer)
     if LEAN_ENABLED and getattr(layer, "zskip_pair_w2", None) is not None:
         _prepare_lean(layer)
+    if S6_ENABLED and getattr(layer, "zskip_pair_config", None) == LEAN_CONFIG == 653:
+        _prepare_s6(layer)
     layer.zskip_pair_prefix_ok = False
     if (getattr(layer, "zskip_pair_w2", None) is not None
         and os.environ.get("ZSKIP_VERIFY_PREFIX", "1") != "0"
@@ -241,8 +256,33 @@ def _prepare_lean(layer: torch.nn.Module) -> None:
                             exc, getattr(layer, "zskip_pair_config", None))
 
 
+def _prepare_s6(layer: torch.nn.Module) -> None:
+    """Optional: the 6-bit scale plane for the lean paired decode; every failure keeps 653 and
+    the 8-bit plane. The swap2 nibbles are shared; only the scale plane is new."""
+    try:
+        if S6_CONFIG not in getattr(_zskip, "S6_CONFIGS", ()):
+            return
+        _zskip.config_info(S6_CONFIG)
+        old = layer.zskip_pair_w2
+        s6 = _zskip.to_s6(old)
+        if s6 is None:
+            logger.info_once("zskip: 6-bit scale plane not applicable (scale range)")
+            return
+        prefix = os.environ.get("ZSKIP_VERIFY_PREFIX", "1") != "0" and _zskip.prefix_available()
+        if _pair_check(layer, s6, S6_CONFIG, ms=range(1, 9), ref_config=LEAN_CONFIG,
+                       ref_packed=old) and (
+            not prefix or _pair_check(layer, s6, S6_CONFIG, prefix=True)
+        ):
+            layer.zskip_pair_w2 = s6
+            layer.zskip_pair_config = S6_CONFIG
+            logger.info_once("zskip: 6-bit scale plane config %d replaces %d for M=5", S6_CONFIG, LEAN_CONFIG)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning_once("zskip: 6-bit scale plane unavailable (%r); config %s",
+                            exc, getattr(layer, "zskip_pair_config", None))
+
+
 def _pair_check(layer: torch.nn.Module, packed: Any, config: int, prefix: bool = False,
-                ms: Any = (4, 5, 8), ref_config: int | None = None) -> bool:
+                ms: Any = (4, 5, 8), ref_config: int | None = None, ref_packed: Any = None) -> bool:
     """Load-time, bitwise against humming: M=4/5/8 (or ms), independent plus crowded routing.
 
     Compare all slots, including exact negative-zero activations and all-zero groups.
@@ -308,7 +348,8 @@ def _pair_check(layer: torch.nn.Module, packed: Any, config: int, prefix: bool =
                     return False
                 if ref_config is not None:
                     old = torch.empty_like(ref)
-                    _zskip.down(act, sorted_ids, expert_ids, ntp, packed, old,
+                    _zskip.down(act, sorted_ids, expert_ids, ntp,
+                                packed if ref_packed is None else ref_packed, old,
                                 mode=_zskip.SKIP, config=ref_config, max_blocks=m*TOP_K,
                                 verify_rows=vrows)
                     if not torch.equal(out[:rows].view(torch.int16), old[:rows].view(torch.int16)):
@@ -322,7 +363,7 @@ def _pair_check(layer: torch.nn.Module, packed: Any, config: int, prefix: bool =
     return True
 
 
-def _pz_self_check(layer: torch.nn.Module) -> bool:
+def _pz_self_check(layer: torch.nn.Module, packed: Any = None, config: int | None = None) -> bool:
     """Load-time guard: humming's w2 and pzskip on a deterministic 496-token call, bitwise."""
     import json
 
@@ -381,9 +422,11 @@ def _pz_self_check(layer: torch.nn.Module) -> bool:
         tuning_config=json.dumps(configs[1]),
     )
     out = torch.empty_like(ref)
-    if _pzskip.block_rows(PZ_CONFIG) != PZ_BLOCK_M:
-        sorted_ids, expert_ids, ntp = _align(topk_ids, _pzskip.block_rows(PZ_CONFIG))
-    _pzskip.down(act, sorted_ids, expert_ids, ntp, layer.zskip_w2, out, wpc=PZ_CONFIG)
+    config = PZ_CONFIG if config is None else config
+    if _pzskip.block_rows(config) != PZ_BLOCK_M:
+        sorted_ids, expert_ids, ntp = _align(topk_ids, _pzskip.block_rows(config))
+    _pzskip.down(act, sorted_ids, expert_ids, ntp, layer.zskip_w2 if packed is None else packed,
+                 out, wpc=config)
     ok = torch.equal(out.view(torch.int16), ref.view(torch.int16))
     if not ok:
         logger.warning(
@@ -391,6 +434,20 @@ def _pz_self_check(layer: torch.nn.Module) -> bool:
             getattr(layer, "layer_name", "?"),
         )
     return ok
+
+
+def _prepare_pz_s6(layer: torch.nn.Module) -> None:
+    """Optional: any failure keeps 369 on the 8-bit plane."""
+    try:
+        s6 = _zskip.to_s6_swap(layer.zskip_w2)
+        if s6 is None:
+            return
+        if _pz_self_check(layer, packed=s6, config=PZ_S6_CONFIG):
+            layer.pz_s6 = s6
+            logger.info_once("pzskip: 6-bit scale plane config %d replaces %d for prefill",
+                             PZ_S6_CONFIG, PZ_CONFIG)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning_once("pzskip: 6-bit scale plane unavailable (%r); config %d", exc, PZ_CONFIG)
 
 
 def _layer_index(layer: torch.nn.Module) -> int:
@@ -645,5 +702,9 @@ def _pz_down(
         sorted_ids, expert_ids, ntp = _align(topk_ids, bm)
     else:
         return False
-    _pzskip.down(inputs, sorted_ids, expert_ids, ntp, layer.zskip_w2, outputs, wpc=PZ_CONFIG)
+    s6 = getattr(layer, "pz_s6", None)
+    if s6 is not None:
+        _pzskip.down(inputs, sorted_ids, expert_ids, ntp, s6, outputs, wpc=PZ_S6_CONFIG)
+    else:
+        _pzskip.down(inputs, sorted_ids, expert_ids, ntp, layer.zskip_w2, outputs, wpc=PZ_CONFIG)
     return True

@@ -29,12 +29,13 @@ __global__ void __launch_bounds__(32) down_pair_kernel(const Params p) {
   static_assert(!HALF || TPW == 1, "half pairs are single tiles");
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   const int g8 = lane >> 2, t = lane & 3;
-  const int mb = blockIdx.y;
+  const int slot = blockIdx.y;
   const int P = blockIdx.x * WPC + warp;  // tile (TPW = 1) or tile pair (TPW = 2)
 #ifndef ZSKIP_NO_PDL
   pdl_wait();
   pdl_launch_dependents();
 #endif
+  const int mb = p.c3lpt ? p.queue[4 + slot] : slot;
   if (mb * 16 >= *p.num_tokens_padded) return;
   const uint8_t* bi = p.ws + (long long)mb * BI_BYTES;
 #ifndef ZSKIP_NO_FUSED

@@ -110,6 +110,12 @@ def init() -> bool:
     lib = _load()
     if lib is None or torch.cuda.is_current_stream_capturing():
         return False
+    c3lpt = getattr(lib, "zskip_set_c3lpt", None)
+    if c3lpt is not None:
+        c3lpt.argtypes = [ctypes.c_int]
+        c3lpt.restype = ctypes.c_int
+        if c3lpt(int(os.environ.get("C3LPT", "1") != "0")) != 0:
+            raise RuntimeError("C3LPT initialization failed")
     rc = lib.zskip_init()
     if rc != 0:
         raise RuntimeError(f"zskip_init failed: {rc}")
@@ -161,7 +167,7 @@ def scratch(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
     ws = _scratch.get(idx)
     if ws is None:
         ws = (torch.zeros(MAX_BLOCKS * BI_BYTES, dtype=torch.uint8, device=device),
-              torch.zeros(4, dtype=torch.int32, device=device))
+              torch.zeros(36, dtype=torch.int32, device=device))
         _scratch[idx] = ws
     return ws
 

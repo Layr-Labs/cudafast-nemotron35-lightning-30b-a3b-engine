@@ -43,6 +43,15 @@ def packed_mm(x, SM, EX, BASE, RI, RAW, y, M, N: tl.constexpr,
     mm = tl.arange(0, BM, layout=SliceLayout(1, ld))
     kk0 = tl.arange(0, BK, layout=SliceLayout(0, ld))
     acc = tl.full((BM, BN), 0, tl.float32, mma)
+    out: tl.constexpr = BlockedLayout([1, 4], [4, 8], [WN, 1], [1, 0])
+    om = tl.arange(0, BM, layout=SliceLayout(1, out))
+    on = pid * BN + tl.arange(0, BN, layout=SliceLayout(0, out))
+    if GATED:
+        if tl.load(gate_ptr) != 0:
+            z = tl.convert_layout(acc, out)
+            tl.store(y + om[:, None] * sym + on[None, :], z.to(y.dtype.element_ty),
+                     mask=(om[:, None] < M) & (on[None, :] < N))
+            return
     # The final half chunk is not padded into eight extra zero MMAs.
     for k0 in range(0, (K // BK) * BK, BK):
         kk = k0 + kk0
@@ -70,10 +79,7 @@ def packed_mm(x, SM, EX, BASE, RI, RAW, y, M, N: tl.constexpr,
         at = tl.convert_layout(at, DotOperandLayout(0, mma, 2))
         bt = tl.convert_layout(tl.permute(wt, (1, 0)), DotOperandLayout(1, mma, 2))
         acc = mma_v2(at, bt, acc)
-    out: tl.constexpr = BlockedLayout([1, 4], [4, 8], [WN, 1], [1, 0])
     acc = tl.convert_layout(acc, out)
-    om = tl.arange(0, BM, layout=SliceLayout(1, out))
-    on = pid * BN + tl.arange(0, BN, layout=SliceLayout(0, out))
     tl.store(y + om[:, None] * sym + on[None, :], acc.to(y.dtype.element_ty),
              mask=(om[:, None] < M) & (on[None, :] < N))
 

@@ -55,6 +55,10 @@ pub mod session_backend;
 #[cfg(unix)]
 pub mod resident;
 
+// Readiness waits that keep a waiting core out of deep idle between verbs.
+#[cfg(unix)]
+pub mod hotwait;
+
 pub use adapter::{Adapter, FREE_RUN_MAX_COUNT};
 pub use engine::{Engine, EngineError, EngineFactory, FreeRunResult, Route, Step};
 pub use protocol::{

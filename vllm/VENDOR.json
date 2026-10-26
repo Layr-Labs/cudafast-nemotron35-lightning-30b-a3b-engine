@@ -369,7 +369,7 @@
     },
     {
       "file": "harness/kernels/cmp2 (+ vllm/v1/worker/gpu_model_runner.py)",
-      "why": "CMP2=1 (default): transparent generic-compression VMM backing for immutable fp8c codes, apk12 planes, shared Marlin weights/scales and target lm_head including its unit-major scale copy. Full load-time storage byte checks precede pointer rebinding and engine capture. Original storages stay alive; unsupported or failed allocations leave ordinary tensors. CMP2=0 disables. Target and drafter formats and arithmetic are unchanged."
+      "why": "CMP2=1 (default): transparent generic-compression VMM backing for immutable fp8c codes, apk12 planes, shared Marlin weights/scales and target lm_head including its unit-major scale copy. Full load-time storage byte checks precede pointer rebinding and engine capture. Original storages stay alive; unsupported or failed allocations leave ordinary tensors. CMP2=0 disables. CMP2_ROUTED=1 (default) also backs each target routed layer's w13_weight, including when expandable segments leave the legacy families ordinary; w2_weight and the block scales stay put so the zskip repack and the nvsc scale alias are not split. CMP2_ROUTED=0 keeps routed weights ordinary. Target and drafter formats and arithmetic are unchanged."
     },
     {
       "file": "harness/kernels/marlinx/csrc/marlinx.cu; harness/kernels/shco/csrc/shx.cu",
@@ -381,7 +381,7 @@
     },
     {
       "file": "env_override.py; v1/worker/gpu_worker.py (+ harness/kernels/cmp2/py/__init__.py)",
-      "why": "env_override.py adds expandable_segments:True to PYTORCH_CUDA_ALLOC_CONF before CUDA is initialized, and init_device sets the same allocator option right after the device is selected (torch._C._accelerator_setAllocatorSettings, the entry point the worker already uses for max_split_size_mb), so every allocation of the process comes from expandable segments; VLLM_EXPANDABLE_SEGMENTS=0 keeps the default allocator. While it is active, cmp2.prepare returns before copying anything (CMP2 compressed=none reason=expandable_segments). No kernel, format, value or schedule change."
+      "why": "env_override.py adds expandable_segments:True to PYTORCH_CUDA_ALLOC_CONF before CUDA is initialized, and init_device sets the same allocator option right after the device is selected (torch._C._accelerator_setAllocatorSettings, the entry point the worker already uses for max_split_size_mb), so every allocation of the process comes from expandable segments; VLLM_EXPANDABLE_SEGMENTS=0 keeps the default allocator. While it is active, cmp2.prepare leaves the legacy families on that allocator. With CMP2_ROUTED=1 (default) it still byte-checks and rebinds target w13_weight onto generic-compression VMM; CMP2_ROUTED=0 restores the full early return (CMP2 compressed=none reason=expandable_segments). No kernel, format, value or schedule change."
     },
     {
       "file": "vllm/v1/spec_decode/llm_base_proposer.py; vllm/v1/spec_decode/nemotron_decode_plan.py; vllm/v1/worker/copy_batch.py; vllm/v1/attention/backends/flashinfer.py",

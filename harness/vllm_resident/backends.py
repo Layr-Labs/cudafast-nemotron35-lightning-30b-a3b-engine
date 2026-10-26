@@ -257,6 +257,7 @@ class VllmBackend:
             raise RuntimeError(f"{len(tokens)} tokens do not fit the {self.ctx_size}-token context")
         self._rid += 1
         self._live = f"r{self._rid}"
+        self._pre_launch(tokens, max_tokens == 1)
         self._engine.add_request(
             self._live,
             {"prompt_token_ids": list(tokens)},
@@ -269,6 +270,29 @@ class VllmBackend:
             emitted = self._collect()
         return emitted
 
+    def _pre_launch(self, tokens: list[int], lite: bool) -> None:
+        """Start the fresh-prefill graph before add_request and scheduling when the
+        block pool is fully free (GPUModelRunner.pre_launch_prefill checks the rest
+        and the runner adopts the launch only for exactly this request)."""
+        try:
+            core = self._engine.engine_core.engine_core
+            runner = core.model_executor.driver_worker.worker.model_runner
+            pre = getattr(runner, "pre_launch_prefill", None)
+            if pre is None:
+                return
+            pool = core.scheduler.kv_cache_manager.block_pool
+            from vllm.v1.core import block_pool as _bp
+
+            pool_free = (
+                bool(getattr(_bp, "_CANONICAL_HEAD", 0))
+                and not pool.enable_caching
+                and not core.scheduler.has_unfinished_requests()
+                and pool.free_block_queue.num_free_blocks == pool.num_gpu_blocks - 1
+            )
+            pre(tokens, lite, pool_free)
+        except Exception:  # noqa: BLE001 - the ordinary path runs unchanged
+            return
+
     def set_emit_target(self, target: int | None) -> None:
         """Prompt + emitted tokens at which the running free run is done (None:
         unbounded). The MTP drafter skips draft passes that could only extend a
@@ -279,6 +303,11 @@ class VllmBackend:
         except AttributeError:
             return
         if drafter is not None:
+            if target is None and getattr(drafter, "_emit_tail_omitted", False):
+                # This free run omitted MTP KV writes. Its queued target
+                # output may finish normally; any subsequent continuation
+                # must prefill again from the resident's committed context.
+                self._mtp_tail_restart_required = True
             drafter.emit_target = target
 
     def step(self) -> list[Emit]:
@@ -319,11 +348,23 @@ class VllmBackend:
         """The live request's queue was drained at a budget's end, so no batch
         of it is in flight. The engine never continues such a request ahead;
         the session restarts it from its context instead."""
-        return self._live is not None and getattr(self, "_c57_tail_drained", False)
+        return self._live is not None and (
+            getattr(self, "_c57_tail_drained", False)
+            or getattr(self, "_mtp_tail_restart_required", False)
+        )
 
     def abort(self) -> bool:
         running = False
         self._c57_tail_drained = False
+        self._mtp_tail_restart_required = False
+        try:
+            runner = self._engine.engine_core.engine_core.model_executor.driver_worker.worker.model_runner
+            drafter = getattr(runner, "drafter", None)
+        except AttributeError:
+            drafter = None
+        if drafter is not None:
+            drafter.emit_target = None
+            drafter._emit_tail_omitted = False
         if self._live is not None:
             running = self._engine.has_unfinished_requests()
             self._engine.abort_request([self._live])

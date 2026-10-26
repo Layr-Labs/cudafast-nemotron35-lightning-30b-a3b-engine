@@ -394,6 +394,10 @@
     {
       "file": "(composition)",
       "why": "e-man07 composition on the record 1e1c2581-e506-4ca4-9341-5f08ffceec86: ArthurOstapenko 53f66afe-0252-402f-b34b-19bea81f1e74 carried byte for byte; jacklightChen 1df4df4a-6dc5-4ecf-8d49-b372ba3726fd carried byte for byte; terrapinelf 80f6fced-3c74-4ce1-9913-058f05e95ec7 carried byte for byte. No new arithmetic."
+    },
+    {
+      "file": "vllm/model_executor/layers/fused_moe/moe_fused_mul_sum.py (+ experts/fused_humming_moe.py, modular_kernel.py, runner/moe_runner.py, quantization/humming.py)",
+      "why": "Explicit per-call delayed shared-output consumer after routed down, static combined-output custom-op contract for TP/DP/EP/PCP1 unpadded 2688 no-transform Humming indexed configuration. Fuse weighted routed sum with shared add, retaining original BF16 reduction rounding, optional routed-scale multiply and second BF16 rounding, then shared-left FP32 add, plus PDL input visibility. Remote-worker private bit comparisons include finite/nonfinite/subnormal/signed-zero payloads; unsupported or refused calls retain original reduction plus torch add. NEMO_MOE_SHARED_SUM=0 restores prior runner contract. No local candidate execution."
     }
   ]
 }

@@ -5,6 +5,7 @@
 import copy
 import json
 import math
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -763,6 +764,7 @@ class HummingIndexedExperts(HummingExpertsBase):
         workspace2: torch.Tensor,
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
+        shared_sum: Callable[[], tuple[torch.Tensor, float]] | None = None,
     ) -> None:
         """
         Standard apply implementation for Humming indexed experts.
@@ -891,6 +893,20 @@ class HummingIndexedExperts(HummingExpertsBase):
             )
         if l2pf_pending:
             _l2pf.join(down_output.device)
+
+        if shared_sum is not None:
+            from vllm.model_executor.layers.fused_moe.moe_fused_mul_sum import (
+                moe_fused_mul_sum_with_shared,
+            )
+
+            # Consume the current call's shared output only after routed down
+            # has been queued. The existing wrapper supplies its aux-stream join.
+            shared, routed_scale = shared_sum()
+            moe_fused_mul_sum_with_shared(
+                buffers["down_output"].view(*topk_ids.shape, -1),
+                topk_weights, shared, output, routed_scale,
+            )
+            return
 
         moe_fused_mul_sum(
             inputs=buffers["down_output"].view(*topk_ids.shape, -1),

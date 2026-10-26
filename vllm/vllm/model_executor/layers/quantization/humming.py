@@ -617,6 +617,43 @@ class HummingLinearMethod(LinearMethodBase):
 
 
 class HummingMoEMethod(FusedMoEMethodBase):
+    def apply_with_shared_sum(
+        self, layer: RoutedExperts, x: torch.Tensor,
+        topk_weights: torch.Tensor, topk_ids: torch.Tensor,
+        shared_sum: Callable[[], tuple[torch.Tensor, float]],
+    ) -> torch.Tensor | None:
+        """Explicit single-call consumer; None means no work has been launched."""
+        from vllm.model_executor.layers.fused_moe.modular_kernel import (
+            FusedMoEKernelModularImpl,
+        )
+        from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
+            HummingIndexedExperts,
+        )
+        from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+
+        kernel = self.moe_kernel
+        if kernel is None or not isinstance(kernel.impl, FusedMoEKernelModularImpl):
+            return None
+        impl = kernel.impl
+        if (
+            type(impl.fused_experts) is not HummingIndexedExperts
+            or impl.prepare_finalize.supports_async()
+            or getattr(impl.fused_experts, "_lora_context", None) is not None
+            or layer.expert_map is not None
+            or layer.activation != MoEActivation.RELU2_NO_MUL
+            or x.ndim != 2 or x.shape[0] == 0 or x.shape[1] != 2688
+            or x.dtype != torch.bfloat16 or not x.is_cuda
+            or topk_ids.shape != (x.shape[0], 6)
+        ):
+            return None
+        return impl.apply(
+            hidden_states=x, w1=layer.w13_weight, w2=layer.w2_weight,
+            topk_ids=topk_ids, topk_weights=topk_weights,
+            activation=layer.activation, global_num_experts=layer.global_num_experts,
+            expert_map=None, apply_router_weight_on_input=False,
+            shared_sum=shared_sum,
+        )
+
     def __init__(
         self, quant_config: HummingLayerQuantizationConfig, moe: "FusedMoEConfig"
     ) -> None:

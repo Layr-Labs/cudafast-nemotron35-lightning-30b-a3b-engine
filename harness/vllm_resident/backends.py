@@ -226,6 +226,7 @@ class VllmBackend:
             logprobs=TOP_K if logprobs else None,
             detokenize=False,
             output_kind=self._delta,
+            skip_clone=True,
         )
 
     def _collect(self) -> list[Emit]:

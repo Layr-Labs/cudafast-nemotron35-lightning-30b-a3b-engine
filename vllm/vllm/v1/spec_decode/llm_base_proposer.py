@@ -48,6 +48,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
     sample_with_exponential_noise,
 )
 from vllm.v1.sample.sampler import _SAMPLING_EPS
+from vllm.v1.spec_decode import mtp_glue as _mtp_glue
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
@@ -635,7 +636,22 @@ class SpecDecodeBaseProposer:
             # batch. Compact the topk indices for each request's last token.
             self.model.model.compact_topk_indices(token_indices_to_sample)
 
-        sample_hidden_states = last_hidden_states[token_indices_to_sample]
+        fused_first = None
+        if (
+            self.num_speculative_tokens > 1
+            and not self.parallel_drafting
+            and not self.uses_mrope
+            and not (self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim == 0)
+            and _mtp_glue.gather_ok(
+                token_indices_to_sample, last_hidden_states, hidden_states, self.positions
+            )
+        ):
+            fused_first = _mtp_glue.gather_first_pass(
+                token_indices_to_sample, last_hidden_states, hidden_states, self.positions
+            )
+            sample_hidden_states = fused_first[0]
+        else:
+            sample_hidden_states = last_hidden_states[token_indices_to_sample]
         if set_moe_row_src is not None and (
             self.num_speculative_tokens <= 1 or self.parallel_drafting
         ):
@@ -663,11 +679,14 @@ class SpecDecodeBaseProposer:
                 ).contiguous()
             return draft_token_ids.view(-1, self.num_speculative_tokens)
 
-        if self.uses_mrope:
+        if fused_first is not None:
+            positions, hidden_states = fused_first[1], fused_first[2]
+        elif self.uses_mrope:
             positions = self.mrope_positions[:, token_indices_to_sample]
+            hidden_states = hidden_states[token_indices_to_sample]
         else:
             positions = self.positions[token_indices_to_sample]
-        hidden_states = hidden_states[token_indices_to_sample]
+            hidden_states = hidden_states[token_indices_to_sample]
 
         if self.constant_draft_positions:
             # Write the sampling positions into the front of the
@@ -756,14 +775,36 @@ class SpecDecodeBaseProposer:
             # Update the inputs.
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax() returns int64 by default.
-            input_ids = draft_token_ids_list[-1].int()
+            fused_step = (
+                not self.use_heterogeneous_vocab
+                and not self.constant_draft_positions
+                and not self.supports_mm_inputs
+                and not self.uses_mrope
+                and not (self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim > 0)
+                and _mtp_glue.step_ok(
+                    draft_token_ids_list[-1], self.input_ids, hidden_states,
+                    self.hidden_states, positions, batch_size,
+                )
+            )
+            if fused_step:
+                input_ids = None
+                positions = self._update_positions_dependent_metadata(
+                    positions,
+                    common_attn_metadata,
+                    batch_size,
+                    input_batch_size,
+                    block_size,
+                    fused=(draft_token_ids_list[-1], hidden_states),
+                )
+            else:
+                input_ids = draft_token_ids_list[-1].int()
 
-            if self.use_heterogeneous_vocab:
+            if not fused_step and self.use_heterogeneous_vocab:
                 # Map target token IDs to draft vocab space (TLI algorithm)
                 assert self.vocab_mapping is not None
                 input_ids = self.vocab_mapping.map_target_to_draft_ids(input_ids)
 
-            if not self.constant_draft_positions:
+            if not fused_step and not self.constant_draft_positions:
                 positions = self._update_positions_dependent_metadata(
                     positions,
                     common_attn_metadata,
@@ -817,8 +858,9 @@ class SpecDecodeBaseProposer:
                     self._draft_plan_event.record()
 
             # copy inputs to buffer for cudagraph
-            self.input_ids[:batch_size] = input_ids
-            self.hidden_states[:batch_size] = hidden_states
+            if not fused_step:
+                self.input_ids[:batch_size] = input_ids
+                self.hidden_states[:batch_size] = hidden_states
             if self.supports_mm_inputs:
                 self.inputs_embeds[:batch_size] = self.model.embed_input_ids(input_ids)
 
@@ -942,6 +984,7 @@ class SpecDecodeBaseProposer:
         batch_size: int,
         input_batch_size: int,
         block_size: int,
+        fused: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Update positions, slot mappings, and sequence metadata for the
         next draft step. Returns the updated positions tensor."""
@@ -952,16 +995,25 @@ class SpecDecodeBaseProposer:
             out_pos = self.xdrope_positions[0, :batch_size]
         else:
             out_pos = self.positions[:batch_size]
-        eagle_step_update_slot_mapping_and_metadata(
-            positions_1d=positions_1d,
-            block_table_tensor=common_attn_metadata.block_table_tensor,
-            seq_lens=common_attn_metadata.seq_lens,
-            block_size=block_size,
-            max_model_len=self.max_model_len,
-            out_clamped_positions=out_pos,
-            out_slot_mapping=self._slot_mapping_buffer[:input_batch_size],
-            input_batch_size=input_batch_size,
-        )
+        if fused is not None:
+            _mtp_glue.step_inputs(
+                fused[0], self.input_ids, fused[1], self.hidden_states,
+                positions_1d, common_attn_metadata.block_table_tensor,
+                common_attn_metadata.seq_lens, block_size, self.max_model_len,
+                out_pos, self._slot_mapping_buffer[:input_batch_size],
+                input_batch_size, PADDING_SLOT_ID,
+            )
+        else:
+            eagle_step_update_slot_mapping_and_metadata(
+                positions_1d=positions_1d,
+                block_table_tensor=common_attn_metadata.block_table_tensor,
+                seq_lens=common_attn_metadata.seq_lens,
+                block_size=block_size,
+                max_model_len=self.max_model_len,
+                out_clamped_positions=out_pos,
+                out_slot_mapping=self._slot_mapping_buffer[:input_batch_size],
+                input_batch_size=input_batch_size,
+            )
         common_attn_metadata.slot_mapping = self._slot_mapping_buffer[:batch_size]
         if self.uses_mrope:
             self.mrope_positions[1:, :batch_size] = self.mrope_positions[0, :batch_size]
@@ -1012,6 +1064,22 @@ class SpecDecodeBaseProposer:
                 token_indices_to_sample = cad.query_start_loc[1:] - 1
 
             num_tokens = target_token_ids.shape[0]
+            if (
+                not self.uses_mrope
+                and not (self.uses_xdrope_dim > 0)
+                and not self.vllm_config.model_config.uses_mrope
+                and _mtp_glue.first_pass_ok(
+                    target_token_ids, next_token_ids, token_indices_to_sample,
+                    target_positions, target_hidden_states, self.input_ids,
+                    self.positions, self.hidden_states,
+                )
+            ):
+                _mtp_glue.first_pass_inputs(
+                    target_token_ids, next_token_ids, token_indices_to_sample,
+                    target_positions, target_hidden_states, self.input_ids,
+                    self.positions, self.hidden_states,
+                )
+                return num_tokens, token_indices_to_sample, cad
             # Shift the input ids by one token.
             # E.g., [a1, b1, b2, c1, c2, c3] -> [b1, b2, c1, c2, c3, c3]
             self.input_ids[: num_tokens - 1] = target_token_ids[1:]

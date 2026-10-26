@@ -305,6 +305,12 @@ PINNED_SOURCE_GUARDS = True
 _SPEC_META_CACHE = os.environ.get("VLLM_SPEC_META_CACHE", "1") != "0"
 _SPEC_META_CACHE_CHECK = os.environ.get("VLLM_SPEC_META_CACHE_CHECK", "0") == "1"
 
+# LOCAL PATCH (cudafast-nemotron35): early launch of the fresh 496 prefill graph
+# (GPUModelRunner._fresh_prefill_early). VLLM_PREFILL_EARLY_CHECK=1 also replays
+# it the ordinary way and compares inputs and outputs.
+_PREFILL_EARLY = os.environ.get("VLLM_PREFILL_EARLY", "1") != "0"
+_PREFILL_EARLY_CHECK = os.environ.get("VLLM_PREFILL_EARLY_CHECK", "0") == "1"
+
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
@@ -4525,6 +4531,8 @@ class GPUModelRunner(
                 "after execute_model() returns None."
             )
 
+        self._fresh_prefill_early(scheduler_output)
+
         if self.routed_experts_initialized:
             self.routed_experts_capturer.clear_buffer()
 
@@ -4553,6 +4561,7 @@ class GPUModelRunner(
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
+            self._fresh_prefill_early_prep(),
             self.synchronize_input_prep(),
         ):
             # Update persistent batch states.
@@ -4826,10 +4835,25 @@ class GPUModelRunner(
                 and not self.num_prompt_logprobs
             )
             fresh_logits = None
+            early, self._fresh_early = self._fresh_early, None
             if use_fresh_graph:
-                model_output, fresh_logits = fresh_graph.replay(
-                    attn_metadata, slot_mappings, input_ids, positions,
-                    lite=not self._drafts_can_be_verified())
+                lite = not self._drafts_can_be_verified()
+                sig = self._fresh_prefill_sig(scheduler_output)
+                if (
+                    early is not None
+                    and early[2] == lite
+                    and early[3] == sig
+                    and early[4] == fresh_graph.plan_state()
+                ):
+                    model_output, fresh_logits = early[0], early[1]
+                    if _PREFILL_EARLY_CHECK:
+                        self._fresh_prefill_early_check(
+                            fresh_graph, early, attn_metadata, slot_mappings,
+                            input_ids, positions, lite, sig)
+                else:
+                    model_output, fresh_logits = fresh_graph.replay(
+                        attn_metadata, slot_mappings, input_ids, positions,
+                        lite=lite, sig=sig)
             else:
                 model_output = self._model_forward(
                     input_ids=input_ids,
@@ -4933,6 +4957,131 @@ class GPUModelRunner(
             common_attn_metadata.max_seq_len + num_drafter_query_tokens
             <= self.effective_drafter_max_model_len
         ) and self._drafts_can_be_verified()
+
+    def _fresh_prefill_sig(self, scheduler_output: "SchedulerOutput"):
+        """What the fresh graph's block-derived request tensors depend on: the
+        block ids of the one new request this step prefills."""
+        new_reqs = scheduler_output.scheduled_new_reqs
+        if len(new_reqs) != 1:
+            return None
+        return tuple(tuple(ids) for ids in new_reqs[0].block_ids)
+
+    def _fresh_prefill_early(self, scheduler_output: "SchedulerOutput") -> None:
+        """LOCAL PATCH (cudafast-nemotron35): launch the fresh 496 graph first.
+
+        The ordinary path builds this step's request state, inputs and
+        attention metadata on the host (~1.5 ms) before the graph replays and
+        the GPU starts. When the one new request's block ids and the FlashInfer
+        plan state equal those the graph's request tensors were last written
+        for (FreshPrefillGraph.early_sig), every tensor replay() would write
+        already holds the same bytes except the prompt ids. Then this zeroes the
+        new blocks (as _update_states would), uploads the prompt ids and replays
+        the same graph before any of that host work; the ordinary path runs
+        while the GPU computes and takes the graph's outputs at the forward
+        (the replay there is skipped only if the request tensors' signature
+        and the wrappers' plan state are still the ones checked here). Same
+        kernels, same inputs, same outputs. VLLM_PREFILL_EARLY=0 disables."""
+        self._fresh_early = None
+        fresh_graph = getattr(self, "_fresh_prefill_graph", None)
+        if (
+            not _PREFILL_EARLY
+            or fresh_graph is None
+            or fresh_graph.early_sig is None
+            or scheduler_output.total_num_scheduled_tokens != 496
+            or len(scheduler_output.scheduled_new_reqs) != 1
+            or scheduler_output.scheduled_cached_reqs.req_ids
+            or scheduler_output.scheduled_spec_decode_tokens
+            or scheduler_output.scheduled_encoder_inputs
+            or scheduler_output.kv_cache_block_copies
+            or self.routed_experts_initialized
+            or self.use_aux_hidden_state_outputs
+            or self.num_prompt_logprobs
+            or self.speculative_config is None
+            or self.speculative_config.use_ngram_gpu()
+            or has_kv_transfer_group()
+            or has_ec_transfer()
+            or self.cache_config.mamba_cache_mode == "align"
+        ):
+            return
+        new = scheduler_output.scheduled_new_reqs[0]
+        params = new.sampling_params
+        if (
+            new.num_computed_tokens != 0
+            or new.prompt_token_ids is None
+            or len(new.prompt_token_ids) != 496
+            or scheduler_output.num_scheduled_tokens.get(new.req_id) != 496
+            or new.prompt_embeds is not None
+            or new.mm_features
+            or new.lora_request is not None
+            or new.pooling_params is not None
+            or params is None
+            or params.prompt_logprobs is not None
+            or new.req_id in self.requests
+            or any(r not in scheduler_output.finished_req_ids for r in self.requests)
+        ):
+            return
+        sig = self._fresh_prefill_sig(scheduler_output)
+        plan_state = fresh_graph.plan_state()
+        if fresh_graph.early_sig != (sig, plan_state):
+            return
+        ids = getattr(self, "_fresh_early_ids", None)
+        if ids is None:
+            ids = torch.empty(496, dtype=fresh_graph.input_ids.dtype, pin_memory=True)
+            self._fresh_early_ids = ids
+            self._fresh_early_event = torch.cuda.Event()
+        else:
+            # The previous early upload read this pinned buffer.
+            self._fresh_early_event.synchronize()
+        ids.numpy()[:] = new.prompt_token_ids
+        if scheduler_output.new_block_ids_to_zero:
+            self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
+            scheduler_output.new_block_ids_to_zero = None
+        lite = params.max_tokens == 1
+        if getattr(self, "_fresh_early_side", None) is None:
+            self._fresh_early_side = torch.cuda.Stream()
+            self._fresh_early_start = torch.cuda.Event()
+        self._fresh_early_start.record()
+        hidden, logits = fresh_graph.replay_early(ids, lite)
+        self._fresh_early_event.record()
+        self._fresh_early = (hidden, logits, lite, sig, plan_state)
+
+    @contextmanager
+    def _fresh_prefill_early_prep(self):
+        """After an early launch, the step's host bookkeeping queues its small
+        copies on a side stream that starts where the main stream stood before
+        the graph, so they (and the prepare-inputs event recorded after them)
+        complete while the graph runs instead of after it: the async scheduler's
+        next step waits on that event before its own preparation. Nothing they
+        write is read by the graph except the FlashInfer prefill wrapper's page
+        indices, rewritten with the same bytes (the early launch requires the
+        same block ids). The main stream waits for the side stream afterwards."""
+        if self._fresh_early is None:
+            yield
+            return
+        side = self._fresh_early_side
+        side.wait_event(self._fresh_early_start)
+        with torch.cuda.stream(side):
+            yield
+        torch.cuda.current_stream().wait_stream(side)
+
+    def _fresh_prefill_early_check(self, fresh_graph, early, attn_metadata,
+                                   slot_mappings, input_ids, positions, lite, sig):
+        """VLLM_PREFILL_EARLY_CHECK=1: replay again the ordinary way and compare
+        every request tensor and the outputs with the early launch's."""
+        used = [t.clone() for t in fresh_graph.request_tensors()]
+        row = early[0][495].clone()
+        logits = early[1].clone()
+        hidden2, logits2 = fresh_graph.replay(
+            attn_metadata, slot_mappings, input_ids, positions, lite=lite, sig=sig)
+        now = fresh_graph.request_tensors()
+        diff = [i for i, (a, b) in enumerate(zip(used, now))
+                if a.shape != b.shape or not torch.equal(a, b)]
+        same_out = torch.equal(row, hidden2[495]) and torch.equal(logits, logits2)
+        self._fresh_early_checks = getattr(self, "_fresh_early_checks", 0) + 1
+        logger.info(
+            "PREFILL_EARLY_CHECK %d: request tensors %d, differing %s; outputs %s",
+            self._fresh_early_checks, len(used), diff,
+            "IDENTICAL" if same_out else "DIFFER")
 
     def _drafts_can_be_verified(self) -> bool:
         """False when every request in the batch has max_tokens == 1.
@@ -5872,6 +6021,13 @@ class GPUModelRunner(
                         assert hasattr(self.drafter, "set_eplb_state")
                         self.drafter.set_eplb_state(self.eplb_state)
                         eplb_models += 1
+
+                # Fix the target's combined-output contract after real weights
+                # and private admission, before compilation/capture consumes it.
+                from vllm.model_executor.layers.fused_moe.prepare_shared_sum import (
+                    prepare as prepare_shared_sum,
+                )
+                prepare_shared_sum(self.model)
 
                 # Transparent immutable-weight backing after target/draft
                 # packing, before engine compilation and graph capture.

@@ -3,6 +3,8 @@
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING
+import math
+import os
 
 import torch
 import torch.nn.functional as F
@@ -214,6 +216,15 @@ direct_register_custom_op(
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
 
+# Same nonmutating input contract as moe_forward_shared, with one combined
+# result. Do not borrow moe_forward's hidden_states mutation declaration.
+direct_register_custom_op(
+    op_name="moe_forward_combined_shared_sum",
+    op_func=_moe_forward,
+    fake_impl=_moe_forward_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
 
 def _unpack(
     result: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
@@ -301,10 +312,68 @@ class MoERunner(MoERunnerInterface):
         # samples one token and drafts nothing (prefill_graph.py).
         self.keep_m_lite = False
 
+        # Eligibility is static, but keep the original output contract until
+        # the official startup helper admits the real backend and private
+        # old/new numerical and performance checks, before engine compilation.
+        self._humming_shared_sum_eligible = (
+            os.environ.get("NEMO_MOE_SHARED_SUM", "1") != "0"
+            and current_platform.is_cuda()
+            and self._shared_experts is not None and shared_expert_gate is None
+            and not enable_dbo and not moe_config.is_sequence_parallel
+            and moe_config.tp_size == moe_config.dp_size == moe_config.ep_size
+            == moe_config.pcp_size == 1
+            and moe_config.hidden_dim == moe_config.hidden_dim_unpadded == 2688
+            and routed_input_transform is None and routed_output_transform is None
+            and moe_config.in_dtype == torch.bfloat16
+            and math.isfinite(routed_scaling_factor)
+            and abs(routed_scaling_factor) <= 3.4028234663852886e38
+            and not isinstance(router, ZeroExpertRouter)
+            and not self._quant_method.is_monolithic
+            and callable(getattr(self._quant_method, "apply_with_shared_sum", None))
+        )
+        # Remain on the original contract until official startup admission.
+        self._humming_shared_sum = False
         self._forward_entry = self._select_forward()
 
         # For smuggling this layer into the fused moe custom op
         register_layer_for_moe_forward_op(get_current_vllm_config(), self)
+
+    def prepare_shared_sum_contract(self) -> bool:
+        """Call once after real weight loading and before engine compilation."""
+        if not self._humming_shared_sum_eligible:
+            return False
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        from vllm.model_executor.layers.fused_moe.modular_kernel import (
+            FusedMoEKernelModularImpl,
+        )
+        from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
+            HummingIndexedExperts,
+        )
+        method = self._quant_method
+        kernel = getattr(method, "moe_kernel", None)
+        if (not getattr(method, "use_a16", False)
+                or kernel is None
+                or not isinstance(kernel.impl, FusedMoEKernelModularImpl)
+                or type(kernel.impl.fused_experts) is not HummingIndexedExperts
+                or kernel.impl.prepare_finalize.supports_async()
+                or getattr(kernel.impl.fused_experts, "_lora_context", None) is not None
+                or self.routed_experts.expert_map is not None
+                or self.routed_experts.apply_router_weight_on_input
+                or self.routed_experts.activation != MoEActivation.RELU2_NO_MUL):
+            return False
+        from vllm.model_executor.layers.fused_moe.moe_fused_mul_sum import (
+            _qualify_shared_sum,
+        )
+        weight = self.routed_experts.w13_weight
+        if not _qualify_shared_sum(weight.device, self.routed_scaling_factor):
+            return False
+        self._humming_shared_sum = True
+        self._forward_entry = self._select_forward()
+        logger.info("MoE shared-sum startup contract enabled: %s method=%s scale=%s",
+                    self.layer_name, type(self._quant_method).__name__,
+                    self.routed_scaling_factor)
+        return True
 
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]
@@ -312,6 +381,8 @@ class MoERunner(MoERunnerInterface):
         return self.routed_experts.load_weights(weights)
 
     def _select_forward(self) -> Callable:
+        if self._humming_shared_sum:
+            return torch.ops.vllm.moe_forward_combined_shared_sum
         if current_platform.is_tpu() or current_platform.is_cpu():
             # TODO: Once the OOM issue for the TPU backend is resolved, we
             # will switch to using the moe_forward custom op.
@@ -414,6 +485,9 @@ class MoERunner(MoERunnerInterface):
         avoid overflow by dividing shared_output by the scale instead
         (the decoder layer compensates with matching divisions).
         """
+        if self._humming_shared_sum:
+            assert shared_output is None
+            return shared_output, fused_output
         if self.routed_scaling_factor != 1.0:
             if fused_output.dtype != torch.float16 or shared_output is None:
                 fused_output *= self.routed_scaling_factor
@@ -650,23 +724,53 @@ class MoERunner(MoERunnerInterface):
                     topk_ids = topk_ids.index_select(0, rows)
                     topk_weights = topk_weights.index_select(0, rows)
 
-                fused_out = self.routed_experts.forward_modular(
-                    x=hidden_states,
-                    topk_weights=topk_weights,
-                    topk_ids=topk_ids,
-                    shared_experts=self._shared_experts,
-                    shared_experts_input=shared_experts_input,
-                )
+                fused_out = None
+                combine = getattr(self._quant_method, "apply_with_shared_sum", None)
+                if self._humming_shared_sum and row_src is None and callable(combine):
+                    def consume_shared():
+                        # Called after routed down is enqueued. Retain the
+                        # existing exactly-once wrapper and current-stream join.
+                        self._maybe_apply_shared_experts(
+                            shared_experts_input,
+                            SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
+                        )
+                        assert self._shared_experts is not None
+                        return self._shared_experts.output, self.routed_scaling_factor
+
+                    fused_out = combine(
+                        self.routed_experts, hidden_states, topk_weights,
+                        topk_ids, consume_shared,
+                    )
+                    if fused_out is not None:
+                        return None, fused_out
+                if fused_out is None:
+                    fused_out = self.routed_experts.forward_modular(
+                        x=hidden_states,
+                        topk_weights=topk_weights,
+                        topk_ids=topk_ids,
+                        shared_experts=self._shared_experts,
+                        shared_experts_input=shared_experts_input,
+                    )
 
         self._maybe_apply_shared_experts(
             shared_experts_input,
             SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
         )
 
-        return (
-            self._shared_experts.output if self._shared_experts is not None else None,
-            fused_out,
+        shared_out = (
+            self._shared_experts.output if self._shared_experts is not None else None
         )
+        if self._humming_shared_sum:
+            assert shared_out is not None
+            # Lite rows and other unsupported experts retain their full old
+            # computation; combine here to honor the static custom-op contract.
+            if self.routed_scaling_factor != 1.0:
+                if fused_out.dtype == torch.float16:
+                    shared_out *= 1.0 / self.routed_scaling_factor
+                else:
+                    fused_out *= self.routed_scaling_factor
+            return None, shared_out + fused_out
+        return shared_out, fused_out
 
     def _sequence_parallel_context(self):
         """Return a context manager for sequence-parallel token
@@ -871,6 +975,9 @@ class MoERunner(MoERunnerInterface):
         ):
             hidden_states = get_pcp_group().reduce_scatter(hidden_states, dim=0)
 
+        if self._humming_shared_sum:
+            assert shared_output is None
+            return hidden_states
         if self.shared_experts is not None:
             assert shared_output is not None
             return shared_output, hidden_states

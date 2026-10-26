@@ -450,6 +450,14 @@
     {
       "file": "model_executor/layers/mamba/ops/mamba_ssm_spec_replay.py (PIPELINED branches only)",
       "why": "C2FMA: the raw-input replay software pipeline (NEMO_MAMBA_REPLAY_PIPELINE, admitted per boot only if its outputs, replayed state and both checkpoint slots are byte-identical to the ordinary kernel) never qualified because the compiler contracted the other product into the FMA: pipeline RN(RN(B*dt)*x + state*dA) vs ordinary RN(state*dA + RN(RN(B*dt)*x)), a 1-ULP fp32 state difference. The pipelined replay and compute loops now spell the ordinary order explicitly with tl.fma(state, dA, dB*x). The ordinary kernel's code is unchanged (the change sits under the PIPELINED constexpr). The boot-time byte comparison and timing admission are unchanged; NEMO_MAMBA_REPLAY_PIPELINE=0 keeps the ordinary path."
+    },
+    {
+      "file": "vllm/v1/worker/gpu_model_runner.py",
+      "why": "terrapinelf: a verify step's AsyncGPUModelRunnerOutput copy of the sampled token ids waits on an event recorded right after the sampler (and _update_states_after_model_execute) instead of on the whole default stream, which by then also holds the next draft loop queued by propose_draft_token_ids. The copy reads only sampled_token_ids, which the sampler has finished writing. Prefill steps (no spec-decode metadata) keep waiting for the whole stream, so the seed token still returns after the seed's draft work. VLLM_OUTPUT_COPY_AFTER_SAMPLE=0 restores the stream wait."
+    },
+    {
+      "file": "(composition)",
+      "why": "terrapinelf on the record 1cb833a7-a22f-416c-b659-aa84adea762f (ArthurOstapenko, commit de290fa): the record's files byte for byte plus the verify-step output copy entry above; the same files as terrapinelf 9843ad8f-71de-4ecb-8ab8-fa9bc8a389e6 (second measurement)."
     }
   ]
 }

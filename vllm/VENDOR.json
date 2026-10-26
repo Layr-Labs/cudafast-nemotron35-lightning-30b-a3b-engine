@@ -378,6 +378,14 @@
     {
       "file": "vllm/v1/worker/decode_prep.py; vllm/v1/worker/copy_batch.py; vllm/v1/worker/gpu_model_runner.py; vllm/v1/attention/backends/flashinfer.py; vllm/v1/attention/backends/mamba2_attn.py; vllm/model_executor/layers/fused_moe/experts/humming_nvsc.py; vllm/model_executor/layers/fused_moe/experts/humming_relu2_epilogue.py",
       "why": "i34-9 993e9bec, carried onto terrapinelf c64b6fe5: in the steady one-request speculative step the per-step device prep (query_start_loc, discard mask, accepted counts, positions, seq_lens, slot mapping, input ids incl. drafts) is one H2D of staged host values plus one kernel, and the remaining small metadata copies go through one copy batch flushed before the target forward; non-steady steps take the stock path (where terrapinelf's batch-1 slice copy still applies). Prefill routed-up reads the 6-bit block scales directly. Same values into the same buffers; no format or arithmetic change."
+    },
+    {
+      "file": "vllm/v1/spec_decode/llm_base_proposer.py; vllm/v1/spec_decode/nemotron_decode_plan.py; vllm/v1/worker/copy_batch.py; vllm/v1/attention/backends/flashinfer.py",
+      "why": "On ENTIRE highest1e1c2581-e506-4ca4-9341-5f08ffceec86, group later native-MTP page metadata and exact native-plan integer-prefix publication into one ordered copy kernel before original staging and plan-ready events. Preserve immutable owners through completion, event after kernel in both staging modes, and materialize on opaque planner/cache-miss fallbacks. Reuses selected993copykernel plus ownPR544lifetime safeguards; no failedPR538producer/stoppedGEMM, no BBFscale-selection delta, no DEBdtypeguard imported. New whole, activation and gain remain unverified."
+    },
+    {
+      "file": "vllm/v1/spec_decode/nemotron_decode_plan.py",
+      "why": "Pending public idea f79355bf-fcbb-4817-8db7-d67f160086eb: extend native structural-plan fill to min(actual blocks,512) while preserving original native snapshot and integer sentinel checks. Own atomic complete-page budget retention protects earlier valid entries when retained plan bytes reach64MiB. Add full private state comparisons at extended midpoint/end, keep original<=128page latency gate, original miss fallback and no assumed actual activation/gain."
     }
   ]
 }

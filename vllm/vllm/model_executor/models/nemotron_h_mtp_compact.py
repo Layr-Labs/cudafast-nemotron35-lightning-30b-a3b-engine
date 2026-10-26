@@ -233,6 +233,11 @@ def maybe_down(h, packed, ids, weights, y, routed_scale, residual=None):
         or not all(t.device == h.device for t in (w2, sd, ids, weights, y))
     ):
         return False
+    if _SLOTS:
+        from .nemotron_h_mtp_inline_compact import maybe_down as maybe_inline_down
+
+        if maybe_inline_down(h, packed, ids, weights, y, routed_scale, residual):
+            return True
     indices = torch.empty(h.shape, dtype=torch.int32, device=h.device)
     values = torch.empty_like(h)
     counts = torch.empty(slots, dtype=torch.int32, device=h.device)

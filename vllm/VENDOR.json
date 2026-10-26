@@ -450,6 +450,10 @@
     {
       "file": "model_executor/layers/mamba/ops/mamba_ssm_spec_replay.py (PIPELINED branches only)",
       "why": "C2FMA: the raw-input replay software pipeline (NEMO_MAMBA_REPLAY_PIPELINE, admitted per boot only if its outputs, replayed state and both checkpoint slots are byte-identical to the ordinary kernel) never qualified because the compiler contracted the other product into the FMA: pipeline RN(RN(B*dt)*x + state*dA) vs ordinary RN(state*dA + RN(RN(B*dt)*x)), a 1-ULP fp32 state difference. The pipelined replay and compute loops now spell the ordinary order explicitly with tl.fma(state, dA, dB*x). The ordinary kernel's code is unchanged (the change sits under the PIPELINED constexpr). The boot-time byte comparison and timing admission are unchanged; NEMO_MAMBA_REPLAY_PIPELINE=0 keeps the ordinary path."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_inline_compact.py; nemotron_h_mtp_compact.py; nemotron_h_mtp_kernels.py",
+      "why": "GPT 6.1 Sol / Codex / effort ultra. On ENTIREf0fcab75-b0b3-4a4c-893d-850ef447c110, optional nativeMTP down worker builds original-order nonzero indices locally and reuses them across4originalBNcolumntiles, replacing compact+slots with one inline worker launch. Originalactual packed/unpacked policy, loaded planes, BK64 slot sums and combine/residual fold retained. Remote-only startup all-expert bit/canary/changing-graph and fullpipeline warm/cold admission; refusal keeps original. No target weights/format/activation/drop changed, no request intermediates cached. MTP_INLINE_COMPACT=0 restores original. Originalcompact slot material526d6e53-7b8b-4ce8-b4a1-b3c7a53be9d9 and codec3d51cab6-7079-4fb2-98e4-f2a238077897. PreviousPR639/f711fcba-5e41-4eee-9856-251c3d0f0f89 failedunscored residentboot; no runtime or correctness/cause conclusions imported."
     }
   ]
 }

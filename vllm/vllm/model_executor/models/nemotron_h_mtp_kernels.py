@@ -760,6 +760,11 @@ def prepare_mtp_relu2(module: torch.nn.Module) -> None:
                 w2.device, float(layer.mixer.routed_scaling_factor))
             from .nemotron_h_mtp_down_packed import prepare as prepare_down_packed
             prepare_down_packed(packed)
+            # Qualify against the actual packed/unpacked choice above, with
+            # full old/new down pipelines and private same-call graph inputs.
+            from .nemotron_h_mtp_inline_compact import prepare as prepare_inline_compact
+
+            prepare_inline_compact(packed, float(layer.mixer.routed_scaling_factor))
         logger.info_once(
             "MTP exact-zero down: %s",
             "BF16 transpose ready" if packed is not False else "l2 fallback (nonfinite weights)",

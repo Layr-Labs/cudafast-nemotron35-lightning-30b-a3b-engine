@@ -46,7 +46,10 @@ except ImportError:
 PZ_ENABLED = os.environ.get("PZSKIP", "1") != "0"
 # config 356: 32-row expert blocks (sparser union masks than humming's 64-row blocks), 384 columns,
 # config 333's arithmetic with a leaner per-group instruction stream; PZSKIP_CONFIG=333 restores 333
-PZ_CONFIG = int(os.environ.get("PZSKIP_CONFIG", "356"))
+# LOCAL PATCH (cudafast-nemotron35, pzhalf): config 369 = 356 reading humming's 64-row prefill
+# layout as 32-row halves, so the 32-row moe_align is not run; PZSKIP_HALF64=0 keeps 356.
+PZ_CONFIG = int(os.environ.get(
+    "PZSKIP_CONFIG", "369" if os.environ.get("PZSKIP_HALF64", "1") != "0" else "356"))
 PZ_BLOCK_M = 64  # humming's prefill bucket that pzskip replaces
 PZ_MAX_TOKENS = 8192
 
@@ -142,7 +145,7 @@ def finalize(layer: torch.nn.Module) -> None:
     if PZ_ENABLED and _pzskip is not None and _pzskip.available():
         _pzskip.scratch(
             gs.device,
-            _pzskip.max_blocks(PZ_MAX_TOKENS * TOP_K, NUM_EXPERTS, _pzskip.block_rows(PZ_CONFIG)),
+            _pzskip.ws_blocks(PZ_MAX_TOKENS * TOP_K, NUM_EXPERTS, PZ_CONFIG),
         )
         if _pz_self_check(layer):
             layer.pzskip_ok = True

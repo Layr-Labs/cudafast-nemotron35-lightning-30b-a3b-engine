@@ -79,6 +79,14 @@ def _mtp_kernels():
 
 # Protect asynchronous H2D sources; switchable for in-process cost screening.
 PINNED_SOURCE_GUARDS = True
+# LOCAL PATCH (drafter3): see prepare_next_token_ids_padded.
+BACKUP_SCALAR = os.environ.get("MTP_BACKUP_SCALAR", "1") != "0"
+# LOCAL PATCH (drafter3): see propose (the first pass's plan on the side stream).
+FIRST_PLAN_SIDE = os.environ.get("MTP_FIRST_PLAN_SIDE", "0") != "0"
+# LOCAL PATCH (drafter3): see _mtp_step_prefetch (MB of the packed qkv head per step;
+# the ALT table is built switched off, for in-process A/B of a second size).
+STEP_PF_MB = float(os.environ.get("L2PF_DRAFT_STEP_MB", "0"))
+STEP_PF_ALT_MB = float(os.environ.get("L2PF_DRAFT_STEP_ALT_MB", "0"))
 
 
 class SpecDecodeBaseProposer:
@@ -576,9 +584,29 @@ class SpecDecodeBaseProposer:
             )
         )
 
-        per_group_attn_metadata, per_layer_attn_metadata = (
-            self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
-        )
+        # LOCAL PATCH (drafter3): the first pass's plan copies (FlashInfer indptrs,
+        # plan info) go to the draft-plan side stream like the later steps' plans
+        # (per-step staging set 0); the first pass's attention waits for them and the
+        # main stream waits again after the pass. Each small H2D costs the GPU ~6-9 us
+        # of serialized copy-engine latency at the head of the pass otherwise.
+        # MTP_FIRST_PLAN_SIDE=0 keeps the plan on the main stream.
+        first_ready = None
+        side = self._draft_plan_side_stream() if FIRST_PLAN_SIDE and batch_size == 1 else None
+        if side is not None and len(self._draft_plan_ready) == self.num_speculative_tokens:
+            main = torch.cuda.current_stream()
+            side.wait_stream(main)
+            with torch.cuda.stream(side):
+                per_group_attn_metadata, per_layer_attn_metadata = (
+                    self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
+                )
+                first_ready = self._draft_plan_ready[-1]
+                first_ready.record(side)
+            for md in {id(m): m for m in per_layer_attn_metadata.values()}.values():
+                md.plan_ready_event = first_ready
+        else:
+            per_group_attn_metadata, per_layer_attn_metadata = (
+                self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
+            )
         num_rejected_cpu = self._copy_num_rejected_to_cpu(num_rejected_tokens_gpu)
 
         cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
@@ -630,6 +658,9 @@ class SpecDecodeBaseProposer:
                 hidden_states = last_hidden_states
             else:
                 last_hidden_states, hidden_states = ret_hidden_states
+
+        if first_ready is not None:
+            torch.cuda.current_stream().wait_event(first_ready)
 
         # After step 0: switch to reuse mode so steps 1+ skip the indexer
         # and read the indices that step 0 just wrote into the shared buffer.
@@ -785,6 +816,8 @@ class SpecDecodeBaseProposer:
         for token_index in range(self.num_speculative_tokens - 1):
             if budget_drafts is not None and token_index + 2 > budget_drafts:
                 break
+            if depth_gate is not None:
+                self._mtp_step_prefetch(depth_gate)
             # Update the inputs.
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax() returns int64 by default.
@@ -952,6 +985,34 @@ class SpecDecodeBaseProposer:
         if draft_probs_list is not None:
             self._last_draft_probs = torch.stack(draft_probs_list, dim=1).contiguous()
         return draft_token_ids
+
+    def _mtp_step_prefetch(self, gate: torch.Tensor) -> None:
+        """LOCAL PATCH (drafter3): a single-row draft step starts with its eager input
+        glue, the start projection (eh_w_h, L2-resident) and a norm, all leaving DRAM
+        idle; queue an L2 prefetch of the head of the packed qkv the step reads next,
+        on l2pf's side stream (eager, no join: it moves no value). Skipped on the device
+        once the depth gate stopped the loop. L2PF_DRAFT_STEP_MB=0 disables."""
+        tables = self._step_pf_tables
+        if tables is None:
+            tables = []
+            try:
+                import l2pf
+            except ImportError:
+                l2pf = None
+            planes = getattr(l2pf, "DRAFT_NEXT", {}).get("qkv") if l2pf is not None else None
+            if (planes is not None and hasattr(l2pf, "GatedTable")
+                    and not torch.cuda.is_current_stream_capturing()):
+                for name, mb, mode in (("stepq", STEP_PF_MB, 2), ("stepq_alt", STEP_PF_ALT_MB, 0)):
+                    if mb > 0:
+                        t = l2pf.GatedTable(l2pf.packed_ranges(planes, int(mb * (1 << 20))),
+                                            gate.device, name=name, mode=mode)
+                        if t.nranges:
+                            tables.append(t)
+            self._step_pf_tables = tables
+        for t in tables:
+            t.launch(gate, 1 << 30)
+
+    _step_pf_tables: list | None = None
 
     def _emit_budget_drafts(
         self, depth_gate, batch_size: int, common_attn_metadata, seq_lens_after_rejection: bool
@@ -1478,6 +1539,34 @@ class SpecDecodeBaseProposer:
         is not sampled and comes from `request.get_token_id()` instead. This is denoted
         the "backup" token id. It also counts rejected tokens via `sampled_token_ids`.
         """
+        # LOCAL PATCH (drafter3): one request: its backup token goes to the kernel as a
+        # launch argument instead of a 4-byte pinned H2D copy, which the GPU spent
+        # ~30 us on (copy-engine latency) at the head of the first draft pass's glue.
+        # Same value, read on the host at the same point. MTP_BACKUP_SCALAR=0 copies.
+        if (BACKUP_SCALAR and gpu_input_batch.num_reqs == 1
+                and sampled_token_ids.shape[0] == 1):
+            backup = int(requests[gpu_input_batch.req_ids[0]].get_token_id(
+                gpu_input_batch.num_tokens_no_spec[0] - 1))
+            batch_size, num_tokens = sampled_token_ids.shape
+            device = sampled_token_ids.device
+            assert discard_request_mask.dtype == torch.bool
+            next_token_ids = torch.empty(batch_size, dtype=torch.int32, device=device)
+            valid_sampled_tokens_count = next_token_ids.new_empty(batch_size)
+            eagle_prepare_next_token_padded_kernel[(batch_size,)](
+                sampled_token_ids,
+                discard_request_mask,
+                next_token_ids,  # unread with BACKUP_SCALAR
+                next_token_ids,
+                valid_sampled_tokens_count,
+                gpu_input_batch.vocab_size,
+                num_tokens,
+                batch_size,
+                sampled_token_ids.stride(0),
+                BLOCK_SIZE_TOKENS=next_power_of_2(num_tokens),
+                backup_scalar=backup,
+                BACKUP_SCALAR=True,
+            )
+            return next_token_ids, valid_sampled_tokens_count
         event = None
         if PINNED_SOURCE_GUARDS:
             # The previous backup H2D may still be behind async work,
@@ -1834,15 +1923,17 @@ class SpecDecodeBaseProposer:
 
         self._maybe_share_embeddings(target_language_model)
         self._maybe_share_lm_head(target_language_model)
+        # Drafter-only projected-embedding table for the start projection
+        # (nemotron_h_mtp.py), built once the embeddings are shared.
+        # LOCAL PATCH (drafter3): built before the screen, whose captured graph
+        # prefetches the table's packed hidden half for the next draft pass.
+        prepare_eh_table = getattr(self.model, "prepare_eh_table", None)
+        if prepare_eh_table is not None:
+            prepare_eh_table()
         # Drafter-only greedy head (partial-K screen + full-K rescore), built
         # once from the shared head's checkpoint tensors.
         prepare_screen = getattr(self.model, "prepare_draft_head_screen", None)
         self._draft_head_screen = prepare_screen() if prepare_screen else None
-        # Drafter-only projected-embedding table for the start projection
-        # (nemotron_h_mtp.py), built once the embeddings are shared.
-        prepare_eh_table = getattr(self.model, "prepare_eh_table", None)
-        if prepare_eh_table is not None:
-            prepare_eh_table()
 
         if (
             self.parallel_drafting

@@ -145,26 +145,28 @@ def _admit_group8(packed, original):
 @gluon.jit
 def load_packed(SM, EX, BASE, RI, RAW, index, mask, EVICT:tl.constexpr=True,
                 WORD:tl.constexpr=False):
+    # LOCAL PATCH (drafter3): EVICT 1 (or True) loads evict-first, 2 evict-last (a weight
+    # every draft pass of a cycle reads), 0 (or False) with the default policy.
     bid = index // 128
     # Escape blocks are supplied entirely by RAW. Read their metadata first,
     # so they do not also stream unused sign/mantissa and exponent planes.
-    rawid = tl.load(RI + bid, mask=mask, other=-1, eviction_policy='evict_first' if EVICT else '')
+    rawid = tl.load(RI + bid, mask=mask, other=-1, eviction_policy='evict_first' if EVICT == 1 else ('evict_last' if EVICT == 2 else ''))
     coded = mask & (rawid < 0)
-    sm = tl.load(SM + index, mask=coded, other=0, eviction_policy='evict_first' if EVICT else '').to(tl.uint16)
+    sm = tl.load(SM + index, mask=coded, other=0, eviction_policy='evict_first' if EVICT == 1 else ('evict_last' if EVICT == 2 else '')).to(tl.uint16)
     if WORD:
         words = EX.to(tl.pointer_type(tl.uint32))
         word = tl.load(words + index // 8, mask=coded, other=0,
-                       eviction_policy='evict_first' if EVICT else '')
+                       eviction_policy='evict_first' if EVICT == 1 else ('evict_last' if EVICT == 2 else ''))
         code = ((word >> ((index % 8).to(tl.uint32) * 4)) & 15).to(tl.uint16)
     else:
         nib = tl.load(EX + index // 2, mask=coded, other=0,
-                      eviction_policy='evict_first' if EVICT else '').to(tl.uint16)
+                      eviction_policy='evict_first' if EVICT == 1 else ('evict_last' if EVICT == 2 else '')).to(tl.uint16)
         code = (nib >> ((index % 2)*4)) & 15
-    base = tl.load(BASE + bid, mask=coded, other=1, eviction_policy='evict_first' if EVICT else '').to(tl.uint16)
+    base = tl.load(BASE + bid, mask=coded, other=1, eviction_policy='evict_first' if EVICT == 1 else ('evict_last' if EVICT == 2 else '')).to(tl.uint16)
     exp = tl.where(code == 0, 0, base + code - 1)
     bits = ((sm & 128) << 8) | (exp << 7) | (sm & 127)
     raw = tl.load(RAW + rawid.to(tl.int64)*128 + index % 128,
-                  mask=mask & (rawid >= 0), other=0, eviction_policy='evict_first' if EVICT else '')
+                  mask=mask & (rawid >= 0), other=0, eviction_policy='evict_first' if EVICT == 1 else ('evict_last' if EVICT == 2 else ''))
     bits = tl.where(rawid >= 0, raw, bits).to(tl.uint16)
     return bits.to(tl.bfloat16, bitcast=True)
 
@@ -464,6 +466,23 @@ direct_register_custom_op(
 )
 
 
+# LOCAL PATCH (drafter3): the single-row passes read the packed eh hidden half with an
+# evict-last L2 policy, so it stays resident across the draft passes of a cycle while
+# the other drafter streams pass through; nemotron_h_mtp_kernels.depth_gate_end returns
+# its lines to the normal priority after the loop. MTP_EH_LAST=0 keeps default loads.
+EH_LAST = os.environ.get("MTP_EH_LAST", "1") != "0"
+# LOCAL PATCH (drafter3): the first draft pass (2..16 rows) also reads the packed planes
+# (packed_small) instead of the BF16 copy, and the post-verify prefetch fetches those
+# planes (gpu_model_runner._l2pf_prefetch). MTP_EH_PACKED5=0 keeps the BF16 path.
+EH_PACKED5 = os.environ.get("MTP_EH_PACKED5", "0") != "0"
+# LOCAL PATCH (drafter3): every pass reads the BF16 eh hidden half (eh_w_h) with the
+# BF16 GEMV / small-M GEMM instead of the packed planes: from L2 the BF16 GEMV takes
+# ~10 us where the packed GEMV's dependent block-metadata loads take ~28 us, and the
+# first pass already reads (and the post-verify prefetch fetches) the BF16 copy.
+# MTP_EH_BF16=0 keeps the packed planes for single-row passes.
+EH_BF16 = os.environ.get("MTP_EH_BF16", "1") != "0" and not EH_PACKED5
+
+
 def _packed_linear_keep_impl(
     x: torch.Tensor, sm: torch.Tensor, ex: torch.Tensor, base: torch.Tensor,
     ri: torch.Tensor, raw: torch.Tensor, n: int, k: int, fallback: torch.Tensor,
@@ -477,9 +496,22 @@ def _packed_linear_keep_impl(
         y = x.new_empty((1, n))
         packed_gemv[(triton.cdiv(n, 8),)](
             x, sm, ex, base, ri, raw, y, n, k, k, gate,
-            BN=8, BK=512, EVICT=False, GATED=gated,
+            BN=8, BK=512, EVICT=2 if EH_LAST else False, GATED=gated,
             num_warps=4, num_stages=3, launch_pdl=mtp_pdl(),
             WORD=word_load_enabled(x.device))
+        return y
+    if (EH_PACKED5 and x.is_cuda and x.dtype == torch.bfloat16 and x.dim() == 2
+            and 1 < x.shape[0] <= 16 and x.shape[1] == k):
+        # LOCAL PATCH (drafter3): the first (multi-row) draft pass reads the same packed
+        # planes, evict-last, so every pass of a cycle finds them in L2.
+        if x.stride(1) != 1:
+            x = x.contiguous()
+        gate, gated = _gate_args(x)
+        y = x.new_empty((x.shape[0], n))
+        packed_small[(triton.cdiv(n, 64),)](
+            x, sm, ex, base, ri, raw, y, x.shape[0], n, k, x.stride(0), y.stride(0), gate,
+            GATED=gated, num_warps=4, num_stages=4, launch_pdl=mtp_pdl(),
+            WORD=word_load_enabled(x.device), EVICT=2 if EH_LAST else False)
         return y
     return torch.ops.vllm.mtp_small_linear_keep(x, fallback)
 
@@ -498,11 +530,25 @@ def prepare_eh_hidden_packed(layer):
     w = layer.eh_w_h
     if tuple(w.shape) != (2688, 2688):
         return
+    _register_next("eh_bf16", (w,))
+    if EH_BF16:
+        return  # single-row passes read eh_w_h (see EH_BF16); no planes are built
     packed = pack_bf16(w)
     if packed is None:
         return
     for suffix, tensor in zip(("sm", "ex", "base", "ri", "raw"), packed.planes):
         layer.register_buffer("_mtp_eh_pk_" + suffix, tensor, persistent=False)
+    _register_next("eh", packed.planes)
+
+
+def _register_next(name, planes):
+    """LOCAL PATCH (drafter3): the packed planes a draft pass reads first, for the
+    screen's next-pass L2 prefetch (harness/kernels/l2pf DRAFT_NEXT)."""
+    try:
+        import l2pf
+    except ImportError:
+        return
+    l2pf.DRAFT_NEXT[name] = tuple(planes)
 
 
 _PACK_OPROJ = os.environ.get("MTP_PACK12_OPROJ", "1") != "0"
@@ -536,6 +582,8 @@ def prepare_mtp_packed(module):
             for suffix, tensor in zip(("sm", "ex", "base", "ri", "raw"), p.planes):
                 layer.register_buffer("_mtp_pk_" + suffix, tensor, persistent=False)
             layer._mtp_pk_n, layer._mtp_pk_k = p.shape
+            if name.endswith("qkv_proj"):
+                _register_next("qkv", p.planes)
             w.data = torch.empty(0, dtype=w.dtype, device=w.device)
         if not getattr(layer, "_fast_moe", False):
             continue
@@ -568,7 +616,7 @@ from triton.experimental.gluon.language.nvidia.ampere import mma_v2
 def packed_small(x,SM,EX,BASE,RI,RAW,y,M,N,K,sxm,sym,gate_ptr,
                  BM:tl.constexpr=16,BN:tl.constexpr=64,BK:tl.constexpr=128,
                  GATED:tl.constexpr=False, launch_pdl:tl.constexpr=False,
-                 WORD:tl.constexpr=False):
+                 WORD:tl.constexpr=False, EVICT:tl.constexpr=True):
     if launch_pdl:
         pdl_prologue()
     ld:tl.constexpr=BlockedLayout([1,8],[2,16],[4,1],[1,0])
@@ -583,7 +631,7 @@ def packed_small(x,SM,EX,BASE,RI,RAW,y,M,N,K,sxm,sym,gate_ptr,
         wmask=(nn[:,None]<N)&(kk[None,:]<K)
         if GATED:
             wmask=wmask & (tl.load(gate_ptr)==0)
-        w=load_packed(SM,EX,BASE,RI,RAW,nn[:,None]*K+kk[None,:],wmask,WORD=WORD)
+        w=load_packed(SM,EX,BASE,RI,RAW,nn[:,None]*K+kk[None,:],wmask,EVICT=EVICT,WORD=WORD)
         a=tl.load(x+mm[:,None]*sxm+kk[None,:],mask=(mm[:,None]<M)&(kk[None,:]<K),other=0.)
         a=tl.convert_layout(a,DotOperandLayout(0,mma,2))
         b=tl.convert_layout(tl.permute(w,(1,0)),DotOperandLayout(1,mma,2))

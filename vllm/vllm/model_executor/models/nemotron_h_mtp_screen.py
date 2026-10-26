@@ -62,6 +62,39 @@ CASCADE_PER = 256
 # groups, keeping the top PRE_PER of each chunk for the 32-group stage.
 PRE_FRAC_GROUPS = 16
 PRE_PER = 1024
+# LOCAL PATCH (drafter3): shares of the next-pass prefetch queued after each of the
+# cascade's three streaming dots and after its final dot (one per top-k window).
+NEXT_PF_SHARES = (0.3, 0.35, 0.2, 0.15)
+# LOCAL PATCH (drafter3): the screen's fp8 group scales are read once per pass like its
+# weights: load them evict-first too, so they do not displace the evict-last eh hidden
+# half or prefetched lines (MTP_SCREEN_SCALE_EF=0 keeps default loads).
+SCREEN_SCALE_EF = os.environ.get("MTP_SCREEN_SCALE_EF", "1") != "0"
+
+
+def _radix_for(radix, n: int):
+    """LOCAL PATCH (drafter3): 8-bit digits (radix 2) only where they measured faster,
+    selections of at most 1024 keys; 2048-key chunks keep 4-bit digits."""
+    return 1 if radix == 2 and n > 1024 else radix
+
+
+def _split_ranges(ranges, shares):
+    """Cut [(tensor, bytes)] (each range a prefix of its tensor) into consecutive pieces
+    of about shares[i] of the total bytes, as [(tensor_view, bytes)] lists; every piece
+    starts 16-byte aligned. Proportional within each range, so every piece covers the
+    same leading fraction of every plane (the planes of the same rows)."""
+    pieces = [[] for _ in shares]
+    for t, nbytes in ranges:
+        flat = t.reshape(-1).view(torch.uint8)
+        nbytes = min(int(nbytes), flat.numel())
+        off = 0
+        acc = 0.0
+        for i, share in enumerate(shares):
+            acc += share
+            end = nbytes if i == len(shares) - 1 else min(nbytes, int(nbytes * acc) // 256 * 256)
+            if end > off:
+                pieces[i].append((flat[off:end], end - off))
+            off = max(off, end)
+    return pieces
 
 
 def screen_enabled() -> bool:
@@ -133,6 +166,7 @@ def _nvfp4_rows_dot(
     BASE: tl.constexpr = False,
     scatter_ptr=None,  # [N] fp32: the result is also stored at its row, when SCATTER
     SCATTER: tl.constexpr = False,
+    SCALE_EF: tl.constexpr = False,
 ):
     """RMODE 0: rows from GATHER as before. 1: rows = rows_ptr[r] + (r // CPER) * CHUNK
     (first-stage top-k indices within their chunk). 2: rows = rows_ptr[c * CPER + ref_ptr[r]]
@@ -189,6 +223,7 @@ def _nvfp4_rows_dot(
             s_ptr + rows[:, None] * (NBYTES // 8) + og[None, :],
             mask=wr[:, None],
             other=0.0,
+            eviction_policy="evict_first" if SCALE_EF else "",
         ).to(tl.float32)
         if HCOLS:
             hl = tl.load(h_ptr + tl.load(hcols_ptr + 2 * ob))
@@ -216,6 +251,7 @@ def _nvfp4_rows_dot_part(
     h_ptr, w_ptr, s_ptr, rows_ptr, part_ptr, R,
     NBYTES: tl.constexpr, BR: tl.constexpr, BB: tl.constexpr, INDEX32: tl.constexpr,
     gate_ptr=None, GATED: tl.constexpr = False, launch_pdl: tl.constexpr = False,
+    SCALE_EF: tl.constexpr = False,
 ):
     """LOCAL PATCH (cudafast-nemotron35): one BB-byte block (program axis 1) of
     _nvfp4_rows_dot's gathered rows: the exact term that kernel's loop adds to its
@@ -250,6 +286,7 @@ def _nvfp4_rows_dot_part(
         s_ptr + rows[:, None] * (NBYTES // 8) + og[None, :],
         mask=wr[:, None],
         other=0.0,
+        eviction_policy="evict_first" if SCALE_EF else "",
     ).to(tl.float32)
     hl = tl.load(h_ptr + 2 * ob)
     hh = tl.load(h_ptr + 2 * ob + 1)
@@ -305,7 +342,7 @@ def _rows_dot_ksplit(h, w, s, rows, gscale, out, part, gated=False):
         h, w, s, rows, part, n_out,
         NBYTES=nbytes, BR=br, BB=64, INDEX32=index32,
         gate_ptr=gate, GATED=gated, launch_pdl=mtp_pdl(),
-        num_warps=4, num_stages=2,
+        num_warps=4, num_stages=2, SCALE_EF=SCREEN_SCALE_EF,
     )
     _nvfp4_rows_dot_sum[(triton.cdiv(n_out, 128),)](
         part, out, n_out, gscale, NK=nk, BR=128,
@@ -337,6 +374,7 @@ def _rows_dot(h, w, s, rows, gscale, out, gather, gated=False, hcols=None, ref=N
         ref_ptr=ref, RMODE=rmode, CHUNK=SCREEN_CHUNK, CPER=cper, SPER=sper,
         base_ptr=base, BASE=base is not None,
         scatter_ptr=scatter, SCATTER=scatter is not None,
+        SCALE_EF=SCREEN_SCALE_EF,
     )
 
 
@@ -410,16 +448,30 @@ def _chunk_topk(
         else:
             active = tl.full((N,), True, tl.int1)
             left = tl.full((), K, tl.int32)
-            bins = tl.arange(0, 16)
             t = tl.full((), 0, tl.int64)
-            for shift in tl.static_range(28, -1, -4):
-                digit = ((key >> shift) & 15).to(tl.int32)
-                hist = tl.histogram(digit, 16, mask=active)
-                suffix = tl.sum(hist, axis=0) - tl.cumsum(hist, axis=0) + hist
-                pick = tl.max(tl.where(suffix >= left, bins, 0), axis=0)
-                left -= tl.sum(tl.where(bins > pick, hist, 0), axis=0)
-                t |= pick.to(tl.int64) << shift
-                active = active & (digit == pick)
+            if RADIX == 2:
+                # LOCAL PATCH (drafter3): the same exact radix selection with 8-bit
+                # digits: four histogram rounds instead of eight (the rounds, not
+                # the elements, set the latency of these small selections).
+                bins8 = tl.arange(0, 256)
+                for shift in tl.static_range(24, -1, -8):
+                    digit = ((key >> shift) & 255).to(tl.int32)
+                    hist = tl.histogram(digit, 256, mask=active)
+                    suffix = tl.sum(hist, axis=0) - tl.cumsum(hist, axis=0) + hist
+                    pick = tl.max(tl.where(suffix >= left, bins8, 0), axis=0)
+                    left -= tl.sum(tl.where(bins8 > pick, hist, 0), axis=0)
+                    t |= pick.to(tl.int64) << shift
+                    active = active & (digit == pick)
+            else:
+                bins = tl.arange(0, 16)
+                for shift in tl.static_range(28, -1, -4):
+                    digit = ((key >> shift) & 15).to(tl.int32)
+                    hist = tl.histogram(digit, 16, mask=active)
+                    suffix = tl.sum(hist, axis=0) - tl.cumsum(hist, axis=0) + hist
+                    pick = tl.max(tl.where(suffix >= left, bins, 0), axis=0)
+                    left -= tl.sum(tl.where(bins > pick, hist, 0), axis=0)
+                    t |= pick.to(tl.int64) << shift
+                    active = active & (digit == pick)
     else:
         # Original binary radix selection, retained for remote admission/fallback.
         t = tl.sum(key * 0, axis=0)
@@ -528,7 +580,7 @@ def _select_token(
 class DraftHeadScreen:
     """Load-time buffers plus the greedy screen for one shared NVFP4 head."""
 
-    def __init__(self, snapshot_dir: str, device: torch.device):
+    def __init__(self, snapshot_dir: str, device: torch.device, depth: int | None = None):
         from safetensors import safe_open
 
         idx = json.load(open(os.path.join(snapshot_dir, "model.safetensors.index.json")))
@@ -671,6 +723,11 @@ class DraftHeadScreen:
         self.radix = self.fused_topk and os.environ.get("VLLM_MTP_RADIX_TOPK", "1") != "0"
         if self.radix:
             self.radix = self._radix_matches(device)
+        # LOCAL PATCH (drafter3): 8-bit digits, admitted by the same load-time comparison
+        # against the binary selection (MTP_SCREEN_RADIX8=0 keeps 4-bit digits).
+        if self.radix and os.environ.get("MTP_SCREEN_RADIX8", "1") != "0":
+            if self._radix_matches(device, mode=2):
+                self.radix = 2
         self.chunk_off = (
             torch.arange(n // SCREEN_CHUNK, device=device) * SCREEN_CHUNK
         )[:, None]
@@ -692,6 +749,32 @@ class DraftHeadScreen:
         if _l2pf is not None and self.cascade:
             _l2pf.DRAFT_SCREEN[:] = [self.w_pre if self.pre else self.w_coarse]
         self.graph = None
+        # LOCAL PATCH (drafter3): next-pass L2 prefetch (harness/kernels/l2pf DRAFT_NEXT):
+        # the head of what the next draft pass reads first, cut into one piece per
+        # top-k window of the cascade (see _greedy_row).
+        self._next_pf = []
+        self._next_max_kept = (1 << 30) if not depth else max(1, int(depth) - 1)
+        if (_l2pf is not None and _l2pf.ENABLED and device.type == "cuda"
+                and getattr(_l2pf, "DRAFT_NEXT_BYTES", 0) > 0
+                and hasattr(_l2pf, "GatedTable")):
+            left = _l2pf.DRAFT_NEXT_BYTES
+            names = ("eh", "qkv") if os.environ.get("L2PF_DRAFT_NEXT_EH", "0") == "1" else ("qkv",)
+            ranges = []
+            for name in names:
+                planes = _l2pf.DRAFT_NEXT.get(name)
+                if planes is None or left <= 0:
+                    continue
+                part = _l2pf.packed_ranges(planes, left)
+                ranges += part
+                left -= sum(int(b) for _, b in part)
+            for piece in _split_ranges(ranges, NEXT_PF_SHARES):
+                table = _l2pf.GatedTable(piece, device, name="next")
+                if table.nranges:
+                    self._next_pf.append(table)
+            if self._next_pf:
+                logger.info("MTP draft screen: next-pass L2 prefetch %s MB in %d pieces, "
+                            "max_kept=%d", [round(t.nbytes / 2**20, 2) for t in self._next_pf],
+                            len(self._next_pf), self._next_max_kept)
         self._h = torch.empty(k, dtype=torch.float32, device=device)
         self._out = torch.empty(1, dtype=torch.int32, device=device)
         if device.type == "cuda" and self.cascade and self.fold:
@@ -723,7 +806,7 @@ class DraftHeadScreen:
             self.fused_topk, self.graph is not None,
         )
 
-    def _radix_matches(self, device: torch.device) -> bool:
+    def _radix_matches(self, device: torch.device, mode: int = 1) -> bool:
         """Official remote model-load admission, no request data or local execution."""
         try:
             pairs = [(SCREEN_CHUNK, CASCADE_PER, False), (CASCADE_PER, SCREEN_PER, True)]
@@ -747,7 +830,7 @@ class DraftHeadScreen:
                         scores = torch.full((2 * n,), 42.0, device=device)
                     a = torch.empty(2 * k, dtype=torch.int64, device=device)
                     b = torch.empty_like(a)
-                    for radix, out in ((False, a), (True, b)):
+                    for radix, out in ((False, a), (mode, b)):
                         _chunk_topk[(2,)](scores, src, out, N=n, K=k, GATHER=gather,
                                           RADIX=radix, num_warps=4 if radix or n != SCREEN_CHUNK else 8,
                                           launch_pdl=mtp_pdl())
@@ -809,9 +892,16 @@ class DraftHeadScreen:
             nchunk = self.n // SCREEN_CHUNK
             tgate, tok = _gate_args(self.scores)
             tgated = gated and tok
+            # LOCAL PATCH (drafter3): each top-k selection below leaves DRAM idle: a
+            # piece of what the next draft pass reads first is queued as each streaming
+            # dot ends (skipped on the device for a stopped loop and for the last pass);
+            # all are joined after the token.
+            next_pf = gated and tok and len(self._next_pf) == len(NEXT_PF_SHARES)
+            if next_pf:
+                self._next_pf[0].launch(tgate, self._next_max_kept)
             _chunk_topk[(nchunk,)](
                 self.scores, self.scores, self._pre_cand,
-                N=SCREEN_CHUNK, K=PRE_PER, GATHER=False, RADIX=self.radix,
+                N=SCREEN_CHUNK, K=PRE_PER, GATHER=False, RADIX=_radix_for(self.radix, SCREEN_CHUNK),
                 num_warps=4 if self.radix else 8, launch_pdl=mtp_pdl(),
                 gate_ptr=tgate, GATED=tgated,
             )
@@ -822,21 +912,27 @@ class DraftHeadScreen:
                 self.gscale, self.mid_scores, True, gated,
                 base=self.scores, scatter=self.scores,
             )
+            if next_pf:
+                self._next_pf[1].launch(tgate, self._next_max_kept)
             _chunk_topk[(nchunk,)](
                 self.mid_scores, self._pre_cand, self._coarse_cand,
-                N=PRE_PER, K=CASCADE_PER, GATHER=True, RADIX=self.radix,
+                N=PRE_PER, K=CASCADE_PER, GATHER=True, RADIX=_radix_for(self.radix, PRE_PER),
                 num_warps=4, launch_pdl=mtp_pdl(), gate_ptr=tgate, GATED=tgated,
             )
             _rows_dot(
                 self._hr, self.w_rest, self.s_rest, self._coarse_cand,
                 self.gscale, self.refine_scores, True, gated, base=self.scores,
             )
+            if next_pf:
+                self._next_pf[2].launch(tgate, self._next_max_kept)
             _chunk_topk[(nchunk,)](
                 self.refine_scores, self._coarse_cand, self._cand,
-                N=CASCADE_PER, K=SCREEN_PER, GATHER=True, RADIX=self.radix,
+                N=CASCADE_PER, K=SCREEN_PER, GATHER=True, RADIX=_radix_for(self.radix, CASCADE_PER),
                 num_warps=4, launch_pdl=mtp_pdl(), gate_ptr=tgate, GATED=tgated,
             )
             cand = self._cand
+            if next_pf:
+                self._finish_next_pf = True
         elif self.cascade and self.fused_topk:
             # LOCAL PATCH (cudafast-nemotron35): the same cascade with the two
             # index_select gathers in one launch and each segmented torch.topk
@@ -865,7 +961,7 @@ class DraftHeadScreen:
             tgated = gated and tok
             _chunk_topk[(nchunk,)](
                 self.scores, self.scores, self._coarse_cand,
-                N=SCREEN_CHUNK, K=CASCADE_PER, GATHER=False, RADIX=self.radix,
+                N=SCREEN_CHUNK, K=CASCADE_PER, GATHER=False, RADIX=_radix_for(self.radix, SCREEN_CHUNK),
                 num_warps=4 if self.radix else 8, launch_pdl=mtp_pdl(),
                 gate_ptr=tgate, GATED=tgated,
             )
@@ -886,7 +982,7 @@ class DraftHeadScreen:
                 )
             _chunk_topk[(nchunk,)](
                 self.refine_scores, self._coarse_cand, self._cand,
-                N=CASCADE_PER, K=SCREEN_PER, GATHER=True, RADIX=self.radix,
+                N=CASCADE_PER, K=SCREEN_PER, GATHER=True, RADIX=_radix_for(self.radix, CASCADE_PER),
                 num_warps=4, launch_pdl=mtp_pdl(), gate_ptr=tgate, GATED=tgated,
             )
             cand = self._cand
@@ -962,6 +1058,9 @@ class DraftHeadScreen:
                 h, self.w_full, self.s_full, cand, self.gscale, self.cand_logits,
                 self._full_part, gated,
             )
+            if getattr(self, "_finish_next_pf", False):
+                tgate, _ = _gate_args(self.scores)
+                self._next_pf[3].launch(tgate, self._next_max_kept)
         else:
             _rows_dot(
                 h, self.w_full, self.s_full, cand, self.gscale, self.cand_logits, True, gated
@@ -973,6 +1072,9 @@ class DraftHeadScreen:
             gate_ptr=gate, GATED=gated and ok, THETA=DEPTH_THETA,
             CUM=DEPTH_CUMULATIVE, launch_pdl=mtp_pdl(),
         )
+        if getattr(self, "_finish_next_pf", False):
+            self._finish_next_pf = False
+            _l2pf.join(out.device)
         return out
 
     def greedy(self, hidden: torch.Tensor) -> torch.Tensor:

@@ -74,6 +74,48 @@ __global__ void prefetch_anchor_kernel(const uint8_t* __restrict__ base, long lo
     asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(p + off), "r"((uint32_t)(n & ~(size_t)15)));
   }
 }
+// LOCAL PATCH (drafter3): a device table of (address, bytes) ranges in one launch. table[0] is a
+// mode word read at run time (a captured graph replays whatever it holds): 0 queues nothing, 1
+// queues every range, 2 also reads the MTP depth gate and queues nothing when the loop is stopped
+// (gate[0] != 0) or active (gate[2] != 0) with max_kept drafts already kept (gate[1] >= max_kept).
+// Ranges follow at table[1 + 2r] (address) and table[2 + 2r] (bytes).
+__global__ void prefetch_table_gated_kernel(const long long* __restrict__ table, int nranges,
+                                            const int* __restrict__ gate, int max_kept,
+                                            uint32_t chunk) {
+  const long long mode = table[0];
+  if (mode == 0) return;
+  if (mode == 2 && gate != nullptr) {
+    const int stop = gate[0], kept = gate[1], active = gate[2];
+    if (stop != 0 || (active != 0 && kept >= max_kept)) return;
+  }
+  size_t first = 0;
+  for (int r = 0; r < nranges; ++r) {
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(table[1 + 2 * r]);
+    const size_t bytes = (size_t)table[2 + 2 * r];
+    const size_t c = (bytes + chunk - 1) / chunk;
+    // Chunk i of the concatenation goes to thread i % blockDim.x.
+    size_t i = (threadIdx.x + blockDim.x - first % blockDim.x) % blockDim.x;
+    for (; i < c; i += blockDim.x) {
+      const size_t off = i * chunk;
+      const uint32_t n = (uint32_t)((bytes - off < chunk ? bytes - off : chunk) & ~(size_t)15);
+      if (n) asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" :: "l"(p + off), "r"(n));
+    }
+    first += c;
+  }
+}
+// LOCAL PATCH (drafter3): return the L2 lines of a table's ranges to the normal eviction priority
+// (applypriority, 128-byte lines; lines not in L2 are unaffected). Used after the draft loop for
+// a weight its passes read evict-last. table as for prefetch_table_gated_kernel; mode 0 skips.
+__global__ void demote_table_kernel(const long long* __restrict__ table, int nranges) {
+  if (table[0] == 0) return;
+  const size_t stride = (size_t)gridDim.x * blockDim.x * 128;
+  for (int r = 0; r < nranges; ++r) {
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(table[1 + 2 * r]);
+    const size_t bytes = (size_t)table[2 + 2 * r];
+    for (size_t off = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 128; off < bytes; off += stride)
+      asm volatile("applypriority.global.L2::evict_normal [%0], 128;\n" :: "l"(p + off));
+  }
+}
 }  // namespace l2pf
 
 // 0 on success; -1 for a misaligned range or chunk.
@@ -118,5 +160,21 @@ extern "C" int l2pf_prefetch_anchor(const void* base, long long slot_stride, con
   l2pf::prefetch_anchor_kernel<<<1, 32, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
       (const uint8_t*)base, slot_stride, slots, slot_col_stride, seq_lens, qsl, tag_off, period, bytes,
       (uint32_t)chunk);
+  return (int)cudaGetLastError();
+}
+
+// table: device int64 array [mode, (address, bytes) x nranges]; addresses 16-byte aligned.
+extern "C" int l2pf_prefetch_table_gated(const void* table, int nranges, const int* gate,
+                                         int max_kept, int chunk, void* stream) {
+  if (!table || nranges <= 0 || chunk < 16 || chunk % 16) return -1;
+  l2pf::prefetch_table_gated_kernel<<<1, 128, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+      (const long long*)table, nranges, gate, max_kept, (uint32_t)chunk);
+  return (int)cudaGetLastError();
+}
+
+extern "C" int l2pf_demote_table(const void* table, int nranges, void* stream) {
+  if (!table || nranges <= 0) return -1;
+  l2pf::demote_table_kernel<<<48, 256, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+      (const long long*)table, nranges);
   return (int)cudaGetLastError();
 }

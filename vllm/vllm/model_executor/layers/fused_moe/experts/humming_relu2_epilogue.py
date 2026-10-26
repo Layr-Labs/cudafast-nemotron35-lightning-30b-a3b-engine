@@ -155,10 +155,15 @@ def _dyn_num_sms(lo: int, hi: int, num_sms: int) -> int:
 class Relu2HummingKernel(HummingKernel):
     dyn_scheduler = False
 
+    def scheduler_code(self):
+        # LOCAL PATCH (cudafast-nemotron35, pfup): humming_pfup overrides this
+        # for the 496-token prefill entry.
+        return _DYN_SCHEDULER
+
     def prepare(self):
         marker = "#if "
         at = self.code.index(marker)
-        extra = _DYN_SCHEDULER if self.dyn_scheduler else ""
+        extra = self.scheduler_code() if self.dyn_scheduler else ""
         self.code = self.code[:at] + extra + _EPILOGUE + self.code[at:]
         super().prepare()
 
@@ -244,8 +249,10 @@ def _variant_key(dyn):
     persistent grids come from the environment, so they are part of it."""
     if not dyn:
         return (False, _w13_k128_enabled())
+    from vllm.model_executor.layers.fused_moe.experts import humming_pfup
+
     return (True, _dyn_num_sms(0, 1 << 30, 0), _dyn_num_sms(0, 1, 0),
-            _w13_k128_enabled())
+            _w13_k128_enabled(), humming_pfup.flags())
 
 
 def _prepare_stock(meta, compute_config, tuning_config, dyn):
@@ -316,10 +323,17 @@ def prepare(meta, compute_config, tuning_config, evict_first=False, dyn=None):
             params.pop("num_sms", None)
             kernel_cls = (DynEvictFirstRelu2HummingKernel if dyn
                           else EvictFirstRelu2HummingKernel)
-            kernel = kernel_cls(**params)
-            kernel.load_cubin()
+            if dyn:
+                # LOCAL PATCH (cudafast-nemotron35, pfup): prefill claim order
+                # and padded-row MMA skip (humming_pfup.py).
+                from vllm.model_executor.layers.fused_moe.experts import humming_pfup
+
+                kernel = humming_pfup.build(kernel_cls, params)
+            else:
+                kernel = kernel_cls(**params)
+                kernel.load_cubin()
             # Exclude the stock-cubin singleton no-op before admitting the hint.
-            assert type(kernel) is kernel_cls
+            assert isinstance(kernel, kernel_cls)
             assert type(original) is (DynRelu2HummingKernel if dyn else Relu2HummingKernel)
             assert ("hm_dyn_claim" in kernel.code) == dyn
             assert "createpolicy.fractional.L2::evict_first" in kernel.code

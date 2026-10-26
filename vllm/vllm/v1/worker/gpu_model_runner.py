@@ -5653,8 +5653,41 @@ class GPUModelRunner(
                     for name, p in drafter_model.named_parameters():
                         if name.endswith("eh_proj.weight"):
                             found["draft"] = p
+                # LOCAL PATCH (drafter3): the head of the packed qkv the first
+                # draft pass reads after the start projection, behind eh_w_h in
+                # the same launch (L2PF_DRAFT_GLUE_QKV_MB=0 keeps eh_w_h alone).
+                # LOCAL PATCH (drafter3): with the packed first-pass start projection
+                # (nemotron_h_mtp_packed.EH_PACKED5) the first draft weight is the
+                # packed eh hidden half; fetch its planes instead of eh_w_h.
+                eh_planes = getattr(l2pf, "DRAFT_NEXT", {}).get("eh")
+                try:
+                    from vllm.model_executor.models.nemotron_h_mtp_packed import EH_PACKED5
+                except ImportError:
+                    EH_PACKED5 = False
+                if (EH_PACKED5 and eh_planes is not None and "draft" in found
+                        and hasattr(l2pf, "GatedTable")):
+                    table = l2pf.GatedTable(
+                        [(t, t.numel() * t.element_size()) for t in eh_planes[:4]],
+                        found["draft"].device, name="glue_eh", mode=1)
+                    if table.nranges:
+                        found["draft_table"] = table
+                planes = getattr(l2pf, "DRAFT_NEXT", {}).get("qkv")
+                qkv_bytes = getattr(l2pf, "DRAFT_GLUE_QKV_BYTES", 0)
+                if ("draft" in found and planes is not None and qkv_bytes > 0
+                        and hasattr(l2pf, "GatedTable")):
+                    table = l2pf.GatedTable(l2pf.packed_ranges(planes, qkv_bytes),
+                                            found["draft"].device, name="glue", mode=1)
+                    if table.nranges:
+                        found["draft_after"] = table
             self._l2pf_tensors = found
-        l2pf.prefetch(self._l2pf_tensors.get(which), max_bytes=20 << 20)
+        table = self._l2pf_tensors.get(which + "_table")
+        if table is not None:
+            table.launch(None, 0)
+        else:
+            l2pf.prefetch(self._l2pf_tensors.get(which), max_bytes=20 << 20)
+        after = self._l2pf_tensors.get(which + "_after")
+        if after is not None:
+            after.launch(None, 0)
 
     def propose_draft_token_ids(
         self,

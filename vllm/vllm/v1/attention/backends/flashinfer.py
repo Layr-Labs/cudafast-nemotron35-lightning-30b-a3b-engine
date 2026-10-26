@@ -1983,6 +1983,11 @@ class FlashInferImpl(AttentionImpl):
         # Regular attention (common case).
         # Decodes are at the front and prefills are at the back.
         if num_prefill_tokens > 0:
+            # LOCAL PATCH (drafter3): the first draft pass's plan copies may run on the
+            # proposer's side stream (as the later draft steps' do); wait for them.
+            plan_ready = getattr(attn_metadata, "plan_ready_event", None)
+            if plan_ready is not None:
+                torch.cuda.current_stream().wait_event(plan_ready)
             prefill_query = query[num_decode_tokens:]
             assert prefill_query.shape[0] == num_prefill_tokens
 

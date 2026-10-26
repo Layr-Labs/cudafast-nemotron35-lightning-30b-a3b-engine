@@ -17,8 +17,8 @@ import torch
 
 __all__ = [
     "LIB_PATH", "ENABLED", "MAMBA_BYTES", "ATTN_BYTES", "MOE_BYTES", "DRAFT_BYTES",
-    "AHEAD", "AHEAD_MOE", "DRAFT_SCREEN",
-    "prefetch", "join",
+    "AHEAD", "AHEAD_MOE", "DRAFT_SCREEN", "DRAFT_NEXT",
+    "prefetch", "join", "packed_ranges", "GatedTable",
 ]
 
 LIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "libl2pf.so")
@@ -36,6 +36,20 @@ MOE_BYTES = int(float(os.environ.get("L2PF_MOE_MB", "12")) * (1 << 20))
 DRAFT_BYTES = int(float(os.environ.get("L2PF_DRAFT_MB", "3")) * (1 << 20))
 # The draft screen's coarse weight matrix (set by the screen at construction).
 DRAFT_SCREEN: list[torch.Tensor] = []
+# LOCAL PATCH (drafter3): drafter windows where DRAM idles on latency-bound kernels.
+# NEXT: each top-k window of the draft screen's cascade prefetches a piece of what the
+# next draft pass reads first (the head of the packed qkv; L2PF_DRAFT_NEXT_EH=1 puts the
+# packed eh hidden half first), skipped on the device for a stopped loop and for the last
+# pass of a depth-d loop (L2PF_DRAFT_NEXT_MB=0 off).
+# SHARED: the single-row MoE's router chain prefetches the head of the packed shared-up
+# planes (L2PF_DRAFT_SHARED_MB=0 off). GLUE_QKV: the first draft pass's eager input glue
+# prefetches the head of the packed qkv after eh_w_h (L2PF_DRAFT_GLUE_QKV_MB=0 off).
+DRAFT_NEXT_BYTES = int(float(os.environ.get("L2PF_DRAFT_NEXT_MB", "0")) * (1 << 20))
+DRAFT_SHARED_BYTES = int(float(os.environ.get("L2PF_DRAFT_SHARED_MB", "0")) * (1 << 20))
+DRAFT_GLUE_QKV_BYTES = int(float(os.environ.get("L2PF_DRAFT_GLUE_QKV_MB", "5")) * (1 << 20))
+# Packed planes the next draft pass reads first: name -> (sm, ex, base, ri)
+# ("eh": the start projection's hidden half, "qkv": the attention input projection).
+DRAFT_NEXT: dict[str, tuple[torch.Tensor, ...]] = {}
 # attention layer name -> the module whose .weight follows that attention
 # (filled by the model at construction).
 AHEAD: dict[str, torch.nn.Module] = {}
@@ -65,6 +79,17 @@ def _load():
         lib.l2pf_prefetch3.restype = ctypes.c_int
     except AttributeError:
         pass  # Older library: retain the original per-range launch ABI.
+    try:
+        lib.l2pf_prefetch_table_gated.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
+                                                  ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+        lib.l2pf_prefetch_table_gated.restype = ctypes.c_int
+    except AttributeError:
+        pass  # Older library: no gated table launch.
+    try:
+        lib.l2pf_demote_table.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+        lib.l2pf_demote_table.restype = ctypes.c_int
+    except AttributeError:
+        pass
     try:
         lib.l2pf_prefetch_slots2.argtypes = [ctypes.c_void_p, ctypes.c_longlong,
                                              ctypes.c_void_p, ctypes.c_longlong, ctypes.c_size_t,
@@ -227,6 +252,92 @@ def prefetch_many(ranges) -> bool:
         raise RuntimeError(f"l2pf_prefetch3 failed: {rc}")
     return True
 
+
+def packed_ranges(planes, budget: int) -> list:
+    """LOCAL PATCH (drafter3): ranges covering the leading values of a 12-bit packed
+    BF16 tensor (planes sm, ex, base, ri: 1, 1/2, 1/128 and 4/128 bytes per value)
+    within budget bytes, the block metadata first (every load reads it before the
+    value planes)."""
+    sm, ex, base, ri = planes[:4]
+    values = min(sm.numel(), int(budget / (1.5 + 5 / 128)))
+    values -= values % 256
+    if values <= 0:
+        return []
+    blocks = values // 128
+    return [(ri, blocks * 4), (base, blocks), (sm, values), (ex, values // 2)]
+
+
+# LOCAL PATCH (drafter3): every gated table by name, for run-time mode changes (lab A/B).
+TABLES: dict[str, list] = {}
+
+
+class GatedTable:
+    """LOCAL PATCH (drafter3): a fixed device table [mode, (address, bytes) x n] and the
+    launch that prefetches its ranges (capturable: the table never moves). The kernel reads
+    the mode at run time: 0 off, 1 unconditional, 2 skipped on the device by the MTP depth
+    gate (see l2pf.cu). set_mode() changes what a captured graph does on its next replay."""
+
+    def __init__(self, ranges, device: torch.device, name: str = "", mode: int = 2):
+        rows = []
+        for t, limit in ranges:
+            if t is None or not t.is_cuda or t.device != device or limit <= 0:
+                continue
+            if t.data_ptr() % 16:
+                continue
+            nbytes = min(t.numel() * t.element_size(), int(limit))
+            nbytes -= nbytes % 16
+            if nbytes > 0:
+                rows.append((t.data_ptr(), nbytes))
+        self.keep = [t for t, _ in ranges if t is not None]
+        self.name = name
+        self.nranges = len(rows)
+        self.nbytes = sum(b for _, b in rows)
+        self.table = (torch.tensor([int(mode)] + [v for r in rows for v in r], dtype=torch.int64,
+                                   device=device) if rows else None)
+        if self.table is not None and name:
+            TABLES.setdefault(name, []).append(self)
+
+    def set_mode(self, mode: int) -> None:
+        if self.table is not None:
+            self.table[0].fill_(int(mode))
+
+    def launch(self, gate: torch.Tensor | None, max_kept: int) -> bool:
+        fn = getattr(_lib, "l2pf_prefetch_table_gated", None) if _lib is not None else None
+        if not ENABLED or fn is None or self.table is None:
+            return False
+        device = self.table.device
+        if gate is not None and (not gate.is_cuda or gate.device != device
+                                 or gate.dtype != torch.int32 or gate.numel() < 3):
+            return False
+        main = torch.cuda.current_stream(device)
+        side = _side_stream(device)
+        side.wait_stream(main)
+        rc = fn(self.table.data_ptr(), self.nranges, 0 if gate is None else gate.data_ptr(),
+                int(max_kept), CHUNK, side.cuda_stream)
+        if rc != 0:
+            raise RuntimeError(f"l2pf_prefetch_table_gated failed: {rc}")
+        return True
+
+
+def demote(table: "GatedTable") -> bool:
+    """LOCAL PATCH (drafter3): on the current stream (ordered after the kernels that read
+    the ranges evict-last), return the table's L2 lines to the normal priority."""
+    fn = getattr(_lib, "l2pf_demote_table", None) if _lib is not None else None
+    if not ENABLED or fn is None or table is None or table.table is None:
+        return False
+    stream = torch.cuda.current_stream(table.table.device)
+    rc = fn(table.table.data_ptr(), table.nranges, stream.cuda_stream)
+    if rc != 0:
+        raise RuntimeError(f"l2pf_demote_table failed: {rc}")
+    return True
+
+
+def set_table_mode(name: str, mode: int) -> int:
+    """Lab A/B: set the run-time mode of every table registered under name."""
+    tables = TABLES.get(name, [])
+    for t in tables:
+        t.set_mode(mode)
+    return len(tables)
 
 if ENABLED:
     _load()

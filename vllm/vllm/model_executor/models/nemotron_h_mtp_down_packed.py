@@ -11,6 +11,7 @@ import torch
 from vllm.triton_utils import tl, triton
 
 _ENABLED = os.environ.get("MTP_DOWN_PACK12", "1") != "0"
+_FORCE = os.environ.get("MTP_DOWN_PACK12_FORCE", "1") != "0"
 _PACKS = {}
 
 
@@ -180,6 +181,12 @@ def prepare(packed):
             best = min(times, key=lambda bn: statistics.median(times[bn]))
             if best and statistics.median(times[best]) < 0.96 * statistics.median(times[0]):
                 flags[(topk, word)] = best
+            elif _FORCE and any(bn for bn in times):
+                # LOCAL PATCH (cudafast-nemotron35): MTP_DOWN_PACK12_FORCE admits the
+                # bit-identical packed slots even when this private timing (sparse
+                # probe densities) does not show the 4% margin.
+                flags[(topk, word)] = min((bn for bn in times if bn),
+                                          key=lambda bn: statistics.median(times[bn]))
         if flags:
             _PACKS[key] = (w, sd, pw, ps, flags)
         print(f"MTP_DOWN_PACK12 admitted={flags} original_weights_retained=True", flush=True)

@@ -366,6 +366,9 @@ class Worker(WorkerBase):
             )
             self.device = torch.device(f"cuda:{visible_device_index}")
             torch.accelerator.set_device_index(self.device)
+            if os.environ.get("VLLM_EXPANDABLE_SEGMENTS", "1") != "0":
+                torch._C._accelerator_setAllocatorSettings("expandable_segments:True")
+                os.environ["VLLM_EXPANDABLE_SEGMENTS_ACTIVE"] = "1"
 
             current_platform.check_if_supports_dtype(self.model_config.dtype)
 

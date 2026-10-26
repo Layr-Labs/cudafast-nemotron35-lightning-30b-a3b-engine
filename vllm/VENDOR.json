@@ -378,6 +378,14 @@
     {
       "file": "vllm/v1/worker/decode_prep.py; vllm/v1/worker/copy_batch.py; vllm/v1/worker/gpu_model_runner.py; vllm/v1/attention/backends/flashinfer.py; vllm/v1/attention/backends/mamba2_attn.py; vllm/model_executor/layers/fused_moe/experts/humming_nvsc.py; vllm/model_executor/layers/fused_moe/experts/humming_relu2_epilogue.py",
       "why": "i34-9 993e9bec, carried onto terrapinelf c64b6fe5: in the steady one-request speculative step the per-step device prep (query_start_loc, discard mask, accepted counts, positions, seq_lens, slot mapping, input ids incl. drafts) is one H2D of staged host values plus one kernel, and the remaining small metadata copies go through one copy batch flushed before the target forward; non-steady steps take the stock path (where terrapinelf's batch-1 slice copy still applies). Prefill routed-up reads the 6-bit block scales directly. Same values into the same buffers; no format or arithmetic change."
+    },
+    {
+      "file": "env_override.py; v1/worker/gpu_worker.py (+ harness/kernels/cmp2/py/__init__.py)",
+      "why": "env_override.py adds expandable_segments:True to PYTORCH_CUDA_ALLOC_CONF before CUDA is initialized, and init_device sets the same allocator option right after the device is selected (torch._C._accelerator_setAllocatorSettings, the entry point the worker already uses for max_split_size_mb), so every allocation of the process comes from expandable segments; VLLM_EXPANDABLE_SEGMENTS=0 keeps the default allocator. While it is active, cmp2.prepare returns before copying anything (CMP2 compressed=none reason=expandable_segments). No kernel, format, value or schedule change."
+    },
+    {
+      "file": "v1/spec_decode/llm_base_proposer.py (+ v1/attention/backends/flashinfer.py)",
+      "why": "With hostfast staging sets, the draft loop's seq_lens correction uses the CPU rejected count (num_draft + 1 - valid_count) instead of waiting on the proposer's rejected-count copy, and the first draft plan's copies run on the plan side stream. Same seq_lens, same plans, same kernels. VLLM_HOSTFAST_S2=0 or VLLM_HOSTFAST_SETS=0 keeps the copy and the synchronize."
     }
   ]
 }

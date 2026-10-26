@@ -132,3 +132,27 @@ includes real/synthetic/adversarial M1..8 tests in dense and skip modes;
 These require the pinned CUDA image and snapshot. This port has NOT been
 CUDA-compiled, GPU-run, token-verified or timed locally. The new fused variant
 has no published timing. Dadon's c113 timing cannot be claimed for c118.
+
+
+## Lean paired decode (configs 600.., ZSKIP_LEAN, config 653 for M=5)
+
+`csrc/zskip_lean.cuh`, `down_lean_kernel`: config 119's per-output computation (swap2 layout, one
+warp per 128-column tile pair, the same MMA chain over the active k16 groups, the same dequantised
+values and epilogue), with a shorter instruction stream and L2 prefetch:
+
+- prep in the CTA without k lists (one 32-bit `mask << 16 | group` entry per active group, two
+  activation rows per round trip, no barrier); one address add per load; skipped k rows load +0;
+- an empty 8-row half keeps the previous finite fragments (as pzskip 336 keeps stale weights;
+  F_ZHALF gives 119's literal zeros); hi nibbles decoded from x01 directly; scale duplicates folded
+  into the HMUL2 operand selectors; a ring of R + 1 slots refilled before each group's math;
+- 119's -0 guard on every intermediate accumulator state (placed after the next group's
+  dequantisation, plus the final state), dense recompute on a -0;
+- F_WPF (653: R = 3, D = 2): each lane prefetches its own pieces of group j + R + D into L2.
+  F_BPF (613) bulk-prefetches whole rows per block instead.
+
+Bitwise: 5152 captured real decode windows (23 layers x 7 sequences x 4 windows x M=1..8) equal
+stock humming's w2 output and config 119; 5888 adversarial cases (all -0, every zero as -0, 0.5/2/8%
+sparse, mixed signed zeros, subnormal, huge, NaN/Inf, zero rows, one-hot, empty groups, dense) equal
+119 in SKIP and DENSE; 3220 verify-prefix cases equal 119. `humming_zskip._prepare_lean` repeats
+the M=1..8 and prefix checks against humming and the checked pair config at load.
+It is on by default (`ZSKIP_LEAN=0` keeps the checked pair config); `ZSKIP_LEAN_CONFIG` picks another lean config.

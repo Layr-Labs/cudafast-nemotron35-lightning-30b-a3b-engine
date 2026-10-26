@@ -450,6 +450,18 @@
     {
       "file": "model_executor/layers/mamba/ops/mamba_ssm_spec_replay.py (PIPELINED branches only)",
       "why": "C2FMA: the raw-input replay software pipeline (NEMO_MAMBA_REPLAY_PIPELINE, admitted per boot only if its outputs, replayed state and both checkpoint slots are byte-identical to the ordinary kernel) never qualified because the compiler contracted the other product into the FMA: pipeline RN(RN(B*dt)*x + state*dA) vs ordinary RN(state*dA + RN(RN(B*dt)*x)), a 1-ULP fp32 state difference. The pipelined replay and compute loops now spell the ordinary order explicitly with tl.fma(state, dA, dB*x). The ordinary kernel's code is unchanged (the change sits under the PIPELINED constexpr). The boot-time byte comparison and timing admission are unchanged; NEMO_MAMBA_REPLAY_PIPELINE=0 keeps the ordinary path."
+    },
+    {
+      "file": "harness/kernels/zskip/{csrc/zskip.cu,csrc/zskip_lean.cuh,py/__init__.py}; vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
+      "why": "i34-9 (ours): lean paired decode kernel for the 5-row verify's routed down projection (zskip config 653): config 113/119's per-output arithmetic and K order with a shorter per-group instruction stream (in-CTA prep without k lists, +0 loads for skipped rows, scale duplicates folded into HMUL2 selectors, register ring refilled before the math, per-lane L2 prefetch). At load it replaces the selected pair config only after a bitwise check against humming and that config (M = 1..8 and the verify prefix). ZSKIP_LEAN=0 keeps the checked pair config."
+    },
+    {
+      "file": "models/nemotron_h_mtp_kernels.py; layers/attention/attention.py (MTP packed branch only)",
+      "why": "DRX_GATED_PREFETCH defaults on: one read-only multi-range kernel replaces each native MTP o-projection/coarse-screen L2 prefetch launch. The existing device depth-stop flag suppresses only MTP-owned bytes; the fused router range remains unconditional. Original side-stream fork/join and target path are unchanged. Missing l2pf/gate, unsupported buffers/ranges or DRX_GATED_PREFETCH=0 retain the original l2pf path. No numeric, format or per-request work changes."
+    },
+    {
+      "file": "harness/kernels/sctopk/{csrc/sctopk.cu,py/__init__.py,build.sh}; vllm/model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "ercumentyildirim (04a39307-60ca-4f16-bc6d-78b8e024c1bf), carried byte for byte: the three-level draft-head screen's per-chunk top-k selections (_chunk_topk, RADIX) run as one CUDA kernel each: an exact 8-bit radix select of the K-th largest key (torch's TopKTypeConfig order key, NaN largest, -0 below +0) over four shared-memory histograms, then every key above it in ascending index order followed by its ties in ascending index order until K are taken, through two block-wide exclusive scans; a stopped draft pass writes the first K ids in index order. Integer operations only, so the id lists equal _chunk_topk's. The screen admits it at load only after comparing both on the cascade's three shapes (ties, signed zeros, NaNs, gated and not); otherwise _chunk_topk stays. VLLM_MTP_SCREEN_SCTOPK=0 (or SCTOPK=0) keeps _chunk_topk."
     }
   ]
 }

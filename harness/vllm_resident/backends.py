@@ -226,6 +226,9 @@ class VllmBackend:
             logprobs=TOP_K if logprobs else None,
             detokenize=False,
             output_kind=self._delta,
+            # A fresh object per request that nothing else holds: the engine's
+            # copy of it may be shallow (no deepcopy on the timed prefill path).
+            skip_clone=True,
         )
 
     def _collect(self) -> list[Emit]:
@@ -249,6 +252,7 @@ class VllmBackend:
         self, tokens: list[int], max_tokens: int | None = None, logprobs: bool = True
     ) -> list[Emit]:
         self.abort()
+        self.set_emit_target(None)
         if len(tokens) + self.depth + 2 > self.ctx_size:
             raise RuntimeError(f"{len(tokens)} tokens do not fit the {self.ctx_size}-token context")
         self._rid += 1
@@ -264,6 +268,18 @@ class VllmBackend:
                 raise RuntimeError("the engine finished the request without emitting a token")
             emitted = self._collect()
         return emitted
+
+    def set_emit_target(self, target: int | None) -> None:
+        """Prompt + emitted tokens at which the running free run is done (None:
+        unbounded). The MTP drafter skips draft passes that could only extend a
+        verify past that point (llm_base_proposer._emit_budget_drafts)."""
+        try:
+            runner = self._engine.engine_core.engine_core.model_executor.driver_worker.worker.model_runner
+            drafter = getattr(runner, "drafter", None)
+        except AttributeError:
+            return
+        if drafter is not None:
+            drafter.emit_target = target
 
     def step(self) -> list[Emit]:
         if self._live is None:

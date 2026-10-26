@@ -48,6 +48,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
     sample_with_exponential_noise,
 )
 from vllm.v1.sample.sampler import _SAMPLING_EPS
+from vllm.v1.spec_decode import mtp_glue as _mtp_glue
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
@@ -66,6 +67,9 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+# LOCAL PATCH (cudafast-nemotron35): free-run emit budget (_emit_budget_drafts).
+_EMIT_BUDGET = os.environ.get("VLLM_MTP_EMIT_BUDGET", "1") != "0"
 
 
 def _mtp_kernels():
@@ -635,7 +639,24 @@ class SpecDecodeBaseProposer:
             # batch. Compact the topk indices for each request's last token.
             self.model.model.compact_topk_indices(token_indices_to_sample)
 
-        sample_hidden_states = last_hidden_states[token_indices_to_sample]
+        # LOCAL PATCH (cudafast-nemotron35): the three gathers of the sampled
+        # row (hidden twice, position once) in one launch (mtp_glue.py).
+        fused_first = None
+        if (
+            self.num_speculative_tokens > 1
+            and not self.parallel_drafting
+            and not self.uses_mrope
+            and not (self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim == 0)
+            and _mtp_glue.gather_ok(
+                token_indices_to_sample, last_hidden_states, hidden_states, self.positions
+            )
+        ):
+            fused_first = _mtp_glue.gather_first_pass(
+                token_indices_to_sample, last_hidden_states, hidden_states, self.positions
+            )
+            sample_hidden_states = fused_first[0]
+        else:
+            sample_hidden_states = last_hidden_states[token_indices_to_sample]
         if set_moe_row_src is not None and (
             self.num_speculative_tokens <= 1 or self.parallel_drafting
         ):
@@ -663,11 +684,14 @@ class SpecDecodeBaseProposer:
                 ).contiguous()
             return draft_token_ids.view(-1, self.num_speculative_tokens)
 
-        if self.uses_mrope:
+        if fused_first is not None:
+            positions, hidden_states = fused_first[1], fused_first[2]
+        elif self.uses_mrope:
             positions = self.mrope_positions[:, token_indices_to_sample]
+            hidden_states = hidden_states[token_indices_to_sample]
         else:
             positions = self.positions[token_indices_to_sample]
-        hidden_states = hidden_states[token_indices_to_sample]
+            hidden_states = hidden_states[token_indices_to_sample]
 
         if self.constant_draft_positions:
             # Write the sampling positions into the front of the
@@ -713,6 +737,7 @@ class SpecDecodeBaseProposer:
         # Only apply this adjustment when we have rejected tokens
         # (i.e., not the first proposal).
         order_draft_plans = False
+        seq_lens_after_rejection = False
         if self.num_speculative_tokens > 1 and num_rejected_tokens_gpu is not None:
             seq_lens_cpu = common_attn_metadata._seq_lens_cpu
             common_attn_metadata.seq_lens -= num_rejected_tokens_gpu
@@ -734,6 +759,7 @@ class SpecDecodeBaseProposer:
             if host_seq_lens is not None:
                 common_attn_metadata._seq_lens_cpu = host_seq_lens
                 order_draft_plans = True
+                seq_lens_after_rejection = True
             elif (
                 num_rejected_cpu is not None
                 and seq_lens_cpu is not None
@@ -746,24 +772,55 @@ class SpecDecodeBaseProposer:
                 self._num_rejected_event.synchronize()
                 common_attn_metadata._seq_lens_cpu = seq_lens_cpu - num_rejected_cpu
                 order_draft_plans = True
+                seq_lens_after_rejection = True
 
         block_size = self.block_size
         assert block_size > 0, "block_size has not been initialized."
+        budget_drafts = self._emit_budget_drafts(
+            depth_gate, batch_size, common_attn_metadata, seq_lens_after_rejection
+        )
         if set_moe_row_src is not None:
             # Padded rows of the single-token steps copy row 0.
             set_moe_row_src(input_batch_size, self._moe_row_zero)
         for token_index in range(self.num_speculative_tokens - 1):
+            if budget_drafts is not None and token_index + 2 > budget_drafts:
+                break
             # Update the inputs.
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax() returns int64 by default.
-            input_ids = draft_token_ids_list[-1].int()
+            # LOCAL PATCH (cudafast-nemotron35): token cast, hidden-row copy and
+            # the slot-mapping step in one launch (mtp_glue.py); the copies move
+            # ahead of the plan build, which reads neither buffer.
+            fused_step = (
+                not self.use_heterogeneous_vocab
+                and not self.constant_draft_positions
+                and not self.supports_mm_inputs
+                and not self.uses_mrope
+                and not (self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim > 0)
+                and _mtp_glue.step_ok(
+                    draft_token_ids_list[-1], self.input_ids, hidden_states,
+                    self.hidden_states, positions, batch_size,
+                )
+            )
+            if fused_step:
+                input_ids = None
+                positions = self._update_positions_dependent_metadata(
+                    positions,
+                    common_attn_metadata,
+                    batch_size,
+                    input_batch_size,
+                    block_size,
+                    fused=(draft_token_ids_list[-1], hidden_states),
+                )
+            else:
+                input_ids = draft_token_ids_list[-1].int()
 
-            if self.use_heterogeneous_vocab:
+            if not fused_step and self.use_heterogeneous_vocab:
                 # Map target token IDs to draft vocab space (TLI algorithm)
                 assert self.vocab_mapping is not None
                 input_ids = self.vocab_mapping.map_target_to_draft_ids(input_ids)
 
-            if not self.constant_draft_positions:
+            if not fused_step and not self.constant_draft_positions:
                 positions = self._update_positions_dependent_metadata(
                     positions,
                     common_attn_metadata,
@@ -817,8 +874,9 @@ class SpecDecodeBaseProposer:
                     self._draft_plan_event.record()
 
             # copy inputs to buffer for cudagraph
-            self.input_ids[:batch_size] = input_ids
-            self.hidden_states[:batch_size] = hidden_states
+            if not fused_step:
+                self.input_ids[:batch_size] = input_ids
+                self.hidden_states[:batch_size] = hidden_states
             if self.supports_mm_inputs:
                 self.inputs_embeds[:batch_size] = self.model.embed_input_ids(input_ids)
 
@@ -878,13 +936,60 @@ class SpecDecodeBaseProposer:
             set_moe_row_src(max(num_input_tokens, input_batch_size), None)
 
         if depth_gate is not None:
-            _mtp_kernels().depth_gate_end(depth_gate)
+            _mtp_kernels().depth_gate_end(
+                depth_gate, max_rows=None if budget_drafts is None else budget_drafts + 1
+            )
+        if budget_drafts is not None:
+            # Draft slots past the budget keep the step's shape; the verify-row
+            # cap written above (budget + 1 rows) leaves them unverified.
+            while len(draft_token_ids_list) < self.num_speculative_tokens:
+                draft_token_ids_list.append(draft_token_ids_list[-1])
+                if draft_probs_list is not None:
+                    draft_probs_list.append(draft_probs_list[-1])
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
         if draft_probs_list is not None:
             self._last_draft_probs = torch.stack(draft_probs_list, dim=1).contiguous()
         return draft_token_ids
+
+    def _emit_budget_drafts(
+        self, depth_gate, batch_size: int, common_attn_metadata, seq_lens_after_rejection: bool
+    ) -> int | None:
+        """LOCAL PATCH (cudafast-nemotron35): drafts worth computing for the next
+        verify when the resident has said how many tokens the running free run
+        still needs (emit_target: prompt + emitted tokens at which it is done).
+        After this step the request holds seq_lens + 1 tokens (the context after
+        rejection plus the step's bonus token); the next verify can emit at most
+        drafts + 1 tokens, so drafts beyond (target - that - 1) only extend a
+        verify past the end of the run. None: no limit (no target, no gate, no
+        verify-row buffer, or the bound is not below the depth). The drafts that
+        are computed are the ones the unlimited loop computes; only later passes
+        are skipped and the verify-row count is capped below them.
+        VLLM_MTP_EMIT_BUDGET=0 disables."""
+        target = getattr(self, "emit_target", None)
+        if (
+            target is None
+            or not _EMIT_BUDGET
+            or depth_gate is None
+            or batch_size != 1
+            or not seq_lens_after_rejection
+        ):
+            return None
+        seq_lens_cpu = common_attn_metadata._seq_lens_cpu
+        if seq_lens_cpu is None or seq_lens_cpu.numel() < 1:
+            return None
+        try:
+            import smallk
+        except ImportError:
+            return None
+        if smallk.live_verify_rows(depth_gate.device) is None:
+            return None
+        emitted = int(seq_lens_cpu[0]) + 1
+        drafts = max(0, int(target) - emitted - 1)
+        if drafts >= self.num_speculative_tokens:
+            return None
+        return drafts
 
     def _mtp_depth_gate_begin(
         self, batch_size: int, sampling_metadata: SamplingMetadata
@@ -942,6 +1047,7 @@ class SpecDecodeBaseProposer:
         batch_size: int,
         input_batch_size: int,
         block_size: int,
+        fused: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Update positions, slot mappings, and sequence metadata for the
         next draft step. Returns the updated positions tensor."""
@@ -952,16 +1058,25 @@ class SpecDecodeBaseProposer:
             out_pos = self.xdrope_positions[0, :batch_size]
         else:
             out_pos = self.positions[:batch_size]
-        eagle_step_update_slot_mapping_and_metadata(
-            positions_1d=positions_1d,
-            block_table_tensor=common_attn_metadata.block_table_tensor,
-            seq_lens=common_attn_metadata.seq_lens,
-            block_size=block_size,
-            max_model_len=self.max_model_len,
-            out_clamped_positions=out_pos,
-            out_slot_mapping=self._slot_mapping_buffer[:input_batch_size],
-            input_batch_size=input_batch_size,
-        )
+        if fused is not None:
+            _mtp_glue.step_inputs(
+                fused[0], self.input_ids, fused[1], self.hidden_states,
+                positions_1d, common_attn_metadata.block_table_tensor,
+                common_attn_metadata.seq_lens, block_size, self.max_model_len,
+                out_pos, self._slot_mapping_buffer[:input_batch_size],
+                input_batch_size, PADDING_SLOT_ID,
+            )
+        else:
+            eagle_step_update_slot_mapping_and_metadata(
+                positions_1d=positions_1d,
+                block_table_tensor=common_attn_metadata.block_table_tensor,
+                seq_lens=common_attn_metadata.seq_lens,
+                block_size=block_size,
+                max_model_len=self.max_model_len,
+                out_clamped_positions=out_pos,
+                out_slot_mapping=self._slot_mapping_buffer[:input_batch_size],
+                input_batch_size=input_batch_size,
+            )
         common_attn_metadata.slot_mapping = self._slot_mapping_buffer[:batch_size]
         if self.uses_mrope:
             self.mrope_positions[1:, :batch_size] = self.mrope_positions[0, :batch_size]
@@ -1012,6 +1127,24 @@ class SpecDecodeBaseProposer:
                 token_indices_to_sample = cad.query_start_loc[1:] - 1
 
             num_tokens = target_token_ids.shape[0]
+            # LOCAL PATCH (cudafast-nemotron35): the shift, the next-token write,
+            # the positions and the hidden rows below in one launch (mtp_glue.py).
+            if (
+                not self.uses_mrope
+                and not (self.uses_xdrope_dim > 0)
+                and not self.vllm_config.model_config.uses_mrope
+                and _mtp_glue.first_pass_ok(
+                    target_token_ids, next_token_ids, token_indices_to_sample,
+                    target_positions, target_hidden_states, self.input_ids,
+                    self.positions, self.hidden_states,
+                )
+            ):
+                _mtp_glue.first_pass_inputs(
+                    target_token_ids, next_token_ids, token_indices_to_sample,
+                    target_positions, target_hidden_states, self.input_ids,
+                    self.positions, self.hidden_states,
+                )
+                return num_tokens, token_indices_to_sample, cad
             # Shift the input ids by one token.
             # E.g., [a1, b1, b2, c1, c2, c3] -> [b1, b2, c1, c2, c3, c3]
             self.input_ids[: num_tokens - 1] = target_token_ids[1:]

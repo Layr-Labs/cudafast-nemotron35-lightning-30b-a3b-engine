@@ -392,6 +392,10 @@
       "why": "Pending public idea f79355bf-fcbb-4817-8db7-d67f160086eb: extend native structural-plan fill to min(actual blocks,512) while preserving original native snapshot and integer sentinel checks. Own atomic complete-page budget retention protects earlier valid entries when retained plan bytes reach64MiB. Add full private state comparisons at extended midpoint/end, keep original<=128page latency gate, original miss fallback and no assumed actual activation/gain."
     },
     {
+      "file": "(composition)",
+      "why": "e-man07 composition on the record 1e1c2581-e506-4ca4-9341-5f08ffceec86: ArthurOstapenko 53f66afe-0252-402f-b34b-19bea81f1e74 carried byte for byte; jacklightChen 1df4df4a-6dc5-4ecf-8d49-b372ba3726fd carried byte for byte; terrapinelf 80f6fced-3c74-4ce1-9913-058f05e95ec7 carried byte for byte. No new arithmetic."
+    },
+    {
       "file": "harness/kernels/shco/py/__init__.py",
       "why": "ArthurOstapenko 53f66afe, carried: in a prefill MoE layer shx runs its persistent workers on half as many CTAs as SMs (HPF_SHX=0 restores one per SM); the unit tables still come from Marlin's partition over all SMs and each unit is summed whole by one CTA, so every output word is unchanged; the scratch is sized for one worker per SM either way."
     },
@@ -414,6 +418,30 @@
     {
       "file": "vllm/model_executor/layers/fused_moe/experts/humming_zskip.py; humming_relu2_epilogue.py; humming_nvsc.py (+ harness/kernels/zskip/py/__init__.py)",
       "why": "ArthurOstapenko (ours): verify-path routed schedule only. (1) The target verify's paired routed-down call uses dadon's zskip config 113 (one prep launch, no empty-half skip) with a three-deep load ring instead of config 119 with a two-deep ring, when a boot-time bitwise check of every layer's pair against config 119 passes on 1-8 rows and on the verify prefix; otherwise the layer keeps 119. (2) The routed up projection's 24-48-row verify bucket uses the existing evict-first derived Humming kernel (the same class the 496-token prefill call uses, in its stock and nvsc forms). Same tiles, ascending K16 MMA chain, fp32 accumulation, dequantisation, negative-zero repair and BF16 epilogue; only kernel selection, load ring depth and an L2 cache hint change. VSW_W2_CONFIG=0, VSW_W2_RING=0 and VSW_EVICT=0 restore the main."
+    },
+    {
+      "file": "vllm/v1/core/block_pool.py",
+      "why": "terrapinelf: with prefix caching disabled, when every block is free again (the last request is gone) BlockPool._canonical_head puts blocks 1..32 back at the head of the free queue in id order, so the next request gets the block ids the first request after boot got. Freed blocks keep no readable content; only which physical blocks hold a request's KV and Mamba state changes. VLLM_CANONICAL_BLOCK_HEAD=0 disables."
+    },
+    {
+      "file": "vllm/v1/worker/gpu_model_runner.py; vllm/v1/worker/prefill_graph.py",
+      "why": "terrapinelf: early launch of the fresh 496 whole-forward prefill graph. When the one new request's block ids and the plan-call counters of the FlashInfer wrappers the graph reads equal those the graph's request tensors were last written for (FreshPrefillGraph.early_sig), execute_model zeroes the new blocks, uploads the prompt ids and replays the graph before the host bookkeeping; that bookkeeping queues its copies on a side stream that starts where the main stream stood before the graph, and the forward takes the graph's outputs. Same kernels, same inputs, same outputs. VLLM_PREFILL_EARLY=0 disables; VLLM_PREFILL_EARLY_CHECK=1 replays again the ordinary way and compares."
+    },
+    {
+      "file": "vllm/v1/worker/copy_batch.py",
+      "why": "terrapinelf: a flush whose recorded copies are independent (no copy writes bytes another reads or writes) runs one program per copy instead of one program with a barrier between copies. Byte moves only. VLLM_PREP_COPY_BATCH_PARALLEL=0 keeps the single-program kernel."
+    },
+    {
+      "file": "vllm/v1/spec_decode/mtp_glue.py (new); vllm/v1/spec_decode/llm_base_proposer.py",
+      "why": "terrapinelf: the MTP draft loop's small input moves in one launch each: the first pass's shifted ids, next-token write, positions and hidden rows; the sampled-row gathers after it; and before every later pass the drafted-token cast, the hidden-row copy and eagle_step_slot_mapping_metadata_kernel's arithmetic. Integer casts, integer adds and byte copies into the same buffers. VLLM_MTP_FUSED_GLUE=0 keeps the stock operations."
+    },
+    {
+      "file": "harness/vllm_resident/resident.py; harness/vllm_resident/backends.py; vllm/v1/spec_decode/llm_base_proposer.py; vllm/model_executor/models/nemotron_h_mtp_kernels.py",
+      "why": "terrapinelf: free-run emit budget. Session.spec_run(first, count) tells the engine the prompt + emitted token count at which the run is done (len(ctx) + 1 + count; VllmBackend.set_emit_target sets drafter.emit_target, cleared when the run returns and when a new request starts). Once a step's rejection is known on the host, the drafter computes how many drafts the next verify can still use (target - (seq_lens_after_rejection + 1) - 1); when that is below the depth it stops the draft loop after that many passes, pads the step's draft slots with the last draft and caps the verify-row count (depth_gate_end max_rows) at drafts + 1, so the padded slots are never verified. The drafts that are computed are the unlimited loop's; the verify rows that run are the same rows the depth gate already varies. VLLM_MTP_EMIT_BUDGET=0 disables."
+    },
+    {
+      "file": "(composition)",
+      "why": "terrapinelf on the record e19e73d6-0b9e-4eea-9fae-c058e7b98884 (ArthurOstapenko, commit 3c37484, the code of ercumentyildirim d1ce8ee7-b204-4819-9923-72af7c0c7b8b): the record's files byte for byte plus terrapinelf's prefill early launch, canonical block head, resident request path, parallel copy-batch flush and fused MTP draft-loop input moves (first measured in 0c93e284-ad2b-4c27-94d7-be1fa525d637 and 1a480c2b-fc0c-4e7d-8e8a-b09f18049b8b) and the free-run emit budget (the entry above)."
     }
   ]
 }

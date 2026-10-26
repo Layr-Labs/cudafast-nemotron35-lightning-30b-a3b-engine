@@ -193,12 +193,22 @@ class Session:
         rounds: list[list[int]] = []
         frontiers: list[int] = []
         pending, produced = first, 0
-        while produced < count:
-            committed = self.cycle(pending, count - produced)
-            rounds.append(committed)
-            pending = self.frontier.token  # type: ignore[union-attr]
-            frontiers.append(pending)
-            produced += len(committed)
+        # The run is done once the engine has emitted the tokens up to the
+        # count-th one after the frontier: the context, the frontier and count
+        # more. The engine may then stop drafting past that point.
+        set_target = getattr(self.b, "set_emit_target", None)
+        if set_target is not None and self.frontier is not None:
+            set_target(len(self.ctx) + 1 + count)
+        try:
+            while produced < count:
+                committed = self.cycle(pending, count - produced)
+                rounds.append(committed)
+                pending = self.frontier.token  # type: ignore[union-attr]
+                frontiers.append(pending)
+                produced += len(committed)
+        finally:
+            if set_target is not None:
+                set_target(None)
         return rounds, frontiers
 
     def top_logits(self, k: int) -> tuple[list[int], list[float]]:
@@ -210,6 +220,12 @@ class Session:
         return [t for t, _ in top[:k]], [v for _, v in top[:k]]
 
     def _check_ids(self, tokens: list[int]) -> None:
+        # Fast path: every id a plain int inside the vocabulary (bool is not
+        # type int). Anything else takes the loop below, which names the token.
+        if all(type(t) is int for t in tokens) and (
+            not tokens or (min(tokens) >= 0 and max(tokens) < self.b.vocab_size)
+        ):
+            return
         for t in tokens:
             if not isinstance(t, int) or isinstance(t, bool) or not 0 <= t < self.b.vocab_size:
                 raise RefusedError(f"token {t!r} is outside the vocabulary")

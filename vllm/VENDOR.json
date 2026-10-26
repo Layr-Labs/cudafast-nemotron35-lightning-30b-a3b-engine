@@ -378,6 +378,22 @@
     {
       "file": "vllm/v1/worker/decode_prep.py; vllm/v1/worker/copy_batch.py; vllm/v1/worker/gpu_model_runner.py; vllm/v1/attention/backends/flashinfer.py; vllm/v1/attention/backends/mamba2_attn.py; vllm/model_executor/layers/fused_moe/experts/humming_nvsc.py; vllm/model_executor/layers/fused_moe/experts/humming_relu2_epilogue.py",
       "why": "i34-9 993e9bec, carried onto terrapinelf c64b6fe5: in the steady one-request speculative step the per-step device prep (query_start_loc, discard mask, accepted counts, positions, seq_lens, slot mapping, input ids incl. drafts) is one H2D of staged host values plus one kernel, and the remaining small metadata copies go through one copy batch flushed before the target forward; non-steady steps take the stock path (where terrapinelf's batch-1 slice copy still applies). Prefill routed-up reads the 6-bit block scales directly. Same values into the same buffers; no format or arithmetic change."
+    },
+    {
+      "file": "env_override.py; v1/worker/gpu_worker.py (+ harness/kernels/cmp2/py/__init__.py)",
+      "why": "env_override.py adds expandable_segments:True to PYTORCH_CUDA_ALLOC_CONF before CUDA is initialized, and init_device sets the same allocator option right after the device is selected (torch._C._accelerator_setAllocatorSettings, the entry point the worker already uses for max_split_size_mb), so every allocation of the process comes from expandable segments; VLLM_EXPANDABLE_SEGMENTS=0 keeps the default allocator. While it is active, cmp2.prepare returns before copying anything (CMP2 compressed=none reason=expandable_segments). No kernel, format, value or schedule change."
+    },
+    {
+      "file": "vllm/v1/spec_decode/llm_base_proposer.py; vllm/v1/spec_decode/nemotron_decode_plan.py; vllm/v1/worker/copy_batch.py; vllm/v1/attention/backends/flashinfer.py",
+      "why": "On ENTIRE highest1e1c2581-e506-4ca4-9341-5f08ffceec86, group later native-MTP page metadata and exact native-plan integer-prefix publication into one ordered copy kernel before original staging and plan-ready events. Preserve immutable owners through completion, event after kernel in both staging modes, and materialize on opaque planner/cache-miss fallbacks. Reuses selected993copykernel plus ownPR544lifetime safeguards; no failedPR538producer/stoppedGEMM, no BBFscale-selection delta, no DEBdtypeguard imported. New whole, activation and gain remain unverified."
+    },
+    {
+      "file": "vllm/v1/spec_decode/nemotron_decode_plan.py",
+      "why": "Pending public idea f79355bf-fcbb-4817-8db7-d67f160086eb: extend native structural-plan fill to min(actual blocks,512) while preserving original native snapshot and integer sentinel checks. Own atomic complete-page budget retention protects earlier valid entries when retained plan bytes reach64MiB. Add full private state comparisons at extended midpoint/end, keep original<=128page latency gate, original miss fallback and no assumed actual activation/gain."
+    },
+    {
+      "file": "(composition)",
+      "why": "e-man07 composition on the record 1e1c2581-e506-4ca4-9341-5f08ffceec86: ArthurOstapenko 53f66afe-0252-402f-b34b-19bea81f1e74 carried byte for byte; jacklightChen 1df4df4a-6dc5-4ecf-8d49-b372ba3726fd carried byte for byte; terrapinelf 80f6fced-3c74-4ce1-9913-058f05e95ec7 carried byte for byte. No new arithmetic."
     }
   ]
 }

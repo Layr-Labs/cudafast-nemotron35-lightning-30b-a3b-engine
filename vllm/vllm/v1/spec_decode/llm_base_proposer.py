@@ -1158,15 +1158,24 @@ class SpecDecodeBaseProposer:
             sets.before(draft_index)
         elif guard is not None:
             guard.before()
-        per_group_attn_metadata: list[object] = []
-        per_layer_attn_metadata: dict[str, object] = {}
-        for attn_group in self.draft_attn_groups:
-            attn_metadata = attn_group.get_metadata_builder().build_for_drafting(
-                common_attn_metadata=common_attn_metadata, draft_index=draft_index
-            )
-            per_group_attn_metadata.append(attn_metadata)
-            for layer_name in attn_group.layer_names:
-                per_layer_attn_metadata[layer_name] = attn_metadata
+        # Publish the subsequent native-MTP step's metadata and exact native
+        # plan prefix in one ordered copy kernel. Flush before staging guards
+        # and the caller's plan-ready event are recorded on this stream.
+        from vllm.v1.worker import copy_batch
+        draft_batch = copy_batch.begin_native_plan(self, common_attn_metadata, draft_index)
+        try:
+            per_group_attn_metadata: list[object] = []
+            per_layer_attn_metadata: dict[str, object] = {}
+            for attn_group in self.draft_attn_groups:
+                attn_metadata = attn_group.get_metadata_builder().build_for_drafting(
+                    common_attn_metadata=common_attn_metadata, draft_index=draft_index
+                )
+                per_group_attn_metadata.append(attn_metadata)
+                for layer_name in attn_group.layer_names:
+                    per_layer_attn_metadata[layer_name] = attn_metadata
+        finally:
+            if draft_batch is not None:
+                draft_batch.flush()
         if sets is not None:
             sets.after()
         elif guard is not None:

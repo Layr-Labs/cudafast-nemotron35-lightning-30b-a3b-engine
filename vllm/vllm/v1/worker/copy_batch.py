@@ -69,6 +69,7 @@ class _Set:
         self.src_base = self.cpu.data_ptr() if ZERO_COPY else self.gpu.data_ptr()
         self.event = torch.cuda.Event()
         self.recorded = False
+        self.owners: list[torch.Tensor] = []
 
 
 class CopyBatch:
@@ -82,6 +83,7 @@ class CopyBatch:
         self.flushes = 0
         self.check_steps = 0
         self.check_diffs = 0
+        self.pending_owners: list[torch.Tensor] = []
         s = self.sets[0]
         _copy_batch_kernel[(1,)](s.cdesc if ZERO_COPY else s.gdesc, 0,
                                  BLOCK=1024, DBLOCK=_DBLOCK, num_warps=4)
@@ -92,10 +94,12 @@ class CopyBatch:
         s = self.sets[self.cur]
         if s.recorded:
             s.event.synchronize()
+        s.owners.clear()
         self.active = True
         self.n = 0
         self.off = _HDR
         self.checks = []
+        self.pending_owners = []
 
     def _immediate(self, dst, src) -> None:
         dst.copy_(src, non_blocking=True)
@@ -116,6 +120,7 @@ class CopyBatch:
             self._immediate(dst, src)
             return
         i = self.n
+        self.pending_owners.extend((dst, src))
         if src.is_cuda:
             s.desc[3 * i + 1] = src.data_ptr()
         else:
@@ -136,14 +141,15 @@ class CopyBatch:
         if self.n == 0:
             return
         s = self.sets[self.cur]
+        s.owners = self.pending_owners
+        self.pending_owners = []
         if not ZERO_COPY:
             s.gpu[:self.off].copy_(s.cpu[:self.off], non_blocking=True)
             s.event.record()
         ref = [d.clone() for d in self.checks] if CHECK else None
         _copy_batch_kernel[(1,)](s.cdesc if ZERO_COPY else s.gdesc, self.n,
                                  BLOCK=1024, DBLOCK=_DBLOCK, num_warps=4)
-        if ZERO_COPY:
-            s.event.record()
+        s.event.record()
         s.recorded = True
         self.flushes += 1
         if CHECK:
@@ -175,3 +181,49 @@ def copy(dst: torch.Tensor, src: torch.Tensor) -> None:
         b.copy(dst, src)
     else:
         dst.copy_(src, non_blocking=True)
+
+
+def materialize() -> None:
+    """Publish recorded writes before an opaque external planning call.
+
+    Reopen the batch so later metadata copies can still be coalesced. This
+    preserves stream order even if a fallback plan consumes a device buffer.
+    """
+    b = _BATCH
+    if b is not None and b.active:
+        b.flush()
+        b.begin()
+
+
+def begin_native_plan(proposer, common, draft_index):
+    """Batch only a later one-row step of the qualified native MTP plan bank.
+
+    The original planner/cache-miss path materializes pending metadata before
+    opaque work. The caller flushes before staging/plan-ready events. Private
+    native-plan admission visits this path too; no request data is retained.
+    """
+    if (not ENABLED or os.environ.get("NEMO_MTP_PLAN_COPY_BATCH", "1") == "0"
+            or draft_index < 1 or common.num_reqs != 1
+            or common.num_actual_tokens != 1 or common.max_query_len != 1
+            or torch.cuda.is_current_stream_capturing()
+            or (_BATCH is not None and _BATCH.active)):
+        return None
+    try:
+        if (type(proposer.model).__name__ != "NemotronHMTP"
+                or proposer.method != "mtp" or len(proposer.draft_attn_groups) != 1):
+            return None
+        from vllm.v1.attention.backends.flashinfer import _FI_PAGE_TRIM
+        builder = proposer.draft_attn_groups[0].get_metadata_builder()
+        wrapper = getattr(builder, "_decode_wrappers_cudagraph", {}).get(1)
+        bank = getattr(wrapper, "_nemo_native_plan", None)
+        if (not _FI_PAGE_TRIM or type(builder).__name__ != "FlashInferMetadataBuilder"
+                or builder.use_dcp or builder.use_trtllm_decode_attention
+                or builder.is_kvcache_nvfp4 or wrapper is None
+                or getattr(wrapper, "vllm_first_call", True)
+                or bank is None or not bank.enabled or bank.force_native):
+            return None
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+    b = get(proposer.device)
+    b.begin()
+    return b

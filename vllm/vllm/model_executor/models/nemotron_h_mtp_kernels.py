@@ -94,6 +94,77 @@ def depth_gate_init(device: torch.device) -> torch.Tensor | None:
     return _GATE
 
 
+# Drafter-only: preserve the router range, gate only immutable MTP weight bytes.
+_DRX_GATED_PREFETCH = os.environ.get("DRX_GATED_PREFETCH", "1") != "0"
+
+
+@triton.jit
+def _mtp_prefetch_range(ptr, N: tl.constexpr, active):
+    if N > 0:
+        if active:
+            off = tl.arange(0, 128) * 65536
+            tl.inline_asm_elementwise(
+                "{ .reg .pred p; setp.ne.u32 p, $3, 0; "
+                "@p cp.async.bulk.prefetch.L2.global [$1], $2; mov.u32 $0, 0; }",
+                constraints="=r,l,r,r",
+                args=[ptr.to(tl.pointer_type(tl.uint8)) + off,
+                      tl.minimum(N - off, 65536), (off < N).to(tl.int32)],
+                dtype=tl.int32, is_pure=False, pack=1,
+            )
+
+
+@triton.jit
+def _mtp_prefetch_gated(p0, p1, p2, gate_ptr, N0: tl.constexpr,
+                        N1: tl.constexpr, N2: tl.constexpr, KEEP_FIRST: tl.constexpr):
+    active = tl.load(gate_ptr) == 0
+    _mtp_prefetch_range(p0, N0, active | KEEP_FIRST)
+    _mtp_prefetch_range(p1, N1, active)
+    _mtp_prefetch_range(p2, N2, active)
+
+
+def mtp_prefetch(ranges, keep_first=False):
+    """One launch/fork as l2pf.prefetch_many; range 0 may remain unconditional."""
+    global _DRX_GATED_PREFETCH
+    if _l2pf is None:
+        return False
+    gate = _GATE
+    if (not _DRX_GATED_PREFETCH or not _l2pf.ENABLED or _l2pf._lib is None
+            or gate is None or not gate.is_cuda or gate.dtype != torch.int32
+            or not gate.is_contiguous() or gate.numel() < 1
+            or _l2pf.CHUNK != 65536 or not 1 <= len(ranges) <= 3):
+        return _l2pf.prefetch_many(ranges)
+    ptrs, sizes = [], []
+    for t, limit in ranges:
+        if t is None or limit <= 0:
+            ptrs.append(gate)
+            sizes.append(0)
+            continue
+        if (t.device != gate.device or t.layout != torch.strided
+                or not t.is_contiguous() or t.storage_offset() != 0
+                or t.data_ptr() % 16):
+            return _l2pf.prefetch_many(ranges)
+        n = min(t.untyped_storage().nbytes(), int(limit)) // 16 * 16
+        if n <= 0 or n > 128 * 65536:
+            return _l2pf.prefetch_many(ranges)
+        ptrs.append(t)
+        sizes.append(n)
+    if not any(sizes):
+        return _l2pf.prefetch_many(ranges)
+    ptrs += [gate] * (3 - len(ptrs))
+    sizes += [0] * (3 - len(sizes))
+    main = torch.cuda.current_stream(gate.device)
+    side = _l2pf._side_stream(gate.device)
+    side.wait_stream(main)
+    try:
+        with torch.cuda.stream(side):
+            _mtp_prefetch_gated[(1,)](*ptrs, gate, *sizes, keep_first, num_warps=4)
+    except Exception as exc:
+        _DRX_GATED_PREFETCH = False
+        logger.warning("MTP gated prefetch unavailable; stock retained: %r", exc)
+        return _l2pf.prefetch_many(ranges)
+    return True
+
+
 def _gate_args(t: torch.Tensor) -> tuple[torch.Tensor, bool]:
     """(gate, GATED) for a drafter kernel launched on t's device."""
     g = _GATE
@@ -673,7 +744,7 @@ def relu2_down(h, w2, sd, ids, tw, y, routed_scale, mode=None, bn=None, warps=No
             _l2pf is not None
             and _l2pf.DRAFT_BYTES > 0
             and bool(_l2pf.DRAFT_SCREEN)
-            and _l2pf.prefetch(_l2pf.DRAFT_SCREEN[0], max_bytes=_l2pf.DRAFT_BYTES)
+            and mtp_prefetch(((_l2pf.DRAFT_SCREEN[0], _l2pf.DRAFT_BYTES),))
         )
         add = can_add_residual(residual, y, routed_scale, ids.numel())
         if maybe_down(h, packed, ids, tw, y, routed_scale, residual=residual if add else None):

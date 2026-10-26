@@ -46,7 +46,9 @@ def available() -> bool:
 
 
 # configs reading humming's 64-row prefill layout as 32-row halves (pzskip.cu case 369)
-HALF64 = (369,)
+HALF64 = (369, 379)
+# 379: 369 reading the 6-bit swap scale plane (zskip to_s6_swap)
+S6_CONFIGS = (379,)
 
 
 def block_rows(wpc: int) -> int:

@@ -229,6 +229,10 @@ def _w13_k128_enabled():
     return os.environ.get("HUMMING_W13_K128", "1") != "0"
 
 
+def _w13_k128_small_enabled():
+    return os.environ.get("HUMMING_W13_K128_SMALL", "1") != "0"
+
+
 def _w13_k128_params(lo, hi, params):
     if (_w13_k128_enabled() and (lo, hi) == (24, 48)
             and params["block_shape"] == [16, 64, 32]
@@ -236,6 +240,16 @@ def _w13_k128_params(lo, hi, params):
             and params["num_stages"] == 8):
         return dict(params, block_shape=[16, 64, 128],
                     warp_shape=[16, 32, 128], num_stages=3)
+    # LOCAL PATCH (cudafast-nemotron35): the smaller verify buckets (1 to 4 rows:
+    # valid_shape_m <= 24) take the same K128 tile and three-deep ring as the 24-48
+    # bucket, two CTAs per SM. Same 16x64 output tiles and ascending K16 MMA chain per
+    # element (a 128-wide K block is four K16 steps in order), same epilogue, so the
+    # same output bits. HUMMING_W13_K128_SMALL=0 keeps the tuned configs.
+    if (_w13_k128_small_enabled() and hi <= 24
+            and params["block_shape"] == [16, 64, 32]
+            and params["warp_shape"] == [16, 32, 32]):
+        return dict(params, block_shape=[16, 64, 128],
+                    warp_shape=[16, 32, 128], num_stages=3, num_ctas_per_sm=2)
     return params
 
 
@@ -243,9 +257,9 @@ def _variant_key(dyn):
     """Cache-key part of the scheduler variant: the claim-when-free kernels'
     persistent grids come from the environment, so they are part of it."""
     if not dyn:
-        return (False, _w13_k128_enabled())
+        return (False, _w13_k128_enabled(), _w13_k128_small_enabled())
     return (True, _dyn_num_sms(0, 1 << 30, 0), _dyn_num_sms(0, 1, 0),
-            _w13_k128_enabled())
+            _w13_k128_enabled(), _w13_k128_small_enabled())
 
 
 def _prepare_stock(meta, compute_config, tuning_config, dyn):

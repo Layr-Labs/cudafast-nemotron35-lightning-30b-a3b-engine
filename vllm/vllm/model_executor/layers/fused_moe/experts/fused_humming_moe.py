@@ -797,6 +797,7 @@ class HummingIndexedExperts(HummingExpertsBase):
             sublayer_name="w13",
         )
 
+        up_masks = None
         # The tuned NVFP4/BF16 path retains the original GEMM output rounding
         # inside its epilogue, then writes relu(output)**2 directly to the
         # activation buffer. Other shapes, formats and activations keep the
@@ -811,12 +812,17 @@ class HummingIndexedExperts(HummingExpertsBase):
                 forward_relu2,
             )
 
-            forward_relu2(
-                layer=self.layer,
-                inputs=inputs,
-                outputs=buffers["activation_output"],
-                **moe_kwargs1,
-            )
+            if expert_map is None and topk_ids.size(0) == 5 and topk_ids.size(1) == 6:
+                from vllm.model_executor.layers.fused_moe.experts.humming_produced_masks import try_launch
+
+                up_masks = try_launch(self.layer, inputs, buffers["activation_output"], moe_kwargs1)
+            if up_masks is None:
+                forward_relu2(
+                    layer=self.layer,
+                    inputs=inputs,
+                    outputs=buffers["activation_output"],
+                    **moe_kwargs1,
+                )
         else:
             HummingMethod.forward_layer(
                 layer=self.layer,
@@ -868,6 +874,7 @@ class HummingIndexedExperts(HummingExpertsBase):
             getattr(self, "_moe_block_size", None),
             moe_kwargs2,
             topk_ids=topk_ids,
+            producer_masks=(up_masks if input_scale is None and inputs is buffers["activation_output"] else None),
         )
         sparse_weights = getattr(self.layer, "routed_sparse_down", None)
         if (

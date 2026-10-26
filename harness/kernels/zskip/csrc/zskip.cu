@@ -82,6 +82,7 @@ struct Params {
   int max_blocks;           // expert blocks covered (grid of prep_kernel)
   unsigned long long* trace;  // optional timing trace: 8 words per item (see down3_kernel)
   const int* verify_rows;  // optional confidence prefix, paired M5 only
+  const uint16_t* row_masks;  // same-call routed-up K16 masks, config 673 only
   int c3lpt;  // shape30/config113 only: read same-call prep permutation
 };
 
@@ -895,6 +896,7 @@ __global__ void __launch_bounds__(WPC * 32) down4_kernel(const Params p) {
 
 
 #include "zskip_pair.cuh"
+#include "zskip_lean.cuh"
 
 // v6: down4 with the -0 guard moved to the end. With skipped rows read as +0, every step keeps
 // the accumulator equal to stock's or both zero (the two differ at most in the sign of a zero), so
@@ -1802,6 +1804,34 @@ static int launch_pair(const Params& p, cudaStream_t stream) {
 
 #endif
 
+#ifndef ZSKIP_NO_PAIR
+// lean paired decode (zskip_lean.cuh): config id, warps per CTA, ring depth R, flags (F_ZHALF 1,
+// F_NOSPLIT 2, F_BPF 4, F_RPF 8, F_WPF 16, prefetch distance code << 8); 653 is the default
+#define ZSKIP_LEAN_CONFIGS(X) X(604, 1, 2, 260) X(613, 1, 2, 2820) X(616, 1, 2, 2824) X(630, 1, 2, 0) \
+  X(640, 1, 3, 272) X(645, 1, 4, 272) X(653, 1, 3, 274) X(656, 1, 4, 274) X(658, 1, 2, 274) X(673, 1, 3, 16658)
+template <int WPC, int R, int F>
+static int launch_lean(const Params& p, cudaStream_t stream) {
+#ifndef ZSKIP_NO_PDL
+  if (g_pdl) {
+    cudaError_t e = launch_pdl(down_lean_kernel<WPC, R, F>, dim3(21 / WPC, p.max_blocks), dim3(WPC * 32), stream, p);
+    if (e != cudaSuccess) {
+      cudaGetLastError();
+      return (int)e;
+    }
+    return (int)cudaGetLastError();
+  }
+#endif
+  down_lean_kernel<WPC, R, F><<<dim3(21 / WPC, p.max_blocks), WPC * 32, 0, stream>>>(p);
+  return (int)cudaGetLastError();
+}
+static bool is_lean_config(int id) {
+#define XL(ID, W_, R_, F_) if (id == ID) return true;
+  ZSKIP_LEAN_CONFIGS(XL)
+#undef XL
+  return false;
+}
+#endif
+
 // v4 config id, warps per CTA, ring depth (active groups in flight per warp), 8-row MMA halves per
 // block (rows per block cap = 8 NH), moe_align block size. 100..107: decode (<= 8 tokens, block 16);
 // 120..: prefill (block_m 16 / 32 / 64, every valid row of the block)
@@ -1984,6 +2014,16 @@ int zskip_config(int id, int* info) {
   PAIR_INFO(119, true, true)
 #endif
 #undef PAIR_INFO
+#define XL(ID, W_, R_, F_) \
+  if (id == ID) { \
+    if (cudaFuncGetAttributes(&attr, down_lean_kernel<W_, R_, F_>) != cudaSuccess) return -1; \
+    info[0] = attr.numRegs; info[1] = 0; info[2] = W_; \
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&info[3], down_lean_kernel<W_, R_, F_>, W_ * 32, 0) != cudaSuccess) \
+      return -1; \
+    return 0; \
+  }
+  ZSKIP_LEAN_CONFIGS(XL)
+#undef XL
 #endif
   return -2;
 }
@@ -1992,11 +2032,19 @@ static int zskip_down_impl(const void* A, long long lda, int shape_m, const int*
                const int* num_tokens_padded, int max_blocks, const void* W, const void* S, const float* GS,
                void* C, long long ldc, long long w_expert, long long w_tile, long long w_k, long long s_expert,
                long long s_tile, long long s_g, int mode, int* stats, int config, void* ws, int* queue,
-               int ctas_per_sm, void* trace, void* stream, const int* verify_rows) {
+               int ctas_per_sm, void* trace, void* stream, const int* verify_rows,
+               const uint16_t* row_masks = nullptr) {
+  if ((config == 673) != (row_masks != nullptr)) return -6;
+  if (row_masks != nullptr && (shape_m != 30 || max_blocks != 30 || mode != SKIP)) return -6;
   if (verify_rows != nullptr && (shape_m != 30 || mode != SKIP ||
-      (config != 113 && config != 114 && config != 118 && config != 119))) return -5;
+      (config != 113 && config != 114 && config != 118 && config != 119
+#ifndef ZSKIP_NO_PAIR
+       && !is_lean_config(config)
+#endif
+       ))) return -5;
   Params p;
   p.verify_rows = verify_rows;
+  p.row_masks = row_masks;
   p.c3lpt = g_c3lpt && shape_m == 30 && max_blocks == 30 && config == 113 && mode == SKIP;
   p.A = reinterpret_cast<const __nv_bfloat16*>(A);
   p.lda = lda;
@@ -2061,6 +2109,10 @@ static int zskip_down_impl(const void* A, long long lda, int shape_m, const int*
   if (config == 118) return launch_pair<true>(p, st);
   if (config == 119) return launch_pair<true, true>(p, st);
 #endif
+#define XL(ID, W_, R_, F_) \
+  if (config == ID) return launch_lean<W_, R_, F_>(p, st);
+  ZSKIP_LEAN_CONFIGS(XL)
+#undef XL
 #endif
   return -2;
 }
@@ -2079,6 +2131,14 @@ int zskip_down_prefix(const void* A, long long lda, int shape_m, const int* sort
                long long s_tile, long long s_g, int mode, int* stats, int config, void* ws, int* queue,
                int ctas_per_sm, void* trace, void* stream, const int* verify_rows) {
   return zskip_down_impl(A, lda, shape_m, sorted_ids, expert_ids, num_tokens_padded, max_blocks, W, S, GS, C, ldc, w_expert, w_tile, w_k, s_expert, s_tile, s_g, mode, stats, config, ws, queue, ctas_per_sm, trace, stream, verify_rows);
+}
+
+int zskip_down_masks(const void* A, long long lda, int shape_m, const int* sorted_ids, const int* expert_ids,
+               const int* num_tokens_padded, int max_blocks, const void* W, const void* S, const float* GS,
+               void* C, long long ldc, long long w_expert, long long w_tile, long long w_k, long long s_expert,
+               long long s_tile, long long s_g, int mode, int* stats, int config, void* ws, int* queue,
+               int ctas_per_sm, void* trace, void* stream, const int* verify_rows, const uint16_t* row_masks) {
+  return zskip_down_impl(A, lda, shape_m, sorted_ids, expert_ids, num_tokens_padded, max_blocks, W, S, GS, C, ldc, w_expert, w_tile, w_k, s_expert, s_tile, s_g, mode, stats, config, ws, queue, ctas_per_sm, trace, stream, verify_rows, row_masks);
 }
 
 int zskip_probe(unsigned long long seed, int blocks, int iters, unsigned long long* counts, uint32_t* samples,

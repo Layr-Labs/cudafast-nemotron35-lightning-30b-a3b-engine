@@ -1086,3 +1086,9 @@ def convert_to_humming_moe_kernel_format(
         from vllm.model_executor.layers.fused_moe.experts import humming_nvsc
 
         humming_nvsc.prepare_layer(layer)
+
+        # Optional same-call activation metadata, after BOTH original zskip
+        # selection and actual NVSC scale/producer preparation are complete.
+        from vllm.model_executor.layers.fused_moe.experts import humming_produced_masks
+
+        humming_produced_masks.prepare_layer(layer)

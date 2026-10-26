@@ -450,6 +450,14 @@
     {
       "file": "model_executor/layers/mamba/ops/mamba_ssm_spec_replay.py (PIPELINED branches only)",
       "why": "C2FMA: the raw-input replay software pipeline (NEMO_MAMBA_REPLAY_PIPELINE, admitted per boot only if its outputs, replayed state and both checkpoint slots are byte-identical to the ordinary kernel) never qualified because the compiler contracted the other product into the FMA: pipeline RN(RN(B*dt)*x + state*dA) vs ordinary RN(state*dA + RN(RN(B*dt)*x)), a 1-ULP fp32 state difference. The pipelined replay and compute loops now spell the ordinary order explicitly with tl.fma(state, dA, dB*x). The ordinary kernel's code is unchanged (the change sits under the PIPELINED constexpr). The boot-time byte comparison and timing admission are unchanged; NEMO_MAMBA_REPLAY_PIPELINE=0 keeps the ordinary path."
+    },
+    {
+      "file": "model_executor/layers/fused_moe/experts/humming_produced_masks.py; fused_humming_moe.py; humming_zskip.py; layers/quantization/utils/humming_utils.py; harness/kernels/zskip",
+      "why": "GPT 6.1 Sol / Codex / effort ultra. On ENTIRE f0fcab75-b0b3-4a4c-893d-850ef447c110, optional routed-up ReLU2 writer emits exact sign-masked K16 nonzero metadata from its original BF16 store. New down config673 unions those same-call masks instead of repeated full activation scans; same653 arithmetic/ring/negative-zero fallback. Actual selected production producer source is extended before compilation, with private full up/down eager/captured bit/canary and warm/cold speed admission. Original653 and sharedZ2 selection preserved. No request mask cached, no numerical format changed. HUMMING_PRODUCED_MASKS=0 disables. PR632 8d6c2643-dde7-42a1-8224-19913d76409d supplies negative experiment/prep-redundancy context only; its 665 and GPF runtime not imported. All execution/compilation/qualification official remote only."
+    },
+    {
+      "file": "model_executor/layers/fused_moe/experts/humming_relu2_epilogue.py",
+      "why": "Selected useful pending90f56a6a-20e0-4bde-8874-7c17aba89533 K128 small-routed-up method, source90e9bc9411083f8769bc662e68fcc94597701221/blobbe644a29e6fd2ec6e50b96856c0d3ae12ccfa123. Same K128 tile/three stages now covers1-4inputrow buckets with2CTAs/SM; existing5-8 selection unchanged. Own addition includes small-flag in variant cache identity. Entire pending composition not a baseline and otherpendingruntime not copied. Combined mask+smalltile experiment has no verified score/independent benefit yet. HUMMING_W13_K128_SMALL=0 restores small buckets."
     }
   ]
 }

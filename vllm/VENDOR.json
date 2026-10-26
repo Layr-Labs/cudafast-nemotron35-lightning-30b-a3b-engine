@@ -5,7 +5,7 @@
   "subtree": "vllm",
   "container_image": "docker.io/vllm/vllm-openai:v0.27.1",
   "container_digest_arm64": "sha256:1c8e60a0841b333c700488cb029d3664807249da0c071e862191b00fe34b228c",
-  "note": "Upstream Python package at the tag. The compiled extensions (csrc) come from the pinned container's install of the same tag; tools/stage-vllm-overlay.sh layers this tree over that install. vllm/vllm/config/fault_tolerance.py is stored LF-normalized (upstream has CRLF).",
+  "note": "Upstream Python package at the tag. The compiled extensions (csrc) come from the pinned container's install of the same tag; tools/stage-vllm-overlay.sh layers this tree over that install. vllm/vllm/config/fault_tolerance.py is stored LF-normalized (upstream has CRLF). Draw 4.",
   "local_patches": [
     {
       "file": "vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py",
@@ -432,16 +432,16 @@
       "why": "terrapinelf: the MTP draft loop's small input moves in one launch each: the first pass's shifted ids, next-token write, positions and hidden rows; the sampled-row gathers after it; and before every later pass the drafted-token cast, the hidden-row copy and eagle_step_slot_mapping_metadata_kernel's arithmetic. Integer casts, integer adds and byte copies into the same buffers. VLLM_MTP_FUSED_GLUE=0 keeps the stock operations."
     },
     {
-      "file": "vllm/v1/engine/core.py (+ harness/vllm_resident/resident.py, backends.py)",
-      "why": "Ours (C57): a synchronous single-stream caller passes the number of tokens it still wants to one engine step. When that budget is at most num_spec_tokens + 1 and a batch is queued, the core first takes the queued batch's result (which the caller waits for either way); if its tokens already cover the budget it returns that output without scheduling another speculative round whose output the caller cannot need, and otherwise it schedules ahead exactly as before, so the next batch is always scheduled before the previous output is applied. A sequence drained this way is restarted from its context if it is ever continued. No target computation, sampling, draft decision, request limit or numerical format changes; the budget is scoped to that one step. C57_LASTDRAFT=0 restores the main's scheduling."
-    },
-    {
       "file": "harness/vllm_resident/resident.py; harness/vllm_resident/backends.py; vllm/v1/spec_decode/llm_base_proposer.py; vllm/model_executor/models/nemotron_h_mtp_kernels.py",
-      "why": "terrapinelf (first submitted as 9bbf6217-46dc-4ab2-aa31-a61ad5025483): free-run emit budget. Session.spec_run(first, count) tells the engine the prompt + emitted token count at which the run is done (len(ctx) + 1 + count; VllmBackend.set_emit_target sets drafter.emit_target, cleared when the run returns and when a new request starts). Once a step's rejection is known on the host, the drafter computes how many drafts the next verify can still use (target - (seq_lens_after_rejection + 1) - 1); when that is below the depth it stops the draft loop after that many passes, pads the step's draft slots with the last draft and caps the verify-row count (depth_gate_end max_rows) at drafts + 1, so the padded slots are never verified. The drafts that are computed are the unlimited loop's; the verify rows that run are the same rows the depth gate already varies. Independent of ArthurOstapenko's C57 tail drain in engine/core.py (which stops the core from speculating a round past the caller's budget); the two touch different code. VLLM_MTP_EMIT_BUDGET=0 disables."
+      "why": "terrapinelf: free-run emit budget. Session.spec_run(first, count) tells the engine the prompt + emitted token count at which the run is done (len(ctx) + 1 + count; VllmBackend.set_emit_target sets drafter.emit_target, cleared when the run returns and when a new request starts). Once a step's rejection is known on the host, the drafter computes how many drafts the next verify can still use (target - (seq_lens_after_rejection + 1) - 1); when that is below the depth it stops the draft loop after that many passes, pads the step's draft slots with the last draft and caps the verify-row count (depth_gate_end max_rows) at drafts + 1, so the padded slots are never verified. The drafts that are computed are the unlimited loop's; the verify rows that run are the same rows the depth gate already varies. VLLM_MTP_EMIT_BUDGET=0 disables."
     },
     {
       "file": "(composition)",
-      "why": "terrapinelf on the record 88455a30-3e21-4da9-b718-9b6809502858 (ArthurOstapenko, commit 27e68ae): the record's files byte for byte plus terrapinelf's free-run emit budget (the entry above), the same files as terrapinelf 1d565812-f993-401a-a5a8-3c5a7c1a6435 (second measurement)."
+      "why": "terrapinelf on the record e19e73d6-0b9e-4eea-9fae-c058e7b98884 (ArthurOstapenko, commit 3c37484, the code of ercumentyildirim d1ce8ee7-b204-4819-9923-72af7c0c7b8b): the record's files byte for byte plus terrapinelf's prefill early launch, canonical block head, resident request path, parallel copy-batch flush and fused MTP draft-loop input moves (first measured in 0c93e284-ad2b-4c27-94d7-be1fa525d637 and 1a480c2b-fc0c-4e7d-8e8a-b09f18049b8b) and the free-run emit budget (the entry above)."
+    },
+    {
+      "file": "vllm/v1/engine/core.py (+ harness/vllm_resident/resident.py, backends.py)",
+      "why": "ArthurOstapenko 88455a30 (C57), carried: a synchronous single-stream caller passes the number of tokens it still wants to one engine step. When that budget is at most num_spec_tokens + 1 and a batch is queued, the core first takes the queued batch's result (which the caller waits for either way); if its tokens already cover the budget it returns that output without scheduling another speculative round whose output the caller cannot need, and otherwise it schedules ahead exactly as before, so the next batch is always scheduled before the previous output is applied. A sequence drained this way is restarted from its context if it is ever continued. No target computation, sampling, draft decision, request limit or numerical format changes; the budget is scoped to that one step. C57_LASTDRAFT=0 restores the main's scheduling."
     },
     {
       "file": "harness/kernels/zskip/csrc/zskip.cu; harness/kernels/zskip/csrc/zskip_pair.cuh; harness/kernels/zskip/py/__init__.py",
@@ -449,7 +449,127 @@
     },
     {
       "file": "model_executor/layers/mamba/ops/mamba_ssm_spec_replay.py (PIPELINED branches only)",
+      "why": "ArthurOstapenko 20c2a640 (C2FMA), carried: the raw-input replay software pipeline (NEMO_MAMBA_REPLAY_PIPELINE, admitted per boot only if its outputs, replayed state and both checkpoint slots are byte-identical to the ordinary kernel) never qualified because the compiler contracted the other product into the FMA: pipeline RN(RN(B*dt)*x + state*dA) vs ordinary RN(state*dA + RN(RN(B*dt)*x)), a 1-ULP fp32 state difference. The pipelined replay and compute loops now spell the ordinary order explicitly with tl.fma(state, dA, dB*x). The ordinary kernel's code is unchanged (the change sits under the PIPELINED constexpr). The boot-time byte comparison and timing admission are unchanged; NEMO_MAMBA_REPLAY_PIPELINE=0 keeps the ordinary path."
+    },
+    {
+      "file": "harness/kernels/sctopk/{csrc/sctopk.cu,py/__init__.py,build.sh}; vllm/model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "Ours: the three-level draft-head screen's per-chunk top-k selections (_chunk_topk, RADIX) run as one CUDA kernel each: an exact 8-bit radix select of the K-th largest key (torch's TopKTypeConfig order key, NaN largest, -0 below +0) over four shared-memory histograms, then every key above it in ascending index order followed by its ties in ascending index order until K are taken, through two block-wide exclusive scans; a stopped draft pass writes the first K ids in index order. Integer operations only, so the id lists equal _chunk_topk's. The screen admits it at load only after comparing both on the cascade's three shapes (ties, signed zeros, NaNs, gated and not); otherwise _chunk_topk stays. VLLM_MTP_SCREEN_SCTOPK=0 (or SCTOPK=0) keeps _chunk_topk."
+    },
+    {
+      "file": "harness/kernels/shco/py/__init__.py",
+      "why": "Ours: SHX_GRID (unset by default, so the half grid stays) sets the prefill shared-expert persistent worker count directly; the unit tables keep Marlin's partition over all SMs and each unit is summed whole by one CTA, so the outputs are unchanged."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_down_packed.py",
+      "why": "Ours: MTP_DOWN_PACK12_FORCE (default on) admits the packed (inherited lossless 12-bit BF16 codec) compact-down slots for a draft top-k whose load-time comparison with the original BF16 slots is bitwise equal on every probe even when that private timing (sparse probe densities) does not show the 4% margin; the fastest bit-identical block width is used. The admission's exhaustive bit comparison is unchanged, the original weights stay retained, and a failed comparison keeps the original slots. MTP_DOWN_PACK12_FORCE=0 restores the timing gate."
+    },
+    {
+      "file": "model_executor/layers/mamba/ops/mamba_ssm_spec_replay.py (PIPELINED branches only)",
       "why": "C2FMA: the raw-input replay software pipeline (NEMO_MAMBA_REPLAY_PIPELINE, admitted per boot only if its outputs, replayed state and both checkpoint slots are byte-identical to the ordinary kernel) never qualified because the compiler contracted the other product into the FMA: pipeline RN(RN(B*dt)*x + state*dA) vs ordinary RN(state*dA + RN(RN(B*dt)*x)), a 1-ULP fp32 state difference. The pipelined replay and compute loops now spell the ordinary order explicitly with tl.fma(state, dA, dB*x). The ordinary kernel's code is unchanged (the change sits under the PIPELINED constexpr). The boot-time byte comparison and timing admission are unchanged; NEMO_MAMBA_REPLAY_PIPELINE=0 keeps the ordinary path."
+    },
+    {
+      "file": "vllm/v1/worker/gpu_model_runner.py",
+      "why": "terrapinelf: a verify step's AsyncGPUModelRunnerOutput copy of the sampled token ids waits on an event recorded right after the sampler (and _update_states_after_model_execute) instead of on the whole default stream, which by then also holds the next draft loop queued by propose_draft_token_ids. The copy reads only sampled_token_ids, which the sampler has finished writing. Prefill steps (no spec-decode metadata) keep waiting for the whole stream, so the seed token still returns after the seed's draft work. VLLM_OUTPUT_COPY_AFTER_SAMPLE=0 restores the stream wait."
+    },
+    {
+      "file": "(composition)",
+      "why": "terrapinelf on the record 1cb833a7-a22f-416c-b659-aa84adea762f (ArthurOstapenko, commit de290fa): the record's files byte for byte plus the verify-step output copy entry above; the same files as terrapinelf 9843ad8f-71de-4ecb-8ab8-fa9bc8a389e6 (second measurement)."
+    },
+    {
+      "file": "vllm/v1/spec_decode/nemotron_compound_loop.py; llm_base_proposer.py; nemotron_decode_plan.py; nemotron_full_step.py",
+      "why": "jacklightChen 581daccd, carried: a boot-qualified parent CUDA graph executes the three remaining sequential native MTP model+head child graphs; two intermediate stages fuse the original token/hidden/position/slot updates with the current live page metadata and the original native FA2 integer-prefix selection on the GPU. Only entries with identical captured native plan_info/scalars are eligible; no attention plan is invented and the current request block ids are copied every invocation. Stage prefix/bytes/page checks, model/token/gate/KV/canary/CPU-shadow comparisons, host+GPU latency gates and source-state restoration run at startup; the runtime handles only supported full-depth native greedy rounds, while budget tails and unsupported states keep the original loop. NEMO_MTP_COMPOUND_LOOP=0 disables."
+    },
+    {
+      "file": "vllm/model_executor/layers/fused_moe/experts/humming_relu2_epilogue.py",
+      "why": "Ours: the routed expert-up (w13) verify buckets for 1 to 4 rows (valid_shape_m <= 24: (0,6], (6,12], (12,24]) take the 24-48 bucket's K128 tile ([16, 64, 128] block, [16, 32, 128] warp) with a three-deep load ring and two CTAs per SM, in both the stock and the nvsc kernels (_w13_k128_params). Each output tile is the same 16x64 tile computed by one CTA over all K in ascending order: a 128-wide K block is the same four K16 MMA steps in the same order, with the same dequantisation, fp32 accumulation and ReLU-square epilogue, so every output word is unchanged. HUMMING_W13_K128_SMALL=0 keeps the tuned configs."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_packed.py; vllm/model_executor/models/nemotron_h_mtp_down_packed.py",
+      "why": "Ours: in the lossless 12-bit BF16 loaders (load_packed, load_packed_group8, _load_packed) the sign/mantissa, exponent-code and block-base loads are masked by the bounds mask only, so they are issued together with the escape-index (RI) load instead of after it. Escape blocks still take their RAW words (the tl.where on the escape index is unchanged), so every decoded BF16 word is unchanged; only the few unused plane bytes of escape blocks are also read."
+    },
+    {
+      "file": "vllm/v1/spec_decode/llm_base_proposer.py",
+      "why": "Ours: propose() records the first draft step's attention-metadata copies (page indptr, page indices, last-page length, kv lengths, plan integer workspace) into the shared copy batch (v1/worker/copy_batch.py) opened right before build_per_group_and_layer_attn_metadata and flushed right after it, so one copy kernel performs them in their recorded order before their readers; not during capture or with a batch already open (VLLM_DRAFT_FIRST_PLAN_BATCH=0 restores the individual copies). prepare_next_token_ids_padded hands eagle_prepare_next_token_padded_kernel the pinned host buffer of the backup next-token ids, read in place instead of after a host-to-device copy; the guard event follows the kernel (VLLM_MTP_BACKUP_ZERO_COPY=0 restores the copy). Same values in the same buffers."
+    },
+    {
+      "file": "vllm/v1/attention/backends/flashinfer.py",
+      "why": "Ours: with a copy batch open, _fast_plan_spec_prefill_impl runs the native spec-prefill planner with the same arguments onto a private scratch integer workspace on a side stream (its own upload lands there) and records [0, num_allocated_bytes) of the pinned workspace, computed from the returned PrefillPlanInfo in PrefillPlanImpl's allocation order, in the batch for the wrapper's device workspace. Each plan layout is first checked once against the native upload on a sentinel-filled workspace (exact range, bytes outside restored); a failing layout keeps the native planner. The previous scratch upload is waited for before the next plan of the wrapper. Same plan info and same device bytes before the attention (VLLM_FI_PLAN_BATCH=0 restores the planner's upload)."
+    },
+    {
+      "file": "harness/kernels/l2pf/{csrc/l2pf.cu,py/__init__.py}; vllm/v1/worker/gpu_model_runner.py",
+      "why": "Ours: prefetch_paced_kernel / l2pf_prefetch_paced / l2pf.prefetch_paced issue the same 64 KB cp.async.bulk.prefetch.L2 pieces of a range in the same order from one thread, the first `burst` at once and then each no earlier than (i - burst + 1) * interval_ns after the first (%globaltimer). GPUModelRunner._l2pf_prefetch('draft') (the drafter's first weight, queued with the verify) uses it with L2PF_DRAFT_PACE_NS (default 400) and L2PF_DRAFT_PACE_BURST (default 2); L2PF_DRAFT_PACE_NS=0 or an older library keeps the unpaced prefetch. Prefetches move no value."
+    },
+    {
+      "file": "vllm/v1/spec_decode/mtp_glue.py; vllm/v1/spec_decode/llm_base_proposer.py",
+      "why": "Ours: store_host_i32 (_store_host_i32_kernel) writes a few int32 values into a pinned host tensor with one kernel (pinned host memory is device-accessible). _copy_num_rejected_to_cpu uses it for the first draft step's rejected counts in place of the non-blocking device-to-host copy, at the same place in the stream and before the same event; contiguous int32 sources of at most 64 values, pinned destination of the same size, not during capture, else the copy (VLLM_MTP_REJECTED_ZERO_COPY=0 restores the copy)."
+    },
+    {
+      "file": "v1/worker/gpu_model_runner.py (GPUModelRunner.pre_launch_prefill, _capture_zero_graph, _fresh_prefill_early); harness/vllm_resident/backends.py (VllmBackend._pre_launch)",
+      "why": "terrapinelf composition on ercumentyildirim 77315793-8e5e-451c-abcc-0a1395ae30ec (its files byte for byte) plus terrapinelf's prefill pre-launch as measured in 1ca21a08-7843-4466-b507-59fef1d5b213 and c5254187-86be-435f-aa33-bf0d4d1ab087: VllmBackend.start calls GPUModelRunner.pre_launch_prefill before add_request when the scheduler has no unfinished request and the block pool is fully free with its canonical head (BlockPool._canonical_head, caching off). The runner needs a hint recorded by the last request allocated from a fully free pool (its block ids and its blocks to zero) and requires FreshPrefillGraph.early_sig to equal (those block ids, the wrappers' current plan state); it zeroes those blocks through a CUDA graph of the same _zero_kv_blocks_kernel over the same block-id list (captured once, capture_begin/capture_end on a side stream in thread-local capture mode, when the hint is recorded), uploads the 496 prompt ids and replays the fresh graph (lite when max_tokens == 1), the work _fresh_prefill_early does after scheduling. _fresh_prefill_early adopts the launch only if the scheduled request has the same prompt ids, block ids, blocks to zero, plan state and lite flag (then it clears new_block_ids_to_zero); otherwise its ordinary early launch or the forward replay runs as before. Same kernels, inputs and outputs. VLLM_PREFILL_PRELAUNCH=0 disables."
+    },
+    {
+      "file": "model_executor/layers/fused_moe/experts/humming_pfup.py (new); humming_relu2_epilogue.py; humming_nvsc.py",
+      "why": "pfup: the 496-token routed-up (w13 + ReLU^2) claim-when-free kernel (nvsc and stock-scale prefill classes). PFUP_REGROUP: the m blocks of one expert (a contiguous run of equal expert_ids) are claimed n-block major inside the run, so the CTAs that read the same weight slice for an expert with more than 64 rows run together and the later ones hit L2; a bijection on the same tile set, every tile still computed whole by one CTA over all K blocks in ascending order. PFUP_MSKIP: a warp's m16 group whose 16 rows are all padding (row index = M; the A loader already skips their loads and the epilogue their stores) skips its mma.sync, and a warp whose rows are all padding also skips the B dequantisation that only feeds those MMAs; every stored row keeps the same MMA chain. Expert ids and row masks live in a 256-byte static shared array (128-byte multiple, as nvsc_table). Real-weight, real-routing check: 22 layers x 2 captured prompts, bitwise equal to the record kernel. A build failure keeps the record kernel. PFUP_REGROUP=0 / PFUP_MSKIP=0 disable each."
+    },
+    {
+      "file": "model_executor/layers/fused_moe/moe_fused_mul_sum.py",
+      "why": "pfcomb: the 496-token prefill top-k combine (6 slots x 2688 bf16, right after the routed down) launches 2 x 512 tiles on 4 warps instead of the heuristic's 4 x 512 on 8; every output element is still one fp32 chain over the six slots in order, rounded once to bf16 (all 16 tried configs bitwise equal to the heuristic on 22 layers x 2 real prompts). Lab: pzskip + combine 1072-1074 vs 1076-1102 us per layer. VLLM_MOE_MUL_SUM_PF=0 restores the heuristic."
+    },
+    {
+      "file": "harness/kernels/pzskip/{csrc/pzskip.cu,py/__init__.py}; model_executor/layers/fused_moe/experts/humming_zskip.py",
+      "why": "pzhalf: pzskip config 369 (now the prefill default) = config 356's prep and kernel reading humming's 64-row prefill moe_align layout as 32-row halves (block b = rows 32 b .. 32 b + 31 of that layout, expert expert_ids[b / 2]). An expert's 32-row chunks are the same rows as in the 32-row layout, since both start at its first slot; a half holding only padding has no rows and its CTAs return at once. So the separate 32-row moe_align (two kernels per MoE layer) is no longer run. Bitwise equal to 356 on 22 layers x 2 real prompts, also with -0 inputs; load-time 496-token check unchanged. PZSKIP_HALF64=0 keeps 356."
+    },
+    {
+      "file": "harness/kernels/l2pf (csrc/l2pf.cu, py/__init__.py); model_executor/models/nemotron_h_mtp_screen.py, nemotron_h_mtp_kernels.py, nemotron_h_mtp_packed.py, nemotron_h_mtp.py; v1/spec_decode/llm_base_proposer.py; v1/worker/gpu_model_runner.py",
+      "why": "drafter3, drafter-only L2 prefetch into DRAM-idle windows of the MTP draft pass (moves no value; target untouched): (1) the draft screen's captured graph, after its first streaming stage, prefetches the packed eh hidden half and the head of the packed qkv that the next draft pass reads first, from a fixed device range table; the prefetch kernel reads the depth gate and queues nothing for a stopped loop or for the last pass of the declared depth (L2PF_DRAFT_NEXT_MB, default 14, 0 off); (2) the single-row MTP MoE prefetches the head of the packed shared-up planes while its router chain runs (L2PF_DRAFT_SHARED_MB, default 4, 0 off); (3) the post-verify draft prefetch adds the head of the packed qkv behind eh_w_h (L2PF_DRAFT_GLUE_QKV_MB, default 5, 0 off). The eh table is built before the screen so its packed planes exist when the screen graph is captured."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_kernels.py (gated_prefetch, relu2_down); model_executor/layers/attention/attention.py (_prefetch_ahead, MTP packed o_proj branch)",
+      "why": "drafter3: the two existing drafter L2 prefetches (the MTP attention window's packed o_proj head and the MoE down window's screen head) launch through the gated range table (harness/kernels/l2pf), so a depth-gated (stopped) draft pass, which reads no weights, no longer streams them and waits for them at the join (about 24 us per stopped pass in the K profile). Same bytes otherwise; no value moves. MTP_PF_GATED=0 keeps the ungated launches."
+    },
+    {
+      "file": "harness/kernels/l2pf (csrc/l2pf.cu, py/__init__.py); model_executor/models/nemotron_h_mtp_screen.py; v1/worker/gpu_model_runner.py",
+      "why": "drafter3 revision: the gated range table carries a run-time mode word (0 off, 1 unconditional, 2 gated by the depth gate) that a captured graph reads on every replay; the screen's next-pass prefetch is cut into one piece per top-k window of the cascade (queued as each streaming dot ends, so it does not compete with the gathers) and covers the head of the packed qkv only by default (L2PF_DRAFT_NEXT_MB default 8; L2PF_DRAFT_NEXT_EH=1 adds the packed eh hidden half first); the post-verify qkv head is a separate launch after the unchanged eh_w_h prefetch."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_packed.py (load_packed EVICT=2, packed_small EVICT, _packed_linear_keep_impl); nemotron_h_mtp_kernels.py (_eh_demote in depth_gate_end); nemotron_h_mtp_screen.py (scale loads); v1/worker/gpu_model_runner.py (_l2pf_prefetch); harness/kernels/l2pf (demote_table_kernel)",
+      "why": "drafter3, L2 residency of the drafter start projection's packed hidden half (11 MB, read by every draft pass): its loads use an evict-last L2 policy (MTP_EH_LAST); the first multi-row pass reads the same packed planes through packed_small instead of the BF16 copy, and the post-verify prefetch fetches the planes instead of eh_w_h (MTP_EH_PACKED5); after the draft loop a small kernel returns those L2 lines to the normal priority (applypriority) so the verify's L2 use is unchanged; the screen's fp8 scale loads are evict-first like its weights (MTP_SCREEN_SCALE_EF). Drafter-only; the first pass's start projection changes from the BF16 small-M GEMM to the packed small-M MMA (same values, possibly a different fp32 accumulation order)."
+    },
+    {
+      "file": "v1/spec_decode/llm_base_proposer.py (prepare_next_token_ids_padded); v1/spec_decode/utils.py (eagle_prepare_next_token_padded_kernel)",
+      "why": "drafter3: with one request the backup token (read on the host exactly as before) reaches eagle_prepare_next_token_padded_kernel as a launch argument (BACKUP_SCALAR, not specialized) instead of a 4-byte pinned H2D copy that cost the GPU ~30 us of copy-engine latency at the head of the first draft pass's glue. Same values; MTP_BACKUP_SCALAR=0 keeps the copy."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_screen.py (_chunk_topk RADIX == 2, _radix_matches mode)",
+      "why": "drafter3: the draft screen's exact per-chunk radix top-k selects its threshold with 8-bit digits (four histogram rounds instead of eight); admitted at load only if it returns the same ids in the same order as the binary selection on the existing test patterns, else the 4-bit selection stays. Same candidates, same order (MTP_SCREEN_RADIX8=0 keeps 4-bit digits)."
+    },
+    {
+      "file": "v1/spec_decode/llm_base_proposer.py (propose: first-pass plan); v1/attention/backends/flashinfer.py (prefill branch plan_ready_event wait)",
+      "why": "drafter3: one greedy request with hostfast staging sets: the first draft pass's attention-metadata build (FlashInfer plan and its small H2D copies, staging set 0) runs on the existing draft-plan side stream, forked after the pass's input kernels, exactly as the later draft steps' plans already do; the first pass's attention (FlashInfer prefill branch) waits on the plan-ready event, and the main stream waits on it again after the pass. Same bytes into the same buffers; the copies leave the serialized head of the pass (each ~6-9 us of copy-engine latency on GB10). MTP_FIRST_PLAN_SIDE=0 keeps the plan on the main stream."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_packed.py (EH_BF16, EH_PACKED5 default off); nemotron_h_mtp_kernels.py (_load_w EVICT 2, mtp_small_linear_keep_impl, _eh_demote); nemotron_h_mtp_screen.py (_radix_for); harness/kernels/l2pf/py/__init__.py and v1/spec_decode/llm_base_proposer.py (defaults)",
+      "why": "drafter3, measured selection: every draft pass reads the BF16 eh hidden half eh_w_h (the BF16 GEMV takes ~10 us from L2 where the packed GEMV's dependent block-metadata loads take ~28 us), with evict-last loads demoted after the loop (MTP_EH_BF16, MTP_EH_LAST); the packed first-pass start projection is off by default (packed_small took 59 us for 5 rows vs 11 us BF16; MTP_EH_PACKED5=1 restores it); 8-bit radix digits only for selections of at most 1024 keys (2048-key chunks measured slower); the next-pass screen prefetch, the shared-up router-window prefetch and the side-stream first-pass plan are kept but default off (L2PF_DRAFT_NEXT_MB, L2PF_DRAFT_SHARED_MB, MTP_FIRST_PLAN_SIDE): neutral or negative in the in-boot A/B."
+    },
+    {
+      "file": "v1/spec_decode/llm_base_proposer.py (_mtp_step_prefetch)",
+      "why": "drafter3: at the start of each single-row draft step (one greedy request, depth gate active) an eager L2 prefetch of the head of the packed MTP qkv planes is queued on l2pf's side stream (gated range table: skipped on the device once the loop stopped); it runs while the step's input glue, the L2-resident start projection and the attention norm leave DRAM idle. Moves no value (L2PF_DRAFT_STEP_MB, default 6, 0 off)."
+    },
+    {
+      "file": "v1/spec_decode/llm_base_proposer.py (STEP_PF_MB default)",
+      "why": "drafter3: the per-step qkv-head prefetch defaults off (L2PF_DRAFT_STEP_MB=0): neutral in the in-boot A/B (+0.06% at 6 MB, +0.02% at 10 MB over 10 rounds); it shortened the qkv GEMV (90 -> 70 us) but pushed the L2-resident start projection back to 32 us."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_down_packed.py (_TILES, _same, _new)",
+      "why": "drafter3: the load-time admission of the packed (12-bit) drafter MoE down also times wider column tiles (BN 128 with 4 or 8 warps, 256 with 8 warps) next to the original 32 and 64: the original tiles read 32-64 B of sign/mantissa per gathered row, too narrow to stream at DRAM speed, so the packed kernel was no faster than the BF16 one and was usually not admitted at the draft's top-3. A wide tile keeps every column's BK=64 chunk order but may change Triton's fp32 tree over the chunk; it is admitted within 1e-5 relative (same non-finite pattern) since drafter numerics are free (MTP_DOWN_PACK12_WIDE_EXACT=1 requires bit equality; MTP_DOWN_PACK12_WIDE=0 keeps the original tiles). The existing timing rule (4% faster than the BF16 slots kernel) still decides."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_compact.py (_BF16_BN)",
+      "why": "drafter3: the BF16 slot kernel of the drafter MoE down (taken whenever the packed admission keeps BF16, the usual case at top-3) uses 128-column tiles instead of 32 (microbenchmark on the real MTP down weights, L2 flushed: 195 vs 211 us at 37% live rows, 226 vs 247 us at 45%). Same 64-row chunk order per column; the fp32 tree inside a chunk may differ (drafter-only numerics, relative differences ~3e-6). MTP_DOWN_BF16_BN=32 restores the original tile."
+    },
+    {
+      "file": "harness/kernels/l2pf/py/__init__.py; model_executor/models/nemotron_h_mtp_packed.py (load_packed); model_executor/models/nemotron_h_mtp_screen.py; v1/spec_decode/llm_base_proposer.py; v1/worker/gpu_model_runner.py; model_executor/layers/fused_moe/experts/humming_nvsc.py",
+      "why": "terrapinelf composition: dadon c5d82720-0817-4e93-be60-21f9d18038e5 merged into terrapinelf 8b419137-21fd-4c28-97a3-ce2ba73fa278 (ercumentyildirim 77315793 + prefill pre-launch), merge base de290fa. Files both changed: l2pf __all__ carries both sides' names; load_packed loads its planes under the bounds mask (77315793) with the three-valued EVICT policy (c5d82720); the screen admits 8-bit Triton digits (c5d82720) and then sctopk (77315793), launches c5d82720's next-pass prefetch pieces before each cascade top-k and runs each top-k through DraftHeadScreen._topk, whose Triton fallback uses _radix_for; the proposer keeps both sides' switches, uses 77315793's first-pass copy batch (c5d82720's side-stream plan, default off, only without it) and c5d82720's launch-argument backup token for one request outside stream capture, else 77315793's zero-copy read; the runner's draft-window prefetch launches c5d82720's gated table when present, else 77315793's paced prefetch, else the plain one, then c5d82720's follow-up table. humming_nvsc._prefill_configs asserts isinstance (not type identity) for the record entry, which humming_pfup.build now derives, so the 6-bit-scale prefill class is admitted with pfup's scheduler text as c5d82720 builds it. Second measurement of this composition (first: 906311d3-040f-4e14-a595-655d80fb7ec7)."
     }
   ]
 }

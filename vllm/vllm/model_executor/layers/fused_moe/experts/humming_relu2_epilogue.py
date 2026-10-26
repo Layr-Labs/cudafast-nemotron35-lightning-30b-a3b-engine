@@ -155,10 +155,15 @@ def _dyn_num_sms(lo: int, hi: int, num_sms: int) -> int:
 class Relu2HummingKernel(HummingKernel):
     dyn_scheduler = False
 
+    def scheduler_code(self):
+        # LOCAL PATCH (cudafast-nemotron35, pfup): humming_pfup overrides this
+        # for the 496-token prefill entry.
+        return _DYN_SCHEDULER
+
     def prepare(self):
         marker = "#if "
         at = self.code.index(marker)
-        extra = _DYN_SCHEDULER if self.dyn_scheduler else ""
+        extra = self.scheduler_code() if self.dyn_scheduler else ""
         self.code = self.code[:at] + extra + _EPILOGUE + self.code[at:]
         super().prepare()
 
@@ -229,6 +234,10 @@ def _w13_k128_enabled():
     return os.environ.get("HUMMING_W13_K128", "1") != "0"
 
 
+def _w13_k128_small_enabled():
+    return os.environ.get("HUMMING_W13_K128_SMALL", "1") != "0"
+
+
 def _w13_k128_params(lo, hi, params):
     if (_w13_k128_enabled() and (lo, hi) == (24, 48)
             and params["block_shape"] == [16, 64, 32]
@@ -236,6 +245,16 @@ def _w13_k128_params(lo, hi, params):
             and params["num_stages"] == 8):
         return dict(params, block_shape=[16, 64, 128],
                     warp_shape=[16, 32, 128], num_stages=3)
+    # LOCAL PATCH (cudafast-nemotron35): the smaller verify buckets (1 to 4 rows:
+    # valid_shape_m <= 24) take the same K128 tile and three-deep ring as the 24-48
+    # bucket, two CTAs per SM. Same 16x64 output tiles and ascending K16 MMA chain per
+    # element (a 128-wide K block is four K16 steps in order), same epilogue, so the
+    # same output bits. HUMMING_W13_K128_SMALL=0 keeps the tuned configs.
+    if (_w13_k128_small_enabled() and hi <= 24
+            and params["block_shape"] == [16, 64, 32]
+            and params["warp_shape"] == [16, 32, 32]):
+        return dict(params, block_shape=[16, 64, 128],
+                    warp_shape=[16, 32, 128], num_stages=3, num_ctas_per_sm=2)
     return params
 
 
@@ -244,8 +263,10 @@ def _variant_key(dyn):
     persistent grids come from the environment, so they are part of it."""
     if not dyn:
         return (False, _w13_k128_enabled())
+    from vllm.model_executor.layers.fused_moe.experts import humming_pfup
+
     return (True, _dyn_num_sms(0, 1 << 30, 0), _dyn_num_sms(0, 1, 0),
-            _w13_k128_enabled())
+            _w13_k128_enabled(), humming_pfup.flags())
 
 
 def _prepare_stock(meta, compute_config, tuning_config, dyn):
@@ -316,10 +337,17 @@ def prepare(meta, compute_config, tuning_config, evict_first=False, dyn=None):
             params.pop("num_sms", None)
             kernel_cls = (DynEvictFirstRelu2HummingKernel if dyn
                           else EvictFirstRelu2HummingKernel)
-            kernel = kernel_cls(**params)
-            kernel.load_cubin()
+            if dyn:
+                # LOCAL PATCH (cudafast-nemotron35, pfup): prefill claim order
+                # and padded-row MMA skip (humming_pfup.py).
+                from vllm.model_executor.layers.fused_moe.experts import humming_pfup
+
+                kernel = humming_pfup.build(kernel_cls, params)
+            else:
+                kernel = kernel_cls(**params)
+                kernel.load_cubin()
             # Exclude the stock-cubin singleton no-op before admitting the hint.
-            assert type(kernel) is kernel_cls
+            assert isinstance(kernel, kernel_cls)
             assert type(original) is (DynRelu2HummingKernel if dyn else Relu2HummingKernel)
             assert ("hm_dyn_claim" in kernel.code) == dyn
             assert "createpolicy.fractional.L2::evict_first" in kernel.code

@@ -67,11 +67,13 @@ PAIR_FUSED_CONFIG = 118
 PAIR_HALFSKIP = os.environ.get("ZSKIP_HALFSKIP", "1") != "0"
 PAIR_HALFSKIP_CONFIG = {PAIR_CONFIG: 114, PAIR_FUSED_CONFIG: 119}
 # Lean paired decode (harness/kernels/zskip/csrc/zskip_lean.cuh): config 119's per-output arithmetic
-# with a shorter per-group instruction stream and per-lane L2 prefetch; with ZSKIP_LEAN=1 it replaces
+# with a shorter per-group instruction stream and per-lane L2 prefetch. Config 663 shares the
+# activation-mask preparation among three output warps without changing any warp's math; with
+# ZSKIP_LEAN=1 it replaces
 # the checked pair config for M=5 after a bitwise check against humming and that config (on by
 # default; ZSKIP_LEAN=0 keeps the pair config): -14 us per call alone, -5 us in situ.
 LEAN_ENABLED = os.environ.get("ZSKIP_LEAN", "1") == "1"
-LEAN_CONFIG = int(os.environ.get("ZSKIP_LEAN_CONFIG", "653"))
+LEAN_CONFIG = int(os.environ.get("ZSKIP_LEAN_CONFIG", "663"))
 # Prefill: MoE layers whose relu^2 activations are sparse enough for the skip to beat humming's
 # 64-row blocks on GB10 (measured per layer on prefill-length calls; the others lose). Layer 51,
 # the last, is left out: the boot prefill graph routes all its rows through one row's experts.

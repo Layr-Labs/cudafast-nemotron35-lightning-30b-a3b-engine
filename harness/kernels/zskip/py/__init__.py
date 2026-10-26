@@ -50,8 +50,8 @@ CONFIGS4.update({400: (2, 2, 4, 32), 401: (3, 2, 4, 32), 402: (6, 2, 4, 32), 403
 CONFIGS4.update({500: (2, 2, 4, 32), 501: (6, 2, 4, 32), 502: (6, 4, 4, 32), 503: (6, 3, 4, 32), 504: (3, 4, 4, 32), 505: (7, 2, 4, 32), 506: (2, 4, 4, 32), 507: (6, 2, 2, 16), 508: (3, 2, 4, 32), 509: (6, 6, 4, 32)})
 CONFIGS4[108] = (2, 4, 1, 16)
 # swap2 decode pairs: 113/118 (unfused/fused prep) and their empty-half dequant skips 114/119
-# lean paired decode (csrc/zskip_lean.cuh): config -> (warps per CTA, ring depth, flags); default 653
-LEAN_CONFIGS = {604: (1, 2, 260), 613: (1, 2, 2820), 616: (1, 2, 2824), 630: (1, 2, 0), 640: (1, 3, 272), 645: (1, 4, 272), 653: (1, 3, 274), 656: (1, 4, 274), 658: (1, 2, 274)}
+# lean paired decode (csrc/zskip_lean.cuh): config -> (warps per CTA, ring depth, flags); default 663
+LEAN_CONFIGS = {604: (1, 2, 260), 613: (1, 2, 2820), 616: (1, 2, 2824), 630: (1, 2, 0), 640: (1, 3, 272), 645: (1, 4, 272), 653: (1, 3, 274), 656: (1, 4, 274), 658: (1, 2, 274), 663: (3, 3, 274)}
 PAIR_CONFIGS = (113, 114, 118, 119) + tuple(LEAN_CONFIGS)
 COMPUTEONLY = 5     # timing probe (lean configs): no weight/scale/activation loads
 DEFAULT_CONFIG = int(os.environ.get("ZSKIP_CONFIG", "0"))

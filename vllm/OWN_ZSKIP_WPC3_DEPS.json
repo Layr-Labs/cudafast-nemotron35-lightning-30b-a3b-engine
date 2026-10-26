@@ -1,0 +1,7 @@
+[
+  {
+    "submissionId": "f5904a37-e3aa-4c29-9a8a-4cecee7b6184",
+    "rationale": "Current promoted record; this candidate is that tree plus one lean zskip launch configuration.",
+    "evidence": "origin/main resolves to 8695be87 (Validate submission f5904a37), official 2.67234; the candidate is one commit on top of it."
+  }
+]

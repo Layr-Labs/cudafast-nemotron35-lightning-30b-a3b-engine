@@ -134,7 +134,7 @@ CUDA-compiled, GPU-run, token-verified or timed locally. The new fused variant
 has no published timing. Dadon's c113 timing cannot be claimed for c118.
 
 
-## Lean paired decode (configs 600.., ZSKIP_LEAN=1, config 653 for M=5)
+## Lean paired decode (configs 600.., ZSKIP_LEAN=1, config 663 for M=5)
 
 `csrc/zskip_lean.cuh`, `down_lean_kernel`: config 119's per-output computation (swap2 layout, one
 warp per 128-column tile pair, the same MMA chain over the active k16 groups, the same dequantised
@@ -147,7 +147,10 @@ values and epilogue), with a shorter instruction stream and L2 prefetch:
   into the HMUL2 operand selectors; a ring of R + 1 slots refilled before each group's math;
 - 119's -0 guard on every intermediate accumulator state (placed after the next group's
   dequantisation, plus the final state), dense recompute on a -0;
-- F_WPF (653: R = 3, D = 2): each lane prefetches its own pieces of group j + R + D into L2.
+- F_WPF (663: WPC = 3, R = 3, D = 2): each lane prefetches its own pieces of group j + R + D into
+  L2. Three adjacent output warps share the row and activation-mask preparation in one CTA; their
+  ordered lists, weight work, accumulator chains and output tiles remain separate. Config 653 is the
+  otherwise identical one-warp-per-CTA diagnostic configuration.
   F_BPF (613) bulk-prefetches whole rows per block instead.
 
 Bitwise: 5152 captured real decode windows (23 layers x 7 sequences x 4 windows x M=1..8) equal

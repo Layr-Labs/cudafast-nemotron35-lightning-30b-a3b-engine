@@ -30,7 +30,6 @@ from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
-# LOCAL PATCH (cudafast-nemotron35): blocks BlockPool._canonical_head restores.
 _CANONICAL_HEAD = (
     32 if os.environ.get("VLLM_CANONICAL_BLOCK_HEAD", "1") != "0" else 0
 )

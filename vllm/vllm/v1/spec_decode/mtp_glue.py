@@ -1,4 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
 """LOCAL PATCH (cudafast-nemotron35): the MTP draft loop's small input moves in
 one launch each.
 
@@ -73,14 +72,12 @@ def _step_inputs_kernel(tok_ptr, ids_ptr, hsrc, hdst, hsrc_stride,
     if req_idx >= batch_size:
         tl.store(out_slot_mapping_ptr + req_idx, PAD_ID)
         return
-    # input_ids[:batch_size] = draft_token_ids.int(); hidden_states[:batch_size] = hidden
     tl.store(ids_ptr + req_idx, tl.load(tok_ptr + req_idx).to(tl.int32))
     o = tl.arange(0, BLOCK)
     for off in range(0, HID, BLOCK):
         m = off + o < HID
         tl.store(hdst + req_idx * HID + off + o,
                  tl.load(hsrc + req_idx * hsrc_stride + off + o, mask=m), mask=m)
-    # eagle_step_slot_mapping_metadata_kernel
     position = tl.load(positions_ptr + req_idx)
     new_position = position + 1
     exceeds_max = new_position >= max_model_len
@@ -126,8 +123,6 @@ def step_ok(tok, ids_buf, hidden_src, hidden_buf, positions_1d, batch_size) -> b
 def _first_pass_inputs_kernel(tgt_ids, next_ids, idx_ptr, ids_dst, tgt_pos, pos_dst,
                               tgt_hidden, hid_dst, hid_stride, num_tokens, batch_size,
                               HID: tl.constexpr, BLOCK: tl.constexpr):
-    # input_ids[:n-1] = target_ids[1:]; input_ids[idx] = next_ids;
-    # positions[:n] = target_positions; hidden_states[:n] = target_hidden
     t = tl.program_id(0)
     write = t < num_tokens - 1
     tn = tl.minimum(t + 1, num_tokens - 1)

@@ -132,11 +132,6 @@ class FreshPrefillGraph:
                 self.graph_lite = graph
             except Exception:  # noqa: BLE001
                 self.graph_lite = None
-        # LOCAL PATCH (cudafast-nemotron35): early launch (gpu_model_runner
-        # _fresh_prefill_early). The request tensors above are written only by
-        # replay(); early_sig names what the last replay wrote them for: the
-        # request's block ids plus the plan state of every FlashInfer wrapper
-        # the graph reads by reference.
         self.early_sig = None
         self.wrappers = _wrappers(self.metadata)
         for wrapper in self.wrappers:

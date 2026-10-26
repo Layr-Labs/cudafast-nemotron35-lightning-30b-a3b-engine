@@ -416,6 +416,10 @@
       "why": "ArthurOstapenko (ours): verify-path routed schedule only. (1) The target verify's paired routed-down call uses dadon's zskip config 113 (one prep launch, no empty-half skip) with a three-deep load ring instead of config 119 with a two-deep ring, when a boot-time bitwise check of every layer's pair against config 119 passes on 1-8 rows and on the verify prefix; otherwise the layer keeps 119. (2) The routed up projection's 24-48-row verify bucket uses the existing evict-first derived Humming kernel (the same class the 496-token prefill call uses, in its stock and nvsc forms). Same tiles, ascending K16 MMA chain, fp32 accumulation, dequantisation, negative-zero repair and BF16 epilogue; only kernel selection, load ring depth and an L2 cache hint change. VSW_W2_CONFIG=0, VSW_W2_RING=0 and VSW_EVICT=0 restore the main."
     },
     {
+      "file": "(composition)",
+      "why": "e-man07 composition on the record 1e1c2581-e506-4ca4-9341-5f08ffceec86: ArthurOstapenko 53f66afe-0252-402f-b34b-19bea81f1e74 carried byte for byte; jacklightChen 1df4df4a-6dc5-4ecf-8d49-b372ba3726fd carried byte for byte; terrapinelf 80f6fced-3c74-4ce1-9913-058f05e95ec7 carried byte for byte. No new arithmetic."
+    },
+    {
       "file": "vllm/v1/core/block_pool.py",
       "why": "terrapinelf: with prefix caching disabled, when every block is free again (the last request is gone) BlockPool._canonical_head puts blocks 1..32 back at the head of the free queue in id order, so the next request gets the block ids the first request after boot got. Freed blocks keep no readable content; only which physical blocks hold a request's KV and Mamba state changes. VLLM_CANONICAL_BLOCK_HEAD=0 disables."
     },
@@ -432,8 +436,12 @@
       "why": "terrapinelf: the MTP draft loop's small input moves in one launch each: the first pass's shifted ids, next-token write, positions and hidden rows; the sampled-row gathers after it; and before every later pass the drafted-token cast, the hidden-row copy and eagle_step_slot_mapping_metadata_kernel's arithmetic. Integer casts, integer adds and byte copies into the same buffers. VLLM_MTP_FUSED_GLUE=0 keeps the stock operations."
     },
     {
-      "file": "vllm/v1/engine/core.py (+ harness/vllm_resident/resident.py, backends.py)",
-      "why": "Ours (C57): a synchronous single-stream caller passes the number of tokens it still wants to one engine step. When that budget is at most num_spec_tokens + 1 and a batch is queued, the core first takes the queued batch's result (which the caller waits for either way); if its tokens already cover the budget it returns that output without scheduling another speculative round whose output the caller cannot need, and otherwise it schedules ahead exactly as before, so the next batch is always scheduled before the previous output is applied. A sequence drained this way is restarted from its context if it is ever continued. No target computation, sampling, draft decision, request limit or numerical format changes; the budget is scoped to that one step. C57_LASTDRAFT=0 restores the main's scheduling."
+      "file": "(composition)",
+      "why": "e-man07 composition on the record e19e73d6-0b9e-4eea-9fae-c058e7b98884: kaankolcu 829973af-457a-4c0d-ab95-5f37c03bc94e carried byte for byte. No new arithmetic."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "Draft-screen weight and scale loads use evict_last so the same matrices can stay in L2 across the draft passes of one cycle. Same addresses, same arithmetic, same stored scores. VLLM_MTP_SCREEN_KEEP=0 restores evict_first."
     }
   ]
 }

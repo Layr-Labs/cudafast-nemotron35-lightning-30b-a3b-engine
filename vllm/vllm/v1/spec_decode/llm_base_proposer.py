@@ -636,8 +636,6 @@ class SpecDecodeBaseProposer:
             # batch. Compact the topk indices for each request's last token.
             self.model.model.compact_topk_indices(token_indices_to_sample)
 
-        # LOCAL PATCH (cudafast-nemotron35): the three gathers of the sampled
-        # row (hidden twice, position once) in one launch (mtp_glue.py).
         fused_first = None
         if (
             self.num_speculative_tokens > 1
@@ -777,9 +775,6 @@ class SpecDecodeBaseProposer:
             # Update the inputs.
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax() returns int64 by default.
-            # LOCAL PATCH (cudafast-nemotron35): token cast, hidden-row copy and
-            # the slot-mapping step in one launch (mtp_glue.py); the copies move
-            # ahead of the plan build, which reads neither buffer.
             fused_step = (
                 not self.use_heterogeneous_vocab
                 and not self.constant_draft_positions
@@ -1069,8 +1064,6 @@ class SpecDecodeBaseProposer:
                 token_indices_to_sample = cad.query_start_loc[1:] - 1
 
             num_tokens = target_token_ids.shape[0]
-            # LOCAL PATCH (cudafast-nemotron35): the shift, the next-token write,
-            # the positions and the hidden rows below in one launch (mtp_glue.py).
             if (
                 not self.uses_mrope
                 and not (self.uses_xdrope_dim > 0)

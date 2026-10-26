@@ -226,8 +226,6 @@ class VllmBackend:
             logprobs=TOP_K if logprobs else None,
             detokenize=False,
             output_kind=self._delta,
-            # A fresh object per request that nothing else holds: the engine's
-            # copy of it may be shallow (no deepcopy on the timed prefill path).
             skip_clone=True,
         )
 
@@ -278,39 +276,8 @@ class VllmBackend:
             emitted = self._collect()
         return emitted
 
-    def step_with_budget(self, budget: int) -> list[Emit]:
-        """One step for a caller that still wants `budget` tokens.
-
-        Near the end of the budget the engine core may return a queued
-        batch's output without first speculating another round, when that
-        output already covers the budget. The budget applies to this call
-        alone; the generation limit and scheduler arithmetic are unchanged.
-        """
-        if os.environ.get("C57_LASTDRAFT", "1") == "0" or self.depth <= 0:
-            return self.step()
-        core = getattr(self._engine.engine_core, "engine_core", None)
-        if core is None:
-            return self.step()
-        core._c57_decode_budget = budget
-        core._c57_drained = False
-        try:
-            emitted = self.step()
-        finally:
-            core._c57_decode_budget = None
-        if getattr(core, "_c57_drained", False):
-            core._c57_drained = False
-            self._c57_tail_drained = True
-        return emitted
-
-    def tail_drained(self) -> bool:
-        """The live request's queue was drained at a budget's end, so no batch
-        of it is in flight. The engine never continues such a request ahead;
-        the session restarts it from its context instead."""
-        return self._live is not None and getattr(self, "_c57_tail_drained", False)
-
     def abort(self) -> bool:
         running = False
-        self._c57_tail_drained = False
         if self._live is not None:
             running = self._engine.has_unfinished_requests()
             self._engine.abort_request([self._live])

@@ -305,9 +305,6 @@ PINNED_SOURCE_GUARDS = True
 _SPEC_META_CACHE = os.environ.get("VLLM_SPEC_META_CACHE", "1") != "0"
 _SPEC_META_CACHE_CHECK = os.environ.get("VLLM_SPEC_META_CACHE_CHECK", "0") == "1"
 
-# LOCAL PATCH (cudafast-nemotron35): early launch of the fresh 496 prefill graph
-# (GPUModelRunner._fresh_prefill_early). VLLM_PREFILL_EARLY_CHECK=1 also replays
-# it the ordinary way and compares inputs and outputs.
 _PREFILL_EARLY = os.environ.get("VLLM_PREFILL_EARLY", "1") != "0"
 _PREFILL_EARLY_CHECK = os.environ.get("VLLM_PREFILL_EARLY_CHECK", "0") == "1"
 
@@ -5030,7 +5027,6 @@ class GPUModelRunner(
             self._fresh_early_ids = ids
             self._fresh_early_event = torch.cuda.Event()
         else:
-            # The previous early upload read this pinned buffer.
             self._fresh_early_event.synchronize()
         ids.numpy()[:] = new.prompt_token_ids
         if scheduler_output.new_block_ids_to_zero:

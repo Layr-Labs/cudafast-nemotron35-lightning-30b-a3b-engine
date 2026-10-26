@@ -61,10 +61,6 @@ def _copy_batch_kernel(desc, N, BLOCK: tl.constexpr, DBLOCK: tl.constexpr):
 
 @triton.jit(do_not_specialize=["desc"])
 def _copy_batch_par_kernel(desc, BLOCK: tl.constexpr):
-    # LOCAL PATCH (cudafast-nemotron35): one program per recorded copy, for a
-    # batch whose copies are independent (CopyBatch._independent): no copy
-    # writes bytes another copy reads or writes, so their order cannot change
-    # a byte and every copy's source and destination latencies overlap.
     i = tl.program_id(0)
     o = tl.arange(0, BLOCK)
     dst = tl.load(desc + 3 * i).to(tl.pointer_type(tl.uint8))

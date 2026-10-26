@@ -133,6 +133,7 @@ def _nvfp4_rows_dot(
     BASE: tl.constexpr = False,
     scatter_ptr=None,  # [N] fp32: the result is also stored at its row, when SCATTER
     SCATTER: tl.constexpr = False,
+    KEEP: tl.constexpr = True,
 ):
     """RMODE 0: rows from GATHER as before. 1: rows = rows_ptr[r] + (r // CPER) * CHUNK
     (first-stage top-k indices within their chunk). 2: rows = rows_ptr[c * CPER + ref_ptr[r]]
@@ -178,18 +179,33 @@ def _nvfp4_rows_dot(
     acc = tl.zeros((BR,), dtype=tl.float32)
     for b0 in range(0, NBYTES, BB):
         ob = b0 + tl.arange(0, BB)
-        wb = tl.load(
-            w_ptr + rows[:, None] * NBYTES + ob[None, :],
-            mask=wr[:, None],
-            other=0,
-            eviction_policy="evict_first",
-        ).to(tl.int32)
-        og = (b0 // 8) + tl.arange(0, BB // 8)
-        sc = tl.load(
-            s_ptr + rows[:, None] * (NBYTES // 8) + og[None, :],
-            mask=wr[:, None],
-            other=0.0,
-        ).to(tl.float32)
+        if KEEP:
+            wb = tl.load(
+                w_ptr + rows[:, None] * NBYTES + ob[None, :],
+                mask=wr[:, None],
+                other=0,
+                eviction_policy="evict_last",
+            ).to(tl.int32)
+            og = (b0 // 8) + tl.arange(0, BB // 8)
+            sc = tl.load(
+                s_ptr + rows[:, None] * (NBYTES // 8) + og[None, :],
+                mask=wr[:, None],
+                other=0.0,
+                eviction_policy="evict_last",
+            ).to(tl.float32)
+        else:
+            wb = tl.load(
+                w_ptr + rows[:, None] * NBYTES + ob[None, :],
+                mask=wr[:, None],
+                other=0,
+                eviction_policy="evict_first",
+            ).to(tl.int32)
+            og = (b0 // 8) + tl.arange(0, BB // 8)
+            sc = tl.load(
+                s_ptr + rows[:, None] * (NBYTES // 8) + og[None, :],
+                mask=wr[:, None],
+                other=0.0,
+            ).to(tl.float32)
         if HCOLS:
             hl = tl.load(h_ptr + tl.load(hcols_ptr + 2 * ob))
             hh = tl.load(h_ptr + tl.load(hcols_ptr + 2 * ob + 1))
@@ -216,6 +232,7 @@ def _nvfp4_rows_dot_part(
     h_ptr, w_ptr, s_ptr, rows_ptr, part_ptr, R,
     NBYTES: tl.constexpr, BR: tl.constexpr, BB: tl.constexpr, INDEX32: tl.constexpr,
     gate_ptr=None, GATED: tl.constexpr = False, launch_pdl: tl.constexpr = False,
+    KEEP: tl.constexpr = True,
 ):
     """LOCAL PATCH (cudafast-nemotron35): one BB-byte block (program axis 1) of
     _nvfp4_rows_dot's gathered rows: the exact term that kernel's loop adds to its
@@ -239,18 +256,33 @@ def _nvfp4_rows_dot_part(
     wr = rmask
     b0 = kb * BB
     ob = b0 + tl.arange(0, BB)
-    wb = tl.load(
-        w_ptr + rows[:, None] * NBYTES + ob[None, :],
-        mask=wr[:, None],
-        other=0,
-        eviction_policy="evict_first",
-    ).to(tl.int32)
-    og = (b0 // 8) + tl.arange(0, BB // 8)
-    sc = tl.load(
-        s_ptr + rows[:, None] * (NBYTES // 8) + og[None, :],
-        mask=wr[:, None],
-        other=0.0,
-    ).to(tl.float32)
+    if KEEP:
+        wb = tl.load(
+            w_ptr + rows[:, None] * NBYTES + ob[None, :],
+            mask=wr[:, None],
+            other=0,
+            eviction_policy="evict_last",
+        ).to(tl.int32)
+        og = (b0 // 8) + tl.arange(0, BB // 8)
+        sc = tl.load(
+            s_ptr + rows[:, None] * (NBYTES // 8) + og[None, :],
+            mask=wr[:, None],
+            other=0.0,
+            eviction_policy="evict_last",
+        ).to(tl.float32)
+    else:
+        wb = tl.load(
+            w_ptr + rows[:, None] * NBYTES + ob[None, :],
+            mask=wr[:, None],
+            other=0,
+            eviction_policy="evict_first",
+        ).to(tl.int32)
+        og = (b0 // 8) + tl.arange(0, BB // 8)
+        sc = tl.load(
+            s_ptr + rows[:, None] * (NBYTES // 8) + og[None, :],
+            mask=wr[:, None],
+            other=0.0,
+        ).to(tl.float32)
     hl = tl.load(h_ptr + 2 * ob)
     hh = tl.load(h_ptr + 2 * ob + 1)
     lo, hi = _e2m1_pair(wb)
@@ -288,6 +320,9 @@ def screen_ksplit_enabled() -> bool:
     return os.environ.get("VLLM_MTP_SCREEN_KSPLIT", "1") != "0"
 
 
+_SCREEN_KEEP = os.environ.get("VLLM_MTP_SCREEN_KEEP", "1") != "0"
+
+
 def _rows_dot_ksplit(h, w, s, rows, gscale, out, part, gated=False):
     n_out = out.numel()
     nbytes = w.shape[1]
@@ -303,7 +338,7 @@ def _rows_dot_ksplit(h, w, s, rows, gscale, out, part, gated=False):
     gated = gated and ok
     _nvfp4_rows_dot_part[(triton.cdiv(n_out, br), nk)](
         h, w, s, rows, part, n_out,
-        NBYTES=nbytes, BR=br, BB=64, INDEX32=index32,
+        NBYTES=nbytes, BR=br, BB=64, INDEX32=index32, KEEP=_SCREEN_KEEP,
         gate_ptr=gate, GATED=gated, launch_pdl=mtp_pdl(),
         num_warps=4, num_stages=2,
     )
@@ -329,7 +364,7 @@ def _rows_dot(h, w, s, rows, gscale, out, gather, gated=False, hcols=None, ref=N
     gated = gated and ok
     _nvfp4_rows_dot[(triton.cdiv(n_out, br),)](
         h, w, s, rows if gather else out, out, n_out, gscale,
-        NBYTES=nbytes, GATHER=gather, BR=br, BB=64, INDEX32=index32,
+        NBYTES=nbytes, GATHER=gather, BR=br, BB=64, INDEX32=index32, KEEP=_SCREEN_KEEP,
         gate_ptr=gate, GATED=gated,
         num_warps=4, num_stages=2,
         launch_pdl=mtp_pdl(),

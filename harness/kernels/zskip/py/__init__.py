@@ -50,7 +50,10 @@ CONFIGS4.update({400: (2, 2, 4, 32), 401: (3, 2, 4, 32), 402: (6, 2, 4, 32), 403
 CONFIGS4.update({500: (2, 2, 4, 32), 501: (6, 2, 4, 32), 502: (6, 4, 4, 32), 503: (6, 3, 4, 32), 504: (3, 4, 4, 32), 505: (7, 2, 4, 32), 506: (2, 4, 4, 32), 507: (6, 2, 2, 16), 508: (3, 2, 4, 32), 509: (6, 6, 4, 32)})
 CONFIGS4[108] = (2, 4, 1, 16)
 # swap2 decode pairs: 113/118 (unfused/fused prep) and their empty-half dequant skips 114/119
-PAIR_CONFIGS = (113, 114, 118, 119)
+# lean paired decode (csrc/zskip_lean.cuh): config -> (warps per CTA, ring depth, flags); default 653
+LEAN_CONFIGS = {604: (1, 2, 260), 613: (1, 2, 2820), 616: (1, 2, 2824), 630: (1, 2, 0), 640: (1, 3, 272), 645: (1, 4, 272), 653: (1, 3, 274), 656: (1, 4, 274), 658: (1, 2, 274)}
+PAIR_CONFIGS = (113, 114, 118, 119) + tuple(LEAN_CONFIGS)
+COMPUTEONLY = 5     # timing probe (lean configs): no weight/scale/activation loads
 DEFAULT_CONFIG = int(os.environ.get("ZSKIP_CONFIG", "0"))
 
 _lib = None
@@ -153,7 +156,8 @@ def config_info(config: int) -> dict:
     if rc != 0:
         raise ValueError(f"zskip config {config}: {rc}")
     return {"regs": info[0], "smem": info[1], "warps": info[2], "ctas_per_sm": info[3],
-            "shape": (1, 3, 1, 16) if config in PAIR_CONFIGS else CONFIGS.get(config) or CONFIGS4.get(config)}
+            "shape": LEAN_CONFIGS.get(config) or ((1, 3, 1, 16) if config in PAIR_CONFIGS
+                                                  else CONFIGS.get(config) or CONFIGS4.get(config))}
 
 
 BI_BYTES = 5120
@@ -283,7 +287,7 @@ def down(a: torch.Tensor, sorted_ids: torch.Tensor, expert_ids: torch.Tensor, nu
     if config is None:
         config = 100
     if (config in PAIR_CONFIGS) != (packed.layout == "swap2"):
-        raise ValueError("configs 113/114/118/119 require swap2; legacy configs require their original layout")
+        raise ValueError("configs 113/114/118/119 and the lean configs require swap2; legacy configs require their original layout")
     shape_m = a.shape[0]
     assert a.dtype == torch.bfloat16 and a.shape[1] == K and a.stride(1) == 1
     assert out.dtype == torch.bfloat16 and out.shape[1] == N and out.stride(1) == 1 and out.shape[0] >= shape_m

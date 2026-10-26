@@ -45,13 +45,21 @@ for li in [int(v) for v in os.environ.get("LAYERS", "1,13,27,40,51").split(",")]
         d2 = int((ref2.view(torch.int16) != out2.view(torch.int16)).sum()); bad += d2; total += ref.numel()
         if d or d2:
             print(f"  layer {li}: {d} / {d2} differ (block_m={kw2.get('block_m', '?')})", flush=True)
+        for wpc in (360, 361, 362, 363, 364):  # 64-row configs: humming's own block-64 layout
+            for a, r in ((act, ref), (neg, ref2)):
+                out3 = torch.zeros_like(ref)
+                pzskip.down(a, kw2["sorted_ids"], kw2["expert_ids"], kw2["num_tokens_padded"], packed, out3, stats=stats, wpc=wpc)
+                torch.cuda.synchronize()
+                d3 = int((r.view(torch.int16) != out3.view(torch.int16)).sum()); bad += d3; total += r.numel()
+                if d3:
+                    print(f"  layer {li}: config {wpc}: {d3} differ", flush=True)
         def tm(f, it=20):
             for _ in range(3): f()
             torch.cuda.synchronize(); t = time.perf_counter()
             for _ in range(it): f()
             torch.cuda.synchronize(); return (time.perf_counter() - t) / it * 1e6
         times["humming"].append(tm(lambda: HummingMethod.forward_layer(layer=ex.layer, inputs=act, input_scale=None, outputs=ref2, sublayer_name="w2", **kw2)))
-        for wpc in (2, 200, 201, 202, 203, 204):
+        for wpc in (2, 200, 201, 202, 203, 204, 360, 361, 362, 363, 364):
             times.setdefault(f"pz{wpc}", []).append(tm(lambda: pzskip.down(act, kw2["sorted_ids"], kw2["expert_ids"], kw2["num_tokens_padded"], packed, out2, wpc=wpc)))
         times["pz_dense"].append(tm(lambda: pzskip.down(act, kw2["sorted_ids"], kw2["expert_ids"], kw2["num_tokens_padded"], packed, out2, dense=True)))
     del ex, packed, raw

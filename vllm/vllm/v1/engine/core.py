@@ -650,7 +650,29 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
-        if self.scheduler.has_requests():
+        # C57: a synchronous single-stream caller near the end of its budget
+        # waits for the oldest queued batch either way. Take that batch's
+        # result first; when its tokens already cover the caller's remaining
+        # budget, return it without speculating another round whose output
+        # the caller cannot need. Otherwise schedule ahead exactly as before,
+        # so the scheduler and the worker see the usual order (the next batch
+        # is always scheduled before the previous output is applied).
+        drain_tail = False
+        tail_budget = getattr(self, "_c57_decode_budget", None)
+        if (
+            batch_queue
+            and tail_budget is not None
+            and 0 < tail_budget <= self.scheduler.num_spec_tokens + 1
+            and self.vllm_config.scheduler_config.max_num_seqs == 1
+        ):
+            queued = batch_queue[-1][0].result()
+            sampled = getattr(queued, "sampled_token_ids", None)
+            drain_tail = (
+                bool(sampled) and len(sampled) == 1 and len(sampled[0]) >= tail_budget
+            )
+            if drain_tail:
+                self._c57_drained = True
+        if self.scheduler.has_requests() and not drain_tail:
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(

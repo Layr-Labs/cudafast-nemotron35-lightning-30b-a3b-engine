@@ -116,8 +116,11 @@ class Session:
             raise RefusedError("no live sequence; sync first")
         return self.frontier
 
-    def _engine_step(self) -> list[Emit]:
-        emitted = self.b.step()
+    def _engine_step(self, budget: int | None = None) -> list[Emit]:
+        step_with_budget = getattr(self.b, "step_with_budget", None)
+        emitted = (step_with_budget(budget)
+                   if budget is not None and callable(step_with_budget)
+                   else self.b.step())
         if not emitted:
             raise RefusedError("the engine step emitted nothing")
         if self.b.depth > 0:
@@ -130,6 +133,13 @@ class Session:
     def _spent(self) -> bool:
         """The bounded request emitted all it may; the engine has stopped."""
         return not self.ahead and self.left is not None and self.left <= 0
+
+    def _drained(self) -> bool:
+        """The engine drained this sequence's queue at a budget's end and holds
+        no batch of it in flight; it is restarted from its context, never
+        stepped ahead from there."""
+        tail_drained = getattr(self.b, "tail_drained", None)
+        return not self.ahead and callable(tail_drained) and tail_drained()
 
     def sync(
         self, tokens: list[int], max_tokens: int | None = None, top_logits: bool = True
@@ -151,7 +161,7 @@ class Session:
     def _feed(self, token: int) -> None:
         """Consume `token` at the frontier and advance to the next one."""
         frontier = self._need_frontier()
-        if token != frontier.token or self._spent():
+        if token != frontier.token or self._spent() or self._drained():
             # Teacher forcing, or a bounded sequence asked to go on: prefill
             # again from the context. Correct, and deliberately not fast.
             self.sync(self.ctx + [token])
@@ -177,11 +187,11 @@ class Session:
             raise RefusedError("a cycle needs a positive budget")
         self._check_ids([fed])
         frontier = self._need_frontier()
-        if fed != frontier.token or self._spent():
+        if fed != frontier.token or self._spent() or self._drained():
             self.sync(self.ctx + [fed])
             return [fed]
         if not self.ahead:
-            self.ahead.extend(self._engine_step())
+            self.ahead.extend(self._engine_step(budget))
         m = min(len(self.ahead), budget)
         taken = [self.ahead.popleft() for _ in range(m)]
         committed = [fed] + [e.token for e in taken[:-1]]
@@ -210,6 +220,12 @@ class Session:
         return [t for t, _ in top[:k]], [v for _, v in top[:k]]
 
     def _check_ids(self, tokens: list[int]) -> None:
+        # Fast path: every id a plain int inside the vocabulary (bool is not
+        # type int). Anything else takes the loop below, which names the token.
+        if all(type(t) is int for t in tokens) and (
+            not tokens or (min(tokens) >= 0 and max(tokens) < self.b.vocab_size)
+        ):
+            return
         for t in tokens:
             if not isinstance(t, int) or isinstance(t, bool) or not 0 <= t < self.b.vocab_size:
                 raise RefusedError(f"token {t!r} is outside the vocabulary")

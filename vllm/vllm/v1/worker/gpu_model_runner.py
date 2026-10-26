@@ -300,6 +300,10 @@ def _keep_verify_rows_for(
 
 # Protect asynchronous H2D sources; switchable for in-process cost screening.
 PINNED_SOURCE_GUARDS = True
+# LOCAL PATCH (cudafast-nemotron35): pacing of the drafter's first-weight L2
+# prefetch (_l2pf_prefetch("draft")); 0 issues every piece at once.
+_L2PF_DRAFT_PACE_NS = int(os.environ.get("L2PF_DRAFT_PACE_NS", "400"))
+_L2PF_DRAFT_PACE_BURST = int(os.environ.get("L2PF_DRAFT_PACE_BURST", "2"))
 
 # LOCAL PATCH (cudafast-nemotron35): spec-decode metadata cache (_calc_spec_decode_metadata).
 _SPEC_META_CACHE = os.environ.get("VLLM_SPEC_META_CACHE", "1") != "0"
@@ -310,6 +314,8 @@ _SPEC_META_CACHE_CHECK = os.environ.get("VLLM_SPEC_META_CACHE_CHECK", "0") == "1
 # it the ordinary way and compares inputs and outputs.
 _PREFILL_EARLY = os.environ.get("VLLM_PREFILL_EARLY", "1") != "0"
 _PREFILL_EARLY_CHECK = os.environ.get("VLLM_PREFILL_EARLY_CHECK", "0") == "1"
+# LOCAL PATCH (cudafast-nemotron35): verify-step output copy right after sampling.
+_OUTPUT_COPY_AFTER_SAMPLE = os.environ.get("VLLM_OUTPUT_COPY_AFTER_SAMPLE", "1") != "0"
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -5171,6 +5177,16 @@ class GPUModelRunner(
         else:
             routed_experts_snapshot = None
             copy_ready_event = None
+            if spec_decode_metadata is not None and _OUTPUT_COPY_AFTER_SAMPLE:
+                # LOCAL PATCH (cudafast-nemotron35): a verify step's sampled ids
+                # are final once the sampler has run; the device-to-host copy
+                # waits for that point instead of for every operation queued
+                # before it, which includes the next draft loop queued below.
+                # A prefill step (no spec metadata) keeps waiting for its draft
+                # pass, so the seed token still returns after the whole seed
+                # work. The copy reads only sampled_token_ids.
+                copy_ready_event = torch.cuda.Event(enable_timing=False)
+                copy_ready_event.record()
 
         self._draft_token_ids = None
         self._draft_probs = None
@@ -5654,7 +5670,16 @@ class GPUModelRunner(
                         if name.endswith("eh_proj.weight"):
                             found["draft"] = p
             self._l2pf_tensors = found
-        l2pf.prefetch(self._l2pf_tensors.get(which), max_bytes=20 << 20)
+        t = self._l2pf_tensors.get(which)
+        if which == "draft" and _L2PF_DRAFT_PACE_NS > 0 and hasattr(l2pf, "prefetch_paced"):
+            # LOCAL PATCH (cudafast-nemotron35): the drafter's first weight is
+            # prefetched at a fixed rate (L2PF_DRAFT_PACE_NS per 64 KB piece after
+            # the first L2PF_DRAFT_PACE_BURST), so the sampler and draft-input
+            # kernels it overlaps are not queued behind the whole range.
+            # Prefetches move no value. L2PF_DRAFT_PACE_NS=0 issues them at once.
+            l2pf.prefetch_paced(t, 20 << 20, _L2PF_DRAFT_PACE_NS, _L2PF_DRAFT_PACE_BURST)
+            return
+        l2pf.prefetch(t, max_bytes=20 << 20)
 
     def propose_draft_token_ids(
         self,

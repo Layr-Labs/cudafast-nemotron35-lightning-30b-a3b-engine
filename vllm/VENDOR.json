@@ -370,6 +370,18 @@
     {
       "file": "harness/kernels/cmp2 (+ vllm/v1/worker/gpu_model_runner.py)",
       "why": "CMP2=1 (default): transparent generic-compression VMM backing for immutable fp8c codes, apk12 planes, shared Marlin weights/scales and target lm_head including its unit-major scale copy. Full load-time storage byte checks precede pointer rebinding and engine capture. Original storages stay alive; unsupported or failed allocations leave ordinary tensors. CMP2=0 disables. Target and drafter formats and arithmetic are unchanged."
+    },
+    {
+      "file": "harness/kernels/cmp2/py/__init__.py; vllm/model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "Own large immutable nativeMTP physical-backing extension on ENTIREhighestBDO. Separate bounded512MiB transactions for EX/BASE/RI/RAW planes (SMptr and object cachekeys preserved) and checkpoint-derived screen matrices before original fold check and CUDAgraph capture. Original targetfamily selection/transaction and original C++ driver unchanged. Whole-storage bytes/metadata checked before all-or-nothing rebinding; old storages kept, newfamily failure cannot roll back already successful parentfamily. No mutable inference/cache/output moved, no math/format/gate/policy change. CMP2_MTP_PLANES=0 and CMP2_MTP_SCREEN=0 disable respective additions; CMP2=0 original globaloff. No local execution or activated gain claim; full new whole unverified."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "Useful pendingAF af057554-b498-43c2-97ae-d5fed50e2ef0/PR526 exactfullscreenblob5e574267a0eebe4c44f1b1cc97e548d57d6df745, only ownimmutablebacking hook composed before fold/capture. 16group pre/top1024per2048, next16group survivor scores then original256/32 refine/fullK/BF16/min-ID/4wordgate. Drafter membership/coarseFP32order differ; targetverify unchanged. No newline/denominator, verifyinputcopy, sharedpacked epilogues or targetSSMchange imported; whole unverified, no localexecution/gain claim."
+    },
+    {
+      "file": "vllm/v1/worker/gpu_model_runner.py",
+      "why": "terrapinelf e1b0d6b8 batch-1 verify input ids by slice copy, on the jacklightChen 2c1d5c87 MTP plane/screen graft. _prepare_input_ids writes input_ids[0] from prev_sampled_token_ids[0,0] and input_ids[1:1+L] from the first L flattened draft ids, the same slots the four-index scatter writes, with the scatter's int32 cast. VLLM_VERIFY_IDS_SLICE=0 keeps the scatter. Batch>1 and non-contiguous index patterns fall through unchanged."
     }
   ]
 }

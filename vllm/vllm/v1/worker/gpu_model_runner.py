@@ -304,6 +304,7 @@ PINNED_SOURCE_GUARDS = True
 # LOCAL PATCH (cudafast-nemotron35): spec-decode metadata cache (_calc_spec_decode_metadata).
 _SPEC_META_CACHE = os.environ.get("VLLM_SPEC_META_CACHE", "1") != "0"
 _SPEC_META_CACHE_CHECK = os.environ.get("VLLM_SPEC_META_CACHE_CHECK", "0") == "1"
+_VERIFY_IDS_SLICE = os.environ.get("VLLM_VERIFY_IDS_SLICE", "1") != "0"
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -1958,6 +1959,32 @@ class GPUModelRunner(
                 self.input_batch.prev_sampled_token_ids[:num_common_tokens, 0],
                 non_blocking=True,
             )
+            return
+        if (
+            _VERIFY_IDS_SLICE
+            and num_reqs == 1
+            and prev_indices == [0]
+            and sample_flattened_indices == [0]
+            and spec_flattened_indices == list(range(1, 1 + len(spec_flattened_indices)))
+            and prev_draft_token_indices == list(range(len(spec_flattened_indices)))
+            and (
+                self._draft_token_ids is None
+                or isinstance(self._draft_token_ids, torch.Tensor)
+            )
+        ):
+            self.input_ids.gpu[:1].copy_(
+                self.input_batch.prev_sampled_token_ids[:1, 0], non_blocking=True
+            )
+            n_spec = len(spec_flattened_indices)
+            if self._draft_token_ids is not None and n_spec:
+                draft_token_ids = self._draft_token_ids.flatten()[:n_spec]
+                if draft_token_ids.dtype != self.input_ids.gpu.dtype:
+                    draft_token_ids = draft_token_ids.to(
+                        dtype=self.input_ids.gpu.dtype
+                    )
+                self.input_ids.gpu[1 : 1 + n_spec].copy_(
+                    draft_token_ids, non_blocking=True
+                )
             return
         # Upload the index tensors asynchronously so the scatter can be non-blocking.
         sampled_tokens_index_tensor = torch.tensor(

@@ -203,12 +203,22 @@ class Session:
         rounds: list[list[int]] = []
         frontiers: list[int] = []
         pending, produced = first, 0
-        while produced < count:
-            committed = self.cycle(pending, count - produced)
-            rounds.append(committed)
-            pending = self.frontier.token  # type: ignore[union-attr]
-            frontiers.append(pending)
-            produced += len(committed)
+        # The run is done once the engine has emitted the tokens up to the
+        # count-th one after the frontier: the context, the frontier and count
+        # more. The engine may then stop drafting past that point.
+        set_target = getattr(self.b, "set_emit_target", None)
+        if set_target is not None and self.frontier is not None:
+            set_target(len(self.ctx) + 1 + count)
+        try:
+            while produced < count:
+                committed = self.cycle(pending, count - produced)
+                rounds.append(committed)
+                pending = self.frontier.token  # type: ignore[union-attr]
+                frontiers.append(pending)
+                produced += len(committed)
+        finally:
+            if set_target is not None:
+                set_target(None)
         return rounds, frontiers
 
     def top_logits(self, k: int) -> tuple[list[int], list[float]]:

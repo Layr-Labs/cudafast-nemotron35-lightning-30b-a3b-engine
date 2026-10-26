@@ -378,6 +378,26 @@
     {
       "file": "vllm/v1/worker/decode_prep.py; vllm/v1/worker/copy_batch.py; vllm/v1/worker/gpu_model_runner.py; vllm/v1/attention/backends/flashinfer.py; vllm/v1/attention/backends/mamba2_attn.py; vllm/model_executor/layers/fused_moe/experts/humming_nvsc.py; vllm/model_executor/layers/fused_moe/experts/humming_relu2_epilogue.py",
       "why": "i34-9 993e9bec, carried onto terrapinelf c64b6fe5: in the steady one-request speculative step the per-step device prep (query_start_loc, discard mask, accepted counts, positions, seq_lens, slot mapping, input ids incl. drafts) is one H2D of staged host values plus one kernel, and the remaining small metadata copies go through one copy batch flushed before the target forward; non-steady steps take the stock path (where terrapinelf's batch-1 slice copy still applies). Prefill routed-up reads the 6-bit block scales directly. Same values into the same buffers; no format or arithmetic change."
+    },
+    {
+      "file": "env_override.py; v1/worker/gpu_worker.py (+ harness/kernels/cmp2/py/__init__.py)",
+      "why": "env_override.py adds expandable_segments:True to PYTORCH_CUDA_ALLOC_CONF before CUDA is initialized, and init_device sets the same allocator option right after the device is selected (torch._C._accelerator_setAllocatorSettings, the entry point the worker already uses for max_split_size_mb), so every allocation of the process comes from expandable segments; VLLM_EXPANDABLE_SEGMENTS=0 keeps the default allocator. While it is active, cmp2.prepare returns before copying anything (CMP2 compressed=none reason=expandable_segments). No kernel, format, value or schedule change."
+    },
+    {
+      "file": "vllm/v1/spec_decode/nemotron_decode_plan.py",
+      "why": "Native MTP FA2 plan bank fills pages past the measured 128-page prefix, up to 512 pages or the existing 64 MiB private budget, whichever comes first. Same snapshot and the same restore as the prefix. The admission sample and its speed gate stay on the first 128 pages. Lengths past the filled prefix, and a budget stop, keep the original planner. No arithmetic change."
+    },
+    {
+      "file": "(composition)",
+      "why": "e-man07 composition on fkiene's record 1e1c2581: terrapinelf 80f6fced, ercumentyildirim 7c43f9ee and newjordan 4ab1d933, each carried byte for byte; the three touch disjoint files. No new arithmetic."
+    },
+    {
+      "file": "vllm/v1/spec_decode/nemotron_step_stage.py; vllm/v1/spec_decode/llm_base_proposer.py",
+      "why": "Native single-token MTP stage fusion: call the unchanged original integer position/slot/seq JIT body inside a one-CTA kernel, then copy current token and hidden payload (uint16 bit moves) into original persistent graph inputs; write original padding slots. Replace metadata launch plus two copies on supported shapes, keep CPU bookkeeping/plan-side-stream events/model/attention/screen and unsupported-shape fallback. Official-worker-only private16case metadata/payload comparisons with aliasing/clamp/padding and special BF16 payloads precede readiness; no numeric projection change, runtime admission or speed claim."
+    },
+    {
+      "file": "harness/kernels/shco/py/__init__.py",
+      "why": "Selected compatible pending53f66afe-0252-402f-b34b-19bea81f1e74 shared-expert prefill concurrency mechanism, exact blob7fd50ff2bd86b9c6aa8ff662f2a8e35b824071d4: half persistent workers while preserving original all-SM Marlin task unit tables and full original scratch allocation capacity. Every unit remains whole with original sums and BF16 epilogue. Intended to leave more execution resources to concurrent routed GEMMs on aux/main streams. No author local timings claimed as ours, no actual admission/gain claim; new entire77+stagefusion+pendingworker combination unverified."
     }
   ]
 }

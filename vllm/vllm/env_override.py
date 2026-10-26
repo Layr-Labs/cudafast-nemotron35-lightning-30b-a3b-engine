@@ -104,6 +104,15 @@ os.environ["PYTORCH_NVML_BASED_CUDA_CHECK"] = "1"
 # https://github.com/vllm-project/vllm/issues/10619.
 os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
 
+# LOCAL PATCH (cudafast-nemotron35): expandable (CUDA VMM) segments for the
+# CUDA caching allocator of every process that imports vllm, set before CUDA
+# is initialized. VLLM_EXPANDABLE_SEGMENTS=0 keeps the default allocator.
+if os.environ.get("VLLM_EXPANDABLE_SEGMENTS", "1") != "0":
+    _alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+    if "expandable_segments" not in _alloc_conf:
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(
+            c for c in (_alloc_conf, "expandable_segments:True") if c)
+
 # Enable Triton autotuning result caching to disk by default.
 # Without this, Triton re-runs autotuning on every process restart,
 # adding significant latency to the first inference request.

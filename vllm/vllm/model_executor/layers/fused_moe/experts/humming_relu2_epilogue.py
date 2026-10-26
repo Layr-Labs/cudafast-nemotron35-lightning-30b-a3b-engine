@@ -226,7 +226,7 @@ def _w13_k128_params(lo, hi, params):
             and params["warp_shape"] == [16, 32, 32]
             and params["num_stages"] == 8):
         return dict(params, block_shape=[16, 64, 128],
-                    warp_shape=[16, 32, 128], num_stages=2)
+                    warp_shape=[16, 32, 128], num_stages=3)
     return params
 
 

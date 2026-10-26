@@ -252,7 +252,9 @@ class Shx:
         self.units_dn_tail = units_tensor(_tail_units(dn, m, 2688), device)
         lib = _load()
         assert lib is not None, _load_error
-        self.scratch = torch.empty(lib.shx_scratch_floats(grid), dtype=torch.float32, device=device)
+        # Scratch for one worker per SM whatever the launch grid, so the allocation sequence (and
+        # every later device address) is the same with HPF_SHX on or off.
+        self.scratch = torch.empty(lib.shx_scratch_floats(max(grid, sms)), dtype=torch.float32, device=device)
         self.work = torch.zeros(2, dtype=torch.int32, device=device)
 
     def up(self, x, layer, out, relu2=True, tail=False):
@@ -284,6 +286,17 @@ _logged = False
 # units of Marlin's last launch, whose rows include that row. Other rows are not written.
 TAIL_ONLY = False
 
+# LOCAL PATCH (cudafast-nemotron35, hpf): in a prefill MoE layer shx runs on the aux stream
+# beside the routed up/down GEMMs. Half as many persistent workers as SMs leaves those GEMMs
+# more of the GPU. The unit tables still come from Marlin's partition over all SMs and each
+# unit is summed whole by one CTA, so every output word is unchanged. HPF_SHX=0 restores one
+# worker per SM.
+HALF_GRID = os.environ.get("HPF_SHX", "1") != "0"
+
+
+def _worker_grid(sms: int) -> int:
+    return max(1, sms // 2) if HALF_GRID else sms
+
 
 def prepare(layer) -> bool:
     """Marks a Marlin NVFP4 linear (after prepare_fp4_layer_for_marlin) of a shared-expert shape as
@@ -305,7 +318,7 @@ def prepare(layer) -> bool:
     idx = w.device.index if w.device.index is not None else torch.cuda.current_device()
     if idx not in _ctx:
         sms = torch.cuda.get_device_properties(idx).multi_processor_count
-        _ctx[idx] = Shx(SHX_M, w.device, sms=sms, grid=sms)
+        _ctx[idx] = Shx(SHX_M, w.device, sms=sms, grid=_worker_grid(sms))
     layer._shx_ok = True
     return True
 

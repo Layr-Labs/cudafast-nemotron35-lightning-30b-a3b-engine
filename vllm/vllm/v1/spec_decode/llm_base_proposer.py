@@ -722,7 +722,19 @@ class SpecDecodeBaseProposer:
             # The draft plan reads seq_lens_cpu; deriving it from the copied
             # counts waits for the first pass to start, not to finish. The
             # bound keeps the step kernel's seq_lens update an exact +1.
-            if (
+            # The runner already copied the sampler's valid counts on its
+            # side stream. Prefer that earlier event to the later main-stream
+            # rejected-count copy. Per-step staging sets independently own the
+            # pinned H2D buffers; retain the old fence when sets are unavailable.
+            host_seq_lens = None
+            if seq_lens_cpu is not None and self._hostfast_draft_sets() is not None:
+                host_seq_lens = self._hostfast_draft_seq_lens(
+                    seq_lens_cpu, batch_size, common_attn_metadata.seq_lens
+                )
+            if host_seq_lens is not None:
+                common_attn_metadata._seq_lens_cpu = host_seq_lens
+                order_draft_plans = True
+            elif (
                 num_rejected_cpu is not None
                 and seq_lens_cpu is not None
                 and seq_lens_cpu.shape == num_rejected_cpu.shape
@@ -751,13 +763,20 @@ class SpecDecodeBaseProposer:
                 assert self.vocab_mapping is not None
                 input_ids = self.vocab_mapping.map_target_to_draft_ids(input_ids)
 
+            step_staged = False
             if not self.constant_draft_positions:
+                from vllm.v1.spec_decode.nemotron_step_stage import maybe_run as stage_step
+                step_staged = stage_step(
+                    self, positions, input_ids, hidden_states, common_attn_metadata,
+                    batch_size, input_batch_size,
+                )
                 positions = self._update_positions_dependent_metadata(
                     positions,
                     common_attn_metadata,
                     batch_size,
                     input_batch_size,
                     block_size,
+                    device_updated=step_staged,
                 )
 
             # Rebuild attention metadata. When draft positions are constant
@@ -805,8 +824,9 @@ class SpecDecodeBaseProposer:
                     self._draft_plan_event.record()
 
             # copy inputs to buffer for cudagraph
-            self.input_ids[:batch_size] = input_ids
-            self.hidden_states[:batch_size] = hidden_states
+            if not step_staged:
+                self.input_ids[:batch_size] = input_ids
+                self.hidden_states[:batch_size] = hidden_states
             if self.supports_mm_inputs:
                 self.inputs_embeds[:batch_size] = self.model.embed_input_ids(input_ids)
 
@@ -930,6 +950,7 @@ class SpecDecodeBaseProposer:
         batch_size: int,
         input_batch_size: int,
         block_size: int,
+        device_updated: bool = False,
     ) -> torch.Tensor:
         """Update positions, slot mappings, and sequence metadata for the
         next draft step. Returns the updated positions tensor."""
@@ -940,16 +961,17 @@ class SpecDecodeBaseProposer:
             out_pos = self.xdrope_positions[0, :batch_size]
         else:
             out_pos = self.positions[:batch_size]
-        eagle_step_update_slot_mapping_and_metadata(
-            positions_1d=positions_1d,
-            block_table_tensor=common_attn_metadata.block_table_tensor,
-            seq_lens=common_attn_metadata.seq_lens,
-            block_size=block_size,
-            max_model_len=self.max_model_len,
-            out_clamped_positions=out_pos,
-            out_slot_mapping=self._slot_mapping_buffer[:input_batch_size],
-            input_batch_size=input_batch_size,
-        )
+        if not device_updated:
+            eagle_step_update_slot_mapping_and_metadata(
+                positions_1d=positions_1d,
+                block_table_tensor=common_attn_metadata.block_table_tensor,
+                seq_lens=common_attn_metadata.seq_lens,
+                block_size=block_size,
+                max_model_len=self.max_model_len,
+                out_clamped_positions=out_pos,
+                out_slot_mapping=self._slot_mapping_buffer[:input_batch_size],
+                input_batch_size=input_batch_size,
+            )
         common_attn_metadata.slot_mapping = self._slot_mapping_buffer[:batch_size]
         if self.uses_mrope:
             self.mrope_positions[1:, :batch_size] = self.mrope_positions[0, :batch_size]
@@ -1967,6 +1989,8 @@ class SpecDecodeBaseProposer:
         if is_graph_capturing and not torch.cuda.is_current_stream_capturing():
             from vllm.v1.spec_decode.nemotron_full_step import prepare
             prepare(self)
+            from vllm.v1.spec_decode.nemotron_step_stage import prepare as prepare_stage
+            prepare_stage(self)
             from vllm.v1.spec_decode.nemotron_decode_plan import prepare as prepare_plan
             prepare_plan(self)
 

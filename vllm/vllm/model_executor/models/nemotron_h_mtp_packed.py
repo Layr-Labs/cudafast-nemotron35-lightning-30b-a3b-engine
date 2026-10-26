@@ -150,17 +150,19 @@ def load_packed(SM, EX, BASE, RI, RAW, index, mask, EVICT:tl.constexpr=True,
     # so they do not also stream unused sign/mantissa and exponent planes.
     rawid = tl.load(RI + bid, mask=mask, other=-1, eviction_policy='evict_first' if EVICT else '')
     coded = mask & (rawid < 0)
-    sm = tl.load(SM + index, mask=coded, other=0, eviction_policy='evict_first' if EVICT else '').to(tl.uint16)
+    # LOCAL PATCH (cudafast-nemotron35): the plane loads use the bounds mask only, so they
+    # issue together with the RI load instead of after it; escape blocks still take RAW.
+    sm = tl.load(SM + index, mask=mask, other=0, eviction_policy='evict_first' if EVICT else '').to(tl.uint16)
     if WORD:
         words = EX.to(tl.pointer_type(tl.uint32))
-        word = tl.load(words + index // 8, mask=coded, other=0,
+        word = tl.load(words + index // 8, mask=mask, other=0,
                        eviction_policy='evict_first' if EVICT else '')
         code = ((word >> ((index % 8).to(tl.uint32) * 4)) & 15).to(tl.uint16)
     else:
-        nib = tl.load(EX + index // 2, mask=coded, other=0,
+        nib = tl.load(EX + index // 2, mask=mask, other=0,
                       eviction_policy='evict_first' if EVICT else '').to(tl.uint16)
         code = (nib >> ((index % 2)*4)) & 15
-    base = tl.load(BASE + bid, mask=coded, other=1, eviction_policy='evict_first' if EVICT else '').to(tl.uint16)
+    base = tl.load(BASE + bid, mask=mask, other=1, eviction_policy='evict_first' if EVICT else '').to(tl.uint16)
     exp = tl.where(code == 0, 0, base + code - 1)
     bits = ((sm & 128) << 8) | (exp << 7) | (sm & 127)
     raw = tl.load(RAW + rawid.to(tl.int64)*128 + index % 128,
@@ -191,11 +193,11 @@ def load_packed_group8(SM, EX, BASE, RI, RAW, index, lane, mask, value_mask,
     coded=mask&(rawid<0)
     index8=index[:,None]+lane[None,:]
     rawid8,_=tl.broadcast(rawid[:,None],index8)
-    sm=tl.load(SM+index8,mask=value_mask&(rawid8<0),other=0,eviction_policy='evict_first' if EVICT else '').to(tl.uint16)
+    sm=tl.load(SM+index8,mask=value_mask,other=0,eviction_policy='evict_first' if EVICT else '').to(tl.uint16)
     words=EX.to(tl.pointer_type(tl.uint32))
-    word=tl.load(words+index//8,mask=coded,other=0,eviction_policy='evict_first' if EVICT else '')
+    word=tl.load(words+index//8,mask=mask,other=0,eviction_policy='evict_first' if EVICT else '')
     code=((word[:,None]>>(lane[None,:].to(tl.uint32)*4))&15).to(tl.uint16)
-    base=tl.load(BASE+bid,mask=coded,other=1,eviction_policy='evict_first' if EVICT else '').to(tl.uint16)
+    base=tl.load(BASE+bid,mask=mask,other=1,eviction_policy='evict_first' if EVICT else '').to(tl.uint16)
     base8,_=tl.broadcast(base[:,None],index8)
     exp=tl.where(code==0,0,base8+code-1)
     bits=((sm&128)<<8)|(exp<<7)|(sm&127)

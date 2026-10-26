@@ -226,6 +226,9 @@ class VllmBackend:
             logprobs=TOP_K if logprobs else None,
             detokenize=False,
             output_kind=self._delta,
+            # A fresh object per request that nothing else holds: the engine's
+            # copy of it may be shallow (no deepcopy on the timed prefill path).
+            skip_clone=True,
         )
 
     def _collect(self) -> list[Emit]:

@@ -199,6 +199,14 @@ def _prepare_pair(layer: torch.nn.Module) -> None:
                     config = skip
             except Exception as exc:  # noqa: BLE001
                 logger.warning_once("zskip: empty-half skip unavailable (%r); config %d", exc, config)
+        # VSW changes scheduling only; retain the original checked pair on any failure.
+        if os.environ.get("VSW_W2_CONFIG", "1") != "0" and config == 119:
+            if (_pair_check(layer, pair, 113, ms=range(1, 9), ref_config=config)
+                and (os.environ.get("ZSKIP_VERIFY_PREFIX", "1") == "0"
+                     or not _zskip.prefix_available()
+                     or _pair_check(layer, pair, 113, prefix=True))):
+                config = 113
+        logger.info("VSW_W2_SELECTED config=%d layer=%s", config, layer.layer_name)
         layer.zskip_pair_w2 = pair
         layer.zskip_pair_config = config
         logger.info_once("zskip: dadon paired decode config %d enabled for M=5", config)

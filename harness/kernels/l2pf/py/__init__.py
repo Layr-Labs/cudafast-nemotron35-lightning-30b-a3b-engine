@@ -18,7 +18,7 @@ import torch
 __all__ = [
     "LIB_PATH", "ENABLED", "MAMBA_BYTES", "ATTN_BYTES", "MOE_BYTES", "DRAFT_BYTES",
     "AHEAD", "AHEAD_MOE", "DRAFT_SCREEN",
-    "prefetch", "join",
+    "prefetch", "prefetch_paced", "join",
 ]
 
 LIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "libl2pf.so")
@@ -57,6 +57,12 @@ def _load():
         return None
     lib.l2pf_prefetch.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p]
     lib.l2pf_prefetch.restype = ctypes.c_int
+    try:
+        lib.l2pf_prefetch_paced.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
+                                            ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+        lib.l2pf_prefetch_paced.restype = ctypes.c_int
+    except AttributeError:
+        pass  # Older library: prefetch_paced issues the unpaced prefetch.
     try:
         lib.l2pf_prefetch3.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
                                      ctypes.c_void_p, ctypes.c_size_t,
@@ -109,6 +115,28 @@ def prefetch(t: torch.Tensor | None, max_bytes: int = 0) -> bool:
     rc = _lib.l2pf_prefetch(st.data_ptr(), nbytes, CHUNK, side.cuda_stream)
     if rc != 0:
         raise RuntimeError(f"l2pf_prefetch failed: {rc}")
+    return True
+
+
+def prefetch_paced(t: torch.Tensor | None, max_bytes: int = 0, interval_ns: int = 0,
+                   burst: int = 1) -> bool:
+    """prefetch(t, max_bytes) with the 64 KB pieces issued at most one per interval_ns after
+    the first `burst` (interval_ns 0, or a library without the paced kernel: prefetch())."""
+    if interval_ns <= 0 or _lib is None or not hasattr(_lib, "l2pf_prefetch_paced"):
+        return prefetch(t, max_bytes)
+    if not ENABLED or t is None or not t.is_cuda:
+        return False
+    st = t.untyped_storage()
+    nbytes = st.nbytes()
+    if max_bytes:
+        nbytes = min(nbytes, max_bytes)
+    main = torch.cuda.current_stream(t.device)
+    side = _side_stream(t.device)
+    side.wait_stream(main)
+    rc = _lib.l2pf_prefetch_paced(st.data_ptr(), nbytes, CHUNK, int(interval_ns), max(1, int(burst)),
+                                  side.cuda_stream)
+    if rc != 0:
+        raise RuntimeError(f"l2pf_prefetch_paced failed: {rc}")
     return True
 
 

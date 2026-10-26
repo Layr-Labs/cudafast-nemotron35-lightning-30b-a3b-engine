@@ -393,7 +393,11 @@
     },
     {
       "file": "(composition)",
-      "why": "e-man07 composition on the record 1e1c2581-e506-4ca4-9341-5f08ffceec86: ArthurOstapenko 53f66afe-0252-402f-b34b-19bea81f1e74 carried byte for byte; jacklightChen 1df4df4a-6dc5-4ecf-8d49-b372ba3726fd carried byte for byte; terrapinelf 80f6fced-3c74-4ce1-9913-058f05e95ec7 carried byte for byte. No new arithmetic."
+      "why": "e-man07 composition on the record 1e1c2581-e506-4ca4-9341-5f08ffceec86: ArthurOstapenko 53f66afe-0252-402f-b34b-19bea81f1e74 carried byte for byte; jacklightChen 1df4df4a-6dc5-4ecf-8d49-b372ba3726fd carried byte for byte; terrapinelf 80f6fced-3c74-4ce1-9913-058f05e95ec7 carried byte for byte. No new arithmetic. The terrapinelf 80f6fced stage change in this list is reverted by the prune entry below, because that submission's own official row measured it at -0.46 percent; every other carried patch stands."
+    },
+    {
+      "file": "vllm/vllm/model_executor/layers/fused_moe/experts/humming_relu2_epilogue.py",
+      "why": "Prune: reverts the stage change carried byte for byte from terrapinelf 80f6fced-3c74-4ce1-9913-058f05e95ec7. That submission measured 2.49525899619 against base 1e1c2581 2.50678606261, -0.46 percent, and was rejected; this restores the preceding value num_stages 2 for the same [16,64,128]/[16,32,128] decode bucket (valid M 24..48, which is the depth-4 verify batch of 5 tokens x top-6 = 30). No other value in the tree changes."
     }
   ]
 }

@@ -117,7 +117,10 @@ def init() -> bool:
     if setter is not None:
         setter.argtypes = [ctypes.c_int]
         setter.restype = ctypes.c_int
-        if setter(int(os.environ.get("RDS_ROUTED_RING2", "1") != "0")) != 0:
+        ring2 = os.environ.get("RDS_ROUTED_RING2", "1") != "0"
+        if os.environ.get("VSW_W2_RING", "1") != "0":
+            ring2 = False
+        if setter(int(ring2)) != 0:
             raise RuntimeError("zskip routed ring initialization failed")
     # Programmatic dependent launch for the v4 pair (prep, down4): both kernels
     # wait for the preceding grid before any memory access. ZSKIP_PDL=0 keeps

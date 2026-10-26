@@ -265,6 +265,9 @@ def _nvfp4_rows_dot_part(
 def _nvfp4_rows_dot_sum(
     part_ptr, out_ptr, R, gscale, NK: tl.constexpr, BR: tl.constexpr,
     gate_ptr=None, GATED: tl.constexpr = False, launch_pdl: tl.constexpr = False,
+    rows_ptr=None, INDEX32: tl.constexpr = True,
+    base_ptr=None, BASE: tl.constexpr = False,
+    scatter_ptr=None, SCATTER: tl.constexpr = False,
 ):
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
@@ -279,7 +282,18 @@ def _nvfp4_rows_dot_sum(
     acc = tl.zeros((BR,), dtype=tl.float32)
     for k in range(NK):
         acc += tl.load(part_ptr + k * R + r, mask=rmask, other=0.0)
-    tl.store(out_ptr + r, acc * gscale, mask=rmask)
+    if BASE:
+        # The same base[row] + acc * gscale (and scatter) as _nvfp4_rows_dot's BASE path.
+        if INDEX32:
+            rows = tl.load(rows_ptr + r, mask=rmask, other=0).to(tl.int32)
+        else:
+            rows = tl.load(rows_ptr + r, mask=rmask, other=0).to(tl.int64)
+        b = tl.load(base_ptr + rows, mask=rmask, other=0.0)
+        tl.store(out_ptr + r, b + acc * gscale, mask=rmask)
+        if SCATTER:
+            tl.store(scatter_ptr + rows, b + acc * gscale, mask=rmask)
+    else:
+        tl.store(out_ptr + r, acc * gscale, mask=rmask)
 
 
 def screen_ksplit_enabled() -> bool:
@@ -288,7 +302,7 @@ def screen_ksplit_enabled() -> bool:
     return os.environ.get("VLLM_MTP_SCREEN_KSPLIT", "1") != "0"
 
 
-def _rows_dot_ksplit(h, w, s, rows, gscale, out, part, gated=False):
+def _rows_dot_ksplit(h, w, s, rows, gscale, out, part, gated=False, base=None, scatter=None):
     n_out = out.numel()
     nbytes = w.shape[1]
     br = 16
@@ -310,6 +324,9 @@ def _rows_dot_ksplit(h, w, s, rows, gscale, out, part, gated=False):
     _nvfp4_rows_dot_sum[(triton.cdiv(n_out, 128),)](
         part, out, n_out, gscale, NK=nk, BR=128,
         gate_ptr=gate, GATED=gated, launch_pdl=mtp_pdl(), num_warps=4,
+        rows_ptr=rows, INDEX32=index32,
+        base_ptr=base, BASE=base is not None,
+        scatter_ptr=scatter, SCATTER=scatter is not None,
     )
 
 
@@ -686,6 +703,12 @@ class DraftHeadScreen:
                 (self.w_full.shape[1] // 64) * self.cand_logits.numel(),
                 dtype=torch.float32, device=device,
             )
+            # The mid (65536 rows x 2 blocks) and rest (16384 rows x 4 blocks)
+            # cascade stages use their own partial-term buffers.
+            self._cascade_part = torch.empty(
+                max(2 * (n // SCREEN_CHUNK) * PRE_PER, 4 * (n // SCREEN_CHUNK) * CASCADE_PER),
+                dtype=torch.float32, device=device,
+            )
         self.big = torch.tensor(1 << 30, dtype=torch.int32, device=device)
         # l2pf: the coarse matrix is registered for the MTP MoE's down
         # projection window (nemotron_h_mtp_kernels.py), which prefetches its head.
@@ -817,20 +840,34 @@ class DraftHeadScreen:
             )
             # The coarse score: pre score + the next 16 groups, also stored at
             # its row for the refine stage's base.
-            _rows_dot(
-                self._hm, self.w_mid, self.s_mid, self._pre_cand,
-                self.gscale, self.mid_scores, True, gated,
-                base=self.scores, scatter=self.scores,
-            )
+            if self._full_part is not None:
+                _rows_dot_ksplit(
+                    self._hm, self.w_mid, self.s_mid, self._pre_cand,
+                    self.gscale, self.mid_scores, self._cascade_part, gated,
+                    base=self.scores, scatter=self.scores,
+                )
+            else:
+                _rows_dot(
+                    self._hm, self.w_mid, self.s_mid, self._pre_cand,
+                    self.gscale, self.mid_scores, True, gated,
+                    base=self.scores, scatter=self.scores,
+                )
             _chunk_topk[(nchunk,)](
                 self.mid_scores, self._pre_cand, self._coarse_cand,
                 N=PRE_PER, K=CASCADE_PER, GATHER=True, RADIX=self.radix,
                 num_warps=4, launch_pdl=mtp_pdl(), gate_ptr=tgate, GATED=tgated,
             )
-            _rows_dot(
-                self._hr, self.w_rest, self.s_rest, self._coarse_cand,
-                self.gscale, self.refine_scores, True, gated, base=self.scores,
-            )
+            if self._full_part is not None:
+                _rows_dot_ksplit(
+                    self._hr, self.w_rest, self.s_rest, self._coarse_cand,
+                    self.gscale, self.refine_scores, self._cascade_part, gated,
+                    base=self.scores,
+                )
+            else:
+                _rows_dot(
+                    self._hr, self.w_rest, self.s_rest, self._coarse_cand,
+                    self.gscale, self.refine_scores, True, gated, base=self.scores,
+                )
             _chunk_topk[(nchunk,)](
                 self.refine_scores, self._coarse_cand, self._cand,
                 N=CASCADE_PER, K=SCREEN_PER, GATHER=True, RADIX=self.radix,

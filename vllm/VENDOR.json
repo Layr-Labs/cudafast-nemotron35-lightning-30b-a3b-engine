@@ -408,12 +408,24 @@
       "why": "The draft-head screen's final full-row dot runs as one program per (16-row block, 64-byte block) computing exactly the term the original loop adds in that iteration, then a second kernel adds the terms of each row in block order and applies the global scale: the same additions in the same order, so the same candidate logits. Stopped draft passes write the same zeros. VLLM_MTP_SCREEN_KSPLIT=0 keeps the original kernel."
     },
     {
+      "file": "model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "The draft-head screen's coarse (w_mid over the pre-screen candidates) and refine (w_rest over the coarse candidates) cascade dots use the same block-term split as the final stage: one program per (16-row block, 64-byte block) computes exactly the term the original loop adds in that iteration into a partial-term buffer of their own, then the sum kernel adds each row's terms in block order, applies the global scale, adds the stage's base score at the candidate's row and, for the coarse stage, writes the result back to that row as the original kernel's scatter did. The same additions in the same order, so the same scores, candidates and draft tokens. Stopped draft passes write the same zeros. VLLM_MTP_SCREEN_KSPLIT=0 keeps the original kernels for all three stages."
+    },
+    {
       "file": "model_executor/layers/fused_moe/experts/humming_relu2_epilogue.py",
       "why": "The claim-when-free routed-up kernel's prefill entry runs a persistent grid of 40 workers instead of 48 (HUMMING_W13_DYN_PF_SMS, default 40), beside the half-grid shx shared expert on the aux stream. Each tile is still computed whole by the one CTA that claims it, with the same K order and MMA chain, so the outputs are unchanged."
     },
     {
       "file": "vllm/model_executor/layers/fused_moe/experts/humming_zskip.py; humming_relu2_epilogue.py; humming_nvsc.py (+ harness/kernels/zskip/py/__init__.py)",
       "why": "ArthurOstapenko (ours): verify-path routed schedule only. (1) The target verify's paired routed-down call uses dadon's zskip config 113 (one prep launch, no empty-half skip) with a three-deep load ring instead of config 119 with a two-deep ring, when a boot-time bitwise check of every layer's pair against config 119 passes on 1-8 rows and on the verify prefix; otherwise the layer keeps 119. (2) The routed up projection's 24-48-row verify bucket uses the existing evict-first derived Humming kernel (the same class the 496-token prefill call uses, in its stock and nvsc forms). Same tiles, ascending K16 MMA chain, fp32 accumulation, dequantisation, negative-zero repair and BF16 epilogue; only kernel selection, load ring depth and an L2 cache hint change. VSW_W2_CONFIG=0, VSW_W2_RING=0 and VSW_EVICT=0 restore the main."
+    },
+    {
+      "file": "harness/kernels/pzskip/{csrc/pzskip.cu,py/__init__.py,tests/exact.py}; vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
+      "why": "Exact schedule variants of the prefill routed down (config 356): 360-364. They keep 356's per-output arithmetic, lean copy roles, skip semantics, -0 recompute and epilogue on humming's own 64-row expert blocks (one union mask per block, each warp owning its columns for all of the block's token tiles), so an expert routed 33-64 rows loads its live weight rows once instead of once per 32-row block. Each layer admits a variant only after bitwise checks against 356 (496/512 tokens with skewed routing, 257 near-uniform, each also with -0 zeros); after 4 layers CUDA graphs over their weights time the survivors against each other on a skewed 496-token call, and the fastest replaces 356 on every layer where it passes, with no speed comparison against 356, so it may be slower. If no variant passes, or on any exception, 356 stays. PZSKIP_VARIANTS=0 disables."
+    },
+    {
+      "file": "v1/worker/copy_batch.py; v1/worker/gpu_model_runner.py",
+      "why": "jungjipdo 34fac137, carried: the metadata copy batch keeps eight independent staging sets in flight instead of two, and the steady fused decode-prep path no longer builds CPU token positions, flattened token indices and a temporary tensor it does not consume. Same copies and values in the same order."
     }
   ]
 }

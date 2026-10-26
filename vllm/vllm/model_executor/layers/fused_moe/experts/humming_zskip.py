@@ -46,7 +46,10 @@ except ImportError:
 PZ_ENABLED = os.environ.get("PZSKIP", "1") != "0"
 # config 356: 32-row expert blocks (sparser union masks than humming's 64-row blocks), 384 columns,
 # config 333's arithmetic with a leaner per-group instruction stream; PZSKIP_CONFIG=333 restores 333
-PZ_CONFIG = int(os.environ.get("PZSKIP_CONFIG", "356"))
+# LOCAL PATCH (cudafast-nemotron35, pzhalf): config 369 = 356 reading humming's 64-row prefill
+# layout as 32-row halves, so the 32-row moe_align is not run; PZSKIP_HALF64=0 keeps 356.
+PZ_CONFIG = int(os.environ.get(
+    "PZSKIP_CONFIG", "369" if os.environ.get("PZSKIP_HALF64", "1") != "0" else "356"))
 PZ_BLOCK_M = 64  # humming's prefill bucket that pzskip replaces
 PZ_MAX_TOKENS = 8192
 
@@ -63,6 +66,12 @@ PAIR_FUSED_CONFIG = 118
 # the same pair kernels without the dequantisation of 8-row k halves whose mask byte is zero
 PAIR_HALFSKIP = os.environ.get("ZSKIP_HALFSKIP", "1") != "0"
 PAIR_HALFSKIP_CONFIG = {PAIR_CONFIG: 114, PAIR_FUSED_CONFIG: 119}
+# Lean paired decode (harness/kernels/zskip/csrc/zskip_lean.cuh): config 119's per-output arithmetic
+# with a shorter per-group instruction stream and per-lane L2 prefetch; with ZSKIP_LEAN=1 it replaces
+# the checked pair config for M=5 after a bitwise check against humming and that config (on by
+# default; ZSKIP_LEAN=0 keeps the pair config): -14 us per call alone, -5 us in situ.
+LEAN_ENABLED = os.environ.get("ZSKIP_LEAN", "1") == "1"
+LEAN_CONFIG = int(os.environ.get("ZSKIP_LEAN_CONFIG", "653"))
 # Prefill: MoE layers whose relu^2 activations are sparse enough for the skip to beat humming's
 # 64-row blocks on GB10 (measured per layer on prefill-length calls; the others lose). Layer 51,
 # the last, is left out: the boot prefill graph routes all its rows through one row's experts.
@@ -142,7 +151,7 @@ def finalize(layer: torch.nn.Module) -> None:
     if PZ_ENABLED and _pzskip is not None and _pzskip.available():
         _pzskip.scratch(
             gs.device,
-            _pzskip.max_blocks(PZ_MAX_TOKENS * TOP_K, NUM_EXPERTS, _pzskip.block_rows(PZ_CONFIG)),
+            _pzskip.ws_blocks(PZ_MAX_TOKENS * TOP_K, NUM_EXPERTS, PZ_CONFIG),
         )
         if _pz_self_check(layer):
             layer.pzskip_ok = True
@@ -158,6 +167,8 @@ def finalize(layer: torch.nn.Module) -> None:
     layer.zskip_pair_config = None
     if PAIR_ENABLED:
         _prepare_pair(layer)
+    if LEAN_ENABLED and getattr(layer, "zskip_pair_w2", None) is not None:
+        _prepare_lean(layer)
     layer.zskip_pair_prefix_ok = False
     if (getattr(layer, "zskip_pair_w2", None) is not None
         and os.environ.get("ZSKIP_VERIFY_PREFIX", "1") != "0"
@@ -212,6 +223,22 @@ def _prepare_pair(layer: torch.nn.Module) -> None:
         logger.info_once("zskip: dadon paired decode config %d enabled for M=5", config)
     except Exception as exc:  # noqa: BLE001
         logger.warning_once("zskip: paired decode unavailable (%r); checked legacy config retained", exc)
+
+
+def _prepare_lean(layer: torch.nn.Module) -> None:
+    """Optional: any failure keeps the checked pair config."""
+    try:
+        _zskip.config_info(LEAN_CONFIG)
+        ref = layer.zskip_pair_config
+        prefix = os.environ.get("ZSKIP_VERIFY_PREFIX", "1") != "0" and _zskip.prefix_available()
+        if _pair_check(layer, layer.zskip_pair_w2, LEAN_CONFIG, ms=range(1, 9), ref_config=ref) and (
+            not prefix or _pair_check(layer, layer.zskip_pair_w2, LEAN_CONFIG, prefix=True)
+        ):
+            layer.zskip_pair_config = LEAN_CONFIG
+            logger.info_once("zskip: lean paired decode config %d replaces %d for M=5", LEAN_CONFIG, ref)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning_once("zskip: lean paired decode unavailable (%r); config %s",
+                            exc, getattr(layer, "zskip_pair_config", None))
 
 
 def _pair_check(layer: torch.nn.Module, packed: Any, config: int, prefix: bool = False,

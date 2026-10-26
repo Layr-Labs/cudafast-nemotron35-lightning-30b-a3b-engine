@@ -457,15 +457,23 @@ def _prefill_configs(meta, compute_config: str, tuning_config: str, dyn: bool) -
         original = HummingKernel._id2kernel[evict[4 * i + 2]]
         want = (fused.DynEvictFirstRelu2HummingKernel if dyn
                 else fused.EvictFirstRelu2HummingKernel)
-        assert type(original) is want, type(original)
+        # The record entry may itself be the pfup-derived class (humming_pfup.build).
+        assert isinstance(original, want), type(original)
         assert config["block_shape"] == [64, 64, 32], config
         assert config["warp_shape"][1:] == [32, 32], config
         assert not config.get("use_stream_k", False)
         params = lc | json.loads(compute_config) | config
         params.pop("num_sms", None)
-        kernel = kernel_cls(**params)
-        kernel.load_cubin()
-        assert type(kernel) is kernel_cls
+        if dyn:
+            # LOCAL PATCH (cudafast-nemotron35, pfup): prefill claim order and
+            # padded-row MMA skip (humming_pfup.py).
+            from vllm.model_executor.layers.fused_moe.experts import humming_pfup
+
+            kernel = humming_pfup.build(kernel_cls, params)
+        else:
+            kernel = kernel_cls(**params)
+            kernel.load_cubin()
+        assert isinstance(kernel, kernel_cls)
         assert "nvsc_table" in kernel.code and "nvsc_evf_load" in kernel.code
         assert ("hm_dyn_claim" in kernel.code) == dyn
         assert "cp.async.cg.shared.global.L2::cache_hint" in kernel.code

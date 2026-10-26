@@ -538,9 +538,12 @@ class NemotronHMTP(nn.Module, SupportsPP):
 
         if not screen_enabled():
             return None
+        spec = getattr(self.vllm_config, "speculative_config", None)
+        depth = getattr(spec, "num_speculative_tokens", None)
         try:
             return DraftHeadScreen(
-                self.vllm_config.model_config.model, self.lm_head.weight.device
+                self.vllm_config.model_config.model, self.lm_head.weight.device,
+                depth=depth,
             )
         except Exception as e:  # noqa: BLE001 - any mismatch keeps the stock head
             logger.warning("MTP draft-head screen disabled: %r", e)

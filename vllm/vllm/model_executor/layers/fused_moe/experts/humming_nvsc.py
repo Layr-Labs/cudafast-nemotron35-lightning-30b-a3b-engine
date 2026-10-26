@@ -404,7 +404,7 @@ def _configs(meta, compute_config: str, tuning_config: str, dyn: bool = False) -
         assert config["block_shape"][1:] == [64, 32], config
         assert config["warp_shape"][1:] == [32, 32], config
         assert not config.get("use_stream_k", False)
-        params = _w13_k128_params(lo, hi, lc | cc | config)
+        params = _w13_k128_params(lo, hi, lc | cc | config, nvsc_compatible=True)
         num_sms = params.pop("num_sms", 0)
         if dyn:  # the claim-when-free decode grid, as for the stock dyn kernel
             num_sms = _dyn_num_sms(lo, hi, num_sms)
@@ -461,7 +461,8 @@ def _prefill_configs(meta, compute_config: str, tuning_config: str, dyn: bool) -
         assert config["block_shape"] == [64, 64, 32], config
         assert config["warp_shape"][1:] == [32, 32], config
         assert not config.get("use_stream_k", False)
-        params = lc | json.loads(compute_config) | config
+        params = fused._w13_pf_params(lo, hi, lc | json.loads(compute_config) | config,
+                                      nvsc_compatible=True)
         params.pop("num_sms", None)
         kernel = kernel_cls(**params)
         kernel.load_cubin()

@@ -30,10 +30,23 @@ the K16 MMA chain, the epilogue and ReLU^2 are the stock code, so the output
 is bit-identical by construction (harness/tests/nvsc_exact.py checks it
 against the stock kernel and times both).
 
-Prefill and more than 8 tokens keep the stock kernel and the stock scale
-tensor, which stays in place as a view of the same allocation (header and
-stream first, then the stock bytes; the stream view handed to the launcher
-has the stock shape). NVSC=0 restores the current behaviour.
+Prefill (LOCAL PATCH nvsc-prefill, default ON, NVSC_PREFILL=0 disables: bit-identical
+on all 23 layers x 4 real 496-token prompts; ~12 us/layer = ~0.29 ms per prefill in
+isolation; benchd-leg ABAB 8 pairs: prefill -0.32% +- 0.26). The 496-token
+w13 call (valid_shape_m 2976, the claim-when-free + evict-first kernel of
+humming_relu2_epilogue.py) runs block [64, 64, 32], warp [32, 32, 32]: the
+same 64-column x 32-K tile and the same two warps per 64-column mini block
+(the stock shared->register index uses warp_id % 2 only; the M warps read
+the same scales), so the decode stream serves it as is: no second repack and
+no extra memory. A derived class (NvscDynEvictFirstRelu2HummingKernel, own
+name and cache key) takes the same two loaders, with the 96-byte stage loads
+under the same L2 evict_first policy as the stock B/BS loads of that kernel;
+the B loader, scheduler, epilogue and pipeline (4 stages) are that kernel's
+own text. Other prefill shapes and more than 8 tokens keep the stock kernel
+and the stock scale tensor, which stays in place as a view of the same
+allocation (header and stream first, then the stock bytes; the stream view
+handed to the launcher has the stock shape). NVSC=0 restores the current
+behaviour; NVSC_PREFILL=0 keeps the stock prefill kernel.
 """
 
 from __future__ import annotations
@@ -48,6 +61,8 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 ENABLED = os.environ.get("NVSC", "1") != "0"
+PREFILL_ENABLED = os.environ.get("NVSC_PREFILL", "1") != "0"
+PREFILL_VALID_M = 2976  # 496 tokens x top-6, the evict-first prefill entry
 
 DECODE_MAX_VALID_M = 48  # 8 tokens x top-6
 HEADER = 128  # 64-byte table + pad; keeps the stream 128-byte aligned
@@ -207,6 +222,52 @@ def _kernel_classes():
 
 _KERNEL_CLASSES: dict = {}
 
+# nvsc-prefill: the same loaders, the 96-byte stage loads with the evict-first
+# L2 policy of the prefill kernel's stock B/BS loads (the table load keeps the
+# default policy: every CTA rereads its 64 bytes).
+_EVF_STAGE = r"""
+CUDA_INLINE void nvsc_evf_load(const int4 *g, int4 *s) {
+  uint32_t sm = cast_smem_ptr_to_uint(s);
+  uint64_t policy;
+  asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(policy));
+  asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0],[%1],16,%2;"
+               :: "r"(sm), "l"(g), "l"(policy) : "memory");
+}
+"""
+_STAGE_LOAD = "if (t < kStageInt4s) legacy_load<true>(gmem_ptr + t, smem_ptr + t);"
+assert _LOADERS.count(_STAGE_LOAD) == 1
+_LOADERS_PF = _LOADERS.replace(
+    "// nvsc: this layer's", _EVF_STAGE + "\n// nvsc: this layer's", 1
+).replace(_STAGE_LOAD, "if (t < kStageInt4s) nvsc_evf_load(gmem_ptr + t, smem_ptr + t);")
+
+
+def _prefill_kernel_classes():
+    """{dyn: class} of the nvsc prefill kernels: the nvsc loaders inserted
+    first, then EvictFirstRelu2HummingKernel.prepare adds the evict-first B
+    loader (its loader_bs include is then skipped by the include guard) and
+    Relu2HummingKernel.prepare the scheduler and epilogue."""
+    from vllm.model_executor.layers.fused_moe.experts.humming_relu2_epilogue import (
+        EvictFirstRelu2HummingKernel,
+    )
+
+    class NvscEvictFirstRelu2HummingKernel(EvictFirstRelu2HummingKernel):
+        def prepare(self):
+            assert self.use_cp_async and not self.use_tma_bs and not self.use_warp_spec
+            assert "#if " not in _LOADERS_PF
+            at = self.code.index("#if ")
+            self.code = self.code[:at] + _LOADERS_PF + self.code[at:]
+            super().prepare()
+
+    class NvscDynEvictFirstRelu2HummingKernel(NvscEvictFirstRelu2HummingKernel):
+        dyn_scheduler = True
+
+    return {False: NvscEvictFirstRelu2HummingKernel, True: NvscDynEvictFirstRelu2HummingKernel}
+
+
+_PF_KERNEL_CLASSES: dict = {}
+_PF_CONFIGS: dict = {}
+_PF_FAILED: set = set()
+
 
 # ---------------------------------------------------------------------------
 # load-time repack
@@ -361,6 +422,103 @@ def _configs(meta, compute_config: str, tuning_config: str, dyn: bool = False) -
     configs = torch.tensor(result, dtype=torch.int64, device="cpu")
     _CONFIGS[key] = configs
     return configs
+
+
+def _prefill_configs(meta, compute_config: str, tuning_config: str, dyn: bool) -> torch.Tensor:
+    """One-entry config list: the record's evict-first prefill entry (same
+    tuning config and persistent grid) with the nvsc kernel."""
+    from humming.kernel.humming import HummingKernel
+
+    from vllm.model_executor.layers.fused_moe.experts import humming_relu2_epilogue as fused
+
+    key = (meta.to_str(), compute_config, tuning_config) + fused._variant_key(dyn)
+    if key in _PF_CONFIGS:
+        return _PF_CONFIGS[key]
+    if not _PF_KERNEL_CLASSES:
+        _PF_KERNEL_CLASSES.update(_prefill_kernel_classes())
+    kernel_cls = _PF_KERNEL_CLASSES[dyn]
+    evict = fused.prepare(meta, compute_config, tuning_config, evict_first=True, dyn=dyn).tolist()
+    tc = json.loads(tuning_config)
+    if isinstance(tc, dict):
+        tc = [[0, 1 << 30, tc]]
+    lc = json.loads(meta.to_str())
+    lc.pop("sublayer_name", None)
+    result = []
+    for i, (lo, hi, config) in enumerate(tc):
+        if not lo < PREFILL_VALID_M <= hi:
+            continue
+        original = HummingKernel._id2kernel[evict[4 * i + 2]]
+        want = (fused.DynEvictFirstRelu2HummingKernel if dyn
+                else fused.EvictFirstRelu2HummingKernel)
+        assert type(original) is want, type(original)  # evict-first kernel in use
+        assert config["block_shape"] == [64, 64, 32], config
+        assert config["warp_shape"][1:] == [32, 32], config
+        assert not config.get("use_stream_k", False)
+        params = lc | json.loads(compute_config) | config
+        params.pop("num_sms", None)
+        kernel = kernel_cls(**params)
+        kernel.load_cubin()
+        assert type(kernel) is kernel_cls
+        assert "nvsc_table" in kernel.code and "nvsc_evf_load" in kernel.code
+        assert ("hm_dyn_claim" in kernel.code) == dyn
+        assert "cp.async.cg.shared.global.L2::cache_hint" in kernel.code
+        assert kernel.kernel_filename != original.kernel_filename
+        # One entry over all M (the launcher resolves its base kernel at M = 1;
+        # the kernel is correct at any M, launch_prefill admits only 2976).
+        result.extend([0, 1 << 30, kernel.kernel_id, evict[4 * i + 3]])
+    assert len(result) == 4, result
+    configs = torch.tensor(result, dtype=torch.int64, device="cpu")
+    _PF_CONFIGS[key] = configs
+    return configs
+
+
+def launch_prefill(layer, inputs, outputs, compute_config, tuning_config, sorted_ids,
+                   expert_ids, num_tokens_padded, top_k, valid_shape_m, dyn=None) -> bool:
+    """The 496-token routed up GEMM (+ReLU^2) with compressed scales in the
+    evict-first prefill kernel. False (nothing launched) when not covered."""
+    from vllm.model_executor.layers.fused_moe.experts.humming_relu2_epilogue import (
+        _dyn_enabled,
+        _variant_key,
+    )
+
+    bs = getattr(layer, "nvsc_w13_bs", None)
+    if bs is None or not ENABLED or not PREFILL_ENABLED:
+        return False
+    if valid_shape_m != PREFILL_VALID_M or top_k != 6:
+        return False
+    dyn = _dyn_enabled() if dyn is None else bool(dyn)
+    variant = _variant_key(dyn)
+    if variant in _PF_FAILED:
+        return False
+    from humming import ops
+
+    meta = layer.humming_metas["w13"]
+    try:
+        configs = _prefill_configs(meta, compute_config, tuning_config, dyn)
+    except Exception as exc:  # noqa: BLE001
+        _PF_FAILED.add(variant)
+        logger.warning("nvsc: prefill kernel unavailable (dyn=%s); using stock: %s", dyn, exc)
+        return False
+    logger.info_once("nvsc: 6-bit w13 block scales in the prefill kernel on %d routed layers",
+                     len(_STATS["packed"]))
+    ops.launch_kernel(
+        configs=configs,
+        inputs=inputs,
+        weight=getattr(layer, meta.weight_name),
+        outputs=outputs,
+        input_scale=None,
+        weight_scale=bs,
+        zero_point=getattr(layer, meta.zero_point_name, None),
+        bias=None,
+        global_scale=getattr(layer, meta.global_scale_name, None),
+        sorted_ids=sorted_ids,
+        expert_ids=expert_ids,
+        num_tokens_padded=num_tokens_padded,
+        locks=layer.locks,
+        top_k=top_k,
+        valid_shape_m=valid_shape_m,
+    )
+    return True
 
 
 def launch(layer, inputs, outputs, compute_config, tuning_config, sorted_ids,

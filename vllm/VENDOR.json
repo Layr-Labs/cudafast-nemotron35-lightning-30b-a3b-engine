@@ -370,6 +370,22 @@
     {
       "file": "harness/kernels/cmp2 (+ vllm/v1/worker/gpu_model_runner.py)",
       "why": "CMP2=1 (default): transparent generic-compression VMM backing for immutable fp8c codes, apk12 planes, shared Marlin weights/scales and target lm_head including its unit-major scale copy. Full load-time storage byte checks precede pointer rebinding and engine capture. Original storages stay alive; unsupported or failed allocations leave ordinary tensors. CMP2=0 disables. Target and drafter formats and arithmetic are unchanged."
+    },
+    {
+      "file": "harness/kernels/marlinx/csrc/marlinx.cu; harness/kernels/shco/csrc/shx.cu",
+      "why": "fkiene 798532d4, carried: the shared-expert up epilogues of marlinx (verify) and shx (prefill) apply ReLU-square to the rounded BF16 pair with packed non-FTZ max.NaN.bf16x2 against +0 and mul.rn.bf16x2 (round_output2_relu2), the same single rounding of the exact square as the scalar path; round_output<false> is unchanged."
+    },
+    {
+      "file": "vllm/v1/worker/decode_prep.py; vllm/v1/worker/gpu_model_runner.py; vllm/v1/worker/copy_batch.py; vllm/v1/attention/backends/mamba2_attn.py; vllm/v1/attention/backends/flashinfer.py",
+      "why": "Port selected fused one-request integer decode preparation, ordered small-copy batch and stable draft-id output from 993e9bec-9497-4bb0-8d72-6def1f106293 onto ENTIRE highest-valid c64b6fe5-d7a2-4093-90c0-291ad3ed64a4. Own additions retain source/destination tensor owners through GPU completion, record completion after the copy kernel in both staging modes, and materialize before opaque wrapper.plan fallback boundaries. Preserve independent DEB draft-id dtype guard on nonfused path. Whole new composition unverified; no isolated gain, activation or all-input equivalence claim."
+    },
+    {
+      "file": "model_executor/layers/fused_moe/experts/humming_nvsc.py; model_executor/layers/fused_moe/experts/humming_relu2_epilogue.py",
+      "why": "Selected 993e9bec-9497-4bb0-8d72-6def1f106293 prefill loader reuses existing lossless6bit coded routed-up scale stream in the guarded evict-first prefill kernel. Existing NVSC source fc04335b-c894-41f9-b73b-aa9b5aac1fb5 retained. No new target quantization or weight repack. Entire993 lower than C64 and not selected as baseline; no component gain claim."
+    },
+    {
+      "file": "harness/kernels/cmp2/py/__init__.py",
+      "why": "Useful pending bbfaa47d-682a-4a71-9aac-6a8e02ad3cf4 extends complete C64 immutable-family selection to target zskip_w2.s and nvsc_w13_bs coded scale streams. Exact pending loader blob52f92c5f70f4f7e0a2be61340486935734da5454 read and reused: only seven added lines versus C64. Same full-storage-byte transaction, shapes/strides and strong original owners retained. Pending method and combination unverified; no compression ratio or speed claim."
     }
   ]
 }

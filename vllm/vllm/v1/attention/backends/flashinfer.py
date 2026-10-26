@@ -88,6 +88,7 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
+from vllm.v1.worker import copy_batch
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheSpec,
@@ -1170,17 +1171,14 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             : num_reqs + 1
         ]
         paged_kv_indptr = self.paged_kv_indptr.gpu[: num_reqs + 1]
-        paged_kv_indptr.copy_(
-            self.paged_kv_indptr_cpu_buffer[: num_reqs + 1], non_blocking=True
-        )
+        # LOCAL PATCH: the three copies below are recorded in the prep copy batch
+        copy_batch.copy(paged_kv_indptr, self.paged_kv_indptr_cpu_buffer[: num_reqs + 1])
 
         # write self.paged_kv_indices inplace
         num_actual_pages = self.paged_kv_indptr.np[num_reqs]
         paged_kv_indices = self.paged_kv_indices.gpu[:num_actual_pages]
         if _FI_PAGE_TRIM and num_reqs == 1:
-            paged_kv_indices.copy_(
-                block_table_tensor[0, :num_actual_pages], non_blocking=True
-            )
+            copy_batch.copy(paged_kv_indices, block_table_tensor[0, :num_actual_pages])
         else:
             _copy_page_indices_kernel[(num_reqs,)](
                 paged_kv_indices,
@@ -1197,8 +1195,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             page_size,
             paged_kv_last_page_len_np,
         )
-        self.paged_kv_last_page_len.gpu[:num_reqs].copy_(
-            self.paged_kv_last_page_len.cpu[:num_reqs], non_blocking=True
+        copy_batch.copy(
+            self.paged_kv_last_page_len.gpu[:num_reqs],
+            self.paged_kv_last_page_len.cpu[:num_reqs],
         )
         return paged_kv_indices
 
@@ -2469,6 +2468,7 @@ def _reuse_fresh_prefill_plan(wrapper, **kw) -> None:
             return
     except (AttributeError, KeyError, TypeError, ValueError):
         key = None
+    copy_batch.materialize()
     wrapper.plan(**kw)
     stabilize_native_plan(wrapper)
     # plan() may initialize/replace the cached module on this first call. A key
@@ -2481,6 +2481,7 @@ def _fast_plan_spec_prefill(wrapper, builder, **kw) -> None:
         _fast_plan_spec_prefill_impl(wrapper, builder, **kw)
     except (AttributeError, TypeError, KeyError, ValueError, RuntimeError):
         wrapper._vllm_fast_const = None
+        copy_batch.materialize()
         wrapper.plan(**kw)
 
 
@@ -2525,6 +2526,7 @@ def _fast_plan_spec_prefill_impl(wrapper, builder, **kw) -> None:
             and total_num_rows <= wrapper._max_total_num_rows
         )
     if not ok:
+        copy_batch.materialize()
         wrapper.plan(**kw)
         wrapper._vllm_fast_const = const
         wrapper._vllm_fast_qo = qo.clone()
@@ -2535,9 +2537,10 @@ def _fast_plan_spec_prefill_impl(wrapper, builder, **kw) -> None:
     kv_lens = get_seq_lens(indptr, lpl, page_size)
     nk = len(kv_lens)
     if nk > wrapper._kv_lens_buffer.shape[0]:
+        copy_batch.materialize()
         wrapper.plan(**kw)
         return
-    wrapper._kv_lens_buffer[:nk].copy_(kv_lens, non_blocking=True)
+    copy_batch.copy(wrapper._kv_lens_buffer[:nk], kv_lens)  # LOCAL PATCH: prep copy batch
     wrapper._max_kv_len = max(kv_lens).item()
     fixed_split_size = kw.get("fixed_split_size")
     head_dim_qk = kw["head_dim_qk"]

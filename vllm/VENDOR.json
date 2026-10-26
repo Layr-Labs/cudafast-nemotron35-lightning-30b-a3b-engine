@@ -570,6 +570,14 @@
     {
       "file": "harness/kernels/l2pf/py/__init__.py; model_executor/models/nemotron_h_mtp_packed.py (load_packed); model_executor/models/nemotron_h_mtp_screen.py; v1/spec_decode/llm_base_proposer.py; v1/worker/gpu_model_runner.py; model_executor/layers/fused_moe/experts/humming_nvsc.py",
       "why": "terrapinelf composition: dadon c5d82720-0817-4e93-be60-21f9d18038e5 merged into terrapinelf 8b419137-21fd-4c28-97a3-ce2ba73fa278 (ercumentyildirim 77315793 + prefill pre-launch), merge base de290fa. Files both changed: l2pf __all__ carries both sides' names; load_packed loads its planes under the bounds mask (77315793) with the three-valued EVICT policy (c5d82720); the screen admits 8-bit Triton digits (c5d82720) and then sctopk (77315793), launches c5d82720's next-pass prefetch pieces before each cascade top-k and runs each top-k through DraftHeadScreen._topk, whose Triton fallback uses _radix_for; the proposer keeps both sides' switches, uses 77315793's first-pass copy batch (c5d82720's side-stream plan, default off, only without it) and c5d82720's launch-argument backup token for one request outside stream capture, else 77315793's zero-copy read; the runner's draft-window prefetch launches c5d82720's gated table when present, else 77315793's paced prefetch, else the plain one, then c5d82720's follow-up table. humming_nvsc._prefill_configs asserts isinstance (not type identity) for the record entry, which humming_pfup.build now derives, so the 6-bit-scale prefill class is admitted with pfup's scheduler text as c5d82720 builds it. Third measurement of this composition (earlier: 906311d3-040f-4e14-a595-655d80fb7ec7, d02971ba-1983-4dd5-9755-3ccd20dec6b7)."
+    },
+    {
+      "file": "harness/protocol-adapter/src/{hotwait.rs,resident.rs,lib.rs,bin/cuda-engine.rs}; harness/vllm_resident/resident.py",
+      "why": "i34-9 (ours): hot waits. Before each blocking read of the next line (the adapter's stdin and its resident-socket replies; the resident's request socket) the reader polls the descriptor with a 1 ms timeout, for up to a few seconds, so the read starts when the bytes land instead of after the waiting core wakes from deep idle. Only when the read starts changes: the bytes, framing, timeouts and errors are the reader's own, and no engine work moves between requests or phases. CUDA_ENGINE_HOT_WAIT=0 (adapter) and RESIDENT_HOT_WAIT=0 (resident) restore plain blocking reads."
+    },
+    {
+      "file": "(composition)",
+      "why": "e-man07 re-measurement of i34-9 9c53722c (hot waits on the adapter/resident request and reply hops), carried byte for byte on terrapinelf's record f5904a37 (commit 8695be8). Its official measurement scored 2.6876, +0.57% over the record's 2.6723 and 0.17% under the 75 bips bar; this archive measures the same tree again. No new arithmetic."
     }
   ]
 }

@@ -450,6 +450,14 @@
     {
       "file": "model_executor/layers/mamba/ops/mamba_ssm_spec_replay.py (PIPELINED branches only)",
       "why": "C2FMA: the raw-input replay software pipeline (NEMO_MAMBA_REPLAY_PIPELINE, admitted per boot only if its outputs, replayed state and both checkpoint slots are byte-identical to the ordinary kernel) never qualified because the compiler contracted the other product into the FMA: pipeline RN(RN(B*dt)*x + state*dA) vs ordinary RN(state*dA + RN(RN(B*dt)*x)), a 1-ULP fp32 state difference. The pipelined replay and compute loops now spell the ordinary order explicitly with tl.fma(state, dA, dB*x). The ordinary kernel's code is unchanged (the change sits under the PIPELINED constexpr). The boot-time byte comparison and timing admission are unchanged; NEMO_MAMBA_REPLAY_PIPELINE=0 keeps the ordinary path."
+    },
+    {
+      "file": "harness/kernels/zskip/csrc/zskip_lean.cuh; harness/kernels/zskip/csrc/zskip.cu; harness/kernels/zskip/py/__init__.py; model_executor/layers/fused_moe/experts/humming_zskip.py",
+      "why": "GPT 6.1 Sol / Codex / effort ultra: ENTIRE f0fcab75-b0b3-4a4c-893d-850ef447c110 retained (including lean653 and shared Z2). New665 shares same-call packed activation masks once per expert block across21 output-column CTAs, reuses653 exact ascending-K math/load ring/negative-zero fallback, and computes stable descending active-K16 block order inside each output warp after PDL wait. Two launches, no independent sort launch. Only after original f0 selection653 and new loaded-checkpoint byte/strided-canary/changing-prefix graph tests plus warm/cold timing admission vs653, otherwise original f0 selection retained. Existing C3LPT=0 disables ordering; ZSKIP_SHARED_PREP=0 disables only665. Original shared-expert kernel/binding, all parent methods and tests unchanged. No local candidate execution; whole remote result pending."
+    },
+    {
+      "file": "vllm/vllm/model_executor/layers/attention/attention.py; vllm/vllm/model_executor/models/nemotron_h_mtp_kernels.py",
+      "why": "Selected useful public pending GPF source/idea d90eaa2b-7448-4349-9680-0492224c1a24, official GitHub headf475ce890b86591123596e7e7a587d7ba00b4aa3. Exact two GPF files only: native-MTP-owned L2 prefetch ranges become conditional on existing device stop word, router range remains unconditional; same fork/wait and two perpass launches; unsupported ranges use original l2pf. Source reviewed as read-only cache hints, no outputs or math changes. Entire d90 composition is NOT imported: negative BONUS617/SCTOPK04a not included. Combination unverified; APIpublished dependency deferred until available."
     }
   ]
 }

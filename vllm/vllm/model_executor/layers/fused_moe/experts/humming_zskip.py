@@ -63,6 +63,13 @@ PAIR_FUSED_CONFIG = 118
 # the same pair kernels without the dequantisation of 8-row k halves whose mask byte is zero
 PAIR_HALFSKIP = os.environ.get("ZSKIP_HALFSKIP", "1") != "0"
 PAIR_HALFSKIP_CONFIG = {PAIR_CONFIG: 114, PAIR_FUSED_CONFIG: 119}
+# Lean paired decode (harness/kernels/zskip/csrc/zskip_lean.cuh): config 119's per-output arithmetic
+# with a shorter per-group instruction stream and per-lane L2 prefetch; with ZSKIP_LEAN=1 it replaces
+# the checked pair config for M=5 after a bitwise check against humming and that config (on by
+# default; ZSKIP_LEAN=0 keeps the pair config): -14 us per call alone, -5 us in situ.
+LEAN_ENABLED = os.environ.get("ZSKIP_LEAN", "1") == "1"
+LEAN_CONFIG = int(os.environ.get("ZSKIP_LEAN_CONFIG", "653"))
+LEAN_SHARED_PREP = os.environ.get("ZSKIP_SHARED_PREP", "1") == "1"
 # Prefill: MoE layers whose relu^2 activations are sparse enough for the skip to beat humming's
 # 64-row blocks on GB10 (measured per layer on prefill-length calls; the others lose). Layer 51,
 # the last, is left out: the boot prefill graph routes all its rows through one row's experts.
@@ -158,6 +165,8 @@ def finalize(layer: torch.nn.Module) -> None:
     layer.zskip_pair_config = None
     if PAIR_ENABLED:
         _prepare_pair(layer)
+    if LEAN_ENABLED and getattr(layer, "zskip_pair_w2", None) is not None:
+        _prepare_lean(layer)
     layer.zskip_pair_prefix_ok = False
     if (getattr(layer, "zskip_pair_w2", None) is not None
         and os.environ.get("ZSKIP_VERIFY_PREFIX", "1") != "0"
@@ -212,6 +221,144 @@ def _prepare_pair(layer: torch.nn.Module) -> None:
         logger.info_once("zskip: dadon paired decode config %d enabled for M=5", config)
     except Exception as exc:  # noqa: BLE001
         logger.warning_once("zskip: paired decode unavailable (%r); checked legacy config retained", exc)
+
+
+def _prepare_lean(layer: torch.nn.Module) -> None:
+    """Keep the entire f0 lean selection, then optionally qualify shared prep."""
+    prefix = os.environ.get("ZSKIP_VERIFY_PREFIX", "1") != "0" and _zskip.prefix_available()
+    try:
+        _zskip.config_info(LEAN_CONFIG)
+        ref = layer.zskip_pair_config
+        if _pair_check(layer, layer.zskip_pair_w2, LEAN_CONFIG, ms=range(1, 9), ref_config=ref) and (
+            not prefix or _pair_check(layer, layer.zskip_pair_w2, LEAN_CONFIG, prefix=True)
+        ):
+            layer.zskip_pair_config = LEAN_CONFIG
+            logger.info_once("zskip: lean paired decode config %d replaces %d for M=5", LEAN_CONFIG, ref)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning_once("zskip: lean paired decode unavailable (%r); config %s",
+                            exc, getattr(layer, "zskip_pair_config", None))
+    # The reference is the *actual f0 selection* after all original checks, not
+    # an older 113/119 choice. Failure retains every winning baseline mechanism.
+    if LEAN_SHARED_PREP and layer.zskip_pair_config == 653:
+        try:
+            _zskip.config_info(665)
+            if (_pair_check(layer, layer.zskip_pair_w2, 665, ms=range(1, 9), ref_config=653)
+                and (not prefix or _pair_check(layer, layer.zskip_pair_w2, 665,
+                                               prefix=True, ref_config=653))):
+                selected, ratios = _lean_graph_admission(layer, 653, [665], prefix)
+                logger.info("zskip: prepared-mask private admission layer=%s selected=%d ratios=%s",
+                            layer.layer_name, selected, ratios)
+                if selected == 665:
+                    layer.zskip_pair_config = selected
+        except Exception as exc:
+            logger.warning_once("zskip: shared prep unavailable (%r); f0 lean selection retained", exc)
+
+
+def _lean_graph_admission(layer, original, choices, prefix):
+    """Exact guarded strided outputs, same-call masks, then warm/cold graph timings.
+
+    This is a kernel admission guard, not evidence of an end-to-end speedup.
+    A candidate needs a >2% median improvement and <1% worst-case regression in
+    these private routing/prefix/cache cases. The official paired whole-bundle
+    run remains the performance test.
+    """
+    import statistics
+
+    if not choices or torch.cuda.is_current_stream_capturing():
+        return original, {}
+    device = layer.w2_global_scale.device
+    gen = torch.Generator(device=device)
+    gen.manual_seed(557931)
+    configs = [original] + [c for c in choices if c != original]
+    ratios = {c: [] for c in configs[1:]}
+    # No pointer, tensor or cache contains production activations. The pressure
+    # writes are outside the measured interval and only used before model warmup.
+    pressure = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=device)
+    profiles = ((False, 0.10, 5), (True, 0.10, 5),
+                (False, 0.02, 1), (True, 0.02, 3))
+    guard = -23206
+    for crowded, density, count in profiles:
+        ids = [[(29 * i + (0 if crowded else 17 * t)) % NUM_EXPERTS
+                for i in range(TOP_K)] for t in range(5)]
+        topk = torch.tensor(ids, dtype=torch.int32, device=device)
+        sorted_ids, expert_ids, ntp = _align(topk, 16)
+        backing = torch.empty(32, INTER + 16, dtype=torch.bfloat16, device=device)
+        backing.view(torch.int16).fill_(guard)
+        a = backing[1:31, :INTER]
+        values = torch.randn(30, INTER, generator=gen, device=device).relu().square()
+        keep = torch.rand(30, INTER, generator=gen, device=device) < density
+        a.copy_((values * keep).to(torch.bfloat16))
+        # Exercise the exact zero sign and wholly empty K16/half groups as well.
+        a[:, :16] = 0
+        a[:, 16:24] = 0
+        a[:, 40:48] = 0
+        bits = a.view(torch.int16)
+        bits.masked_fill_(bits == 0, -32768)
+        before = backing.view(torch.int16).clone()
+        vrows = torch.tensor([count], dtype=torch.int32, device=device) if prefix else None
+        owners, outputs, graphs = {}, {}, {}
+
+        def run(c):
+            return _zskip.down(a, sorted_ids, expert_ids, ntp, layer.zskip_pair_w2,
+                               outputs[c], mode=_zskip.SKIP, config=c, max_blocks=30,
+                               verify_rows=vrows)
+
+        for c in configs:
+            owners[c] = torch.empty(32, HIDDEN + 16, dtype=torch.bfloat16, device=device)
+            owners[c].view(torch.int16).fill_(guard)
+            outputs[c] = owners[c][1:31, :HIDDEN]
+            run(c)
+            run(c)
+        torch.cuda.current_stream(device).synchronize()
+        for c in configs:
+            graphs[c] = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graphs[c]):
+                run(c)
+
+        def intact(c):
+            raw = owners[c].view(torch.int16)
+            return (bool((raw[0] == guard).all()) and bool((raw[-1] == guard).all())
+                    and bool((raw[1:31, HIDDEN:] == guard).all())
+                    and torch.equal(backing.view(torch.int16), before))
+
+        # Change the prefix in place across graph replays: no stale list/order
+        # may survive either direction, including the lower/upper clamped cases.
+        for live in ((0, 1, 3, 5, 8, -1, count) if prefix else (None,)):
+            if live is not None:
+                vrows.fill_(live)
+            for c in configs:
+                graphs[c].replay()
+            torch.cuda.current_stream(device).synchronize()
+            ref_bits = outputs[original].view(torch.int16)
+            for c in configs:
+                if not intact(c) or not torch.equal(outputs[c].view(torch.int16), ref_bits):
+                    return original, {"exact_or_guard_failure": c}
+
+        for cold in (False, True):
+            samples = {c: [] for c in configs}
+            for repeat in range(5):
+                order = configs if repeat % 2 == 0 else list(reversed(configs))
+                for c in order:
+                    if cold:
+                        pressure.fill_(repeat)
+                    start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                    start.record()
+                    graphs[c].replay()
+                    stop.record()
+                    stop.synchronize()
+                    samples[c].append(start.elapsed_time(stop))
+            base = statistics.median(samples[original])
+            if base <= 0:
+                return original, {"invalid_original_timing": base}
+            for c in configs[1:]:
+                ratios[c].append(statistics.median(samples[c]) / base)
+        # Strong owners remain live through all replays and comparisons.
+        torch.cuda.current_stream(device).synchronize()
+    admitted = [c for c, values in ratios.items()
+                if values and statistics.median(values) < 0.98 and max(values) < 1.01]
+    if not admitted:
+        return original, ratios
+    return min(admitted, key=lambda c: statistics.median(ratios[c])), ratios
 
 
 def _pair_check(layer: torch.nn.Module, packed: Any, config: int, prefix: bool = False,

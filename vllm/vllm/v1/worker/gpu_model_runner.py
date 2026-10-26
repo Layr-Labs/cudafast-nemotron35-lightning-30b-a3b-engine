@@ -310,6 +310,8 @@ _SPEC_META_CACHE_CHECK = os.environ.get("VLLM_SPEC_META_CACHE_CHECK", "0") == "1
 # it the ordinary way and compares inputs and outputs.
 _PREFILL_EARLY = os.environ.get("VLLM_PREFILL_EARLY", "1") != "0"
 _PREFILL_EARLY_CHECK = os.environ.get("VLLM_PREFILL_EARLY_CHECK", "0") == "1"
+# LOCAL PATCH (cudafast-nemotron35): verify-step output copy right after sampling.
+_OUTPUT_COPY_AFTER_SAMPLE = os.environ.get("VLLM_OUTPUT_COPY_AFTER_SAMPLE", "1") != "0"
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -5171,6 +5173,16 @@ class GPUModelRunner(
         else:
             routed_experts_snapshot = None
             copy_ready_event = None
+            if spec_decode_metadata is not None and _OUTPUT_COPY_AFTER_SAMPLE:
+                # LOCAL PATCH (cudafast-nemotron35): a verify step's sampled ids
+                # are final once the sampler has run; the device-to-host copy
+                # waits for that point instead of for every operation queued
+                # before it, which includes the next draft loop queued below.
+                # A prefill step (no spec metadata) keeps waiting for its draft
+                # pass, so the seed token still returns after the whole seed
+                # work. The copy reads only sampled_token_ids.
+                copy_ready_event = torch.cuda.Event(enable_timing=False)
+                copy_ready_event.record()
 
         self._draft_token_ids = None
         self._draft_probs = None

@@ -45,6 +45,15 @@ except ImportError:
     _l2pf = None
 
 from vllm.logger import init_logger
+
+# LOCAL PATCH (cudafast-nemotron35): the three-level cascade's per-chunk top-k selections as
+# one CUDA kernel each (harness/kernels/sctopk), used only after a load-time comparison with
+# _chunk_topk; the same ids in the same order. VLLM_MTP_SCREEN_SCTOPK=0 keeps _chunk_topk.
+try:
+    import sctopk as _sctopk
+except ImportError:
+    _sctopk = None
+_SCTOPK = os.environ.get("VLLM_MTP_SCREEN_SCTOPK", "1") != "0"
 from vllm.triton_utils import tl, triton
 
 from .nemotron_h_mtp_kernels import (
@@ -671,6 +680,12 @@ class DraftHeadScreen:
         self.radix = self.fused_topk and os.environ.get("VLLM_MTP_RADIX_TOPK", "1") != "0"
         if self.radix:
             self.radix = self._radix_matches(device)
+        self.sctopk = (
+            self.radix and self.pre and _SCTOPK and _sctopk is not None
+            and device.type == "cuda" and _sctopk.available()
+        )
+        if self.sctopk:
+            self.sctopk = self._sctopk_matches(device)
         self.chunk_off = (
             torch.arange(n // SCREEN_CHUNK, device=device) * SCREEN_CHUNK
         )[:, None]
@@ -759,6 +774,53 @@ class DraftHeadScreen:
             logger.warning("MTP radix top-k unavailable (%r); original selection retained", exc)
             return False
 
+    def _sctopk_matches(self, device: torch.device) -> bool:
+        """sctopk against _chunk_topk (RADIX) on the cascade's three shapes, gated and not,
+        with ties, signed zeros and NaNs: identical id lists or sctopk stays off."""
+        try:
+            gen = torch.Generator(device=device).manual_seed(20261026)
+            c = 4
+            stop = torch.zeros(3, dtype=torch.int32, device=device)
+            for n, k, gather in ((SCREEN_CHUNK, PRE_PER, False), (PRE_PER, CASCADE_PER, True),
+                                 (CASCADE_PER, SCREEN_PER, True)):
+                for trial in range(6):
+                    s = torch.randn(c * n, device=device, generator=gen) * 3
+                    if trial == 1:
+                        s = torch.round(s * 4) / 4
+                    elif trial == 2:
+                        s[::7] = float("nan")
+                        s[::5] = -0.0
+                    elif trial == 3:
+                        s = torch.zeros_like(s)
+                    src = torch.randperm(1 << 20, device=device, generator=gen)[: c * n]
+                    for flag in (0, 1):
+                        stop.fill_(flag)
+                        a = torch.full((c * k,), -1, dtype=torch.int64, device=device)
+                        b = torch.full((c * k,), -2, dtype=torch.int64, device=device)
+                        _chunk_topk[(c,)](s, src if gather else s, a, N=n, K=k, GATHER=gather,
+                                          RADIX=True, num_warps=4, gate_ptr=stop, GATED=True)
+                        if not _sctopk.chunk_topk(s, src, b, n, k, gather, gate=stop, pdl=False):
+                            return False
+                        if not torch.equal(a, b):
+                            logger.warning("MTP screen sctopk differs; _chunk_topk retained")
+                            return False
+            torch.cuda.synchronize(device)
+            return True
+        except Exception as e:  # noqa: BLE001 - any failure keeps _chunk_topk
+            logger.warning("MTP screen sctopk unavailable: %r", e)
+            return False
+
+    def _topk(self, scores, src, out, n, k, gather, tgate, tgated, num_warps):
+        if self.sctopk and _sctopk.chunk_topk(
+            scores, src, out, n, k, gather, gate=tgate if tgated else None, pdl=mtp_pdl()
+        ):
+            return
+        _chunk_topk[(self.n // SCREEN_CHUNK,)](
+            scores, src if gather else scores, out,
+            N=n, K=k, GATHER=gather, RADIX=self.radix,
+            num_warps=num_warps, launch_pdl=mtp_pdl(), gate_ptr=tgate, GATED=tgated,
+        )
+
     def _fold_matches(self, k: int, device: torch.device) -> bool:
         """Load time, before capture: the folded cascade against the unfolded one on
         random rows, bitwise on every stage's scores and on the token."""
@@ -809,11 +871,9 @@ class DraftHeadScreen:
             nchunk = self.n // SCREEN_CHUNK
             tgate, tok = _gate_args(self.scores)
             tgated = gated and tok
-            _chunk_topk[(nchunk,)](
-                self.scores, self.scores, self._pre_cand,
-                N=SCREEN_CHUNK, K=PRE_PER, GATHER=False, RADIX=self.radix,
-                num_warps=4 if self.radix else 8, launch_pdl=mtp_pdl(),
-                gate_ptr=tgate, GATED=tgated,
+            self._topk(
+                self.scores, self.scores, self._pre_cand, SCREEN_CHUNK, PRE_PER, False,
+                tgate, tgated, 4 if self.radix else 8,
             )
             # The coarse score: pre score + the next 16 groups, also stored at
             # its row for the refine stage's base.
@@ -822,19 +882,17 @@ class DraftHeadScreen:
                 self.gscale, self.mid_scores, True, gated,
                 base=self.scores, scatter=self.scores,
             )
-            _chunk_topk[(nchunk,)](
-                self.mid_scores, self._pre_cand, self._coarse_cand,
-                N=PRE_PER, K=CASCADE_PER, GATHER=True, RADIX=self.radix,
-                num_warps=4, launch_pdl=mtp_pdl(), gate_ptr=tgate, GATED=tgated,
+            self._topk(
+                self.mid_scores, self._pre_cand, self._coarse_cand, PRE_PER, CASCADE_PER, True,
+                tgate, tgated, 4,
             )
             _rows_dot(
                 self._hr, self.w_rest, self.s_rest, self._coarse_cand,
                 self.gscale, self.refine_scores, True, gated, base=self.scores,
             )
-            _chunk_topk[(nchunk,)](
-                self.refine_scores, self._coarse_cand, self._cand,
-                N=CASCADE_PER, K=SCREEN_PER, GATHER=True, RADIX=self.radix,
-                num_warps=4, launch_pdl=mtp_pdl(), gate_ptr=tgate, GATED=tgated,
+            self._topk(
+                self.refine_scores, self._coarse_cand, self._cand, CASCADE_PER, SCREEN_PER, True,
+                tgate, tgated, 4,
             )
             cand = self._cand
         elif self.cascade and self.fused_topk:

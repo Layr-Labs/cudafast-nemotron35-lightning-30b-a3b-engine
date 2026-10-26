@@ -69,7 +69,47 @@ def _select(models, torch):
                     if any(tag in field.lower() for tag in ("workspace", "scratch", "lock")):
                         continue
                     add(prefix + "." + field, tensor)
+            if owner == "drafter":
+                # Drafter packed BF16 planes read by every draft pass: the
+                # attention projections' and the eh hidden half's registered
+                # planes, and the shared-expert up planes; the routed-up packs
+                # contribute only their small base/index/raw planes.
+                for field in ("_mtp_pk_", "_mtp_eh_pk_"):
+                    for part in ("sm", "ex", "base", "ri", "raw"):
+                        add(prefix + "." + field + part, getattr(layer, field + part, None))
+                fast = getattr(layer, "_fast_moe_weights", None)
+                if isinstance(fast, tuple) and len(fast) == 6:
+                    for idx, first in ((0, 2), (2, 0)):
+                        for j, plane in enumerate(getattr(fast[idx], "planes", ())[first:]):
+                            add(prefix + f"._fast_moe_weights.{idx}.planes.{first + j}", plane)
+    if models and models[-1] is not None:
+        # The drafter's packed down projections live in the down-pack registry,
+        # keyed by the BF16 sources (which stay ordinary); move their planes:
+        # the shared slice whole, the routed one's small planes.
+        try:
+            from vllm.model_executor.models import nemotron_h_mtp_down_packed as dp
+            for key, entry in list(dp._PACKS.items()):
+                if len(entry) < 4 or entry[2] is None or entry[3] is None:
+                    continue
+                for idx, first in ((2, 2), (3, 0)):
+                    for j, plane in enumerate(getattr(entry[idx], "planes", ())[first:]):
+                        add(f"drafter.down_pack.{idx}.planes.{first + j}", plane)
+        except Exception:  # noqa: BLE001 - registry absent: nothing more selected
+            pass
     return selected
+
+
+def _rekey_packed_mm():
+    """The packed-GEMV admission registry is keyed by its first plane's address;
+    re-key every entry after the planes moved (same objects, same flags)."""
+    try:
+        from vllm.model_executor.models import nemotron_h_mtp_pkmm as pk
+    except Exception:  # noqa: BLE001
+        return
+    entries = list(pk._ADMITTED.values())
+    pk._ADMITTED.clear()
+    for packed, flags in entries:
+        pk._ADMITTED[pk._identity(packed)] = (packed, flags)
 
 
 def prepare(models):
@@ -141,6 +181,7 @@ def prepare(models):
                 raise
         _ORIGINALS.extend(originals)
         _COMPRESSED.extend(compressed)
+        _rekey_packed_mm()
     except Exception as exc:
         _LOG.warning("CMP2 compressed=none reason=%r ordinary_tensors_retained=True", exc)
         return

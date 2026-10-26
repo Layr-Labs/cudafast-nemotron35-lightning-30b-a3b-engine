@@ -118,11 +118,12 @@ def depth_gate_begin(batch_size: int, all_greedy: bool) -> torch.Tensor | None:
     return g
 
 
-@triton.jit
-def _depth_gate_end_kernel(gate_ptr, vrows_ptr, VROWS_ALL: tl.constexpr, HAS_VROWS: tl.constexpr):
+@triton.jit(do_not_specialize=["max_rows"])
+def _depth_gate_end_kernel(gate_ptr, vrows_ptr, max_rows, VROWS_ALL: tl.constexpr,
+                           HAS_VROWS: tl.constexpr):
     kept = tl.load(gate_ptr + 1)
     if HAS_VROWS:
-        tl.store(vrows_ptr, tl.where(kept > 0, kept + 1, VROWS_ALL))
+        tl.store(vrows_ptr, tl.minimum(tl.where(kept > 0, kept + 1, VROWS_ALL), max_rows))
     tl.store(gate_ptr, 0)
     tl.store(gate_ptr + 2, 0)
 
@@ -130,9 +131,11 @@ def _depth_gate_end_kernel(gate_ptr, vrows_ptr, VROWS_ALL: tl.constexpr, HAS_VRO
 _GATE_END_FUSED = os.environ.get("MTP_GATE_END_FUSED", "1") != "0"
 
 
-def depth_gate_end(gate: torch.Tensor) -> None:
+def depth_gate_end(gate: torch.Tensor, max_rows: int | None = None) -> None:
     """End of the draft loop: verify rows = kept drafts + 1 (every row when nothing
-    was counted), then the stop flag and the active mark cleared."""
+    was counted), capped at max_rows when given (LOCAL PATCH, cudafast-nemotron35:
+    the free-run emit budget, llm_base_proposer._emit_budget_drafts), then the stop
+    flag and the active mark cleared."""
     try:
         import smallk
     except ImportError:
@@ -149,15 +152,17 @@ def depth_gate_end(gate: torch.Tensor) -> None:
     ):
         _depth_gate_end_kernel[(1,)](
             gate, gate if vrows is None else vrows,
+            (1 << 30) if max_rows is None else int(max_rows),
             VROWS_ALL=0 if vrows is None else smallk.VROWS_ALL,
             HAS_VROWS=vrows is not None,
         )
         return
     if vrows is not None:
         kept = gate[1:2]
-        vrows.copy_(
-            torch.where(kept > 0, kept + 1, torch.full_like(kept, smallk.VROWS_ALL))
-        )
+        rows = torch.where(kept > 0, kept + 1, torch.full_like(kept, smallk.VROWS_ALL))
+        if max_rows is not None:
+            rows = torch.clamp(rows, max=int(max_rows))
+        vrows.copy_(rows)
     gate[0:1].zero_()
     gate[2:3].zero_()
 

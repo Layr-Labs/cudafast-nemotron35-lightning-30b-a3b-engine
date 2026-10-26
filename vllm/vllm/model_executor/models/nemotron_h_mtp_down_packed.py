@@ -84,14 +84,18 @@ _TILES = ((32, 4), (64, 4)) + (
     ((128, 4), (128, 8), (256, 8)) if os.environ.get("MTP_DOWN_PACK12_WIDE", "1") != "0" else ())
 
 
-_WIDE_EXACT = os.environ.get("MTP_DOWN_PACK12_WIDE_EXACT", "0") != "0"
+# LOCAL PATCH (cudafast-nemotron35): wide tiles are admitted on bit equality only (default
+# 1). The drafts feed the verify batch, whose FP8 activation scales are computed over all of
+# its rows, so a draft that differs from the record drafter's can move a near-tie in the
+# timed window; MTP_DOWN_PACK12_WIDE_EXACT=0 restores the 1e-5 relative admission.
+_WIDE_EXACT = os.environ.get("MTP_DOWN_PACK12_WIDE_EXACT", "1") != "0"
 
 
 def _same(old, new, tile):
     """The original tiles must match the original slots bit for bit. A wider tile owns
     more columns per program, which can change the fp32 tree of tl.sum over the 64-row
-    chunk (Triton's layout); the drafter's numerics are free, so a wide tile is admitted
-    within 1e-5 relative (same NaN/inf pattern) unless MTP_DOWN_PACK12_WIDE_EXACT=1."""
+    chunk (Triton's layout); with MTP_DOWN_PACK12_WIDE_EXACT=0 a wide tile is admitted
+    within 1e-5 relative (same NaN/inf pattern), by default only on bit equality."""
     if torch.equal(old.view(torch.int32), new.view(torch.int32)):
         return True
     bn = tile[0] if isinstance(tile, tuple) else tile

@@ -8,9 +8,11 @@ the drafter's lm_head is the target's shared NVFP4 head (131072 x 2688, about
 198 MB), and the drafter reads all of it three times per depth-3 cycle only to
 take one argmax per draft. This replaces that argmax:
 
-1. screen every vocabulary row on the 32 most important whole NVFP4
-   16-element groups, chosen once from weight-only importance, in fp32;
-2. keep the top CASCADE_PER rows of every SCREEN_CHUNK-row chunk;
+1. screen every vocabulary row on the 16 most important whole NVFP4
+   16-element groups, chosen once from weight-only importance, in fp32, and
+   keep the top PRE_PER rows of every SCREEN_CHUNK-row chunk;
+2. add the next 16 groups for those rows (their score on the 32 most
+   important groups) and keep the top CASCADE_PER rows of every chunk;
 3. rescore those candidates on the original 64 importance groups and keep
    the top SCREEN_PER candidates of each original chunk;
 4. rescore those rows on the full K in fp32, round to bf16 as the stock head
@@ -26,6 +28,7 @@ proposal can differ when either screen removes a candidate or the rescore's
 different fp32 accumulation changes rounded logits. The target's verification decides
 every committed token, and the timed window is still checked against its oracle.
 
+VLLM_MTP_SCREEN_PRE=0 screens every row on the 32 groups (steps 1-2 in one).
 VLLM_MTP_SCREEN_CASCADE=0 restores the original 64-group single screen.
 VLLM_MTP_SCREEN=0 restores the stock head.
 """
@@ -55,6 +58,10 @@ SCREEN_CHUNK = 2048
 SCREEN_PER = 32
 CASCADE_FRAC_GROUPS = 32
 CASCADE_PER = 256
+# First stage of the three-level cascade: every row on its 16 most important
+# groups, keeping the top PRE_PER of each chunk for the 32-group stage.
+PRE_FRAC_GROUPS = 16
+PRE_PER = 1024
 
 
 def screen_enabled() -> bool:
@@ -124,6 +131,8 @@ def _nvfp4_rows_dot(
     SPER: tl.constexpr = 1,
     base_ptr=None,  # [N] fp32 per-row scores already computed over other groups, when BASE
     BASE: tl.constexpr = False,
+    scatter_ptr=None,  # [N] fp32: the result is also stored at its row, when SCATTER
+    SCATTER: tl.constexpr = False,
 ):
     """RMODE 0: rows from GATHER as before. 1: rows = rows_ptr[r] + (r // CPER) * CHUNK
     (first-stage top-k indices within their chunk). 2: rows = rows_ptr[c * CPER + ref_ptr[r]]
@@ -196,12 +205,14 @@ def _nvfp4_rows_dot(
         # its own groups) plus this kernel's dot over the remaining groups.
         b = tl.load(base_ptr + rows, mask=wr, other=0.0)
         tl.store(out_ptr + r, b + acc * gscale, mask=rmask)
+        if SCATTER:
+            tl.store(scatter_ptr + rows, b + acc * gscale, mask=rmask)
     else:
         tl.store(out_ptr + r, acc * gscale, mask=rmask)
 
 
 def _rows_dot(h, w, s, rows, gscale, out, gather, gated=False, hcols=None, ref=None,
-              rmode=0, cper=1, sper=1, base=None):
+              rmode=0, cper=1, sper=1, base=None, scatter=None):
     n_out = out.numel()
     nbytes = w.shape[1]
     gather = gather or rmode != 0
@@ -223,6 +234,7 @@ def _rows_dot(h, w, s, rows, gscale, out, gather, gated=False, hcols=None, ref=N
         hcols_ptr=hcols, HCOLS=hcols is not None,
         ref_ptr=ref, RMODE=rmode, CHUNK=SCREEN_CHUNK, CPER=cper, SPER=sper,
         base_ptr=base, BASE=base is not None,
+        scatter_ptr=scatter, SCATTER=scatter is not None,
     )
 
 
@@ -325,6 +337,24 @@ def _chunk_topk(
     else:
         val = c.to(tl.int64) * N + i
     tl.store(out_ptr + c * K + pos, val, mask=take)
+
+
+@triton.jit
+def _gather_three(
+    h_ptr, ia_ptr, oa_ptr, ib_ptr, ob_ptr, ic_ptr, oc_ptr,
+    NA: tl.constexpr, NB: tl.constexpr, NC: tl.constexpr,
+    launch_pdl: tl.constexpr = False,
+):
+    """oa = h[ia], ob = h[ib], oc = h[ic] in one launch; pure copies."""
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    a = tl.arange(0, NA)
+    tl.store(oa_ptr + a, tl.load(h_ptr + tl.load(ia_ptr + a)))
+    b = tl.arange(0, NB)
+    tl.store(ob_ptr + b, tl.load(h_ptr + tl.load(ib_ptr + b)))
+    c = tl.arange(0, NC)
+    tl.store(oc_ptr + c, tl.load(h_ptr + tl.load(ic_ptr + c)))
 
 
 @triton.jit
@@ -499,6 +529,43 @@ class DraftHeadScreen:
             self.s_rest = s[:, rest_groups].to(device).contiguous()
             self.rest_cols = rest_cols.to(device)
             self._hr = torch.empty(rest_cols.numel(), dtype=torch.float32, device=device)
+        # LOCAL PATCH (cudafast-nemotron35): three-level cascade. Every row is
+        # screened on the 16 most important groups only; the top PRE_PER of each
+        # chunk add the next 16 groups (the coarse 32-group score, stored back at
+        # its row for the refine stage), and the top CASCADE_PER of those go on to
+        # the refine stage as before. VLLM_MTP_SCREEN_PRE=0 keeps two levels.
+        self.pre = (
+            self.reuse
+            and os.environ.get("VLLM_MTP_SCREEN_PRE", "1") != "0"
+            and 0 < PRE_FRAC_GROUPS < CASCADE_FRAC_GROUPS
+            and CASCADE_PER <= PRE_PER <= SCREEN_CHUNK
+            and _pow2(PRE_PER)
+            and _pow2(PRE_FRAC_GROUPS * 16)
+            and _pow2((CASCADE_FRAC_GROUPS - PRE_FRAC_GROUPS) * 16)
+        )
+        if self.pre:
+            pre_groups = ranked_groups[:PRE_FRAC_GROUPS].sort().values
+            mid_groups = ranked_groups[PRE_FRAC_GROUPS:CASCADE_FRAC_GROUPS].sort().values
+            pre_cols = (pre_groups[:, None] * 16 + torch.arange(16)[None, :]).reshape(-1)
+            mid_cols = (mid_groups[:, None] * 16 + torch.arange(16)[None, :]).reshape(-1)
+            self.w_pre = (
+                w.view(n, ng, 8)[:, pre_groups, :].reshape(n, -1).to(device).contiguous()
+            )
+            self.s_pre = s[:, pre_groups].to(device).contiguous()
+            self.w_mid = (
+                w.view(n, ng, 8)[:, mid_groups, :].reshape(n, -1).to(device).contiguous()
+            )
+            self.s_mid = s[:, mid_groups].to(device).contiguous()
+            self.pre_cols = pre_cols.to(device)
+            self.mid_cols = mid_cols.to(device)
+            self._hp = torch.empty(pre_cols.numel(), dtype=torch.float32, device=device)
+            self._hm = torch.empty(mid_cols.numel(), dtype=torch.float32, device=device)
+            self._pre_cand = torch.empty(
+                (n // SCREEN_CHUNK) * PRE_PER, dtype=torch.int64, device=device
+            )
+            self.mid_scores = torch.empty(
+                (n // SCREEN_CHUNK) * PRE_PER, dtype=torch.float32, device=device
+            )
         self.radix = self.fused_topk and os.environ.get("VLLM_MTP_RADIX_TOPK", "1") != "0"
         if self.radix:
             self.radix = self._radix_matches(device)
@@ -513,10 +580,22 @@ class DraftHeadScreen:
         # l2pf: the coarse matrix is registered for the MTP MoE's down
         # projection window (nemotron_h_mtp_kernels.py), which prefetches its head.
         if _l2pf is not None and self.cascade:
-            _l2pf.DRAFT_SCREEN[:] = [self.w_coarse]
+            _l2pf.DRAFT_SCREEN[:] = [self.w_pre if self.pre else self.w_coarse]
         self.graph = None
         self._h = torch.empty(k, dtype=torch.float32, device=device)
         self._out = torch.empty(1, dtype=torch.int32, device=device)
+        # Move only immutable checkpoint-derived matrices before the first
+        # weight-dependent private fold probe and the production screen graph.
+        # Existing l2pf registrations name these same Tensor objects.
+        try:
+            import cmp2 as _cmp2
+        except ImportError:
+            logger.info("CMP2 mtp-screen ordinary: allocator unavailable")
+        else:
+            try:
+                _cmp2.prepare_screen(self)
+            except Exception as exc:
+                logger.warning("CMP2 mtp-screen ordinary: %r", exc)
         if device.type == "cuda" and self.cascade and self.fold:
             self.fold = self._fold_matches(k, device)
         if device.type == "cuda" and screen_graph_enabled():
@@ -549,8 +628,10 @@ class DraftHeadScreen:
     def _radix_matches(self, device: torch.device) -> bool:
         """Official remote model-load admission, no request data or local execution."""
         try:
-            for n, k, gather in ((SCREEN_CHUNK, CASCADE_PER, False),
-                                 (CASCADE_PER, SCREEN_PER, True)):
+            pairs = [(SCREEN_CHUNK, CASCADE_PER, False), (CASCADE_PER, SCREEN_PER, True)]
+            if getattr(self, "pre", False):
+                pairs += [(SCREEN_CHUNK, PRE_PER, False), (PRE_PER, CASCADE_PER, True)]
+            for n, k, gather in pairs:
                 index = torch.arange(2 * n, device=device, dtype=torch.int32)
                 src = (torch.arange(2 * n, device=device, dtype=torch.int64) + 10000).flip(0)
                 for case in range(4):
@@ -613,7 +694,52 @@ class DraftHeadScreen:
         buffer it touches is fixed-address, so the body is capturable as-is."""
         if out is None:
             out = torch.empty((), dtype=torch.int32, device=h.device)
-        if self.cascade and self.fused_topk:
+        if self.cascade and self.fused_topk and self.pre:
+            # LOCAL PATCH (cudafast-nemotron35): the three-level cascade
+            # (see __init__); the refine stage and everything after it are
+            # the two-level cascade's.
+            _gather_three[(1,)](
+                h, self.pre_cols, self._hp, self.mid_cols, self._hm,
+                self.rest_cols, self._hr,
+                NA=self.pre_cols.numel(), NB=self.mid_cols.numel(),
+                NC=self.rest_cols.numel(), launch_pdl=mtp_pdl(),
+            )
+            _rows_dot(
+                self._hp, self.w_pre, self.s_pre, None,
+                self.gscale, self.scores, False, gated,
+            )
+            nchunk = self.n // SCREEN_CHUNK
+            tgate, tok = _gate_args(self.scores)
+            tgated = gated and tok
+            _chunk_topk[(nchunk,)](
+                self.scores, self.scores, self._pre_cand,
+                N=SCREEN_CHUNK, K=PRE_PER, GATHER=False, RADIX=self.radix,
+                num_warps=4 if self.radix else 8, launch_pdl=mtp_pdl(),
+                gate_ptr=tgate, GATED=tgated,
+            )
+            # The coarse score: pre score + the next 16 groups, also stored at
+            # its row for the refine stage's base.
+            _rows_dot(
+                self._hm, self.w_mid, self.s_mid, self._pre_cand,
+                self.gscale, self.mid_scores, True, gated,
+                base=self.scores, scatter=self.scores,
+            )
+            _chunk_topk[(nchunk,)](
+                self.mid_scores, self._pre_cand, self._coarse_cand,
+                N=PRE_PER, K=CASCADE_PER, GATHER=True, RADIX=self.radix,
+                num_warps=4, launch_pdl=mtp_pdl(), gate_ptr=tgate, GATED=tgated,
+            )
+            _rows_dot(
+                self._hr, self.w_rest, self.s_rest, self._coarse_cand,
+                self.gscale, self.refine_scores, True, gated, base=self.scores,
+            )
+            _chunk_topk[(nchunk,)](
+                self.refine_scores, self._coarse_cand, self._cand,
+                N=CASCADE_PER, K=SCREEN_PER, GATHER=True, RADIX=self.radix,
+                num_warps=4, launch_pdl=mtp_pdl(), gate_ptr=tgate, GATED=tgated,
+            )
+            cand = self._cand
+        elif self.cascade and self.fused_topk:
             # LOCAL PATCH (cudafast-nemotron35): the same cascade with the two
             # index_select gathers in one launch and each segmented torch.topk
             # (+ chunk offset / + gather) in one launch that writes the id list

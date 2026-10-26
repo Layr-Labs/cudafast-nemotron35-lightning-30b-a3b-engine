@@ -210,6 +210,10 @@ class Session:
         return [t for t, _ in top[:k]], [v for _, v in top[:k]]
 
     def _check_ids(self, tokens: list[int]) -> None:
+        if all(type(t) is int for t in tokens) and (
+            not tokens or (min(tokens) >= 0 and max(tokens) < self.b.vocab_size)
+        ):
+            return
         for t in tokens:
             if not isinstance(t, int) or isinstance(t, bool) or not 0 <= t < self.b.vocab_size:
                 raise RefusedError(f"token {t!r} is outside the vocabulary")

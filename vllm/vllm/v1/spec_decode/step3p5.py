@@ -83,14 +83,18 @@ class Step3p5MTPProposer(EagleProposer):
         batch_size: int,
         input_batch_size: int,
         block_size: int,
+        fused: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         old_positions_1d = positions[0] if self.uses_mrope else positions
+        if fused is not None:
+            old_positions_1d = old_positions_1d.clone()
         positions = super()._update_positions_dependent_metadata(
             positions,
             common_attn_metadata,
             batch_size,
             input_batch_size,
             block_size,
+            fused=fused,
         )
         # Parent already produced slot_mapping for the primary gid.
         self._per_group_slot_mappings[self.kv_cache_gid] = (

@@ -132,6 +132,10 @@ class FreshPrefillGraph:
                 self.graph_lite = graph
             except Exception:  # noqa: BLE001
                 self.graph_lite = None
+        self.early_sig = None
+        self.wrappers = _wrappers(self.metadata)
+        for wrapper in self.wrappers:
+            _count_plans(wrapper)
 
     def _forward(self, lite: bool = False):
         # Only row 495 of the final hidden state is read (:94, :115, and the
@@ -162,7 +166,11 @@ class FreshPrefillGraph:
             model.set_last_moe_row_src(None)
         return hidden, logits
 
-    def replay(self, metadata, slots, input_ids, positions, lite: bool = False):
+    def plan_state(self):
+        return tuple((id(w), getattr(w, "_vp_plan_calls", 0)) for w in self.wrappers)
+
+    def replay(self, metadata, slots, input_ids, positions, lite: bool = False,
+               sig=None):
         # Rewrite every captured request tensor, even shape-derived constants.
         seen = set()
         _refresh(self.metadata, metadata, seen)
@@ -170,9 +178,102 @@ class FreshPrefillGraph:
         self.input_ids.copy_(input_ids)
         self.positions.copy_(positions)
         self.logits_indices.fill_(495)
+        self.early_sig = None if sig is None else (sig, self.plan_state())
         self.replays += 1
         if lite and self.graph_lite is not None:
             self.graph_lite.replay()
             return self.hidden_lite, self.logits_lite
         self.graph.replay()
         return self.hidden, self.logits
+
+    def replay_early(self, input_ids, lite: bool):
+        """Replay for a request whose block ids and wrapper plan state equal
+        early_sig: every request tensor already holds what replay() would write
+        (positions 0..495, logits row 495 and the block-derived metadata), so
+        only the prompt ids are new."""
+        self.input_ids.copy_(input_ids, non_blocking=True)
+        self.replays += 1
+        if lite and self.graph_lite is not None:
+            self.graph_lite.replay()
+            return self.hidden_lite, self.logits_lite
+        self.graph.replay()
+        return self.hidden, self.logits
+
+    def request_tensors(self):
+        """Every tensor a replay reads that replay() writes, plus the wrappers'
+        fixed plan buffers (for the early-launch check)."""
+        out, seen = [], set()
+
+        def walk(value):
+            if id(value) in seen:
+                return
+            seen.add(id(value))
+            if isinstance(value, torch.Tensor):
+                out.append(value)
+            elif dataclasses.is_dataclass(value):
+                for field in dataclasses.fields(value):
+                    walk(getattr(value, field.name))
+            elif isinstance(value, dict):
+                for item in value.values():
+                    walk(item)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    walk(item)
+
+        walk(self.metadata)
+        walk(self.slots)
+        walk(self.input_ids)
+        walk(self.positions)
+        walk(self.logits_indices)
+        for wrapper in self.wrappers:
+            for name in sorted(vars(wrapper)):
+                value = getattr(wrapper, name, None)
+                if (isinstance(value, torch.Tensor) and value.is_cuda
+                        and name.endswith(("_buf", "_buffer"))
+                        and name != "_float_workspace_buffer"):
+                    walk(value)
+        return out
+
+
+def _wrappers(metadata):
+    """FlashInfer prefill wrappers the captured metadata references."""
+    found, seen = [], set()
+
+    def walk(value):
+        if id(value) in seen or isinstance(value, torch.Tensor):
+            return
+        seen.add(id(value))
+        if dataclasses.is_dataclass(value):
+            for field in dataclasses.fields(value):
+                item = getattr(value, field.name)
+                if field.name == "wrapper" and hasattr(item, "plan"):
+                    if all(item is not w for w in found):
+                        found.append(item)
+                else:
+                    walk(item)
+        elif isinstance(value, dict):
+            for item in value.values():
+                walk(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                walk(item)
+
+    walk(metadata)
+    return found
+
+
+def _count_plans(wrapper):
+    """Count plan() calls on a wrapper: a plan may rewrite the buffers the
+    captured attention reads, so an early launch must see none since the
+    last replay()."""
+    if getattr(wrapper, "_vp_plan_counted", False):
+        return
+    plan = wrapper.plan
+
+    def counted(*args, **kwargs):
+        wrapper._vp_plan_calls = getattr(wrapper, "_vp_plan_calls", 0) + 1
+        return plan(*args, **kwargs)
+
+    wrapper._vp_plan_calls = 0
+    wrapper.plan = counted
+    wrapper._vp_plan_counted = True

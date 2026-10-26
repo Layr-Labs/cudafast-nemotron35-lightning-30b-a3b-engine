@@ -442,6 +442,14 @@
     {
       "file": "(composition)",
       "why": "terrapinelf on the record 88455a30-3e21-4da9-b718-9b6809502858 (ArthurOstapenko, commit 27e68ae): the record's files byte for byte plus terrapinelf's free-run emit budget (the entry above), the same files as terrapinelf 1d565812-f993-401a-a5a8-3c5a7c1a6435 (second measurement)."
+    },
+    {
+      "file": "harness/kernels/zskip/csrc/zskip.cu; harness/kernels/zskip/csrc/zskip_pair.cuh; harness/kernels/zskip/py/__init__.py",
+      "why": "C3LPT defaults on: for the decode verify routed-down call (shape 30, max_blocks 30, config 113, SKIP) one extra one-warp kernel between prep and down_pair sorts the 30 expert blocks by descending active-K16 count (ties keep index order) into same-call queue scratch queue[4..33] (the queue grows from 4 to 36 int32, +128 B per device); down_pair reads its expert block from that order after the PDL wait. Only the order in which CTAs start changes: each output keeps its CTA-local ascending K accumulation chain, no two CTAs write the same output, and the kernel body from the workspace read to the final store is unchanged. All other shapes/configs run as before. C3LPT=0 restores the original order (no sort launch)."
+    },
+    {
+      "file": "(composition)",
+      "why": "e-man07 composition on the record 5c220854-a54c-4a7d-92c4-e95da9007466: ArthurOstapenko b5c7de8c-8bf0-415e-a2d1-a138856dc934 carried byte for byte. No new arithmetic."
     }
   ]
 }

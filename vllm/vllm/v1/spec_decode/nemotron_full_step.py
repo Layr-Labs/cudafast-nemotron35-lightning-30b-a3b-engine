@@ -153,6 +153,14 @@ def prepare(p):
         # Own strong output references and a private pool throughout replay.
         p._nemo_full = (graph, padded, signature, _inputs(kwargs),
                         (outputs, private, metadata, zero_row))
+        # A compound graph may reuse this exact captured executable layout,
+        # never substitute a different native plan's scalar launch arguments.
+        from vllm.v1.spec_decode.nemotron_decode_plan import _SCALARS
+        wrapper = builder._decode_wrappers_cudagraph[1]
+        p._nemo_full_native_layout = (
+            wrapper, tuple(wrapper._plan_info),
+            tuple((n, getattr(wrapper, n)) for n in _SCALARS if hasattr(wrapper, n)),
+        )
         logger.info('Native MTP full-step graph prepared at padded=%d', padded)
     except Exception as exc:
         logger.warning('Native MTP full-step graph unavailable: %r', exc)

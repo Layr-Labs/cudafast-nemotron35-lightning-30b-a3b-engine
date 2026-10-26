@@ -901,6 +901,23 @@ class SpecDecodeBaseProposer:
                     batch_size,
                 )
 
+            # The first later-step input/plan is original. A boot-qualified
+            # compound graph can then execute all three remaining native MTP
+            # passes, including original head graphs and device-selected
+            # original native plan prefixes for passes two and three.
+            if (token_index == 0 and budget_drafts is None
+                    and seq_lens_after_rejection and depth_gate is not None
+                    and draft_probs_list is None):
+                from vllm.v1.spec_decode.nemotron_compound_loop import maybe_run
+                compound_tokens = maybe_run(
+                    self, model_kwargs, per_layer_attn_metadata,
+                    common_attn_metadata, input_batch_size, batch_size,
+                    sampling_metadata,
+                )
+                if compound_tokens is not None:
+                    draft_token_ids_list.extend(compound_tokens)
+                    break
+
             with set_forward_context(
                 per_layer_attn_metadata,
                 self.vllm_config,
@@ -2123,6 +2140,8 @@ class SpecDecodeBaseProposer:
             prepare(self)
             from vllm.v1.spec_decode.nemotron_decode_plan import prepare as prepare_plan
             prepare_plan(self)
+            from vllm.v1.spec_decode.nemotron_compound_loop import prepare as prepare_loop
+            prepare_loop(self)
 
     def _get_eagle3_use_aux_hidden_state_from_config(self) -> bool:
         """

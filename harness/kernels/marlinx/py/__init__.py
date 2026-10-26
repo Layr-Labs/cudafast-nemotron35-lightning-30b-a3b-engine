@@ -40,6 +40,7 @@ _pdl_active = False
 _init_pdl = None
 _ops = {}
 _ops_pdl = {}
+_lean_active = False  # MARLINX_LEAN kernels loaded (see LEAN_LAYERS)
 
 
 def _load():
@@ -70,6 +71,12 @@ def _load():
             lib.marlinx_gemm_su.argtypes = lib.marlinx_gemm.argtypes + [
                 ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]  # Z SU relu2 pdl
             lib.marlinx_gemm_su.restype = ctypes.c_int
+        if hasattr(lib, "marlinx_gemm_lean"):
+            lib.marlinx_init_lean.argtypes = []
+            lib.marlinx_init_lean.restype = ctypes.c_int
+            lib.marlinx_gemm_lean.argtypes = lib.marlinx_gemm.argtypes[:11] + [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]  # stream Z2 relu2 pdl
+            lib.marlinx_gemm_lean.restype = ctypes.c_int
         lib.marlinx_hog.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
                                     ctypes.c_longlong, ctypes.c_void_p, ctypes.c_void_p]
         lib.marlinx_hog.restype = ctypes.c_int
@@ -118,6 +125,8 @@ def _init() -> bool:
         raise RuntimeError(f"marlinx_init failed: {rc}")
     if _init_pdl is not None and _init_pdl() == 0:
         _pdl_active = True
+    global _lean_active
+    _lean_active = bool(LEAN_LAYERS) and hasattr(lib, "marlinx_gemm_lean") and lib.marlinx_init_lean() == 0
     _ready = True
     return True
 
@@ -164,8 +173,13 @@ def prepare(layer) -> bool:
     layer._marlinx_ok = ok
     layer._marlinx_zs = None
     layer._marlinx_su = None
+    layer._marlinx_lean = False
+    su_on = SU_SHAPES.get((n, k)) in SU_LAYERS
+    if ok and _lean_active and not su_on and LEAN_SHAPES.get((n, k)) in LEAN_LAYERS:
+        layer._marlinx_lean = True
     if ok and ZS_ENABLED and (n, k) == ZS_SHAPE and hasattr(_lib, "marlinx_gemm_zs"):
-        layer._marlinx_zs = zs_repack(w, n, k)
+        # the lean down reads the Z2 nibble order (same bytes, same size)
+        layer._marlinx_zs = z2_repack(w, n, k) if layer._marlinx_lean else zs_repack(w, n, k)
     if ok and SU_SHAPES.get((n, k)) in SU_LAYERS and hasattr(_lib, "marlinx_gemm_su"):
         layer._marlinx_su = su_repack(s, n, k)
         # the shared up runs through an opaque op that receives the tensors, not the layer
@@ -217,10 +231,40 @@ def zs_repack(w: torch.Tensor, n: int, k: int) -> torch.Tensor:
     return out.to(torch.int32).contiguous()
 
 
+# MARLINX_LEAN (csrc lean_kernel): leaner instruction streams for the shared expert
+# projections at M <= 8, same arithmetic and output bits. Comma list: "up", "down"
+# ("1" = both, "0" or "" = off; default "down": the lean shared down). The lean down with the zero-row skip reads the Z2
+# copy (z2_repack) in place of the zs_repack copy (same size).
+_LEAN_ENV = os.environ.get("MARLINX_LEAN", "down")
+LEAN_SHAPES = {(3712, 2688): "up", (2688, 3712): "down"}
+LEAN_LAYERS = frozenset(("up", "down") if _LEAN_ENV == "1" else
+                        (v for v in _LEAN_ENV.split(",") if v in ("up", "down")))
+# Z2 nibble order inside each zs_repack word (byte j = feature 16j+g | feature 16j+g+8 << 4,
+# i.e. nibble 2j = lo_j, 2j+1 = hi_j): new nibble i <- old nibble _Z2_SRC[rows][i].
+# Rows 2t, 2t+1 (k row < 8) feed the even nibbles of Marlin's word, rows 2t+8, 2t+9 the odd.
+_Z2_SRC = ((0, 2, 1, 3, 4, 6, 5, 7), (2, 0, 3, 1, 6, 4, 7, 5))
+
+
+@torch.no_grad()
+def z2_repack(w: torch.Tensor, n: int, k: int) -> torch.Tensor:
+    """zs_repack(w) with the nibbles of every word permuted to Z2 order (csrc block_mma_z2)."""
+    z = zs_repack(w, n, k).to(torch.int64) & 0xFFFFFFFF  # [K/16][16][N/64][8]
+    out = torch.zeros_like(z)
+    for half in (0, 1):
+        rows = slice(0, 8) if half == 0 else slice(8, 16)
+        src = z[:, rows]
+        acc = torch.zeros_like(src)
+        for i, j in enumerate(_Z2_SRC[half]):
+            acc |= ((src >> (4 * j)) & 15) << (4 * i)
+        out[:, rows] = acc
+    out = out - (out >= (1 << 31)).to(torch.int64) * (1 << 32)
+    return out.to(torch.int32).contiguous()
+
+
 def gemm(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
          global_scale: torch.Tensor, n: int, k: int, depth: int = DEPTH,
          relu2: bool = False, zs: torch.Tensor | None = None,
-         su: torch.Tensor | None = None) -> torch.Tensor:
+         su: torch.Tensor | None = None, lean: bool = False) -> torch.Tensor:
     """out[M, n] for a 2-D bf16 x[M, k] (1 <= M <= 8); no guard beyond the C side's."""
     global _pdl_active
     lib = _load()
@@ -239,6 +283,16 @@ def gemm(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
         out.data_ptr(), n, n, k, _sm_count(x.device), depth,
         torch.cuda.current_stream(x.device).cuda_stream,
     )
+    if lean and su is None:
+        # zs is then the z2_repack copy
+        lean_args = args[:11] + (args[12], zs.data_ptr() if zs is not None else None, int(relu2))
+        rc = lib.marlinx_gemm_lean(*lean_args, int(use_pdl))
+        if rc and use_pdl and not torch.cuda.is_current_stream_capturing():
+            _pdl_active = False
+            rc = lib.marlinx_gemm_lean(*lean_args, 0)
+        if rc != 0:
+            raise RuntimeError(f"marlinx_gemm_lean failed: {rc} (M={m} N={n} K={k})")
+        return out
     if su is not None:
         su_args = args + (zs.data_ptr() if zs is not None else None, su.data_ptr(), int(relu2))
         rc = lib.marlinx_gemm_su(*su_args, int(use_pdl))
@@ -282,7 +336,8 @@ def maybe_apply(layer, x: torch.Tensor) -> torch.Tensor | None:
         return None
     n = layer.output_size_per_partition
     out = gemm(x2, layer.weight, layer.weight_scale, layer.weight_global_scale, n, k,
-               zs=getattr(layer, "_marlinx_zs", None), su=getattr(layer, "_marlinx_su", None))
+               zs=getattr(layer, "_marlinx_zs", None), su=getattr(layer, "_marlinx_su", None),
+               lean=getattr(layer, "_marlinx_lean", False))
     return out.reshape(*x.shape[:-1], n)
 
 
@@ -327,5 +382,6 @@ def maybe_apply_relu2(x, weight, weight_scale, global_scale, n, k):
         return None
     hit = _su_by_scale.get(weight_scale.data_ptr())
     su = hit[1] if hit is not None and hit[0].shape == weight_scale.shape else None
-    out = gemm(x2, weight, weight_scale, global_scale, n, k, relu2=True, su=su)
+    lean = su is None and _lean_active and "up" in LEAN_LAYERS
+    out = gemm(x2, weight, weight_scale, global_scale, n, k, relu2=True, su=su, lean=lean)
     return out.reshape(*x.shape[:-1], n)

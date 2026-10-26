@@ -27,6 +27,10 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 
+#ifndef MX_LEAN_PW
+#define MX_LEAN_PW 8  // MARLINX_LEAN weight ring depth (k16 blocks per warp)
+#endif
+
 namespace marlinx {
 
 struct Params {
@@ -468,6 +472,231 @@ __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
   if (!w) write_out<Relu2>(p, col, h, lane, R);
 }
 
+// ---------------------------------------------------------------------------
+// MARLINX_LEAN: the shared expert projections (up 2688->3712, down 3712->2688) with
+// gemm_kernel's CTA, grid, warp chains, segment folds, MMA operands and epilogue,
+// and a shorter instruction stream per k16 block:
+//   * shapes are template constants (strides and the chain length fold into
+//     immediates; 32-bit offsets from per-warp base pointers);
+//   * activation loads after griddepcontrol.wait are plain coherent loads without a
+//     compiler memory clobber (the wait itself orders them);
+//   * a segment can only close after a k = 1 block, so only odd ring slots carry
+//     the fold code;
+//   * zero-row skip (down): no CTA-wide mask pass and no barrier before the first
+//     weight load. A lane needs k rows 2t, 2t+1, 2t+8, 2t+9 of each k16 block, and
+//     its own activation words of that block hold exactly those columns of its
+//     token row, so OR-ing the 4 nonzero bits over the 8 token lanes (3 xor
+//     shuffles) gives gemm_kernel's mask bits for those rows. Activations run PW
+//     blocks ahead of the weights in their own ring.
+//   * zero-row skip copy in "Z2" nibble order (py z2_repack: the same u32 per
+//     (k16 block, k row, half column, lane group) as zs_repack, nibbles permuted
+//     within the word) so Marlin's operand halves come from 4 byte permutes and
+//     shifts instead of rebuilding Marlin's words nibble by nibble. A skipped row
+//     keeps whatever finite weights its register held (fp4 x e4m3 is always
+//     finite); they multiply activations that are +-0 in every row < M, so every
+//     product is a zero and every fp32 sum is unchanged (rows >= M are discarded).
+
+// Marlin's dequant<bf16, fe2m1f, skip_flop> output half for the nibbles at bits 12-15
+// and 28-31 of v (dequant_fp4's o1).
+__device__ __forceinline__ uint32_t fp4_top(uint32_t v) {
+  return (v & 0x80008000u) | ((v & 0x70007000u) >> 6);
+}
+
+template <bool PDL>
+__device__ __forceinline__ uint32_t ld_act_lean(const uint32_t* p) {
+  if constexpr (!PDL) return ld_nc_u32(p);
+  uint32_t r;
+  asm volatile("ld.global.u32 %0, [%1];" : "=r"(r) : "l"(p));
+  return r;
+}
+
+__device__ __forceinline__ void scale_pairs(const uint2& sq, uint32_t (&fs)[4]) {
+  uint32_t t[2];
+  dequant_scales(sq.x, t);
+  fs[0] = t[0];
+  fs[1] = t[1];
+  dequant_scales(sq.y, t);
+  fs[2] = t[0];
+  fs[3] = t[1];
+}
+
+__device__ __forceinline__ void mma_scaled(uint32_t (&b0)[2], uint32_t (&b1)[2], uint32_t fsj,
+                                           const uint32_t (&a)[2], float (&acc)[4]) {
+  const __nv_bfloat162 s = as_bf162(fsj);
+  const __nv_bfloat162 sx = __bfloat162bfloat162(s.x);
+  const __nv_bfloat162 sy = __bfloat162bfloat162(s.y);
+  b0[0] = as_u32(__hmul2(as_bf162(b0[0]), sx));
+  b0[1] = as_u32(__hmul2(as_bf162(b0[1]), sx));
+  b1[0] = as_u32(__hmul2(as_bf162(b1[0]), sy));
+  b1[1] = as_u32(__hmul2(as_bf162(b1[1]), sy));
+  mma_trans(a, b0, b1, acc);
+}
+
+// One k16 block from Z2 row words r = {row 2t, 2t+1, 2t+8, 2t+9}: the same b0/b1
+// operands block_mma<ZS> builds from Marlin's word j (b?[0] use only its even
+// nibbles = rows 2t/2t+1, b?[1] only its odd nibbles = rows 2t+8/2t+9).
+__device__ __forceinline__ void block_mma_z2(const uint4& r, const uint2& sq, const uint32_t (&a)[2],
+                                             float (&acc)[4][4]) {
+  uint32_t fs[4];
+  scale_pairs(sq, fs);
+  const uint32_t pa[2] = {__byte_perm(r.x, r.y, 0x5410), __byte_perm(r.x, r.y, 0x7632)};
+  const uint32_t pb[2] = {__byte_perm(r.z, r.w, 0x5410), __byte_perm(r.z, r.w, 0x7632)};
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const uint32_t qa = pa[j >> 1], qb = pb[j >> 1];
+    uint32_t b0[2], b1[2];
+    if (j & 1) {
+      b0[0] = fp4_top(qa << 8);
+      b1[0] = fp4_top(qa);
+      b0[1] = fp4_top(qb << 12);
+      b1[1] = fp4_top(qb << 4);
+    } else {
+      b0[0] = fp4_top(qa << 12);
+      b1[0] = fp4_top(qa << 4);
+      b0[1] = fp4_top(qb << 8);
+      b1[1] = fp4_top(qb);
+    }
+    mma_scaled(b0, b1, fs[j], a, acc[j]);
+  }
+}
+
+template <int N, int K, bool Relu2, bool ZS, bool PDL, int PW>
+__global__ void __launch_bounds__(128) lean_kernel(const Params p) {
+  constexpr int PA = ZS ? 2 * PW : PW;  // activation ring
+  constexpr int KT = K / 128;
+  constexpr int TOTAL = 2 * KT;         // k16 blocks per warp chain
+  constexpr int NB = N / 2;             // uint4 per k16 row of B
+  constexpr int NS = N / 8;             // uint2 per k16 row of S
+  constexpr int ZST = N / 8;            // u32 per k row of Z
+  __shared__ float red[2][3][16][32];
+  const int unit = blockIdx.x;
+  const int lane = threadIdx.x & 31;
+  const int w = threadIdx.x >> 5;
+  const int col = unit >> 1;
+  const int h = unit & 1;
+  const int tok = lane >> 2;
+  const int t4 = lane & 3;
+  const int first_cut = column_first_cut(p, col);
+  // per-warp bases; block (tau, k) is at k16 row 8 tau + 2 w + k
+  const uint4* Bw = p.B + (64 * col + 32 * h + lane + 2 * w * NB);
+  const uint2* Sw = p.S + (16 * col + 8 * h + tok + 2 * w * NS);
+  const uint32_t* Zw = nullptr;
+  if constexpr (ZS) Zw = p.Z + (unit * 8 + tok + (32 * w + 2 * t4) * ZST);
+  const bool arow = tok < p.M;
+  const uint32_t* Aw =
+      reinterpret_cast<const uint32_t*>(p.A + (arow ? (long long)tok * p.lda : 0)) + (t4 + 16 * w);
+
+  uint4 rb[PW];
+  uint2 rs[PW];
+  uint32_t ra[PA][2];
+#pragma unroll
+  for (int s = 0; s < PW; ++s) rb[s] = make_uint4(0u, 0u, 0u, 0u);
+
+  Cursor lw, la, cs;
+  cursor_init(lw, first_cut, KT, p.iters);
+  la = lw;
+  cs = lw;
+  auto load_a = [&](int s) {
+    const int o = 8 * (8 * la.tau + la.k);
+    ra[s][0] = arow ? ld_act_lean<PDL>(Aw + o) : 0u;
+    ra[s][1] = arow ? ld_act_lean<PDL>(Aw + o + 4) : 0u;
+    cursor_next(la, p.iters);
+  };
+  // weights (and scales) of the block at lw into slot ws; ZS: rows from act slot as
+  auto load_w = [&](int ws, int as, bool scales) {
+    const int o = 8 * lw.tau + lw.k;
+    if constexpr (ZS) {
+      const uint32_t a0 = ra[as][0], a1 = ra[as][1];
+      uint32_t nz = ((a0 & 0x7fffu) ? 1u : 0u) | ((a0 & 0x7fff0000u) ? 2u : 0u) |
+                    ((a1 & 0x7fffu) ? 4u : 0u) | ((a1 & 0x7fff0000u) ? 8u : 0u);
+      nz |= __shfl_xor_sync(0xffffffffu, nz, 4);
+      nz |= __shfl_xor_sync(0xffffffffu, nz, 8);
+      nz |= __shfl_xor_sync(0xffffffffu, nz, 16);
+      const uint32_t* z = Zw + o * (16 * ZST);
+      if (nz & 1u) rb[ws].x = ld_stream_u32(z);
+      if (nz & 2u) rb[ws].y = ld_stream_u32(z + ZST);
+      if (nz & 4u) rb[ws].z = ld_stream_u32(z + 8 * ZST);
+      if (nz & 8u) rb[ws].w = ld_stream_u32(z + 9 * ZST);
+    } else {
+      rb[ws] = ld_stream_v4(Bw + o * NB);
+    }
+    if (scales) rs[ws] = ld_nc_v2(Sw + o * NS);
+    cursor_next(lw, p.iters);
+  };
+
+#ifndef MARLINX_NO_PDL
+  if constexpr (PDL) {
+    // Weights and scales are immutable: preload before the wait (ZS: scales only,
+    // its weight rows depend on A).
+    Cursor pre = lw;
+#pragma unroll
+    for (int s = 0; s < PW; ++s) {
+      const int o = 8 * pre.tau + pre.k;
+      if constexpr (!ZS) rb[s] = ld_stream_v4(Bw + o * NB);
+      rs[s] = ld_nc_v2(Sw + o * NS);
+      cursor_next(pre, p.iters);
+    }
+    pdl_wait();
+  }
+#endif
+#pragma unroll
+  for (int s = 0; s < PA; ++s) load_a(s);
+  if constexpr (ZS || !PDL) {
+#pragma unroll
+    for (int s = 0; s < PW; ++s) {
+      if constexpr (ZS) load_w(s, s, !PDL);
+      else load_w(s, s, true);
+    }
+  } else {
+#pragma unroll
+    for (int s = 0; s < PW; ++s) cursor_next(lw, p.iters);
+  }
+
+  float acc[4][4];
+  float R[4][4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j)
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+      acc[j][e] = 0.0f;
+      R[j][e] = 0.0f;
+    }
+  bool first_seg = true;
+  int par = 0;
+
+#pragma unroll 1
+  for (int base = 0; base < TOTAL; base += PA) {
+#pragma unroll
+    for (int s = 0; s < PA; ++s) {
+      const int i = base + s;
+      if (TOTAL % PA == 0 || i < TOTAL) {
+        const int ws = s % PW;
+        if constexpr (ZS) block_mma_z2(rb[ws], rs[ws], ra[s], acc);
+        else block_mma<false>(rb[ws], rs[ws], ra[s], acc);
+        const bool seg_end = cursor_next(cs, p.iters);
+        if constexpr (ZS) {
+          if (i + PW < TOTAL) load_w(ws, (s + PW) % PA, true);
+          if (i + PA < TOTAL) load_a(s);
+        } else {
+          if (i + PW < TOTAL) {
+            load_a(s);
+            load_w(ws, s, true);
+          }
+        }
+        if ((s & 1) && seg_end) {  // segments end after a k = 1 block (odd i; base is even)
+          close_segment(red, par, w, lane, acc, R, first_seg);
+          first_seg = false;
+          par ^= 1;
+        }
+      }
+    }
+  }
+#ifndef MARLINX_NO_PDL
+  if constexpr (PDL) pdl_launch_dependents();
+#endif
+  if (!w) write_out<Relu2>(p, col, h, lane, R);
+}
+
 // Streaming-read kernel used by the tests as a bandwidth probe and as a
 // stand-in for a concurrent memory-bound kernel (dynamic smem reserves SM space).
 template <int U>
@@ -513,6 +742,29 @@ static int launch(const Params& p, cudaStream_t stream, bool pdl) {
   return (int)cudaGetLastError();
 }
 
+template <int N, int K, bool Relu2, bool ZS, int PW = 8>
+static int launch_lean(const Params& p, cudaStream_t stream, bool pdl) {
+#ifndef MARLINX_NO_PDL
+  if (pdl) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(2 * p.n_tiles);
+    cfg.blockDim = dim3(128);
+    cfg.dynamicSmemBytes = 0;
+    cfg.stream = stream;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = attr;
+    cfg.numAttrs = 1;
+    cudaError_t rc = cudaLaunchKernelEx(&cfg, lean_kernel<N, K, Relu2, ZS, true, PW>, p);
+    if (rc != cudaSuccess) { cudaGetLastError(); return (int)rc; }
+    return (int)cudaGetLastError();
+  }
+#endif
+  lean_kernel<N, K, Relu2, ZS, false, PW><<<2 * p.n_tiles, 128, 0, stream>>>(p);
+  return (int)cudaGetLastError();
+}
+
 }  // namespace marlinx
 
 extern "C" {
@@ -545,6 +797,26 @@ int marlinx_init_pdl(void) {
   return 0;
 }
 #endif
+
+// MARLINX_LEAN kernels (shared expert shapes only): every specialization, for loading
+// before graph capture. Returns 0 or a cudaError_t value.
+int marlinx_init_lean(void) {
+  cudaFuncAttributes attr;
+  cudaError_t e;
+#define MX_LEAN_INIT(...)                                                              \
+  if ((e = cudaFuncGetAttributes(&attr, marlinx::lean_kernel<__VA_ARGS__>)) != cudaSuccess) \
+    return (int)e;
+  MX_LEAN_INIT(3712, 2688, true, false, false, MX_LEAN_PW)
+  MX_LEAN_INIT(2688, 3712, false, false, false, MX_LEAN_PW)
+  MX_LEAN_INIT(2688, 3712, false, true, false, MX_LEAN_PW)
+#ifndef MARLINX_NO_PDL
+  MX_LEAN_INIT(3712, 2688, true, false, true, MX_LEAN_PW)
+  MX_LEAN_INIT(2688, 3712, false, false, true, MX_LEAN_PW)
+  MX_LEAN_INIT(2688, 3712, false, true, true, MX_LEAN_PW)
+#endif
+#undef MX_LEAN_INIT
+  return 0;
+}
 
 // Registers per thread of gemm_kernel<depth> (depth 4 or 8), or -1.
 int marlinx_regs(int depth) {
@@ -658,6 +930,50 @@ int marlinx_gemm_zs_pdl(const void* A, long long lda, int M, const void* B, cons
   return marlinx_gemm_impl(A, lda, M, B, S, GS, C, ldc, N, K, sms, depth, stream, false, Z, true);
 }
 #endif
+
+// MARLINX_LEAN: shared up (relu2 = 1: N 3712, K 2688) or shared down (N 2688,
+// K 3712; Z2 = py z2_repack(B) for the zero-row skip, or null for dense). Same
+// arithmetic and output bits as marlinx_gemm_relu2 / marlinx_gemm_zs / marlinx_gemm.
+int marlinx_gemm_lean(const void* A, long long lda, int M, const void* B, const void* S,
+                      const void* GS, void* C, long long ldc, int N, int K, int sms,
+                      void* stream, const void* Z2, int relu2, int pdl) {
+#ifdef MARLINX_NO_PDL
+  if (pdl) return -10;
+#endif
+  if (M < 1 || M > 8) return -1;
+  if (sms <= 0) return -3;
+  if (lda % 8 || (reinterpret_cast<uintptr_t>(A) & 15)) return -4;
+  marlinx::Params p;
+  p.A = static_cast<const __nv_bfloat16*>(A);
+  p.lda = lda;
+  p.M = M;
+  p.B = static_cast<const uint4*>(B);
+  p.S = static_cast<const uint2*>(S);
+  p.GS = static_cast<const float*>(GS);
+  p.C = static_cast<__nv_bfloat16*>(C);
+  p.ldc = ldc;
+  p.N = N;
+  p.K = K;
+  p.n_tiles = N / 128;
+  p.k_tiles = K / 128;
+  p.Z = static_cast<const uint32_t*>(Z2);
+  p.SU = nullptr;
+  int part2 = p.n_tiles;
+  if (p.n_tiles > sms) {
+    part2 = p.n_tiles % sms;
+    if (part2 * 3 <= sms) part2 += sms;
+  }
+  p.part1_cols = p.n_tiles - part2;
+  p.iters = (p.k_tiles * part2 + sms - 1) / sms;
+  cudaStream_t st = static_cast<cudaStream_t>(stream);
+  if (relu2) {
+    if (N != 3712 || K != 2688 || Z2) return -6;
+    return marlinx::launch_lean<3712, 2688, true, false, MX_LEAN_PW>(p, st, pdl != 0);
+  }
+  if (N != 2688 || K != 3712) return -7;
+  if (Z2) return marlinx::launch_lean<2688, 3712, false, true, MX_LEAN_PW>(p, st, pdl != 0);
+  return marlinx::launch_lean<2688, 3712, false, false, MX_LEAN_PW>(p, st, pdl != 0);
+}
 
 // Unit-major scale variant (any mode): SU = py su_repack(S). Same arithmetic.
 int marlinx_gemm_su(const void* A, long long lda, int M, const void* B, const void* S,

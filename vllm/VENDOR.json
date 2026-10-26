@@ -394,6 +394,10 @@
     {
       "file": "(composition)",
       "why": "e-man07 composition on the record 1e1c2581-e506-4ca4-9341-5f08ffceec86: ArthurOstapenko 53f66afe-0252-402f-b34b-19bea81f1e74 carried byte for byte; jacklightChen 1df4df4a-6dc5-4ecf-8d49-b372ba3726fd carried byte for byte; terrapinelf 80f6fced-3c74-4ce1-9913-058f05e95ec7 carried byte for byte. No new arithmetic."
+    },
+    {
+      "file": "harness/kernels/pzskip/{csrc/pzskip.cu,py/__init__.py,tests/exact.py}; vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
+      "why": "Exact schedule variants of the prefill routed down (config 356): 360-364. They keep 356's per-output arithmetic, lean copy roles, skip semantics, -0 recompute and epilogue on humming's own 64-row expert blocks (one union mask per block, each warp owning its columns for all of the block's token tiles), so an expert routed 33-64 rows loads its live weight rows once instead of once per 32-row block. Each layer admits a variant only after bitwise checks against 356 (496/512 tokens with skewed routing, 257 near-uniform, each also with -0 zeros); after 4 layers CUDA graphs over their weights time the survivors against each other on a skewed 496-token call, and the fastest replaces 356 on every layer where it passes, with no speed comparison against 356, so it may be slower. If no variant passes, or on any exception, 356 stays. PZSKIP_VARIANTS=0 disables."
     }
   ]
 }

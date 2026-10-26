@@ -70,6 +70,7 @@ logger = init_logger(__name__)
 
 # LOCAL PATCH (cudafast-nemotron35): free-run emit budget (_emit_budget_drafts).
 _EMIT_BUDGET = os.environ.get("VLLM_MTP_EMIT_BUDGET", "1") != "0"
+_EMIT_BONUS_ONLY = os.environ.get("VLLM_MTP_BONUS_ONLY", "1") != "0"
 
 
 def _mtp_kernels():
@@ -545,6 +546,18 @@ class SpecDecodeBaseProposer:
         self._last_draft_probs = None
         batch_size = common_attn_metadata.batch_size()
 
+        # A zero-draft emit budget needs only the target's next bonus row.
+        # Decide before preparing/capturing any MTP inputs: unlike the later
+        # budget cap, this also omits the first attention/MoE/head forward.
+        tail_ids = self._emit_bonus_only(
+            batch_size, common_attn_metadata, sampling_metadata,
+            next_token_ids, token_indices_to_sample, num_rejected_tokens_gpu,
+        )
+        if tail_ids is not None:
+            return tail_ids
+        if getattr(self, "_emit_tail_omitted", False):
+            raise RuntimeError("native MTP tail needs a context restart before drafting")
+
         if self.method in ("eagle3", "dflash"):
             model = self.model
             if isinstance(model, BreakableCUDAGraphWrapper):
@@ -952,6 +965,83 @@ class SpecDecodeBaseProposer:
         if draft_probs_list is not None:
             self._last_draft_probs = torch.stack(draft_probs_list, dim=1).contiguous()
         return draft_token_ids
+
+    def _emit_bonus_only(
+        self, batch_size, cad, sampling_metadata, next_token_ids,
+        token_indices_to_sample, num_rejected_tokens_gpu,
+    ):
+        """Skip all native MTP work only for a proved zero-draft tail.
+
+        The verify CPU shadow belongs to this call; subtract THIS sampler's
+        rejected count once in a private CPU value. Do not change either
+        shared shadow: the original fallback still owns its correction.
+        Ordinary rounds return before waiting for the sampler-copy event.
+        Missing draft KV is recorded and the resident must restart from its
+        full context before any later continuation outside this free run.
+        """
+        target = getattr(self, "emit_target", None)
+        seq_cpu = cad._seq_lens_cpu
+        if (
+            not _EMIT_BUDGET or not _EMIT_BONUS_ONLY or target is None
+            or self.method != "mtp" or self.num_speculative_tokens <= 1
+            or self.parallel_drafting or batch_size != 1
+            or self.use_heterogeneous_vocab or self.needs_extra_input_slots
+            or self.supports_mm_inputs or self.uses_mrope
+            or self.uses_xdrope_dim > 0 or self.eplb_state is not None
+            or num_rejected_tokens_gpu is None or token_indices_to_sample is None
+            or not sampling_metadata.all_greedy
+            or not hostfast.S2 or self.hostfast_num_rejected_cpu is None
+            or seq_cpu is None or seq_cpu.numel() != 1
+            or seq_cpu.device.type != "cpu" or next_token_ids.numel() != 1
+            or int(target) > int(seq_cpu[0]) + 2
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        model = self.model
+        if isinstance(model, BreakableCUDAGraphWrapper):
+            model = model.unwrap()
+        if type(model).__name__ != "NemotronHMTP":
+            return None
+        screen = getattr(self, "_draft_head_screen", None)
+        if screen is None or getattr(screen, "graph", None) is None:
+            return None
+        kernels = _mtp_kernels()
+        if kernels is None:
+            return None
+        try:
+            import smallk
+        except ImportError:
+            return None
+        if smallk.live_verify_rows(next_token_ids.device) is None:
+            return None
+        # This callback fences the runner's current sampler-count copy, not
+        # the later first-MTP-pass rejected-count copy. Resolve it only after
+        # the optimistic bound says a bonus-only tail is possible.
+        rejected = self.hostfast_num_rejected_cpu()
+        if (
+            rejected is None or rejected.numel() != 1
+            or rejected.device.type != "cpu" or rejected.dtype != torch.int32
+            or not 0 <= int(rejected[0]) <= self.num_speculative_tokens
+        ):
+            return None
+        exact_seq = hostfast.draft_seq_lens(
+            seq_cpu, rejected, batch_size, self.max_model_len,
+            self.num_speculative_tokens,
+        )
+        if exact_seq is None or int(target) > int(exact_seq[0]) + 2:
+            return None
+        gate = self._mtp_depth_gate_begin(batch_size, sampling_metadata)
+        if gate is None:
+            return None
+        kernels.depth_gate_end(gate, max_rows=1)
+        # The existing row cap makes every draft slot unverified. Keep the
+        # original int64 [batch, depth] contract with a valid-vocabulary ID;
+        # target row zero, its hidden state and bonus sampler are untouched.
+        ids = next_token_ids.to(torch.int64).reshape(1, 1).expand(
+            1, self.num_speculative_tokens
+        ).contiguous()
+        self._emit_tail_omitted = True
+        return ids
 
     def _emit_budget_drafts(
         self, depth_gate, batch_size: int, common_attn_metadata, seq_lens_after_rejection: bool

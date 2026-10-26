@@ -450,6 +450,18 @@
     {
       "file": "model_executor/layers/mamba/ops/mamba_ssm_spec_replay.py (PIPELINED branches only)",
       "why": "C2FMA: the raw-input replay software pipeline (NEMO_MAMBA_REPLAY_PIPELINE, admitted per boot only if its outputs, replayed state and both checkpoint slots are byte-identical to the ordinary kernel) never qualified because the compiler contracted the other product into the FMA: pipeline RN(RN(B*dt)*x + state*dA) vs ordinary RN(state*dA + RN(RN(B*dt)*x)), a 1-ULP fp32 state difference. The pipelined replay and compute loops now spell the ordinary order explicitly with tl.fma(state, dA, dB*x). The ordinary kernel's code is unchanged (the change sits under the PIPELINED constexpr). The boot-time byte comparison and timing admission are unchanged; NEMO_MAMBA_REPLAY_PIPELINE=0 keeps the ordinary path."
+    },
+    {
+      "file": "models/nemotron_h_mtp_kernels.py; layers/attention/attention.py (MTP packed branch only)",
+      "why": "DRX_GATED_PREFETCH defaults on: one read-only multi-range kernel replaces each native MTP o-projection/coarse-screen L2 prefetch launch. The existing device depth-stop flag suppresses only MTP-owned bytes; the fused router range remains unconditional. Original side-stream fork/join and target path are unchanged. Missing l2pf/gate, unsupported buffers/ranges or DRX_GATED_PREFETCH=0 retain the original l2pf path. No numeric, format or per-request work changes."
+    },
+    {
+      "file": "vllm/v1/spec_decode/llm_base_proposer.py; harness/vllm_resident/backends.py",
+      "why": "jacklightChen (6ee1778c-07ee-4eee-9dd5-a43b6f39059b), carried byte for byte: On ENTIRE highest1e1c2581-e506-4ca4-9341-5f08ffceec86, group later native-MTP page metadata and exact native-plan integer-prefix publication into one ordered copy kernel before original staging and plan-ready events. Preserve immutable owners through completion, event after kernel in both staging modes, and materialize on opaque planner/cache-miss fallbacks. Reuses selected993copykernel plus ownPR544lifetime safeguards; no failedPR538producer/stoppedGEMM, no BBFscale-selection delta, no DEBdtypeguard imported. New whole, activation and gain remain unverified."
+    },
+    {
+      "file": "harness/kernels/sctopk/{csrc/sctopk.cu,py/__init__.py,build.sh}; vllm/model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "ercumentyildirim (04a39307-60ca-4f16-bc6d-78b8e024c1bf), carried byte for byte: the three-level draft-head screen's per-chunk top-k selections (_chunk_topk, RADIX) run as one CUDA kernel each: an exact 8-bit radix select of the K-th largest key (torch's TopKTypeConfig order key, NaN largest, -0 below +0) over four shared-memory histograms, then every key above it in ascending index order followed by its ties in ascending index order until K are taken, through two block-wide exclusive scans; a stopped draft pass writes the first K ids in index order. Integer operations only, so the id lists equal _chunk_topk's. The screen admits it at load only after comparing both on the cascade's three shapes (ties, signed zeros, NaNs, gated and not); otherwise _chunk_topk stays. VLLM_MTP_SCREEN_SCTOPK=0 (or SCTOPK=0) keeps _chunk_topk."
     }
   ]
 }

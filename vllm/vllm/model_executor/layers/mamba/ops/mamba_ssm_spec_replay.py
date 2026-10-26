@@ -377,7 +377,9 @@ def _selective_scan_update_spec_replay_kernel(
                 dt = softplus(dt)
             dA = fast_exp(invariant_A * dt)
             dB = current_B * dt
-            state = state * dA + dB * current_x[:, None]
+            # C2FMA: the ordinary loop's exact order, RN(state * dA + RN(dB * x)).
+            # Left implicit, the compiler contracts the other product here.
+            state = tl.fma(state, dA, dB * current_x[:, None])
             current_x, current_dt, current_B = next_x, next_dt, next_B
             rpos = next_pos
     else:
@@ -459,7 +461,10 @@ def _selective_scan_update_spec_replay_kernel(
             z = tl.load(z_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
 
         dB = B * dt
-        state = state * dA + dB * x[:, None]
+        if PIPELINED:
+            state = tl.fma(state, dA, dB * x[:, None])  # C2FMA, as above
+        else:
+            state = state * dA + dB * x[:, None]
 
         if LAZY:
             if i_t == next_t:

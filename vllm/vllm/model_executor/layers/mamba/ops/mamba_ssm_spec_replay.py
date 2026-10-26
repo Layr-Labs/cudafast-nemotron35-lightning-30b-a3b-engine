@@ -120,6 +120,13 @@ def prefill_tag_view(state: torch.Tensor) -> torch.Tensor | None:
     slot_elems = state.shape[1] * state.shape[2] * state.shape[3]
     if state.stride(0) < slot_elems + 1 or state.stride(1) != state.shape[2] * state.shape[3]:
         return None
+    # The stride check alone does not prove the storage covers the last slot:
+    # a paged state can have stride(0) >= slot_elems + 1 while the backing
+    # storage ends before slot shape[0]-1's tag. as_strided would then raise
+    # "out of bounds for storage" (seen at depth 3, 282 slots x stride 542720).
+    last = state.storage_offset() + (state.shape[0] - 1) * state.stride(0) + slot_elems
+    if last >= state.untyped_storage().size() // state.element_size():
+        return None
     return torch.as_strided(
         state.view(torch.int32), (state.shape[0],), (state.stride(0),),
         state.storage_offset() + slot_elems,

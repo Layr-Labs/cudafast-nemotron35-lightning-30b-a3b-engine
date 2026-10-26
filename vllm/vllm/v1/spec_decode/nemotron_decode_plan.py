@@ -96,6 +96,7 @@ class NativePlanBank:
         self.force_native = False
         self.last_native_key = None
         self.last_restore = False
+        self.last_restore_key = None
         # Strong references prevent pointer reuse from admitting a new arena.
         self.owners = tuple(getattr(wrapper, n) for n in (
             "_float_workspace_buffer", "_int_workspace_buffer", "_qo_indptr_buf",
@@ -104,6 +105,7 @@ class NativePlanBank:
     def __call__(self, wrapper, **kw):
         import torch
         self.last_restore = False
+        self.last_restore_key = None
         signed = None
         try:
             if not torch.cuda.is_current_stream_capturing():
@@ -123,6 +125,7 @@ class NativePlanBank:
             for name, value in scalars:
                 setattr(wrapper, name, value)
             self.last_restore = True
+            self.last_restore_key = key
             return
         # A cache miss enters an opaque native planner. Publish any recorded
         # page metadata before it can consume device buffers or launch work.

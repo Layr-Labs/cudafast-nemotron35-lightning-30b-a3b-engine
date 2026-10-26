@@ -68,6 +68,9 @@ from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
 
+# LOCAL PATCH (cudafast-nemotron35): free-run emit budget (_emit_budget_drafts).
+_EMIT_BUDGET = os.environ.get("VLLM_MTP_EMIT_BUDGET", "1") != "0"
+
 
 def _mtp_kernels():
     """nemotron_h_mtp_kernels when the model loaded it (never imported here)."""
@@ -734,6 +737,7 @@ class SpecDecodeBaseProposer:
         # Only apply this adjustment when we have rejected tokens
         # (i.e., not the first proposal).
         order_draft_plans = False
+        seq_lens_after_rejection = False
         if self.num_speculative_tokens > 1 and num_rejected_tokens_gpu is not None:
             seq_lens_cpu = common_attn_metadata._seq_lens_cpu
             common_attn_metadata.seq_lens -= num_rejected_tokens_gpu
@@ -755,6 +759,7 @@ class SpecDecodeBaseProposer:
             if host_seq_lens is not None:
                 common_attn_metadata._seq_lens_cpu = host_seq_lens
                 order_draft_plans = True
+                seq_lens_after_rejection = True
             elif (
                 num_rejected_cpu is not None
                 and seq_lens_cpu is not None
@@ -767,13 +772,19 @@ class SpecDecodeBaseProposer:
                 self._num_rejected_event.synchronize()
                 common_attn_metadata._seq_lens_cpu = seq_lens_cpu - num_rejected_cpu
                 order_draft_plans = True
+                seq_lens_after_rejection = True
 
         block_size = self.block_size
         assert block_size > 0, "block_size has not been initialized."
+        budget_drafts = self._emit_budget_drafts(
+            depth_gate, batch_size, common_attn_metadata, seq_lens_after_rejection
+        )
         if set_moe_row_src is not None:
             # Padded rows of the single-token steps copy row 0.
             set_moe_row_src(input_batch_size, self._moe_row_zero)
         for token_index in range(self.num_speculative_tokens - 1):
+            if budget_drafts is not None and token_index + 2 > budget_drafts:
+                break
             # Update the inputs.
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax() returns int64 by default.
@@ -925,13 +936,60 @@ class SpecDecodeBaseProposer:
             set_moe_row_src(max(num_input_tokens, input_batch_size), None)
 
         if depth_gate is not None:
-            _mtp_kernels().depth_gate_end(depth_gate)
+            _mtp_kernels().depth_gate_end(
+                depth_gate, max_rows=None if budget_drafts is None else budget_drafts + 1
+            )
+        if budget_drafts is not None:
+            # Draft slots past the budget keep the step's shape; the verify-row
+            # cap written above (budget + 1 rows) leaves them unverified.
+            while len(draft_token_ids_list) < self.num_speculative_tokens:
+                draft_token_ids_list.append(draft_token_ids_list[-1])
+                if draft_probs_list is not None:
+                    draft_probs_list.append(draft_probs_list[-1])
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
         if draft_probs_list is not None:
             self._last_draft_probs = torch.stack(draft_probs_list, dim=1).contiguous()
         return draft_token_ids
+
+    def _emit_budget_drafts(
+        self, depth_gate, batch_size: int, common_attn_metadata, seq_lens_after_rejection: bool
+    ) -> int | None:
+        """LOCAL PATCH (cudafast-nemotron35): drafts worth computing for the next
+        verify when the resident has said how many tokens the running free run
+        still needs (emit_target: prompt + emitted tokens at which it is done).
+        After this step the request holds seq_lens + 1 tokens (the context after
+        rejection plus the step's bonus token); the next verify can emit at most
+        drafts + 1 tokens, so drafts beyond (target - that - 1) only extend a
+        verify past the end of the run. None: no limit (no target, no gate, no
+        verify-row buffer, or the bound is not below the depth). The drafts that
+        are computed are the ones the unlimited loop computes; only later passes
+        are skipped and the verify-row count is capped below them.
+        VLLM_MTP_EMIT_BUDGET=0 disables."""
+        target = getattr(self, "emit_target", None)
+        if (
+            target is None
+            or not _EMIT_BUDGET
+            or depth_gate is None
+            or batch_size != 1
+            or not seq_lens_after_rejection
+        ):
+            return None
+        seq_lens_cpu = common_attn_metadata._seq_lens_cpu
+        if seq_lens_cpu is None or seq_lens_cpu.numel() < 1:
+            return None
+        try:
+            import smallk
+        except ImportError:
+            return None
+        if smallk.live_verify_rows(depth_gate.device) is None:
+            return None
+        emitted = int(seq_lens_cpu[0]) + 1
+        drafts = max(0, int(target) - emitted - 1)
+        if drafts >= self.num_speculative_tokens:
+            return None
+        return drafts
 
     def _mtp_depth_gate_begin(
         self, batch_size: int, sampling_metadata: SamplingMetadata

@@ -49,6 +49,17 @@ PZ_ENABLED = os.environ.get("PZSKIP", "1") != "0"
 PZ_CONFIG = int(os.environ.get("PZSKIP_CONFIG", "356"))
 PZ_BLOCK_M = 64  # humming's prefill bucket that pzskip replaces
 PZ_MAX_TOKENS = 8192
+# Exact schedule variants of PZ_CONFIG (pzskip.cu configs 360-364) on humming's own 64-row expert
+# blocks, so an expert routed 33-64 rows loads its live weight rows once rather than once per 32-row
+# block. A variant serves a layer only after bitwise checks against PZ_CONFIG on that layer. Once
+# PZ_VARIANT_LAYERS layers have checked, CUDA graphs over their weights time the variants that passed
+# on all of them against each other, and the fastest serves every layer where it passes, with no
+# comparison against PZ_CONFIG's time. PZSKIP_VARIANTS=0 disables.
+PZ_VARIANTS_ENABLED = os.environ.get("PZSKIP_VARIANTS", "1") != "0"
+PZ_VARIANTS = (360, 361, 362, 363, 364)
+PZ_VARIANT_LAYERS = 4
+_pz_pending: list[tuple[torch.nn.Module, set[int]]] = []
+_pz_choice: int | None = None  # None: not timed yet; 0: PZ_CONFIG stays
 
 ENABLED = os.environ.get("ZSKIP", "1") != "0"
 # kernel v4 (warp per 64-column tile, weights as the MMA A operand) on the "swap" repack
@@ -146,7 +157,14 @@ def finalize(layer: torch.nn.Module) -> None:
         )
         if _pz_self_check(layer):
             layer.pzskip_ok = True
+            layer.pz_config = PZ_CONFIG
             logger.info_once("pzskip: zero-row-skipping routed down projection enabled for prefill")
+            if PZ_VARIANTS_ENABLED:
+                try:
+                    _pz_admit(layer)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning_once("pzskip: schedule variants unavailable (%r); config %d kept",
+                                        exc, PZ_CONFIG)
     if layer.zskip_prefill:
         logger.info_once(
             "zskip: prefill routed down projection enabled on layers %s",
@@ -199,6 +217,14 @@ def _prepare_pair(layer: torch.nn.Module) -> None:
                     config = skip
             except Exception as exc:  # noqa: BLE001
                 logger.warning_once("zskip: empty-half skip unavailable (%r); config %d", exc, config)
+        # VSW changes scheduling only; retain the original checked pair on any failure.
+        if os.environ.get("VSW_W2_CONFIG", "1") != "0" and config == 119:
+            if (_pair_check(layer, pair, 113, ms=range(1, 9), ref_config=config)
+                and (os.environ.get("ZSKIP_VERIFY_PREFIX", "1") == "0"
+                     or not _zskip.prefix_available()
+                     or _pair_check(layer, pair, 113, prefix=True))):
+                config = 113
+        logger.info("VSW_W2_SELECTED config=%d layer=%s", config, layer.layer_name)
         layer.zskip_pair_w2 = pair
         layer.zskip_pair_config = config
         logger.info_once("zskip: dadon paired decode config %d enabled for M=5", config)
@@ -356,6 +382,109 @@ def _pz_self_check(layer: torch.nn.Module) -> bool:
             getattr(layer, "layer_name", "?"),
         )
     return ok
+
+
+def _pz_inputs(dev: torch.device, m: int, seed: int, sigma: float):
+    """Prefill-shaped routed w2 inputs: top-6 routing with expert popularity exp(sigma * N(0, 1))
+    (sigma 0.8: about 1.25 32-row blocks per routed expert), and relu^2 activations with 55% of each
+    expert's rows dead for all of its tokens."""
+    gen = torch.Generator(device=dev)
+    gen.manual_seed(seed)
+    pop = sigma * torch.randn(NUM_EXPERTS, generator=gen, device=dev)
+    u = torch.rand(m, NUM_EXPERTS, generator=gen, device=dev).clamp_min(1e-12)
+    topk_ids = (pop - torch.log(-torch.log(u))).topk(TOP_K, dim=1).indices.to(torch.int32)
+    live = torch.rand(NUM_EXPERTS, INTER, generator=gen, device=dev) >= 0.55
+    x = torch.randn(m * TOP_K, INTER, generator=gen, device=dev)
+    act = (x.relu().square() * live[topk_ids.reshape(-1).long()]).to(torch.bfloat16).contiguous()
+    return topk_ids, act
+
+
+def _pz_run(layer: torch.nn.Module, act: torch.Tensor, topk_ids: torch.Tensor, config: int,
+            out: torch.Tensor | None = None) -> torch.Tensor:
+    sorted_ids, expert_ids, ntp = _align(topk_ids, _pzskip.block_rows(config))
+    if out is None:
+        out = torch.zeros(act.shape[0], HIDDEN, dtype=torch.bfloat16, device=act.device)
+    _pzskip.down(act, sorted_ids, expert_ids, ntp, layer.zskip_w2, out, wpc=config)
+    return out
+
+
+def _pz_variant_ok(layer: torch.nn.Module, config: int) -> bool:
+    """Bitwise against PZ_CONFIG on this layer: 496 and 512 tokens with skewed routing, 257 with
+    near-uniform routing, each also with every zero activation turned into -0."""
+    dev = layer.w2_global_scale.device
+    for i, (m, sigma) in enumerate(((496, 0.8), (512, 0.8), (257, 0.0))):
+        topk_ids, act = _pz_inputs(dev, m, 6100 + i, sigma)
+        neg = act.clone()
+        neg[neg == 0] = -0.0
+        for a in (act, neg):
+            ref = _pz_run(layer, a, topk_ids, PZ_CONFIG)
+            out = _pz_run(layer, a, topk_ids, config)
+            if not torch.equal(out.view(torch.int16), ref.view(torch.int16)):
+                logger.warning("pzskip: variant %d differs from config %d on %s", config, PZ_CONFIG,
+                               getattr(layer, "layer_name", "?"))
+                return False
+    return True
+
+
+def _pz_admit(layer: torch.nn.Module) -> None:
+    global _pz_choice
+    if _pz_choice == 0:
+        return
+    if _pz_choice is not None:
+        if _pz_variant_ok(layer, _pz_choice):
+            layer.pz_config = _pz_choice
+        return
+    passed = {c for c in PZ_VARIANTS if _pz_variant_ok(layer, c)}
+    _pz_pending.append((layer, passed))
+    if len(_pz_pending) < PZ_VARIANT_LAYERS:
+        return
+    layers = [entry[0] for entry in _pz_pending]
+    survivors = sorted(set.intersection(*(entry[1] for entry in _pz_pending)))
+    _pz_pending.clear()
+    _pz_choice = 0
+    choice = _pz_time(layers, survivors) if survivors else 0
+    _pz_choice = choice
+    if choice:
+        for checked in layers:
+            checked.pz_config = choice
+
+
+def _pz_time(layers: list[torch.nn.Module], configs: list[int]) -> int:
+    """Median graph time of one 496-token call on each layer's own weights, interleaved."""
+    dev = layers[0].w2_global_scale.device
+    topk_ids, act = _pz_inputs(dev, 496, 6200, 0.8)
+    out = torch.empty(act.shape[0], HIDDEN, dtype=torch.bfloat16, device=dev)
+
+    def call(config: int) -> None:
+        for checked in layers:
+            _pz_run(checked, act, topk_ids, config, out)
+
+    graphs = {}
+    for config in configs:
+        call(config)
+        torch.cuda.synchronize(dev)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            call(config)
+        graph.replay()
+        torch.cuda.synchronize(dev)
+        graphs[config] = graph
+    times: dict[int, list[float]] = {config: [] for config in graphs}
+    for _ in range(9):
+        for config, graph in graphs.items():
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            graph.replay()
+            end.record()
+            end.synchronize()
+            times[config].append(start.elapsed_time(end))
+    del graphs
+    med = {config: sorted(v)[len(v) // 2] * 1e3 / len(layers) for config, v in times.items()}
+    best = min(configs, key=med.__getitem__)
+    logger.info("pzskip: 496-token down us/layer %s", {c: round(t, 1) for c, t in med.items()})
+    logger.info("pzskip: schedule variant %d replaces config %d", best, PZ_CONFIG)
+    return best
 
 
 def _layer_index(layer: torch.nn.Module) -> int:
@@ -601,7 +730,8 @@ def _pz_down(
         or outputs.stride(0) % 2
     ):
         return False
-    bm = _pzskip.block_rows(PZ_CONFIG)
+    config = getattr(layer, "pz_config", PZ_CONFIG)
+    bm = _pzskip.block_rows(config)
     if bm == PZ_BLOCK_M:
         sorted_ids = moe_kwargs["sorted_ids"]
         expert_ids = moe_kwargs["expert_ids"]
@@ -610,5 +740,5 @@ def _pz_down(
         sorted_ids, expert_ids, ntp = _align(topk_ids, bm)
     else:
         return False
-    _pzskip.down(inputs, sorted_ids, expert_ids, ntp, layer.zskip_w2, outputs, wpc=PZ_CONFIG)
+    _pzskip.down(inputs, sorted_ids, expert_ids, ntp, layer.zskip_w2, outputs, wpc=config)
     return True

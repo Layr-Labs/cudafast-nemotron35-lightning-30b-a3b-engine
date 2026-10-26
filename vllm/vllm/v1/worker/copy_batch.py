@@ -41,6 +41,7 @@ _MAXD = 32
 _HDR = 3 * _MAXD * 8
 _CAP = 1 << 16
 _DBLOCK = triton.next_power_of_2(3 * _MAXD)
+_NSETS = 8
 
 
 @triton.jit(do_not_specialize=["desc", "N"])
@@ -74,8 +75,11 @@ class _Set:
 
 class CopyBatch:
     def __init__(self, device) -> None:
-        self.sets = [_Set(device), _Set(device)]
-        self.cur = 1
+        # Keep several independent staging sets in flight.  Each set retains
+        # its own completion event and tensor owners until that exact slot is
+        # reused, so extending the ring does not weaken source lifetimes.
+        self.sets = [_Set(device) for _ in range(_NSETS)]
+        self.cur = _NSETS - 1
         self.active = False
         self.n = 0
         self.off = _HDR
@@ -90,7 +94,7 @@ class CopyBatch:
         torch.cuda.synchronize()
 
     def begin(self) -> None:
-        self.cur ^= 1
+        self.cur = (self.cur + 1) % len(self.sets)
         s = self.sets[self.cur]
         if s.recorded:
             s.event.synchronize()

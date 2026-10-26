@@ -2109,12 +2109,6 @@ class GPUModelRunner(
             num_scheduled_tokens, self.query_pos.np
         )
 
-        # Get positions.
-        positions_np = (
-            self.input_batch.num_computed_tokens_cpu[req_indices]
-            + self.query_pos.np[: cu_num_tokens[-1]]
-        )
-
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
@@ -2125,33 +2119,38 @@ class GPUModelRunner(
         if self.uses_xdrope_dim > 0:
             self._calc_xdrope_positions(scheduler_output)
 
-        # Get token indices.
-        # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
-        # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
-        # where M is the max_model_len.
-        token_indices = (
-            positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]
-        )
-        token_indices_tensor = torch.from_numpy(token_indices)
-
-        # NOTE(woosuk): We use torch.index_select instead of np.take here
-        # because torch.index_select is much faster than np.take for large
-        # tensors.
-        if not (fused and decode_prep.SKIP_CPU_IDS):
-            torch.index_select(
-                self.input_batch.token_ids_cpu_tensor.flatten(),
-                0,
-                token_indices_tensor,
-                out=self.input_ids.cpu[:total_num_scheduled_tokens],
+        need_cpu_ids = not (fused and decode_prep.SKIP_CPU_IDS)
+        if need_cpu_ids or self.enable_prompt_embeds:
+            # Get positions and flattened token indices only when a CPU gather
+            # consumes them.  The fused decode-prep kernel writes input_ids
+            # directly in its steady path.
+            positions_np = (
+                self.input_batch.num_computed_tokens_cpu[req_indices]
+                + self.query_pos.np[: cu_num_tokens[-1]]
             )
-        if self.enable_prompt_embeds:
-            is_token_ids = self.input_batch.is_token_ids_tensor.flatten()
-            torch.index_select(
-                is_token_ids,
-                0,
-                token_indices_tensor,
-                out=self.is_token_ids.cpu[:total_num_scheduled_tokens],
+            token_indices = (
+                positions_np
+                + req_indices * self.input_batch.token_ids_cpu.shape[1]
             )
+            token_indices_tensor = torch.from_numpy(token_indices)
+            # NOTE(woosuk): We use torch.index_select instead of np.take here
+            # because torch.index_select is much faster than np.take for large
+            # tensors.
+            if need_cpu_ids:
+                torch.index_select(
+                    self.input_batch.token_ids_cpu_tensor.flatten(),
+                    0,
+                    token_indices_tensor,
+                    out=self.input_ids.cpu[:total_num_scheduled_tokens],
+                )
+            if self.enable_prompt_embeds:
+                is_token_ids = self.input_batch.is_token_ids_tensor.flatten()
+                torch.index_select(
+                    is_token_ids,
+                    0,
+                    token_indices_tensor,
+                    out=self.is_token_ids.cpu[:total_num_scheduled_tokens],
+                )
 
         # Because we did not pre-allocate a massive prompt_embeds CPU tensor on
         # the InputBatch, we need to fill in the prompt embeds into the expected

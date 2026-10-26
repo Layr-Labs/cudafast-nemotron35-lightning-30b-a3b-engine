@@ -828,6 +828,15 @@ def _prefetch_ahead(ahead, rows: int, budget: int | None = None,
     budget = _l2pf.ATTN_BYTES if budget is None else budget
     native_sm = getattr(ahead, "_mtp_pk_sm", None)
     if native_sm is not None:
+        # LOCAL PATCH (drafter3): the MTP drafter's o_proj (packed planes): skipped on
+        # the device in a depth-gated (stopped) draft pass, which reads no weights.
+        from vllm.model_executor.models.nemotron_h_mtp_kernels import gated_prefetch
+        ranges = [(native_sm, budget * 2 // 3), (ahead._mtp_pk_ex, budget - budget * 2 // 3)]
+        if gate is not None and gate_bytes > 0:
+            ranges.insert(0, (gate, gate_bytes))
+        queued = gated_prefetch(ranges, native_sm.device, name="oproj")
+        if queued is not None:
+            return queued
         return _l2pf.prefetch_many(((gate, gate_bytes),
                                    (native_sm, budget * 2 // 3),
                                    (ahead._mtp_pk_ex, budget - budget * 2 // 3)))

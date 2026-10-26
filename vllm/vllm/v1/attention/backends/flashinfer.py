@@ -1983,6 +1983,11 @@ class FlashInferImpl(AttentionImpl):
         # Regular attention (common case).
         # Decodes are at the front and prefills are at the back.
         if num_prefill_tokens > 0:
+            # LOCAL PATCH (drafter3): the first draft pass's plan copies may run on the
+            # proposer's side stream (as the later draft steps' do); wait for them.
+            plan_ready = getattr(attn_metadata, "plan_ready_event", None)
+            if plan_ready is not None:
+                torch.cuda.current_stream().wait_event(plan_ready)
             prefill_query = query[num_decode_tokens:]
             assert prefill_query.shape[0] == num_prefill_tokens
 
@@ -2475,7 +2480,151 @@ def _reuse_fresh_prefill_plan(wrapper, **kw) -> None:
     wrapper._vp_fresh_plan_key = key
 
 
+# LOCAL PATCH (cudafast-nemotron35): the spec-prefill plan's integer workspace
+# goes to the device through the open copy batch (worker/copy_batch.py: one
+# kernel that reads the staged bytes) instead of the planner's own
+# host-to-device copy on the main stream. The planner still runs unchanged;
+# its own upload goes to a private scratch buffer on a side stream. The bytes
+# that reach the wrapper's integer workspace are the planner's pinned bytes
+# [0, num_allocated_bytes), as before. VLLM_FI_PLAN_BATCH=0 disables.
+_FI_PLAN_BATCH = os.environ.get("VLLM_FI_PLAN_BATCH", "1") != "0"
+_plan_batch_stream: dict = {}
+
+
+# PrefillPlanInfo words that fix the integer workspace extent: padded batch size,
+# total_num_rows offset, kv_chunk_size_ptr offset, block_valid_mask offset,
+# enable_cuda_graph, split_kv.
+_EXTENT_WORDS = (0, 2, 9, 12, 13, 14)
+
+
+def _prefill_plan_layout(plan) -> tuple | None:
+    """The extent words of a 15-word PrefillPlanInfo (one FFI read each)."""
+    try:
+        if len(plan) != 15:
+            return None
+        return tuple(int(plan[i]) for i in _EXTENT_WORDS)
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def _prefill_plan_int_bytes(layout, capacity: int) -> int | None:
+    """int_allocator.num_allocated_bytes() of a PrefillPlan from its extent
+    words (scheduler.cuh PrefillPlanImpl allocation order)."""
+    if layout is None:
+        return None
+    padded, total_rows_off, chunk_off, valid_mask_off, cuda_graph, split = layout
+    if padded < 1 or cuda_graph not in (0, 1) or split not in (0, 1):
+        return None
+    if split:
+        end = valid_mask_off + padded  # block_valid_mask: padded bools
+    elif cuda_graph:
+        end = total_rows_off + 4  # total_num_rows: one uint32
+    else:
+        end = chunk_off + 4  # kv_chunk_size_ptr: one int32
+    return end if 0 < end <= capacity else None
+
+
+def _plan_batch_state(wrapper):
+    st = getattr(wrapper, "_vllm_plan_batch", None)
+    if st is None:
+        st = {"done": torch.cuda.Event(), "checked": set(), "scratch": None, "off": False,
+              "pin": None}
+        wrapper._vllm_plan_batch = st
+    return st
+
+
+def _plan_batch_ok(wrapper) -> bool:
+    b = copy_batch._BATCH
+    if not (_FI_PLAN_BATCH and b is not None and b.active
+            and not torch.cuda.is_current_stream_capturing()):
+        return False
+    st = _plan_batch_state(wrapper)
+    if st["off"]:
+        return False
+    pin = wrapper._pin_memory_int_workspace_buffer
+    if st["pin"] is not pin:
+        # The staging sets swap the pinned workspace per draft step: check each
+        # buffer once.
+        st["pin"] = pin
+        st["pin_ok"] = (
+            wrapper._int_workspace_buffer.dtype == torch.uint8
+            and pin.dtype == torch.uint8
+            and pin.is_pinned()
+        )
+    return st["pin_ok"]
+
+
+def _native_plan_checked(wrapper, args, key) -> list:
+    """The native plan on the current stream, once per layout key: checks that
+    its upload is exactly [0, _prefill_plan_int_bytes) of the pinned workspace."""
+    st = _plan_batch_state(wrapper)
+    dev = wrapper._int_workspace_buffer
+    pin = wrapper._pin_memory_int_workspace_buffer
+    cap = min(dev.numel(), pin.numel(), 1 << 16)
+    copy_batch.materialize()
+    torch.cuda.current_stream().synchronize()
+    probe = 256
+    saved_dev = dev[:cap].clone()
+    saved_pin = pin[:cap].clone()
+    dev[:cap].fill_(0xA5)
+    torch.cuda.current_stream().synchronize()
+    plan = wrapper._cached_module.plan(wrapper._float_workspace_buffer, dev, pin, *args)
+    torch.cuda.current_stream().synchronize()
+    end = _prefill_plan_int_bytes(_prefill_plan_layout(plan), cap)
+    ok = end is not None and end + probe <= cap
+    if ok:
+        got = dev[:cap].cpu()
+        ok = bool(torch.equal(got[:end], pin[:end])) and bool(
+            torch.all(got[end:end + probe] == 0xA5).item()
+        )
+    # Restore every byte the check touched outside the planner's own upload.
+    if end is not None and ok:
+        dev[end:cap].copy_(saved_dev[end:cap])
+    else:
+        dev[:cap].copy_(saved_dev)
+        pin[:cap].copy_(saved_pin)
+        plan = wrapper._cached_module.plan(wrapper._float_workspace_buffer, dev, pin, *args)
+        st["off"] = True
+    torch.cuda.current_stream().synchronize()
+    if ok:
+        st["checked"].add(key)
+    return plan
+
+
+def _plan_via_batch(wrapper, args) -> list:
+    """The planner's result with its integer workspace recorded in the copy batch."""
+    st = _plan_batch_state(wrapper)
+    dev = wrapper._int_workspace_buffer
+    pin = wrapper._pin_memory_int_workspace_buffer
+    if st["scratch"] is None or st["scratch"].shape != dev.shape:
+        st["scratch"] = torch.empty_like(dev)
+    side = _plan_batch_stream.get(dev.device)
+    if side is None:
+        side = _plan_batch_stream[dev.device] = torch.cuda.Stream(device=dev.device)
+    main = torch.cuda.current_stream()
+    torch.cuda.set_stream(side)
+    try:
+        plan = wrapper._cached_module.plan(
+            wrapper._float_workspace_buffer, st["scratch"], pin, *args
+        )
+        st["done"].record(side)
+    finally:
+        torch.cuda.set_stream(main)
+    key = _prefill_plan_layout(plan)
+    end = _prefill_plan_int_bytes(key, min(dev.numel(), pin.numel(), 1 << 16))
+    if end is None or key not in st["checked"]:
+        # Unchecked layout: the planner again on the main stream (same inputs,
+        # same bytes), with the extent check.
+        return _native_plan_checked(wrapper, args, key)
+    copy_batch.copy(dev[:end], pin[:end])
+    return plan
+
+
 def _fast_plan_spec_prefill(wrapper, builder, **kw) -> None:
+    st = getattr(wrapper, "_vllm_plan_batch", None)
+    if st is not None:
+        # The previous side-stream upload has read the pinned workspace.
+        st["done"].synchronize()
     try:
         _fast_plan_spec_prefill_impl(wrapper, builder, **kw)
     except (AttributeError, TypeError, KeyError, ValueError, RuntimeError):
@@ -2544,29 +2693,35 @@ def _fast_plan_spec_prefill_impl(wrapper, builder, **kw) -> None:
     fixed_split_size = kw.get("fixed_split_size")
     head_dim_qk = kw["head_dim_qk"]
     head_dim_vo = kw.get("head_dim_vo") or head_dim_qk
+    args = (
+        qo,
+        indptr,
+        kv_lens,
+        wrapper._max_total_num_rows or total_num_rows,
+        n - 1,
+        kw["num_qo_heads"],
+        kw["num_kv_heads"],
+        page_size,
+        wrapper.is_cuda_graph_enabled,
+        head_dim_qk,
+        head_dim_vo,
+        kw["causal"],
+        kw["window_left"],
+        fixed_split_size or -1,
+        kw.get("disable_split_kv", False),
+        0,
+        0,
+    )
     with torch.cuda.device(wrapper.device):
-        wrapper._plan_info = wrapper._cached_module.plan(
-            wrapper._float_workspace_buffer,
-            wrapper._int_workspace_buffer,
-            wrapper._pin_memory_int_workspace_buffer,
-            qo,
-            indptr,
-            kv_lens,
-            wrapper._max_total_num_rows or total_num_rows,
-            n - 1,
-            kw["num_qo_heads"],
-            kw["num_kv_heads"],
-            page_size,
-            wrapper.is_cuda_graph_enabled,
-            head_dim_qk,
-            head_dim_vo,
-            kw["causal"],
-            kw["window_left"],
-            fixed_split_size or -1,
-            kw.get("disable_split_kv", False),
-            0,
-            0,
-        )
+        if _plan_batch_ok(wrapper):
+            wrapper._plan_info = _plan_via_batch(wrapper, args)
+        else:
+            wrapper._plan_info = wrapper._cached_module.plan(
+                wrapper._float_workspace_buffer,
+                wrapper._int_workspace_buffer,
+                wrapper._pin_memory_int_workspace_buffer,
+                *args,
+            )
 
 
 def fast_plan_decode(

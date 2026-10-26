@@ -45,9 +45,15 @@ def available() -> bool:
     return ENABLED and _load() is not None
 
 
+# configs reading humming's 64-row prefill layout as 32-row halves (pzskip.cu case 369)
+HALF64 = (369,)
+
+
 def block_rows(wpc: int) -> int:
     """Expert block rows a config expects in its moe_align layout (320-339 and 356/357: 32,
     other 340-359: 16)."""
+    if wpc in HALF64:  # the moe_align layout it reads (humming's); it runs 32-row halves
+        return 64
     if wpc in (356, 357):  # config 333's 32-row CTA with a lean instruction stream
         return 32
     return 32 if 320 <= wpc < 340 else (16 if 340 <= wpc < 360 else BM)
@@ -55,6 +61,12 @@ def block_rows(wpc: int) -> int:
 
 def max_blocks(shape_m: int, num_experts: int, bm: int = BM) -> int:
     return (shape_m + num_experts * (bm - 1) + bm - 1) // bm
+
+
+def ws_blocks(shape_m: int, num_experts: int, wpc: int) -> int:
+    """Block-info entries a config needs for shape_m routed rows."""
+    b = max_blocks(shape_m, num_experts, block_rows(wpc))
+    return 2 * b if wpc in HALF64 else b
 
 
 def scratch(device: torch.device, blocks: int) -> torch.Tensor:
@@ -77,6 +89,8 @@ def down(a: torch.Tensor, sorted_ids: torch.Tensor, expert_ids: torch.Tensor,
     assert lib is not None, _load_error
     bm = block_rows(wpc)
     blocks = min(max_blocks(a.shape[0], num_experts, bm), sorted_ids.numel() // bm)
+    if wpc in HALF64:
+        blocks *= 2
     ws = scratch(a.device, blocks)
     rc = lib.pzskip_down(
         a.data_ptr(), a.stride(0), a.shape[0], sorted_ids.data_ptr(), expert_ids.data_ptr(),

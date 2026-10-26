@@ -156,6 +156,12 @@ def _down_combine(
 
 # MTP_DOWN_SLOTS=0 runs _down (one program per column block, slots in a loop).
 _SLOTS = os.environ.get("MTP_DOWN_SLOTS", "1") != "0"
+# LOCAL PATCH (drafter3): column tile of the BF16 slot kernel (the path the draft's top-3
+# takes whenever the packed admission keeps BF16). On the real MTP down weights, L2 cold,
+# 37% live rows: BN 128 195 us vs BN 32 211 us (90%: 226 vs 247). Same per-column chunk
+# order; Triton's fp32 tree over each 64-row chunk may differ (drafter-only numerics).
+# MTP_DOWN_BF16_BN=32 restores the original tile.
+_BF16_BN = int(os.environ.get("MTP_DOWN_BF16_BN", "128"))
 
 
 _ADD_RES = os.environ.get("MTP_DOWN_ADD_RESIDUAL", "1") != "0"
@@ -246,9 +252,9 @@ def maybe_down(h, packed, ids, weights, y, routed_scale, residual=None):
         part = torch.empty((slots, 2688), dtype=torch.float32, device=h.device)
         from .nemotron_h_mtp_down_packed import maybe_slots
         if not maybe_slots(packed, indices, values, counts, ids, part, mtp_pdl()):
-            _down_slots[(triton.cdiv(2688, 32), slots)](
+            _down_slots[(triton.cdiv(2688, _BF16_BN), slots)](
                 indices, values, counts, w2, sd, ids, part,
-                H=2688, I=1856, TOPK=topk, BN=32, BK=64, num_warps=4, num_stages=3,
+                H=2688, I=1856, TOPK=topk, BN=_BF16_BN, BK=64, num_warps=4, num_stages=3,
                 launch_pdl=mtp_pdl(),
             )
         _down_combine[(triton.cdiv(2688, 256),)](

@@ -79,6 +79,14 @@ def _mtp_kernels():
 
 # Protect asynchronous H2D sources; switchable for in-process cost screening.
 PINNED_SOURCE_GUARDS = True
+# LOCAL PATCH (cudafast-nemotron35): eagle_prepare_next_token_padded_kernel reads
+# the backup next-token ids from their pinned host buffer instead of after a
+# separate host-to-device copy (VLLM_MTP_BACKUP_ZERO_COPY=0 restores the copy).
+BACKUP_ZERO_COPY = os.environ.get("VLLM_MTP_BACKUP_ZERO_COPY", "1") != "0"
+# LOCAL PATCH (cudafast-nemotron35): the first draft pass's attention metadata
+# copies are recorded into one copy batch flushed right after the build
+# (VLLM_DRAFT_FIRST_PLAN_BATCH=0 issues them one by one).
+FIRST_PLAN_BATCH = os.environ.get("VLLM_DRAFT_FIRST_PLAN_BATCH", "1") != "0"
 
 
 class SpecDecodeBaseProposer:
@@ -576,9 +584,22 @@ class SpecDecodeBaseProposer:
             )
         )
 
-        per_group_attn_metadata, per_layer_attn_metadata = (
-            self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
-        )
+        # LOCAL PATCH (cudafast-nemotron35): the first step's metadata copies
+        # (page indptr/indices/last-page-len, kv lens, plan integer workspace)
+        # as one ordered copy kernel on the main stream (worker/copy_batch.py).
+        first_batch = self._draft_first_plan_batch() if FIRST_PLAN_BATCH else None
+        if first_batch is not None:
+            first_batch.begin()
+            try:
+                per_group_attn_metadata, per_layer_attn_metadata = (
+                    self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
+                )
+            finally:
+                first_batch.flush()
+        else:
+            per_group_attn_metadata, per_layer_attn_metadata = (
+                self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
+            )
         num_rejected_cpu = self._copy_num_rejected_to_cpu(num_rejected_tokens_gpu)
 
         cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
@@ -900,6 +921,23 @@ class SpecDecodeBaseProposer:
                     self.draft_model_config,
                     batch_size,
                 )
+
+            # The first later-step input/plan is original. A boot-qualified
+            # compound graph can then execute all three remaining native MTP
+            # passes, including original head graphs and device-selected
+            # original native plan prefixes for passes two and three.
+            if (token_index == 0 and budget_drafts is None
+                    and seq_lens_after_rejection and depth_gate is not None
+                    and draft_probs_list is None):
+                from vllm.v1.spec_decode.nemotron_compound_loop import maybe_run
+                compound_tokens = maybe_run(
+                    self, model_kwargs, per_layer_attn_metadata,
+                    common_attn_metadata, input_batch_size, batch_size,
+                    sampling_metadata,
+                )
+                if compound_tokens is not None:
+                    draft_token_ids_list.extend(compound_tokens)
+                    break
 
             with set_forward_context(
                 per_layer_attn_metadata,
@@ -1366,6 +1404,19 @@ class SpecDecodeBaseProposer:
             return None
         return st or None
 
+    def _draft_first_plan_batch(self):
+        """The shared copy batch (worker/copy_batch.py) for the first draft
+        step's metadata copies, or None (capture, disabled, or a batch open)."""
+        from vllm.v1.worker import copy_batch
+
+        if (
+            not copy_batch.ENABLED
+            or torch.cuda.is_current_stream_capturing()
+            or (copy_batch._BATCH is not None and copy_batch._BATCH.active)
+        ):
+            return None
+        return copy_batch.get(self.device)
+
     def _hostfast_draft_sets(self) -> "hostfast.DraftStagingSets | None":
         """One pinned staging set per draft step for the drafter's FlashInfer
         builders (hostfast DraftStagingSets), or None for one shared set."""
@@ -1478,8 +1529,16 @@ class SpecDecodeBaseProposer:
         is not sampled and comes from `request.get_token_id()` instead. This is denoted
         the "backup" token id. It also counts rejected tokens via `sampled_token_ids`.
         """
+        # LOCAL PATCH (cudafast-nemotron35): with the zero-copy read the kernel
+        # below is the pinned buffer's only reader; the guard event then
+        # follows the kernel instead of the copy.
+        zero_copy = (
+            BACKUP_ZERO_COPY
+            and self.backup_next_token_ids.cpu.is_pinned()
+            and not torch.cuda.is_current_stream_capturing()
+        )
         event = None
-        if PINNED_SOURCE_GUARDS:
+        if PINNED_SOURCE_GUARDS or zero_copy:
             # The previous backup H2D may still be behind async work,
             # including startup paths without a valid-count wait. Protect its
             # pinned CPU source before reusing it.
@@ -1494,10 +1553,13 @@ class SpecDecodeBaseProposer:
             self.backup_next_token_ids.np[i] = requests[
                 gpu_input_batch.req_ids[i]
             ].get_token_id(gpu_input_batch.num_tokens_no_spec[i] - 1)
-        self.backup_next_token_ids.copy_to_gpu(num_reqs)
-        if event is not None:
-            event.record()
-        backup_tokens_gpu = self.backup_next_token_ids.gpu
+        if zero_copy:
+            backup_tokens_gpu = self.backup_next_token_ids.cpu
+        else:
+            self.backup_next_token_ids.copy_to_gpu(num_reqs)
+            if event is not None:
+                event.record()
+            backup_tokens_gpu = self.backup_next_token_ids.gpu
 
         batch_size, num_tokens = sampled_token_ids.shape
         device = sampled_token_ids.device
@@ -1525,6 +1587,8 @@ class SpecDecodeBaseProposer:
             sampled_token_ids.stride(0),
             BLOCK_SIZE_TOKENS=BLOCK_SIZE_TOKENS,
         )
+        if zero_copy:
+            event.record()
 
         return next_token_ids, valid_sampled_tokens_count
 
@@ -2123,6 +2187,8 @@ class SpecDecodeBaseProposer:
             prepare(self)
             from vllm.v1.spec_decode.nemotron_decode_plan import prepare as prepare_plan
             prepare_plan(self)
+            from vllm.v1.spec_decode.nemotron_compound_loop import prepare as prepare_loop
+            prepare_loop(self)
 
     def _get_eagle3_use_aux_hidden_state_from_config(self) -> bool:
         """

@@ -157,3 +157,25 @@ Isolated lm_head M = 5 cold: 893-909 -> 836-844 us; in a profiled decode step 0.
 0.809 ms. `tests/marlinx_su_exact.py`: lm_head and all 23 shared down (with and without
 the zero-row skip copy) and up (relu2) projections, M = 1..8, three activation kinds,
 PDL and ordinary launch, bitwise equal to stock Marlin / marlinx (4096 cases).
+
+## Lean shared expert kernels (MARLINX_LEAN, default `down`)
+
+`lean_kernel<N, K, Relu2, ZS, PDL, 8>` runs the shared up (relu2-fused) and down
+projections (dense or zero-row skip) with gemm_kernel's grid, CTA, warp chains, segment
+folds, MMA operands and epilogue, and a shorter per-k16-block instruction stream: shapes
+as template constants (strides fold to immediates), activation loads after
+`griddepcontrol.wait` without a compiler memory clobber, fold code only in the odd ring
+slots (a segment always ends after a k = 1 block), and for the zero-row skip no CTA-wide
+mask pass: a lane's own activation words of a k16 block are exactly the columns of the
+k rows it needs (2t, 2t+1, 2t+8, 2t+9), so three xor shuffles over the token lanes give
+gemm_kernel's mask bits; activations run 8 blocks ahead of the weights. The skip copy is
+stored in "Z2" nibble order (`z2_repack`: zs_repack's words with nibbles permuted, same
+size) so Marlin's operand halves come from 4 byte permutes and shifts. A skipped row keeps
+stale finite weights, which multiply activations that are +-0 in every row < M.
+
+`MARLINX_LEAN` takes `up`, `down` or `1` (both); the default is `down`, `0` turns both off; `tests/marlinx_lean_exact.py [REAL.pt]`
+checks lean == marlinx == stock Marlin on all 23 layers, M = 1..8, ZS on and off, PDL and
+ordinary launch, real captured decode inputs and adversarial inputs (38644 cases), plus
+CUDA graph replay.
+
+The lean down is on by default; the lean up stays off.

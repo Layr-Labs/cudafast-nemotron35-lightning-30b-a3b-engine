@@ -450,6 +450,10 @@
     {
       "file": "model_executor/layers/mamba/ops/mamba_ssm_spec_replay.py (PIPELINED branches only)",
       "why": "C2FMA: the raw-input replay software pipeline (NEMO_MAMBA_REPLAY_PIPELINE, admitted per boot only if its outputs, replayed state and both checkpoint slots are byte-identical to the ordinary kernel) never qualified because the compiler contracted the other product into the FMA: pipeline RN(RN(B*dt)*x + state*dA) vs ordinary RN(state*dA + RN(RN(B*dt)*x)), a 1-ULP fp32 state difference. The pipelined replay and compute loops now spell the ordinary order explicitly with tl.fma(state, dA, dB*x). The ordinary kernel's code is unchanged (the change sits under the PIPELINED constexpr). The boot-time byte comparison and timing admission are unchanged; NEMO_MAMBA_REPLAY_PIPELINE=0 keeps the ordinary path."
+    },
+    {
+      "file": "harness/kernels/cmp2/py/__init__.py; model_executor/layers/fused_moe/experts/humming_cmp2.py",
+      "why": "Carried from jacklightChen 65083ab2-085b-4188-8ce7-aeb460dfa813 (ranked +0.69% over its bar): routed-only generic-compression VMM backing for the target w13 up-projection, admitted only after the production forward_relu2 dispatcher runs bit-identical on both backings and at least 2% faster in warm and L2-swept private graphs (M 1/5/496, spread and reused routing); byte roundtrip, alias refusal and rollback unchanged. Extended here (own, same file pair): the target M=5 verify routed-down zskip pair repack (zskip_pair_w2.w) is eligible for the same immutable storage route, qualified through the production zskip pair kernel and config of its layer. CMP2_ROUTED_DOWN=0 keeps the pair ordinary. Refusal on either family retains the ordinary backing."
     }
   ]
 }

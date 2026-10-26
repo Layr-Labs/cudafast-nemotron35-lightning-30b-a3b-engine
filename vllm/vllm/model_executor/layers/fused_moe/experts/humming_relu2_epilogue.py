@@ -18,6 +18,13 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
+# VSW: exact verify-only schedule switches, read once at process boot.
+_VSW_EVICT = os.environ.get("VSW_EVICT", "1") != "0"
+_VSW_W2_CONFIG = os.environ.get("VSW_W2_CONFIG", "1") != "0"
+_VSW_W2_RING = os.environ.get("VSW_W2_RING", "1") != "0"
+logger.info("VSW_VERIFY stages=%d sms=%d evict=%s w2_config=%d ring=%d",
+            3, 44, _VSW_EVICT, (113 if _VSW_W2_CONFIG else 119), (3 if _VSW_W2_RING else 2))
+
 _EPILOGUE = r"""
 #include <cuda_bf16.h>
 #define EpilogueArithmetic UnfusedEpilogueArithmetic
@@ -139,7 +146,9 @@ def _dyn_num_sms(lo: int, hi: int, num_sms: int) -> int:
     prefill entry may take every SM's slots, since a CTA that only becomes
     resident once the shared expert's CTA leaves just claims fewer tiles."""
     if hi >= (1 << 29):
-        return int(os.environ.get("HUMMING_W13_DYN_PF_SMS", "48"))
+        # LOCAL PATCH (cudafast-nemotron35): 40 workers for the prefill entry,
+        # which runs beside the half-grid shx shared expert on the aux stream.
+        return int(os.environ.get("HUMMING_W13_DYN_PF_SMS", "40"))
     return int(os.environ.get("HUMMING_W13_DYN_DEC_SMS", "44"))
 
 
@@ -262,8 +271,16 @@ def _prepare_stock(meta, compute_config, tuning_config, dyn):
         num_sms = params.pop("num_sms", 0)
         if dyn:
             num_sms = _dyn_num_sms(lo, hi, num_sms)
-        kernel = (DynRelu2HummingKernel if dyn else Relu2HummingKernel)(**params)
+        if (lo, hi) == (24, 48) and _VSW_EVICT:
+            cls = DynEvictFirstRelu2HummingKernel if dyn else EvictFirstRelu2HummingKernel
+        else:
+            cls = DynRelu2HummingKernel if dyn else Relu2HummingKernel
+        kernel = cls(**params)
         kernel.load_cubin()
+        if (lo, hi) == (24, 48):
+            logger.info_once("VSW_VERIFY_STOCK stages=%d sms=%d evict=%s",
+                             params["num_stages"], num_sms,
+                             isinstance(kernel, EvictFirstRelu2HummingKernel))
         result.extend([lo, hi, kernel.kernel_id, num_sms])
     configs = torch.tensor(result, dtype=torch.int64, device="cpu")
     _CACHE[key] = configs

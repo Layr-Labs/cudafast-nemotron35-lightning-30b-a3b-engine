@@ -408,9 +408,19 @@ def _configs(meta, compute_config: str, tuning_config: str, dyn: bool = False) -
         num_sms = params.pop("num_sms", 0)
         if dyn:  # the claim-when-free decode grid, as for the stock dyn kernel
             num_sms = _dyn_num_sms(lo, hi, num_sms)
-        kernel = kernel_cls(**params)
+        bucket_cls = kernel_cls
+        from vllm.model_executor.layers.fused_moe.experts.humming_relu2_epilogue import _VSW_EVICT
+        if (lo, hi) == (24, 48) and _VSW_EVICT:
+            if not _PF_KERNEL_CLASSES:
+                _PF_KERNEL_CLASSES.update(_prefill_kernel_classes())
+            bucket_cls = _PF_KERNEL_CLASSES[dyn]
+        kernel = bucket_cls(**params)
         kernel.load_cubin()
-        assert type(kernel) is kernel_cls
+        assert type(kernel) is bucket_cls
+        if (lo, hi) == (24, 48):
+            logger.info_once("VSW_VERIFY_NVSC stages=%d sms=%d evict=%s",
+                             params["num_stages"], num_sms,
+                             type(kernel) is _PF_KERNEL_CLASSES.get(dyn))
         assert "nvsc_table" in kernel.code
         assert ("hm_dyn_claim" in kernel.code) == dyn
         result.extend([lo, hi, kernel.kernel_id, num_sms])

@@ -450,6 +450,22 @@
     {
       "file": "model_executor/layers/mamba/ops/mamba_ssm_spec_replay.py (PIPELINED branches only)",
       "why": "C2FMA: the raw-input replay software pipeline (NEMO_MAMBA_REPLAY_PIPELINE, admitted per boot only if its outputs, replayed state and both checkpoint slots are byte-identical to the ordinary kernel) never qualified because the compiler contracted the other product into the FMA: pipeline RN(RN(B*dt)*x + state*dA) vs ordinary RN(state*dA + RN(RN(B*dt)*x)), a 1-ULP fp32 state difference. The pipelined replay and compute loops now spell the ordinary order explicitly with tl.fma(state, dA, dB*x). The ordinary kernel's code is unchanged (the change sits under the PIPELINED constexpr). The boot-time byte comparison and timing admission are unchanged; NEMO_MAMBA_REPLAY_PIPELINE=0 keeps the ordinary path."
+    },
+    {
+      "file": "harness/kernels/zskip/csrc/zskip_lean.cuh (new); zskip/csrc/zskip.cu; zskip/py/__init__.py; zskip/README.md; vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
+      "why": "i34-9 f0fcab75 (carried whole): leaner M=5 routed-down paired decode kernel, configuration 653. Same per-output arithmetic, accumulation order and epilogue as the checked configurations, with the activation preparation inside the CTA (no list or barrier), zero loads for skipped groups instead of post-masking, folded duplicate scales, an ahead-refilled register ring and per-lane prefetch. It is checked bitwise at boot against the record's selected configuration and against the reference kernel for every row count plus the verify-prefix mode; any mismatch keeps the record's choice. ZSKIP_LEAN=0 restores the record's config. Note that when 653 is selected the record's longest-first ordering, which is admitted for configuration 113 only, does not apply to that call."
+    },
+    {
+      "file": "harness/kernels/marlinx/csrc/marlinx.cu; marlinx/py/__init__.py; marlinx/README.md; marlinx/tests/marlinx_lean_exact.py (new)",
+      "why": "i34-9 f0fcab75 (carried whole): lean shared-expert down projection at M <= 8 with the same grid, warp chains, segment folds, operands and epilogue; the skip mask is built from each lane's own activation words and the skip copy is stored in a nibble-permuted layout of the same size. MARLINX_LEAN=down is its carrier's default; MARLINX_LEAN=0 restores the record's kernel."
+    },
+    {
+      "file": "vllm/v1/spec_decode/nemotron_compound_loop.py (new); nemotron_full_step.py; nemotron_decode_plan.py; nemotron_full_step.py's _nemo_full_native_layout; vllm/v1/spec_decode/llm_base_proposer.py",
+      "why": "jacklightChen 581daccd, the compound-loop part only (carried; its sctopk kernel and nemotron_h_mtp_screen.py changes are deliberately not carried, see the entry below): once the first later-step input/plan of a draft round exists, a boot-qualified compound graph executes the remaining native MTP passes, reusing the captured full-step executable layout, the original head graphs and device-selected original native plan prefixes for passes two and three. Only structural native planner bytes are retained; request block IDs are copied from the live request on every invocation, so no token, KV or prompt is cached. It runs only for token_index 0 with no emit budget, a live depth gate, sequence lengths after rejection and no draft probs; NEMO_MTP_COMPOUND_LOOP=0 disables it. Boot qualification and compilation run on the official box; _SCALARS/last_restore_key only publish plan metadata the bank already records."
+    },
+    {
+      "file": "(composition)",
+      "why": "This archive is the promoted record 1cb833a7 (ArthurOstapenko, main de290fa) plus the two whole carries above and nothing else. Deliberately omitted, with their measured effects on this same record: the sctopk draft-screen top-k CUDA kernel (04a39307 scored 2.63341555730318, -1.21%, and d49831eb scored 2.61406155762125, -2.67%) and the verify-step sampled-token output copy that waits on an event recorded after the sampler (9843ad8f scored 2.61082378181504, -2.92%). No k=0/1 subset of either is carried, and no threshold, format, sampler, target arithmetic or manifest value is changed: depth stays 4 and every frozen format (NVFP4 W4A16 experts and output head, FP8 Mamba projections, FP8 KV cache, fp32 SSM state, native BF16 MTP head) is the record's."
     }
   ]
 }

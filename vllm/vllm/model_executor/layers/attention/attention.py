@@ -828,9 +828,12 @@ def _prefetch_ahead(ahead, rows: int, budget: int | None = None,
     budget = _l2pf.ATTN_BYTES if budget is None else budget
     native_sm = getattr(ahead, "_mtp_pk_sm", None)
     if native_sm is not None:
-        return _l2pf.prefetch_many(((gate, gate_bytes),
-                                   (native_sm, budget * 2 // 3),
-                                   (ahead._mtp_pk_ex, budget - budget * 2 // 3)))
+        from vllm.model_executor.models.nemotron_h_mtp_kernels import mtp_prefetch
+
+        return mtp_prefetch(((gate, gate_bytes),
+                             (native_sm, budget * 2 // 3),
+                             (ahead._mtp_pk_ex, budget - budget * 2 // 3)),
+                            keep_first=True)
     planes = getattr(ahead, "_apk_planes", None)
     if planes is None or rows != 5:
         return _l2pf.prefetch_many(((gate, gate_bytes), (ahead.weight, budget)))

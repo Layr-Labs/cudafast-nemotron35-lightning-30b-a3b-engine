@@ -97,6 +97,14 @@ def _heuristic_config(
     is_sm90_plus = current_platform.has_device_capability(90)
     is_sm80_before = not current_platform.has_device_capability(80)
 
+    # LOCAL PATCH (cudafast-nemotron35, pfcomb): the 496-token prefill combine (top-6 slots of
+    # 2688 bf16) right after pzskip: 2 x 512 tiles on 4 warps instead of 4 x 512 on 8. Each output
+    # element is still one fp32 chain over the six slots in order (tile-config independent),
+    # rounded once to bf16. VLLM_MOE_MUL_SUM_PF=0 restores the heuristic.
+    if (os.environ.get("VLLM_MOE_MUL_SUM_PF", "1") != "0" and num_tokens == 496
+            and top_k == 6 and size == 2688 and not is_fp32):
+        return 2, 512, 4, 4
+
     if current_platform.has_device_capability(90):
         # SM90/SM100+: prefer small tiles + many CTAs.
         if is_fp32:

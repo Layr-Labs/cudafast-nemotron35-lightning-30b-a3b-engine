@@ -175,7 +175,7 @@ def eagle_prepare_inputs_padded_kernel(
     tl.store(num_rejected_tokens_gpu_ptr + req_idx, num_rejected_tokens)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["backup_scalar"])
 def eagle_prepare_next_token_padded_kernel(
     sampled_token_ids_ptr,  # [num_reqs, num_sampled_tokens_per_req]
     discard_request_mask_ptr,  # [num_reqs]
@@ -187,6 +187,8 @@ def eagle_prepare_next_token_padded_kernel(
     num_reqs,  # tl.int32
     stride_sampled_token_ids,  # tl.int32 (stride for dim 0)
     BLOCK_SIZE_TOKENS: tl.constexpr,  # Power-of-2 >= num_sampled_tokens_per_req
+    backup_scalar=0,  # LOCAL PATCH (drafter3): request 0's backup token, when BACKUP_SCALAR
+    BACKUP_SCALAR: tl.constexpr = False,
 ):
     """
     Fused kernel for Eagle prepare_next_token_ids_padded. This kernel computes the
@@ -203,7 +205,10 @@ def eagle_prepare_next_token_padded_kernel(
     is_discarded = tl.load(discard_request_mask_ptr + req_idx)
 
     if is_discarded:
-        backup_token = tl.load(backup_next_token_ids_ptr + req_idx)
+        if BACKUP_SCALAR:
+            backup_token = backup_scalar.to(tl.int32)
+        else:
+            backup_token = tl.load(backup_next_token_ids_ptr + req_idx)
         valid_count = tl.full((), 0, dtype=tl.uint32)
         tl.store(next_token_ids_ptr + req_idx, backup_token)
         tl.store(valid_sampled_tokens_count_ptr + req_idx, valid_count)
@@ -232,7 +237,10 @@ def eagle_prepare_next_token_padded_kernel(
             tl.store(next_token_ids_ptr + req_idx, last_valid_token)
         else:
             # No valid tokens found, use backup token
-            backup_token = tl.load(backup_next_token_ids_ptr + req_idx)
+            if BACKUP_SCALAR:
+                backup_token = backup_scalar.to(tl.int32)
+            else:
+                backup_token = tl.load(backup_next_token_ids_ptr + req_idx)
             tl.store(next_token_ids_ptr + req_idx, backup_token)
 
         tl.store(valid_sampled_tokens_count_ptr + req_idx, valid_count)

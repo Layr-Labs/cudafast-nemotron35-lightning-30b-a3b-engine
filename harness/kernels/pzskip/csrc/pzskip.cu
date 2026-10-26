@@ -62,6 +62,7 @@ struct Params {
   int max_blocks;
   int dense;               // 1: load every row (humming's computation, for checks)
   int* stats;              // optional: [0] dense redo warps
+  int half64;              // smem5 prep: 32-row halves of a 64-row moe_align layout (config 369)
 };
 
 __device__ __forceinline__ uint32_t hmul2_u32(uint32_t a, uint32_t b) {
@@ -779,7 +780,7 @@ __global__ void __launch_bounds__(128) prep2_kernel(const Params p) {
     for (int r = 0; r < BMT; ++r) n += s_rows[r] >= 0 ? 1 : 0;
     s_n = n;
     *reinterpret_cast<int*>(bi + BI_NROWS) = n;
-    *reinterpret_cast<int*>(bi + BI_EXPERT) = live ? p.expert_ids[mb] : -1;
+    *reinterpret_cast<int*>(bi + BI_EXPERT) = live ? p.expert_ids[p.half64 ? (mb >> 1) : mb] : -1;
   }
   __syncthreads();
   {
@@ -1045,6 +1046,7 @@ int pzskip_down(const void* A, long long lda, int shape_m, const int* sorted_ids
   p.max_blocks = max_blocks;
   p.dense = dense;
   p.stats = stats;
+  p.half64 = 0;
   cudaStream_t st = static_cast<cudaStream_t>(stream);
   // configs 300-399 launch their own prep (with their block size); 3BB: BB = block rows 16/32
   // (except 356/357: 32-row blocks, see smem5_kernel)
@@ -1118,6 +1120,24 @@ int pzskip_down(const void* A, long long lda, int shape_m, const int* sorted_ids
       return pzskip::launch_smem5<1, 4, 3, 0>(p, st);
     }  // 333's CTA, lean issue (see smem5_kernel)
     case 357: return pzskip::launch_smem5<2, 2, 3>(p, st);
+    // LOCAL PATCH (cudafast-nemotron35, pzhalf): 356 on humming's 64-row prefill moe_align
+    // layout, read as 32-row halves (block b covers rows 32 b .. 32 b + 31 of the 64-row
+    // layout, expert expert_ids[b / 2]). An expert's 32-row chunks are the same rows as in the
+    // 32-row layout (both start at its first slot); a half holding only padding has no rows and
+    // its CTAs return at once. Same blocks, same arithmetic; the second moe_align is not run.
+    case 369: {
+      pzskip::Params q = p;
+      q.half64 = 1;
+#ifndef PZSKIP_NO_CACHE_POLICY
+      const char* enabled = std::getenv("HUMMING_EVICT_PZ");
+      if (q.shape_m == 2976 && (!enabled || enabled[0] != '0')) {
+        int rc = pzskip::launch_smem5<1, 4, 3, 1>(q, st);
+        if (!rc) return 0;
+        cudaGetLastError();
+      }
+#endif
+      return pzskip::launch_smem5<1, 4, 3, 0>(q, st);
+    }
     // 16-row blocks: one warp per 64-column tile, 2 token tiles
     case 340: return pzskip::launch_smem4<1, 4, 2, 8, 16>(p, st);
     case 341: return pzskip::launch_smem4<1, 4, 3, 6, 16>(p, st);

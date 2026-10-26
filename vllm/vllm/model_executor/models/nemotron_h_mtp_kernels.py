@@ -102,6 +102,34 @@ def _gate_args(t: torch.Tensor) -> tuple[torch.Tensor, bool]:
     return g, True
 
 
+# LOCAL PATCH (drafter3): drafter L2 prefetches that a stopped (depth-gated) pass
+# would wait for without reading the bytes are skipped on the device instead.
+# MTP_PF_GATED=0 keeps the ungated launches.
+_PF_GATED = os.environ.get("MTP_PF_GATED", "1") != "0"
+_PF_TABLES: dict = {}
+
+
+def gated_prefetch(ranges, device: torch.device, name: str = "",
+                   max_kept: int = 1 << 30) -> bool | None:
+    """Queue an L2 prefetch of ranges [(tensor, bytes)] on l2pf's side stream that the
+    kernel skips once the depth gate stopped the loop. None when it does not apply
+    (no gate, no gated l2pf launch, or a table that would be built during capture):
+    the caller keeps its own launch."""
+    if (_l2pf is None or not hasattr(_l2pf, "GatedTable")
+            or _GATE is None or _GATE.device != device):
+        return None
+    key = tuple((t.data_ptr(), int(b)) for t, b in ranges if t is not None)
+    table = _PF_TABLES.get(key)
+    if table is None:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        table = _l2pf.GatedTable(ranges, device, name=name, mode=2 if _PF_GATED else 1)
+        _PF_TABLES[key] = table
+    if not table.nranges:
+        return None
+    return table.launch(_GATE, max_kept)
+
+
 def depth_gate_begin(batch_size: int, all_greedy: bool) -> torch.Tensor | None:
     """Start of a draft loop: clear the stop flag and the kept count, and mark the
     loop active (the screen counts and stops only then). Only for one greedy
@@ -129,6 +157,32 @@ def _depth_gate_end_kernel(gate_ptr, vrows_ptr, max_rows, VROWS_ALL: tl.constexp
 
 
 _GATE_END_FUSED = os.environ.get("MTP_GATE_END_FUSED", "1") != "0"
+_EH_DEMOTE: dict = {}
+
+
+def _eh_demote(device: torch.device) -> None:
+    """LOCAL PATCH (drafter3): the single-row passes read the packed eh hidden half
+    evict-last (nemotron_h_mtp_packed.EH_LAST); after the loop, give its L2 lines back
+    the normal priority so the verify's own L2 use is unchanged."""
+    from .nemotron_h_mtp_packed import EH_BF16, EH_LAST
+
+    if not EH_LAST or _l2pf is None or not hasattr(_l2pf, "demote"):
+        return
+    key = device.index
+    table = _EH_DEMOTE.get(key)
+    if table is None:
+        if EH_BF16:
+            w = getattr(_l2pf, "DRAFT_NEXT", {}).get("eh_bf16")
+            ranges = [] if w is None else [(w[0], w[0].numel() * w[0].element_size())]
+        else:
+            planes = getattr(_l2pf, "DRAFT_NEXT", {}).get("eh")
+            ranges = ([] if planes is None else
+                      [(t, t.numel() * t.element_size()) for t in planes[:4]])
+        if not ranges or torch.cuda.is_current_stream_capturing():
+            return
+        table = _l2pf.GatedTable(ranges, device, name="demote", mode=1)
+        _EH_DEMOTE[key] = table
+    _l2pf.demote(table)
 
 
 def depth_gate_end(gate: torch.Tensor, max_rows: int | None = None) -> None:
@@ -136,6 +190,7 @@ def depth_gate_end(gate: torch.Tensor, max_rows: int | None = None) -> None:
     was counted), capped at max_rows when given (LOCAL PATCH, cudafast-nemotron35:
     the free-run emit budget, llm_base_proposer._emit_budget_drafts), then the stop
     flag and the active mark cleared."""
+    _eh_demote(gate.device)
     try:
         import smallk
     except ImportError:
@@ -183,7 +238,11 @@ _EVICT_W = os.environ.get("MTP_FAST_EVICT", "1") != "0"
 
 @triton.jit
 def _load_w(ptrs, mask, EVICT: tl.constexpr):
-    if EVICT:
+    # LOCAL PATCH (drafter3): EVICT 2 loads evict-last (the BF16 eh hidden half every
+    # draft pass of a cycle reads); 1 / True evict-first; 0 / False default.
+    if EVICT == 2:
+        w = tl.load(ptrs, mask=mask, other=0.0, eviction_policy="evict_last")
+    elif EVICT:
         w = tl.load(ptrs, mask=mask, other=0.0, eviction_policy="evict_first")
     else:
         w = tl.load(ptrs, mask=mask, other=0.0)
@@ -307,8 +366,10 @@ def mtp_small_linear_keep_impl(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor
     """mtp_small_linear with ordinary (not evict-first) weight loads, for a
     weight every draft pass of a cycle reads again: the drafter's other weight
     streams are evict-first, so this one can stay in the 24 MB L2 between
-    passes. Same arithmetic as mtp_small_linear."""
-    return _small_linear(x, w, False)
+    passes. Same arithmetic as mtp_small_linear. LOCAL PATCH (drafter3): with
+    MTP_EH_LAST (default) the loads are evict-last; depth_gate_end demotes."""
+    from .nemotron_h_mtp_packed import EH_LAST
+    return _small_linear(x, w, 2 if EH_LAST else False)
 
 
 def _small_linear(x: torch.Tensor, w: torch.Tensor, evict: bool) -> torch.Tensor:
@@ -669,12 +730,12 @@ def relu2_down(h, w2, sd, ids, tw, y, routed_scale, mode=None, bn=None, warps=No
         # the head of the draft screen's coarse matrix, which the drafter
         # streams next, into L2 meanwhile (moves no value). Joined after
         # whichever down kernel runs.
-        pf = (
-            _l2pf is not None
-            and _l2pf.DRAFT_BYTES > 0
-            and bool(_l2pf.DRAFT_SCREEN)
-            and _l2pf.prefetch(_l2pf.DRAFT_SCREEN[0], max_bytes=_l2pf.DRAFT_BYTES)
-        )
+        pf = False
+        if _l2pf is not None and _l2pf.DRAFT_BYTES > 0 and bool(_l2pf.DRAFT_SCREEN):
+            pf = gated_prefetch([(_l2pf.DRAFT_SCREEN[0], _l2pf.DRAFT_BYTES)], y.device,
+                                name="shead")
+            if pf is None:
+                pf = _l2pf.prefetch(_l2pf.DRAFT_SCREEN[0], max_bytes=_l2pf.DRAFT_BYTES)
         add = can_add_residual(residual, y, routed_scale, ids.numel())
         if maybe_down(h, packed, ids, tw, y, routed_scale, residual=residual if add else None):
             if pf:
@@ -907,6 +968,7 @@ def _mtp_moe_single_row_dispatch(
     w13, w2, su, sd, inter, n_shared = layer._fast_moe_weights
     M, H = hidden_states.shape
     x = hidden_states if M == 1 else hidden_states.index_select(0, row_src[:1])  # [1, H]
+    shared_pf = _shared_prefetch(layer, su, x)
     router_logits, _ = mixer.gate(x)
     topk_weights, topk_ids = mixer.experts.router.select_experts(
         hidden_states=x, router_logits=router_logits
@@ -929,7 +991,7 @@ def _mtp_moe_single_row_dispatch(
             tw, order = torch.sort(tw, descending=True)
             tw = tw[:_DRAFT_TOPK].contiguous()
             ids = ids.index_select(0, order[:_DRAFT_TOPK]).contiguous()
-    return mtp_moe_row(
+    out = mtp_moe_row(
         x,
         ids,
         tw,
@@ -942,6 +1004,32 @@ def _mtp_moe_single_row_dispatch(
         M,
         residual=residual,
     )
+    if shared_pf:
+        _l2pf.join(x.device)
+    return out
+
+
+def _shared_prefetch(layer, su, x) -> bool:
+    """LOCAL PATCH (drafter3): the router chain (gate GEMV, top-k, keep) is
+    latency-bound; prefetch the head of the packed shared-up planes, which the up
+    kernel reads in its last slots, into L2 meanwhile (moves no value). Skipped on
+    the device once the depth gate stopped the loop. L2PF_DRAFT_SHARED_MB=0 off."""
+    if (_l2pf is None or getattr(_l2pf, "DRAFT_SHARED_BYTES", 0) <= 0
+            or not hasattr(_l2pf, "GatedTable") or not x.is_cuda):
+        return False
+    from .nemotron_h_mtp_packed import PackedBF16
+
+    if not isinstance(su, PackedBF16):
+        return False
+    table = getattr(layer, "_mtp_shared_pf", None)
+    if table is None:
+        if torch.cuda.is_current_stream_capturing():
+            return False  # the table is built on an eager (warm-up) call
+        table = _l2pf.GatedTable(_l2pf.packed_ranges(su.planes, _l2pf.DRAFT_SHARED_BYTES),
+                                 x.device, name="shared")
+        layer._mtp_shared_pf = table
+    gate, gated = _gate_args(x)
+    return table.launch(gate if gated else None, 1 << 30)
 
 
 

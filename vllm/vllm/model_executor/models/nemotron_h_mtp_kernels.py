@@ -847,7 +847,9 @@ def mtp_moe_row(
 
 # LOCAL PATCH (cudafast-nemotron35): routed experts the MTP draft evaluates per
 # token (the router's top 6 by weight, highest first); MTP_DRAFT_TOPK=0 keeps all.
-_DRAFT_TOPK = int(os.environ.get("MTP_DRAFT_TOPK", "3"))
+# Default 6 = every routed expert the router selects (the original MTP head).
+# MTP_DRAFT_TOPK=3 restores the top-3 cut.
+_DRAFT_TOPK = int(os.environ.get("MTP_DRAFT_TOPK", "6"))
 # MTP_TOPK_KEEP_KERNEL=0 keeps torch.sort + slice + index_select for the selection.
 _TOPK_KEEP_KERNEL = os.environ.get("MTP_TOPK_KEEP_KERNEL", "1") != "0"
 

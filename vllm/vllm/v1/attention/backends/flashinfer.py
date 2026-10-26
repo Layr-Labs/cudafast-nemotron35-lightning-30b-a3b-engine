@@ -1993,6 +1993,9 @@ class FlashInferImpl(AttentionImpl):
                 layer._q_scale,
             )
 
+            plan_ready = getattr(attn_metadata, "plan_ready_event", None)
+            if plan_ready is not None:
+                torch.cuda.current_stream().wait_event(plan_ready)
             if not prefill_use_trtllm:
                 assert isinstance(attn_metadata.prefill, FIPrefill)
                 prefill_wrapper = attn_metadata.prefill.wrapper

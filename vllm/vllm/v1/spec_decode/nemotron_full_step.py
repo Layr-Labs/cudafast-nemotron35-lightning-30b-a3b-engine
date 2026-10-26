@@ -170,6 +170,13 @@ def maybe_run(p, kwargs, metadata, padded, batch_size):
     if (BatchDescriptor(num_tokens=padded) not in graph.concrete_cudagraph_entries
             or _inputs(kwargs) != inputs or _metadata(p, metadata) != signature):
         return None
+    # Current-call plan events are Python metadata, not captured graph inputs.
+    # Honor them explicitly at replay's boundary; the startup graph cannot
+    # acquire a new event dependency by changing its forward-context object.
+    for md in {id(v): v for v in metadata.values()}.values():
+        ready = getattr(md, "plan_ready_event", None)
+        if ready is not None:
+            torch.cuda.current_stream(p.device).wait_event(ready)
     with set_forward_context(metadata, p.vllm_config, num_tokens=padded,
                              cudagraph_runtime_mode=CUDAGraphMode.FULL,
                              slot_mapping=p._get_slot_mapping(padded)):

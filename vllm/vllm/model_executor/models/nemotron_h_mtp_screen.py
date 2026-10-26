@@ -211,6 +211,108 @@ def _nvfp4_rows_dot(
         tl.store(out_ptr + r, acc * gscale, mask=rmask)
 
 
+@triton.jit
+def _nvfp4_rows_dot_part(
+    h_ptr, w_ptr, s_ptr, rows_ptr, part_ptr, R,
+    NBYTES: tl.constexpr, BR: tl.constexpr, BB: tl.constexpr, INDEX32: tl.constexpr,
+    gate_ptr=None, GATED: tl.constexpr = False, launch_pdl: tl.constexpr = False,
+):
+    """LOCAL PATCH (cudafast-nemotron35): one BB-byte block (program axis 1) of
+    _nvfp4_rows_dot's gathered rows: the exact term that kernel's loop adds to its
+    accumulator in that iteration, stored at part[kb, r]. _nvfp4_rows_dot_sum adds
+    the terms in the loop's order, so the result is the same bits with BB-block
+    parallelism instead of a serial BB loop per row block."""
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    if GATED:
+        if tl.load(gate_ptr) != 0:
+            return
+    pid = tl.program_id(0)
+    kb = tl.program_id(1)
+    r = pid * BR + tl.arange(0, BR)
+    rmask = r < R
+    if INDEX32:
+        rows = tl.load(rows_ptr + r, mask=rmask, other=0).to(tl.int32)
+    else:
+        rows = tl.load(rows_ptr + r, mask=rmask, other=0).to(tl.int64)
+    wr = rmask
+    b0 = kb * BB
+    ob = b0 + tl.arange(0, BB)
+    wb = tl.load(
+        w_ptr + rows[:, None] * NBYTES + ob[None, :],
+        mask=wr[:, None],
+        other=0,
+        eviction_policy="evict_first",
+    ).to(tl.int32)
+    og = (b0 // 8) + tl.arange(0, BB // 8)
+    sc = tl.load(
+        s_ptr + rows[:, None] * (NBYTES // 8) + og[None, :],
+        mask=wr[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    hl = tl.load(h_ptr + 2 * ob)
+    hh = tl.load(h_ptr + 2 * ob + 1)
+    lo, hi = _e2m1_pair(wb)
+    part = lo * hl[None, :] + hi * hh[None, :]
+    part = tl.reshape(part, (BR, BB // 8, 8))
+    acc = tl.zeros((BR,), dtype=tl.float32)
+    acc += tl.sum(tl.sum(part, axis=2) * sc, axis=1)
+    tl.store(part_ptr + kb * R + r, acc, mask=rmask)
+
+
+@triton.jit
+def _nvfp4_rows_dot_sum(
+    part_ptr, out_ptr, R, gscale, NK: tl.constexpr, BR: tl.constexpr,
+    gate_ptr=None, GATED: tl.constexpr = False, launch_pdl: tl.constexpr = False,
+):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    pid = tl.program_id(0)
+    r = pid * BR + tl.arange(0, BR)
+    rmask = r < R
+    if GATED:
+        if tl.load(gate_ptr) != 0:
+            tl.store(out_ptr + r, tl.zeros((BR,), dtype=tl.float32) * gscale, mask=rmask)
+            return
+    acc = tl.zeros((BR,), dtype=tl.float32)
+    for k in range(NK):
+        acc += tl.load(part_ptr + k * R + r, mask=rmask, other=0.0)
+    tl.store(out_ptr + r, acc * gscale, mask=rmask)
+
+
+def screen_ksplit_enabled() -> bool:
+    """The final full-row dot as BB-block partial terms + an in-order sum (same
+    bits): VLLM_MTP_SCREEN_KSPLIT=0 keeps the single serial-loop kernel."""
+    return os.environ.get("VLLM_MTP_SCREEN_KSPLIT", "1") != "0"
+
+
+def _rows_dot_ksplit(h, w, s, rows, gscale, out, part, gated=False):
+    n_out = out.numel()
+    nbytes = w.shape[1]
+    br = 16
+    nk = nbytes // 64
+    max_rows = max(w.shape[0], n_out) + br - 1
+    index32 = (
+        max_rows * nbytes < 2**31
+        and max_rows * (nbytes // 8) < 2**31
+        and n_out + br - 1 < 2**31
+    )
+    gate, ok = _gate_args(out)
+    gated = gated and ok
+    _nvfp4_rows_dot_part[(triton.cdiv(n_out, br), nk)](
+        h, w, s, rows, part, n_out,
+        NBYTES=nbytes, BR=br, BB=64, INDEX32=index32,
+        gate_ptr=gate, GATED=gated, launch_pdl=mtp_pdl(),
+        num_warps=4, num_stages=2,
+    )
+    _nvfp4_rows_dot_sum[(triton.cdiv(n_out, 128),)](
+        part, out, n_out, gscale, NK=nk, BR=128,
+        gate_ptr=gate, GATED=gated, launch_pdl=mtp_pdl(), num_warps=4,
+    )
+
+
 def _rows_dot(h, w, s, rows, gscale, out, gather, gated=False, hcols=None, ref=None,
               rmode=0, cper=1, sper=1, base=None, scatter=None):
     n_out = out.numel()
@@ -236,6 +338,80 @@ def _rows_dot(h, w, s, rows, gscale, out, gather, gated=False, hcols=None, ref=N
         base_ptr=base, BASE=base is not None,
         scatter_ptr=scatter, SCATTER=scatter is not None,
     )
+
+
+def _qualify_ksplit(w, scales, gscale, part, count):
+    """Fresh private operands on the official worker; no request or oracle input."""
+    if torch.cuda.is_current_stream_capturing():
+        return False
+    try:
+        k = w.shape[1] * 2
+        h = torch.empty(k, dtype=torch.float32, device=w.device)
+        rows = torch.arange(count, dtype=torch.int64, device=w.device)
+        rows = (rows * 8191 + 17) % w.shape[0]
+        ref = torch.empty(count, dtype=torch.float32, device=w.device)
+        actual = torch.empty_like(ref)
+        at = torch.arange(k, dtype=torch.int32, device=w.device)
+        for case in range(4):
+            if case == 0:
+                h.copy_((at % 71 - 35).float() / 29)
+            elif case == 1:
+                h.copy_(torch.where(at % 2 == 0, 0.0, -0.0))
+            elif case == 2:
+                h.copy_((at % 3 - 1).float() * 1.0e-40)
+            else:
+                patterns = torch.tensor([0, 0x80000000, 0x7f800000,
+                                         0xff800000, 0x7fc00001],
+                                        dtype=torch.int64, device=w.device)
+                h.copy_(patterns[at % 5].to(torch.int32).view(torch.float32))
+            _rows_dot(h, w, scales, rows, gscale, ref, True, False)
+            _rows_dot_ksplit(h, w, scales, rows, gscale, actual, part, False)
+            if not torch.equal(ref.view(torch.int32), actual.view(torch.int32)):
+                print("MTP final-stage ksplit private words differ; original retained", flush=True)
+                return False
+        # The source whole later measured lower. Numerical qualification alone
+        # is not a performance remedy: include the old kernel in private timing.
+        h.copy_((at % 71 - 35).float() / 29)
+        sweep = torch.empty(64 << 20, dtype=torch.uint8, device=w.device)
+        for spread in (1, 61):
+            rank = torch.arange(count, dtype=torch.int64, device=w.device)
+            private_rows = ((rank // 32) * 2048 + ((rank % 32) * spread + 17) % 2048)
+            rows.copy_(private_rows % w.shape[0])
+            graphs = []
+            for which in (0, 1):
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    if which == 0:
+                        _rows_dot(h, w, scales, rows, gscale, ref, True, False)
+                    else:
+                        _rows_dot_ksplit(h, w, scales, rows, gscale, actual, part, False)
+                graph.replay()
+                torch.cuda.synchronize(w.device)
+                graphs.append(graph)
+            for swept in (False, True):
+                times = [[], []]
+                for iteration in range(9):
+                    for which in ((0, 1) if iteration % 2 == 0 else (1, 0)):
+                        if swept:
+                            sweep.zero_()
+                        begin = torch.cuda.Event(enable_timing=True)
+                        end = torch.cuda.Event(enable_timing=True)
+                        begin.record()
+                        graphs[which].replay()
+                        end.record()
+                        end.synchronize()
+                        times[which].append(begin.elapsed_time(end))
+                old_time, new_time = [sorted(t)[4] for t in times]
+                print("MTP final ksplit private old/new ms", spread, swept,
+                      old_time, new_time, flush=True)
+                if not (0 < old_time < 1.0e6 and 0 < new_time <= .99 * old_time):
+                    return False
+            del graphs
+        print("MTP final-stage ksplit private words and all speed gates passed", flush=True)
+        return True
+    except Exception as exc:
+        print("MTP final-stage ksplit private qualification refused", type(exc).__name__, flush=True)
+        return False
 
 
 def screen_topk_enabled() -> bool:
@@ -576,6 +752,17 @@ class DraftHeadScreen:
         self.cand_logits = torch.empty(
             (n // SCREEN_CHUNK) * SCREEN_PER, dtype=torch.float32, device=device
         )
+        # LOCAL PATCH (cudafast-nemotron35): partial terms of the final full-row dot.
+        self._full_part = None
+        if (screen_ksplit_enabled() and device.type == "cuda"
+                and self.w_full.shape[1] % 64 == 0):
+            self._full_part = torch.empty(
+                (self.w_full.shape[1] // 64) * self.cand_logits.numel(),
+                dtype=torch.float32, device=device,
+            )
+            if not _qualify_ksplit(self.w_full, self.s_full, self.gscale,
+                                   self._full_part, self.cand_logits.numel()):
+                self._full_part = None
         self.big = torch.tensor(1 << 30, dtype=torch.int32, device=device)
         # l2pf: the coarse matrix is registered for the MTP MoE's down
         # projection window (nemotron_h_mtp_kernels.py), which prefetches its head.
@@ -847,9 +1034,15 @@ class DraftHeadScreen:
                 .topk(SCREEN_PER, dim=-1, sorted=False).indices
                 + self.chunk_off
             ).reshape(-1)
-        _rows_dot(
-            h, self.w_full, self.s_full, cand, self.gscale, self.cand_logits, True, gated
-        )
+        if self._full_part is not None and cand.numel() == self.cand_logits.numel():
+            _rows_dot_ksplit(
+                h, self.w_full, self.s_full, cand, self.gscale, self.cand_logits,
+                self._full_part, gated,
+            )
+        else:
+            _rows_dot(
+                h, self.w_full, self.s_full, cand, self.gscale, self.cand_logits, True, gated
+            )
         gate, ok = _gate_args(out)
         _select_token[(1,)](
             self.cand_logits, cand, out, N=self.cand_logits.numel(),

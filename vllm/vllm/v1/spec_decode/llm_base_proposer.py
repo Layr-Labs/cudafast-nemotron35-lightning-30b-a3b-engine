@@ -572,9 +572,29 @@ class SpecDecodeBaseProposer:
             )
         )
 
-        per_group_attn_metadata, per_layer_attn_metadata = (
-            self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
+        side = (
+            self._draft_plan_side_stream()
+            if self.method == "mtp" and type(self.model).__name__ == "NemotronHMTP"
+            else None
         )
+        if side is not None:
+            main = torch.cuda.current_stream()
+            side.wait_stream(main)
+            with torch.cuda.stream(side):
+                per_group_attn_metadata, per_layer_attn_metadata = (
+                    self.build_per_group_and_layer_attn_metadata(
+                        common_attn_metadata, draft_index=0
+                    )
+                )
+                if self._draft_plan_first_ready is None:
+                    self._draft_plan_first_ready = torch.cuda.Event()
+                self._draft_plan_first_ready.record(side)
+            for md in {id(m): m for m in per_layer_attn_metadata.values()}.values():
+                md.plan_ready_event = self._draft_plan_first_ready
+        else:
+            per_group_attn_metadata, per_layer_attn_metadata = (
+                self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
+            )
         num_rejected_cpu = self._copy_num_rejected_to_cpu(num_rejected_tokens_gpu)
 
         cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
@@ -722,7 +742,30 @@ class SpecDecodeBaseProposer:
             # The draft plan reads seq_lens_cpu; deriving it from the copied
             # counts waits for the first pass to start, not to finish. The
             # bound keeps the step kernel's seq_lens update an exact +1.
+            fast_rejected = None
+            hook = self.hostfast_num_rejected_cpu
             if (
+                self.method == "mtp" and hostfast.S2 and hook is not None
+                and seq_lens_cpu is not None
+                and self._hostfast_draft_sets() is not None
+                and common_attn_metadata.max_seq_len + self.num_speculative_tokens
+                <= self.max_model_len
+            ):
+                got = hook()
+                if (
+                    isinstance(got, torch.Tensor) and got.device.type == "cpu"
+                    and got.dtype == seq_lens_cpu.dtype and got.ndim == 1
+                    and 1 <= got.shape[0] <= seq_lens_cpu.shape[0]
+                ):
+                    if got.shape[0] < seq_lens_cpu.shape[0]:
+                        ext = torch.zeros(seq_lens_cpu.shape[0], dtype=got.dtype, device="cpu")
+                        ext[: got.shape[0]] = got
+                        got = ext
+                    fast_rejected = got
+            if fast_rejected is not None:
+                common_attn_metadata._seq_lens_cpu = seq_lens_cpu - fast_rejected
+                order_draft_plans = True
+            elif (
                 num_rejected_cpu is not None
                 and seq_lens_cpu is not None
                 and seq_lens_cpu.shape == num_rejected_cpu.shape
@@ -1194,6 +1237,7 @@ class SpecDecodeBaseProposer:
     # draft attention group).
     _draft_plan_stream: "torch.cuda.Stream | bool | None" = None
     _draft_plan_ready: list = []
+    _draft_plan_first_ready: "torch.cuda.Event | None" = None
 
     def _draft_plan_side_stream(self) -> "torch.cuda.Stream | None":
         """The side stream for the draft steps' plan copies, or None (then the
@@ -1978,6 +2022,8 @@ class SpecDecodeBaseProposer:
             prepare(self)
             from vllm.v1.spec_decode.nemotron_decode_plan import prepare as prepare_plan
             prepare_plan(self)
+            from vllm.v1.worker.copy_batch import prepare_native_plan_lanes
+            prepare_native_plan_lanes(self)
 
     def _get_eagle3_use_aux_hidden_state_from_config(self) -> bool:
         """

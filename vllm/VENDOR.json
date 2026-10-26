@@ -394,6 +394,18 @@
     {
       "file": "(composition)",
       "why": "e-man07 composition on the record 1e1c2581-e506-4ca4-9341-5f08ffceec86: ArthurOstapenko 53f66afe-0252-402f-b34b-19bea81f1e74 carried byte for byte; jacklightChen 1df4df4a-6dc5-4ecf-8d49-b372ba3726fd carried byte for byte; terrapinelf 80f6fced-3c74-4ce1-9913-058f05e95ec7 carried byte for byte. No new arithmetic."
+    },
+    {
+      "file": "vllm/v1/worker/copy_batch.py (+ vllm/v1/spec_decode/llm_base_proposer.py, nemotron_full_step.py and vllm/v1/attention/backends/flashinfer.py)",
+      "why": "Independent startup-qualified two-slot copy publication lanes for native MTP steps1..3, with target pool preserved and an explicit active recorder. Prevent cross-step reuse fences while retaining each lane completion events and source owners, ordered copy kernel and opaque-plan materialization. Official-worker18-chain fresh-private integer fixture checks repeated cross-stream lane reuse and CPU->GPU->GPU ordered byte copies. No local execution. Selected08c7b71e-c99f-48c1-a2cf-1c9e7981f228 first-pass plan side stream, prefill consumer event wait and earlier valid-count CPU shadow with original fallback; new narrow native-type/CPU-buffer guards. Full whole composition unvalidated. NEMO_MTP_PLAN_COPY_LANES=0 retains original common publication pool. Current metadata plan-ready events explicitly waited at full-step graph replay boundary, since startup-captured Python forward context cannot dynamically insert later event nodes. No old-race or path-activation claim."
+    },
+    {
+      "file": "harness/kernels/pzskip/csrc/pzskip.cu, py/__init__.py, tests/exact.py (+ vllm/model_executor/layers/fused_moe/experts/humming_zskip.py)",
+      "why": "Material e2ebf729-0f3e-4482-9323-08e1a9316b27 64-row union-mask prefill weight-sharing configs360..364, exact full CXX/Python/test sources; retain original356 and its own correctness check. Adapted remote startup admission includes356 in every timing panel, cloned already-available64row alignment, balanced/skewed fresh private routing and no-sweep/64MiB scratch-sweep conditions with rotated order9graphreplays. Select64row only if bit exact on actual startup weights and >=1% faster in ALL four private conditions; otherwise356. Selected variants onlyserve496token shape; all other shapes keepparentconfig. No local import/compile/test and no whole/activation/gain claim."
+    },
+    {
+      "file": "vllm/model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "Material b04d1857-f4f8-438e-9d82-ce3e58203132 final full-row native-MTP screen dot split into exact per64-byte terms and original-order sum. Source8daf7345626c147acdba75b3bbe40aaf08089559/fullb98a9d085d03159b47701a316ba135698180a325; keep existing cascade, candidates, final scale, tie selection, depth gate and screen graph. Added official startup-only fresh real-head/private-h FP32-word comparison (finite, signedzero, subnormal, nonfinite), original serial fallback on refusal. No local execution, activation or gain claim. After sourcewhole API2.51443672028346 lower thanbaseline, add actual official-worker old/new graph performance gate: two private32-per-chunk candidate layouts x no-sweep/64MiB sweep,9alternatingreplays. Require>=1%faster inALLfourconditions or retain original serial kernel; numerical guard alone is not treated as performance remediation."
     }
   ]
 }

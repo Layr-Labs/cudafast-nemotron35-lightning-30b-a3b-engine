@@ -90,6 +90,10 @@ class CopyBatch:
         torch.cuda.synchronize()
 
     def begin(self) -> None:
+        global _ACTIVE_BATCH
+        if (_ACTIVE_BATCH is not None and _ACTIVE_BATCH is not self
+                and _ACTIVE_BATCH.active):
+            raise RuntimeError("nested metadata copy batch")
         self.cur ^= 1
         s = self.sets[self.cur]
         if s.recorded:
@@ -100,6 +104,7 @@ class CopyBatch:
         self.off = _HDR
         self.checks = []
         self.pending_owners = []
+        _ACTIVE_BATCH = self
 
     def _immediate(self, dst, src) -> None:
         dst.copy_(src, non_blocking=True)
@@ -135,9 +140,12 @@ class CopyBatch:
             self.checks.append(dst)
 
     def flush(self) -> None:
+        global _ACTIVE_BATCH
         if not self.active:
             return
         self.active = False
+        if _ACTIVE_BATCH is self:
+            _ACTIVE_BATCH = None
         if self.n == 0:
             return
         s = self.sets[self.cur]
@@ -165,6 +173,7 @@ class CopyBatch:
 
 
 _BATCH: CopyBatch | None = None
+_ACTIVE_BATCH: CopyBatch | None = None
 
 
 def get(device) -> CopyBatch:
@@ -176,7 +185,7 @@ def get(device) -> CopyBatch:
 
 def copy(dst: torch.Tensor, src: torch.Tensor) -> None:
     """dst.copy_(src, non_blocking=True), recorded while a batch is open."""
-    b = _BATCH
+    b = _ACTIVE_BATCH
     if b is not None and b.active:
         b.copy(dst, src)
     else:
@@ -189,7 +198,7 @@ def materialize() -> None:
     Reopen the batch so later metadata copies can still be coalesced. This
     preserves stream order even if a fallback plan consumes a device buffer.
     """
-    b = _BATCH
+    b = _ACTIVE_BATCH
     if b is not None and b.active:
         b.flush()
         b.begin()
@@ -206,7 +215,7 @@ def begin_native_plan(proposer, common, draft_index):
             or draft_index < 1 or common.num_reqs != 1
             or common.num_actual_tokens != 1 or common.max_query_len != 1
             or torch.cuda.is_current_stream_capturing()
-            or (_BATCH is not None and _BATCH.active)):
+            or (_ACTIVE_BATCH is not None and _ACTIVE_BATCH.active)):
         return None
     try:
         if (type(proposer.model).__name__ != "NemotronHMTP"
@@ -224,6 +233,75 @@ def begin_native_plan(proposer, common, draft_index):
             return None
     except (AttributeError, KeyError, TypeError, ValueError):
         return None
-    b = get(proposer.device)
+    lanes = getattr(proposer, "_nemo_plan_copy_lanes", None)
+    b = lanes.get(draft_index) if lanes is not None else None
+    if b is None:
+        b = get(proposer.device)
     b.begin()
     return b
+
+
+def prepare_native_plan_lanes(proposer):
+    """Official startup only: separate publication storage per native step.
+
+    Target retains _BATCH. Native steps retain their own pairs of staging sets,
+    so a later step cannot wait on a preceding step's still queued publication.
+    Each lane still waits before reusing its own storage in a later cycle.
+    """
+    if (not ENABLED or os.environ.get("NEMO_MTP_PLAN_COPY_BATCH", "1") == "0"
+            or os.environ.get("NEMO_MTP_PLAN_COPY_LANES", "1") == "0"
+            or getattr(proposer, "_nemo_plan_copy_lanes_attempted", False)
+            or torch.cuda.is_current_stream_capturing()
+            or (_ACTIVE_BATCH is not None and _ACTIVE_BATCH.active)
+            or type(proposer.model).__name__ != "NemotronHMTP"
+            or proposer.method != "mtp"
+            or proposer.speculative_config.num_speculative_tokens != 4
+            or len(proposer.draft_attn_groups) != 1):
+        return
+    builder = proposer.draft_attn_groups[0].get_metadata_builder()
+    wrapper = getattr(builder, "_decode_wrappers_cudagraph", {}).get(1)
+    bank = getattr(wrapper, "_nemo_native_plan", None)
+    if bank is None or not bank.enabled or bank.force_native:
+        return
+    proposer._nemo_plan_copy_lanes_attempted = True
+    proposer._nemo_plan_copy_lanes = None
+    from vllm.logger import init_logger
+    logger = init_logger(__name__)
+    lanes = {}
+    try:
+        lanes = {i: CopyBatch(proposer.device) for i in range(1, 4)}
+        # Fresh private integer payloads exercise cross-lane reuse, owners and
+        # original ordered device-source copies, outside any model or request.
+        side = torch.cuda.Stream(device=proposer.device)
+        main = torch.cuda.current_stream(proposer.device)
+        side.wait_stream(main)
+        checks = []
+        for cycle in range(6):
+            for step, batch in lanes.items():
+                stream = side if step % 2 else main
+                with torch.cuda.stream(stream):
+                    src = torch.arange(32, dtype=torch.int32, device="cpu", pin_memory=True)
+                    src += cycle * 97 + step * 11
+                    first = torch.empty(32, dtype=torch.int32, device=proposer.device)
+                    second = torch.empty_like(first)
+                    batch.begin()
+                    copy(first, src)
+                    if cycle % 2 == 0:
+                        materialize()
+                    copy(second, first)
+                    batch.flush()
+                    checks.append((second, src.clone()))
+        main.wait_stream(side)
+        torch.cuda.synchronize(proposer.device)
+        if not all(torch.equal(actual.cpu(), ref) for actual, ref in checks):
+            raise RuntimeError("private native publication lane comparison refused")
+        proposer._nemo_plan_copy_lanes = lanes
+        logger.info("Native MTP per-step copy lanes qualified: 3 lanes, 18 private chains")
+    except Exception as exc:
+        logger.warning("Native MTP copy lanes unavailable: %s", type(exc).__name__)
+    finally:
+        # A failed private enqueue must not leave routing pointed at a private
+        # active batch. Normal completion has already flushed every lane.
+        active = _ACTIVE_BATCH
+        if active is not None and any(active is b for b in lanes.values()):
+            active.flush()

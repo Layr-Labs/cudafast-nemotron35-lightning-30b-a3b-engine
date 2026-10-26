@@ -6,6 +6,9 @@ Out-of-window blocks retain all 16 original bits in a compact raw side plane.
 Compute launches use the drafter's programmatic-dependent-launch flag, and the
 same confidence gate as the BF16 kernels: a set stop flag masks every weight
 load, so a stopped draft pass writes zeros and streams no packed weights.
+An optional native-MTP adaptive expert budget also zeroes a weak third routed
+slot on current finite router weights. Encoded weights and retained-expert
+arithmetic stay unchanged; draft outputs may differ and require remote scoring.
 """
 import os
 import time
@@ -254,7 +257,9 @@ def packed_moe_up(x_ptr, SM, EX, BASE, RI, RAW, SSM, SEX, SBASE, SRI, SRAW,
                    ids_ptr,h_ptr,I,K,stride_we,stride_wn,stride_wsn,gate_ptr,
                    TOPK:tl.constexpr,BN:tl.constexpr,BK:tl.constexpr,EVICT:tl.constexpr,
                    GATED:tl.constexpr=False, launch_pdl:tl.constexpr=False,
-                   WN:tl.constexpr=2, WORD:tl.constexpr=False, GROUP8:tl.constexpr=True):
+                   WN:tl.constexpr=2, WORD:tl.constexpr=False, GROUP8:tl.constexpr=True,
+                   router_weights=None, finite_experts=None,
+                   ADAPTIVE:tl.constexpr=False):
     if launch_pdl:
         pdl_prologue()
     # WN warps along N, 4 along K: the K layout (8 x 32 x 4), and with it every
@@ -276,6 +281,22 @@ def packed_moe_up(x_ptr, SM, EX, BASE, RI, RAW, SSM, SEX, SBASE, SRI, SRAW,
             # Stopped pass: store the zeros the masked loads would give, stream nothing.
             stopped_zero(h_ptr+j*I+offs_n,nmask,SliceLayout(1,layout),BN)
             return
+    if ADAPTIVE and TOPK == 3:
+        if j == 2:
+            a = tl.load(router_weights).to(tl.float32)
+            b = tl.load(router_weights + 1).to(tl.float32)
+            c = tl.load(router_weights + 2).to(tl.float32)
+            mass = (a + b) + c
+            ordered = (a >= b) & (b >= c) & (c >= 0.0)
+            finite = (tl.abs(a) < float("inf")) & (tl.abs(b) < float("inf"))
+            finite &= (tl.abs(c) < float("inf")) & (mass < float("inf"))
+            expert = tl.load(ids_ptr + 2)
+            safe_weight = tl.load(finite_experts + expert)
+            # Draft-only adaptive expert budget. Keep the original first two
+            # weights, without renormalizing, and omit a weak third contribution.
+            if ordered & finite & (mass > 0.0) & safe_weight & (c <= 0.25 * mass):
+                stopped_zero(h_ptr+j*I+offs_n,nmask,SliceLayout(1,layout),BN)
+                return
     wn=nmask
     if j<TOPK:
         e=tl.load(ids_ptr+j).to(tl.int64)
@@ -349,6 +370,7 @@ def _decode(SM, EX, BASE, RI, RAW, W, N: tl.constexpr, B: tl.constexpr):
 class PackedBF16:
     shape: tuple
     planes: tuple
+    adaptive_finite: torch.Tensor | None = None
 
     def decode(self):
         w = torch.empty(self.shape, dtype=torch.bfloat16, device=self.planes[0].device)
@@ -548,6 +570,17 @@ def prepare_mtp_packed(module):
         pu, ps = pack_bf16(up), pack_bf16(su)
         if pu is None or ps is None:
             continue
+        if os.environ.get("MTP_ADAPTIVE_EXPERTS", "1") != "0":
+            try:
+                # Immutable checkpoint metadata only. The later zero-work down
+                # slot must not conceal nonfinite weights in the omitted expert.
+                pu.adaptive_finite = (
+                    torch.isfinite(up).all(dim=(1, 2))
+                    & torch.isfinite(down).all(dim=(1, 2))
+                ).contiguous()
+            except Exception as exc:
+                pu.adaptive_finite = None
+                print(f"MTP adaptive experts kept original top3: {exc!r}", flush=True)
         for original, packed in ((up, pu), (su, ps)):
             raw_bytes += original.numel() * 2
             packed_bytes += packed.nbytes

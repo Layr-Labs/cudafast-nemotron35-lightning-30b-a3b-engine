@@ -16,9 +16,11 @@ device's streaming rate:
   when every MoE input row is the same row, which the single-request proposer
   guarantees (``NemotronHMTP.set_moe_row_src``).
 
-These change the drafter's floating-point summation order only. The target
-model never calls them. The target decides every emitted token, so the
-emitted stream is unchanged; only the draft acceptance can move.
+These are drafter-only numerical methods. The optional adaptive expert budget
+can omit a weak third routed contribution; it is not a bit-identical draft
+transformation. The target model never calls these kernels and remains the
+verification authority. Correctness and throughput of a new whole must be
+established by the official remote validation; draft acceptance can move.
 """
 
 import os
@@ -31,6 +33,7 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
+_ADAPTIVE_EXPERTS = os.environ.get("MTP_ADAPTIVE_EXPERTS", "1") != "0"
 
 # l2pf (harness/kernels/l2pf); absent, nothing changes.
 try:
@@ -783,12 +786,19 @@ def mtp_moe_row(
 
     gate, gated = _gate_args(x)
     if isinstance(w13, PackedBF16):
+        finite = w13.adaptive_finite
+        adaptive = (_ADAPTIVE_EXPERTS and topk == 3
+                    and isinstance(finite, torch.Tensor)
+                    and finite.dtype == torch.bool and tuple(finite.shape) == (E,)
+                    and finite.device == x.device and finite.is_contiguous())
         packed_moe_up[(triton.cdiv(inter, _PK_UP_BN), topk + n_shared)](
             x, *w13.planes, *su.planes, ids, h, inter, H,
             inter * H, H, H, gate, TOPK=topk, BN=_PK_UP_BN, BK=_MOE_UP_BK,
             EVICT=_EVICT_W, GATED=gated, num_warps=4 * _PK_UP_WN,
             num_stages=_MOE_UP_STAGES, launch_pdl=mtp_pdl(), WN=_PK_UP_WN,
             WORD=word_load_enabled(x.device),
+            router_weights=tw, finite_experts=finite if adaptive else None,
+            ADAPTIVE=adaptive,
         )
     else:
         _mtp_moe_up_kernel[(triton.cdiv(inter, _MOE_UP_BN), topk + n_shared)](

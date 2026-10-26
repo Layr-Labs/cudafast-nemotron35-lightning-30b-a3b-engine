@@ -378,6 +378,10 @@
     {
       "file": "vllm/v1/worker/decode_prep.py; vllm/v1/worker/copy_batch.py; vllm/v1/worker/gpu_model_runner.py; vllm/v1/attention/backends/flashinfer.py; vllm/v1/attention/backends/mamba2_attn.py; vllm/model_executor/layers/fused_moe/experts/humming_nvsc.py; vllm/model_executor/layers/fused_moe/experts/humming_relu2_epilogue.py",
       "why": "i34-9 993e9bec, carried onto terrapinelf c64b6fe5: in the steady one-request speculative step the per-step device prep (query_start_loc, discard mask, accepted counts, positions, seq_lens, slot mapping, input ids incl. drafts) is one H2D of staged host values plus one kernel, and the remaining small metadata copies go through one copy batch flushed before the target forward; non-steady steps take the stock path (where terrapinelf's batch-1 slice copy still applies). Prefill routed-up reads the 6-bit block scales directly. Same values into the same buffers; no format or arithmetic change."
+    },
+    {
+      "file": "vllm/v1/spec_decode/nemotron_decode_plan.py",
+      "why": "Native MTP FA2 plan bank fills pages past the measured 128-page prefix, up to 512 pages or the existing 64 MiB private budget, whichever comes first. Same snapshot and the same restore as the prefix. The admission sample and its speed gate stay on the first 128 pages. Lengths past the filled prefix, and a budget stop, keep the original planner. No arithmetic change."
     }
   ]
 }

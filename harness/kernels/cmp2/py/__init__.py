@@ -123,6 +123,9 @@ def prepare(models):
         return
     import torch
 
+    # CMP2_COMP=0 (default): ordinary (uncompressed) 2 MiB-aligned VMM backing;
+    # CMP2_COMP=1 restores generic-compressible allocations.
+    comp = 1 if os.environ.get("CMP2_COMP", "0") == "1" else 0
     changes, originals, compressed = [], [], []
     labels = []
     checked_bytes = 0
@@ -147,11 +150,11 @@ def prepare(models):
                 tensor.untyped_storage(), 0, (nbytes,), (1,))
             host = source.cpu()
             actual, allocated = ctypes.c_int(-1), ctypes.c_size_t(0)
-            ptr = lib.cmp_allocate(nbytes, 1, ctypes.byref(actual), ctypes.byref(allocated))
+            ptr = lib.cmp_allocate(nbytes, comp, ctypes.byref(actual), ctypes.byref(allocated))
             if not ptr:
                 raise RuntimeError(lib.cmp_last_error().decode())
             raw = torch.from_dlpack(capsule_new(ptr, b"dltensor", None))
-            if actual.value != 1 or raw.data_ptr() % 2097152:
+            if actual.value != comp or raw.data_ptr() % 2097152:
                 raise RuntimeError("compression type or 2 MiB alignment check failed")
             raw.copy_(host)
             # Full storage comparison as bytes, including padding/NaN payloads.
@@ -186,7 +189,7 @@ def prepare(models):
         _LOG.warning("CMP2 compressed=none reason=%r ordinary_tensors_retained=True", exc)
         return
     _LOG.info(
-        "CMP2 compressed=[%s] storages=%d full_byte_checks=%d checked_bytes=%d "
+        "CMP2 comp=%d compressed=[%s] storages=%d full_byte_checks=%d checked_bytes=%d "
         "original_storages_retained=True",
-        ",".join(labels), len(compressed), len(compressed), checked_bytes,
+        comp, ",".join(labels), len(compressed), len(compressed), checked_bytes,
     )

@@ -11,6 +11,7 @@ import torch
 from vllm.triton_utils import tl, triton
 
 _ENABLED = os.environ.get("MTP_DOWN_PACK12", "1") != "0"
+_FORCE = os.environ.get("MTP_DOWN_PACK12_FORCE", "1") != "0"
 _PACKS = {}
 
 
@@ -22,17 +23,18 @@ def _load_packed(SM, EX, BASE, RI, RAW, index, mask, EVICT:tl.constexpr=True,
     # so they do not also stream unused sign/mantissa and exponent planes.
     rawid = tl.load(RI + bid, mask=mask, other=-1, eviction_policy='evict_first' if EVICT else '')
     coded = mask & (rawid < 0)
-    sm = tl.load(SM + index, mask=coded, other=0, eviction_policy='evict_first' if EVICT else '').to(tl.uint16)
+    # LOCAL PATCH (cudafast-nemotron35): plane loads use the bounds mask only (issued with RI).
+    sm = tl.load(SM + index, mask=mask, other=0, eviction_policy='evict_first' if EVICT else '').to(tl.uint16)
     if WORD:
         words = EX.to(tl.pointer_type(tl.uint32))
-        word = tl.load(words + index // 8, mask=coded, other=0,
+        word = tl.load(words + index // 8, mask=mask, other=0,
                        eviction_policy='evict_first' if EVICT else '')
         code = ((word >> ((index % 8).to(tl.uint32) * 4)) & 15).to(tl.uint16)
     else:
-        nib = tl.load(EX + index // 2, mask=coded, other=0,
+        nib = tl.load(EX + index // 2, mask=mask, other=0,
                       eviction_policy='evict_first' if EVICT else '').to(tl.uint16)
         code = (nib >> ((index % 2)*4)) & 15
-    base = tl.load(BASE + bid, mask=coded, other=1, eviction_policy='evict_first' if EVICT else '').to(tl.uint16)
+    base = tl.load(BASE + bid, mask=mask, other=1, eviction_policy='evict_first' if EVICT else '').to(tl.uint16)
     exp = tl.where(code == 0, 0, base + code - 1)
     bits = ((sm & 128) << 8) | (exp << 7) | (sm & 127)
     raw = tl.load(RAW + rawid.to(tl.int64)*128 + index % 128,
@@ -180,6 +182,12 @@ def prepare(packed):
             best = min(times, key=lambda bn: statistics.median(times[bn]))
             if best and statistics.median(times[best]) < 0.96 * statistics.median(times[0]):
                 flags[(topk, word)] = best
+            elif _FORCE and any(bn for bn in times):
+                # LOCAL PATCH (cudafast-nemotron35): MTP_DOWN_PACK12_FORCE admits the
+                # bit-identical packed slots even when this private timing (sparse
+                # probe densities) does not show the 4% margin.
+                flags[(topk, word)] = min((bn for bn in times if bn),
+                                          key=lambda bn: statistics.median(times[bn]))
         if flags:
             _PACKS[key] = (w, sd, pw, ps, flags)
         print(f"MTP_DOWN_PACK12 admitted={flags} original_weights_retained=True", flush=True)

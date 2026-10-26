@@ -19,6 +19,31 @@ __global__ void prefetch_kernel(const uint8_t* __restrict__ p, size_t bytes, uin
   }
 }
 
+// The same pieces issued by one thread at a fixed rate: after the first `burst` pieces, piece i
+// is issued no earlier than (i - burst + 1) * interval_ns after the first (%globaltimer), so at
+// most a few pieces are queued ahead of the latency-bound kernels the prefetch overlaps.
+__global__ void prefetch_paced_kernel(const uint8_t* __restrict__ p, size_t bytes, uint32_t chunk,
+                                      uint32_t interval_ns, uint32_t burst) {
+  if (threadIdx.x != 0) return;
+  uint64_t t0;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+  size_t i = 0;
+  for (size_t off = 0; off < bytes; off += chunk, ++i) {
+    if (i >= burst) {
+      const uint64_t due = t0 + (uint64_t)(i - burst + 1) * interval_ns;
+      uint64_t now;
+      asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+      while (now < due) {
+        __nanosleep(64);
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+      }
+    }
+    const size_t n = bytes - off < chunk ? bytes - off : chunk;
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(p + off),
+                 "r"((uint32_t)(n & ~(size_t)15)));
+  }
+}
+
 // A router and one projection (or its two packed planes) share one launch,
 // one side-stream fork, and the caller's existing total byte budget.
 __global__ void prefetch3_kernel(const uint8_t* p0, size_t b0,
@@ -81,6 +106,16 @@ extern "C" int l2pf_prefetch(const void* p, size_t bytes, int chunk, void* strea
   if (reinterpret_cast<uintptr_t>(p) % 16 || chunk < 16 || chunk % 16) return -1;
   l2pf::prefetch_kernel<<<1, 128, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
       (const uint8_t*)p, bytes, (uint32_t)chunk);
+  return (int)cudaGetLastError();
+}
+
+// 0 on success; -1 for a misaligned range or chunk.
+extern "C" int l2pf_prefetch_paced(const void* p, size_t bytes, int chunk, int interval_ns, int burst,
+                                   void* stream) {
+  if (reinterpret_cast<uintptr_t>(p) % 16 || chunk < 16 || chunk % 16 || interval_ns < 0 || burst < 1)
+    return -1;
+  l2pf::prefetch_paced_kernel<<<1, 32, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+      (const uint8_t*)p, bytes, (uint32_t)chunk, (uint32_t)interval_ns, (uint32_t)burst);
   return (int)cudaGetLastError();
 }
 

@@ -392,8 +392,24 @@
       "why": "Pending public idea f79355bf-fcbb-4817-8db7-d67f160086eb: extend native structural-plan fill to min(actual blocks,512) while preserving original native snapshot and integer sentinel checks. Own atomic complete-page budget retention protects earlier valid entries when retained plan bytes reach64MiB. Add full private state comparisons at extended midpoint/end, keep original<=128page latency gate, original miss fallback and no assumed actual activation/gain."
     },
     {
-      "file": "(composition)",
-      "why": "e-man07 composition on the record 1e1c2581-e506-4ca4-9341-5f08ffceec86: ArthurOstapenko 53f66afe-0252-402f-b34b-19bea81f1e74 carried byte for byte; jacklightChen 1df4df4a-6dc5-4ecf-8d49-b372ba3726fd carried byte for byte; terrapinelf 80f6fced-3c74-4ce1-9913-058f05e95ec7 carried byte for byte. No new arithmetic."
+      "file": "harness/kernels/shco/py/__init__.py",
+      "why": "ArthurOstapenko 53f66afe, carried: in a prefill MoE layer shx runs its persistent workers on half as many CTAs as SMs (HPF_SHX=0 restores one per SM); the unit tables still come from Marlin's partition over all SMs and each unit is summed whole by one CTA, so every output word is unchanged; the scratch is sized for one worker per SM either way."
+    },
+    {
+      "file": "model_executor/layers/fused_moe/experts/humming_relu2_epilogue.py",
+      "why": "terrapinelf 80f6fced, carried: the 24..48-row routed-up K128 schedule runs with num_stages=3 instead of 2; the same tiles, K order and MMA chain, so the outputs are unchanged."
+    },
+    {
+      "file": "v1/spec_decode/llm_base_proposer.py",
+      "why": "newjordan 4ab1d933, carried: when the hostfast draft staging sets are available, the draft plan's seq_lens_cpu is derived from the sampler's valid counts the runner already copied on its side stream (the earlier event) instead of the later main-stream rejected-count copy; the same values, the same bound and the same ordered draft plans."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_screen.py",
+      "why": "The draft-head screen's final full-row dot runs as one program per (16-row block, 64-byte block) computing exactly the term the original loop adds in that iteration, then a second kernel adds the terms of each row in block order and applies the global scale: the same additions in the same order, so the same candidate logits. Stopped draft passes write the same zeros. VLLM_MTP_SCREEN_KSPLIT=0 keeps the original kernel."
+    },
+    {
+      "file": "vllm/model_executor/layers/fused_moe/experts/humming_zskip.py; humming_relu2_epilogue.py; humming_nvsc.py (+ harness/kernels/zskip/py/__init__.py)",
+      "why": "ArthurOstapenko (ours): verify-path routed schedule only. (1) The target verify's paired routed-down call uses dadon's zskip config 113 (one prep launch, no empty-half skip) with a three-deep load ring instead of config 119 with a two-deep ring, when a boot-time bitwise check of every layer's pair against config 119 passes on 1-8 rows and on the verify prefix; otherwise the layer keeps 119. (2) The routed up projection's 24-48-row verify bucket uses the existing evict-first derived Humming kernel (the same class the 496-token prefill call uses, in its stock and nvsc forms). Same tiles, ascending K16 MMA chain, fp32 accumulation, dequantisation, negative-zero repair and BF16 epilogue; only kernel selection, load ring depth and an L2 cache hint change. VSW_W2_CONFIG=0, VSW_W2_RING=0 and VSW_EVICT=0 restore the main."
     }
   ]
 }

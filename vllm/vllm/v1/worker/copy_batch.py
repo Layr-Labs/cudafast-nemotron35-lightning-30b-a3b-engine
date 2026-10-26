@@ -36,11 +36,13 @@ from vllm.triton_utils import tl, triton
 ENABLED = os.environ.get("VLLM_PREP_COPY_BATCH", "1") != "0"
 CHECK = os.environ.get("VLLM_PREP_COPY_BATCH_CHECK", "0") == "1"
 ZERO_COPY = os.environ.get("VLLM_PREP_ZERO_COPY", "1") != "0"
+PARALLEL = os.environ.get("VLLM_PREP_COPY_BATCH_PARALLEL", "1") != "0"
 
 _MAXD = 32
 _HDR = 3 * _MAXD * 8
 _CAP = 1 << 16
 _DBLOCK = triton.next_power_of_2(3 * _MAXD)
+_NSETS = 8
 
 
 @triton.jit(do_not_specialize=["desc", "N"])
@@ -56,6 +58,22 @@ def _copy_batch_kernel(desc, N, BLOCK: tl.constexpr, DBLOCK: tl.constexpr):
             m = off + o < n
             tl.store(dst + off + o, tl.load(src + off + o, mask=m), mask=m)
         tl.debug_barrier()
+
+
+@triton.jit(do_not_specialize=["desc"])
+def _copy_batch_par_kernel(desc, BLOCK: tl.constexpr):
+    # LOCAL PATCH (cudafast-nemotron35): one program per recorded copy, for a
+    # batch whose copies are independent (CopyBatch._independent): no copy
+    # writes bytes another copy reads or writes, so their order cannot change
+    # a byte and every copy's source and destination latencies overlap.
+    i = tl.program_id(0)
+    o = tl.arange(0, BLOCK)
+    dst = tl.load(desc + 3 * i).to(tl.pointer_type(tl.uint8))
+    src = tl.load(desc + 3 * i + 1).to(tl.pointer_type(tl.uint8))
+    n = tl.load(desc + 3 * i + 2)
+    for off in range(0, n, BLOCK):
+        m = off + o < n
+        tl.store(dst + off + o, tl.load(src + off + o, mask=m), mask=m)
 
 
 class _Set:
@@ -74,8 +92,11 @@ class _Set:
 
 class CopyBatch:
     def __init__(self, device) -> None:
-        self.sets = [_Set(device), _Set(device)]
-        self.cur = 1
+        # Keep several independent staging sets in flight.  Each set retains
+        # its own completion event and tensor owners until that exact slot is
+        # reused, so extending the ring does not weaken source lifetimes.
+        self.sets = [_Set(device) for _ in range(_NSETS)]
+        self.cur = _NSETS - 1
         self.active = False
         self.n = 0
         self.off = _HDR
@@ -84,13 +105,14 @@ class CopyBatch:
         self.check_steps = 0
         self.check_diffs = 0
         self.pending_owners: list[torch.Tensor] = []
+        self._indep_cache: dict = {}
         s = self.sets[0]
         _copy_batch_kernel[(1,)](s.cdesc if ZERO_COPY else s.gdesc, 0,
                                  BLOCK=1024, DBLOCK=_DBLOCK, num_warps=4)
         torch.cuda.synchronize()
 
     def begin(self) -> None:
-        self.cur ^= 1
+        self.cur = (self.cur + 1) % len(self.sets)
         s = self.sets[self.cur]
         if s.recorded:
             s.event.synchronize()
@@ -134,6 +156,37 @@ class CopyBatch:
             self._immediate(dst, src)
             self.checks.append(dst)
 
+    def _independent(self, s) -> bool:
+        """True when no recorded copy writes a byte another one reads or writes
+        (staged host sources are private to this batch and never written)."""
+        n = self.n
+        d = s.desc
+        key = []
+        for i in range(n):
+            src = int(d[3 * i + 1])
+            staged = s.src_base <= src < s.src_base + _CAP
+            key.append((int(d[3 * i]), int(d[3 * i + 2]), None if staged else src))
+        key = tuple(key)
+        hit = self._indep_cache.get(key)
+        if hit is not None:
+            return hit
+        ok = True
+        for i in range(n):
+            di, ni, _ = key[i]
+            for j in range(n):
+                if i == j:
+                    continue
+                dj, nj, sj = key[j]
+                if di < dj + nj and dj < di + ni:
+                    ok = False
+                if sj is not None and di < sj + nj and sj < di + ni:
+                    ok = False
+            if not ok:
+                break
+        if len(self._indep_cache) < 64:
+            self._indep_cache[key] = ok
+        return ok
+
     def flush(self) -> None:
         if not self.active:
             return
@@ -147,8 +200,12 @@ class CopyBatch:
             s.gpu[:self.off].copy_(s.cpu[:self.off], non_blocking=True)
             s.event.record()
         ref = [d.clone() for d in self.checks] if CHECK else None
-        _copy_batch_kernel[(1,)](s.cdesc if ZERO_COPY else s.gdesc, self.n,
-                                 BLOCK=1024, DBLOCK=_DBLOCK, num_warps=4)
+        if PARALLEL and self._independent(s):
+            _copy_batch_par_kernel[(self.n,)](s.cdesc if ZERO_COPY else s.gdesc,
+                                              BLOCK=1024, num_warps=4)
+        else:
+            _copy_batch_kernel[(1,)](s.cdesc if ZERO_COPY else s.gdesc, self.n,
+                                     BLOCK=1024, DBLOCK=_DBLOCK, num_warps=4)
         s.event.record()
         s.recorded = True
         self.flushes += 1

@@ -1086,3 +1086,13 @@ def convert_to_humming_moe_kernel_format(
         from vllm.model_executor.layers.fused_moe.experts import humming_nvsc
 
         humming_nvsc.prepare_layer(layer)
+
+    # LOCAL PATCH (cudafast-nemotron35, w13-var): load-time timing choice among
+    # bit-identical schedules for the (24,48) decode bucket. Both sublayers are
+    # transformed above, so the real w13 weights exist here; this is the first
+    # load point (the down-projection analogue of humming_zskip.finalize) where
+    # a timing choice can run.
+    if tuned:
+        from vllm.model_executor.layers.fused_moe.experts import humming_relu2_epilogue
+
+        humming_relu2_epilogue.select_w13_variant(layer)

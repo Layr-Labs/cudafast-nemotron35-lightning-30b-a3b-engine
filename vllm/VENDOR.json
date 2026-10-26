@@ -442,6 +442,10 @@
     {
       "file": "(composition)",
       "why": "terrapinelf on the record 88455a30-3e21-4da9-b718-9b6809502858 (ArthurOstapenko, commit 27e68ae): the record's files byte for byte plus terrapinelf's free-run emit budget (the entry above), the same files as terrapinelf 1d565812-f993-401a-a5a8-3c5a7c1a6435 (second measurement)."
+    },
+    {
+      "file": "vllm/model_executor/layers/fused_moe/experts/humming_relu2_epilogue.py; humming_nvsc.py; quantization/utils/humming_utils.py",
+      "why": "At load, once a routed layer's real weights exist, build the record's fixed schedule for the (24,48) decode bucket and every neighbour that keeps the same N tile and warp arrangement while varying the K tile over 64, 128, 256 and the stage count over 2, 3, 4. A candidate runs on that layer's own weights with a deterministic 30-row decode input and is dropped unless its output equals the record configuration's bitwise, negative zero included; only survivors are timed, in CUDA graphs, and the fastest becomes the process-wide choice. Any failure, any rejected candidate and any unavailable timing keeps the record's configuration. HUMMING_W13_VAR=0 disables the choice. Timing never decides what is computed, only which already-equal schedule runs."
     }
   ]
 }

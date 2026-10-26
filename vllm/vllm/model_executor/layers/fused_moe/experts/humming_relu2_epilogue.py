@@ -229,14 +229,199 @@ def _w13_k128_enabled():
     return os.environ.get("HUMMING_W13_K128", "1") != "0"
 
 
-def _w13_k128_params(lo, hi, params):
+# LOCAL PATCH (cudafast-nemotron35, w13-var): a load-time choice among
+# BIT-IDENTICAL schedule variants for the (24,48) decode bucket, which the
+# record hardcodes to block_k = warp_k = 128 with 3 stages. The choice keeps the
+# record's N tile (64) and warp arrangement ([16, 32, K]) and only varies the K
+# tile over {64, 128, 256} and the stage count over {2, 3, 4}. select_w13_variant
+# (called from humming_utils.py once the real w13 weights exist) builds each
+# candidate, runs it on this layer's own weights with a deterministic 30-row
+# decode input, drops what the builder rejects and anything whose output is not
+# bit-identical (int16 view) to the record config's, times the survivors with
+# CUDA graphs, and stores the fastest here. HUMMING_W13_VAR=0 keeps the record
+# config. Timing only ranks variants that already passed the bit check, so no
+# clock or load average can change what is computed.
+_W13_VAR_ENABLED = os.environ.get("HUMMING_W13_VAR", "1") != "0"
+_W13_VAR_K_TILES = (64, 128, 256)
+_W13_VAR_STAGES = (2, 3, 4)
+_W13_RECORD_PARAMS = {"block_shape": [16, 64, 128],
+                      "warp_shape": [16, 32, 128], "num_stages": 3}
+_W13_VAR_WINNER: dict | None = None
+_W13_VAR_DONE = False
+
+
+def _w13_k128_params(lo, hi, params, nvsc_compatible=False):
     if (_w13_k128_enabled() and (lo, hi) == (24, 48)
             and params["block_shape"] == [16, 64, 32]
             and params["warp_shape"] == [16, 32, 32]
             and params["num_stages"] == 8):
-        return dict(params, block_shape=[16, 64, 128],
-                    warp_shape=[16, 32, 128], num_stages=3)
+        winner = _W13_VAR_WINNER if _W13_VAR_ENABLED else None
+        if winner is None or (nvsc_compatible
+                              and winner["block_shape"][2] not in (32, 128)):
+            winner = _W13_RECORD_PARAMS
+        return dict(params, **winner)
     return params
+
+
+def _w13_variant_kernel(meta, compute_config, lo, hi, config, dyn, layer,
+                        inputs, outputs, sorted_ids, expert_ids,
+                        num_tokens_padded, top_k, valid_shape_m):
+    """Build the relu2 w13 kernel for one (lo, hi) entry and return a launch fn."""
+    lc = json.loads(meta.to_str())
+    lc.pop("sublayer_name", None)
+    cc = json.loads(compute_config)
+    params = lc | cc | dict(config)
+    num_sms = params.pop("num_sms", 0)
+    if dyn:
+        num_sms = _dyn_num_sms(lo, hi, num_sms)
+    if (lo, hi) == (24, 48) and _VSW_EVICT:
+        cls = DynEvictFirstRelu2HummingKernel if dyn else EvictFirstRelu2HummingKernel
+    else:
+        cls = DynRelu2HummingKernel if dyn else Relu2HummingKernel
+    kernel = cls(**params)
+    kernel.load_cubin()
+    configs = torch.tensor([0, 1 << 30, kernel.kernel_id, num_sms],
+                           dtype=torch.int64, device="cpu")
+    weight = getattr(layer, meta.weight_name)
+    weight_scale = getattr(layer, meta.weight_scale_name, None)
+    zero_point = getattr(layer, meta.zero_point_name, None)
+    global_scale = getattr(layer, meta.global_scale_name, None)
+    locks = layer.locks
+
+    def fn():
+        ops.launch_kernel(
+            configs=configs, inputs=inputs, weight=weight, outputs=outputs,
+            input_scale=None, weight_scale=weight_scale, zero_point=zero_point,
+            bias=None, global_scale=global_scale, sorted_ids=sorted_ids,
+            expert_ids=expert_ids, num_tokens_padded=num_tokens_padded,
+            locks=locks, top_k=top_k, valid_shape_m=valid_shape_m,
+        )
+    return fn
+
+
+def _w13_variant_time(fn, rounds=3, reps=10):
+    import statistics
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(2):
+            fn()
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fn()
+    graph.replay()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    samples = []
+    for _ in range(rounds):
+        start.record()
+        for _ in range(reps):
+            graph.replay()
+        end.record()
+        end.synchronize()
+        samples.append(start.elapsed_time(end) / reps)
+    del graph
+    return statistics.median(samples)
+
+
+def select_w13_variant(layer):
+    """Load-time timing choice for the (24,48) decode bucket. Any failure keeps
+    the record config. Runs once (idempotent across the routed layers)."""
+    global _W13_VAR_WINNER, _W13_VAR_DONE
+    if _W13_VAR_DONE or not _W13_VAR_ENABLED or not _w13_k128_enabled():
+        return
+    _W13_VAR_DONE = True
+    try:
+        _W13_VAR_WINNER = _choose_w13_variant(layer)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("humming w13 variant timing unavailable; keeping record config: %s", exc)
+        _W13_VAR_WINNER = None
+
+
+def _choose_w13_variant(layer):
+    from vllm import envs
+    from vllm.model_executor.layers.fused_moe.experts import humming_tuned_moe
+    from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
+        _humming_batch_invariant,
+    )
+    from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+        moe_align_block_size,
+    )
+
+    configs = humming_tuned_moe.tuned_moe_configs(layer)
+    if configs is None:
+        return None
+    base = None
+    for lo, hi, config in configs[0]:
+        if (lo, hi) == (24, 48):
+            base = dict(config)
+            break
+    if base is None:
+        return None
+    meta = layer.humming_metas["w13"]
+    compute_config = json.dumps({
+        "use_batch_invariant": _humming_batch_invariant(),
+        "use_f16_accum": envs.VLLM_HUMMING_USE_F16_ACCUM,
+        "gemm_type": "indexed",
+    })
+    dyn = _dyn_enabled()
+
+    dev = getattr(layer, meta.weight_name).device
+    top_k = 6
+    m = 5
+    rows = m * top_k  # 30, inside (24, 48]
+    ids = [[(17 * t + 29 * i) % 128 for i in range(top_k)] for t in range(m)]
+    topk_ids = torch.tensor(ids, dtype=torch.int32, device=dev)
+    sorted_ids, expert_ids, ntp = moe_align_block_size(
+        topk_ids=topk_ids, block_size=16, num_experts=128,
+        expert_map=None, ignore_invalid_experts=True,
+    )
+    gen = torch.Generator(device=dev).manual_seed(20261026)
+    inputs = (torch.randn(m, 2688, generator=gen, device=dev)
+              .to(torch.bfloat16).contiguous())
+    inputs.view(torch.int16)[0, :64] = -32768  # a negative-zero activation row
+
+    ref = torch.empty(rows, 1856, dtype=torch.bfloat16, device=dev)
+    record_fn = _w13_variant_kernel(
+        meta, compute_config, 24, 48, base | _W13_RECORD_PARAMS, dyn,
+        layer, inputs, ref, sorted_ids, expert_ids, ntp, top_k, rows)
+    record_fn()
+    torch.cuda.synchronize()
+
+    survivors = []
+    for k in _W13_VAR_K_TILES:
+        for stages in _W13_VAR_STAGES:
+            cand = dict(base, block_shape=[16, 64, k], warp_shape=[16, 32, k],
+                        num_stages=stages)
+            try:
+                out = torch.empty(rows, 1856, dtype=torch.bfloat16, device=dev)
+                fn = _w13_variant_kernel(
+                    meta, compute_config, 24, 48, cand, dyn, layer, inputs, out,
+                    sorted_ids, expert_ids, ntp, top_k, rows)
+                fn()
+                torch.cuda.synchronize()
+            except Exception as exc:  # noqa: BLE001
+                logger.info("w13 variant K=%d stages=%d rejected: %s", k, stages, exc)
+                continue
+            if not torch.equal(out.view(torch.int16), ref.view(torch.int16)):
+                logger.info("w13 variant K=%d stages=%d not bit-identical; dropped", k, stages)
+                continue
+            survivors.append((k, stages, fn))
+    if not survivors:
+        return None
+    timed = []
+    for k, stages, fn in survivors:
+        timed.append((_w13_variant_time(fn), k, stages))
+    timed.sort()
+    winner_us, wk, ws = timed[0]
+    logger.info(
+        "humming w13 variant (24,48): %s; winner K=%d stages=%d %.2fus",
+        [(k, s, round(us, 2)) for us, k, s in timed], wk, ws, winner_us)
+    return {"block_shape": [16, 64, wk], "warp_shape": [16, 32, wk], "num_stages": ws}
 
 
 def _variant_key(dyn):

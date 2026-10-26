@@ -349,11 +349,20 @@ def forward_relu2(
             expert_ids, num_tokens_padded, top_k, valid_shape_m, dyn=dyn,
         ):
             return outputs
+    evict_first = (inputs.shape[0] == 496 and top_k == 6
+                   and valid_shape_m == 2976
+                   and os.environ.get("HUMMING_EVICT_FIRST", "1") != "0")
+    if nvsc is not False and evict_first:
+        from vllm.model_executor.layers.fused_moe.experts import humming_nvsc
+
+        if humming_nvsc.launch_prefill(
+            layer, inputs, outputs, compute_config, tuning_config, sorted_ids,
+            expert_ids, num_tokens_padded, top_k, valid_shape_m, dyn=dyn,
+        ):
+            return outputs
     configs = prepare(
         meta, compute_config, tuning_config,
-        evict_first=(inputs.shape[0] == 496 and top_k == 6
-                     and valid_shape_m == 2976
-                     and os.environ.get("HUMMING_EVICT_FIRST", "1") != "0"),
+        evict_first=evict_first,
         dyn=dyn,
     )
     return ops.launch_kernel(

@@ -212,7 +212,7 @@ from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
-from vllm.v1.worker import hostfast, mamba_utils, prefill_fast
+from vllm.v1.worker import copy_batch, decode_prep, hostfast, mamba_utils, prefill_fast
 from vllm.v1.worker.block_table import SlotMappingMode
 from vllm.v1.worker.cp_utils import (
     check_attention_cp_compatibility,
@@ -1959,6 +1959,28 @@ class GPUModelRunner(
                 non_blocking=True,
             )
             return
+        # LOCAL PATCH (cudafast-nemotron35): one request continuing from the previous
+        # step with its drafts right after its sampled token (the batch-1 decode
+        # loop): the scatters below write input_ids[0] = prev sampled token and
+        # input_ids[1 : 1 + L] = its L drafts; two slice copies write the same
+        # values without uploading four index tensors.
+        if (
+            num_reqs == 1
+            and prev_indices == [0]
+            and sample_flattened_indices == [0]
+            and spec_flattened_indices == list(range(1, 1 + len(spec_flattened_indices)))
+            and prev_draft_token_indices == list(range(len(spec_flattened_indices)))
+            and (self._draft_token_ids is None or isinstance(self._draft_token_ids, torch.Tensor))
+        ):
+            self.input_ids.gpu[:1].copy_(
+                self.input_batch.prev_sampled_token_ids[:1, 0], non_blocking=True
+            )
+            n_spec = len(spec_flattened_indices)
+            if self._draft_token_ids is not None and n_spec:
+                self.input_ids.gpu[1 : 1 + n_spec].copy_(
+                    self._draft_token_ids.flatten()[:n_spec], non_blocking=True
+                )
+            return
         # Upload the index tensors asynchronously so the scatter can be non-blocking.
         sampled_tokens_index_tensor = torch.tensor(
             sample_flattened_indices, dtype=torch.int64, pin_memory=PIN_MEMORY
@@ -2058,6 +2080,21 @@ class GPUModelRunner(
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
 
+        fused_d = -1
+        if getattr(self, "_decode_prep", None) is not None:
+            self._decode_prep.draft_ready = -1
+        if decode_prep.ENABLED:
+            if getattr(self, "_decode_prep", None) is None:
+                self._decode_prep = decode_prep.DecodePrep(self)
+            fused_d = self._decode_prep.eligible(
+                self, num_reqs, total_num_scheduled_tokens, scheduler_output
+            )
+        prep_check = None
+        if fused_d >= 0 and decode_prep.CHECK:
+            prep_check = (fused_d, [t.clone() for t in decode_prep.state_buffers(self)])
+            fused_d = -1
+        fused = fused_d >= 0
+
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
         self.input_batch.block_table.commit_block_table(num_reqs)
@@ -2100,12 +2137,13 @@ class GPUModelRunner(
         # NOTE(woosuk): We use torch.index_select instead of np.take here
         # because torch.index_select is much faster than np.take for large
         # tensors.
-        torch.index_select(
-            self.input_batch.token_ids_cpu_tensor.flatten(),
-            0,
-            token_indices_tensor,
-            out=self.input_ids.cpu[:total_num_scheduled_tokens],
-        )
+        if not (fused and decode_prep.SKIP_CPU_IDS):
+            torch.index_select(
+                self.input_batch.token_ids_cpu_tensor.flatten(),
+                0,
+                token_indices_tensor,
+                out=self.input_ids.cpu[:total_num_scheduled_tokens],
+            )
         if self.enable_prompt_embeds:
             is_token_ids = self.input_batch.is_token_ids_tensor.flatten()
             torch.index_select(
@@ -2159,7 +2197,8 @@ class GPUModelRunner(
         # Note: pad query_start_loc to be non-decreasing, as kernels
         # like FlashAttention requires that
         self.query_start_loc.np[num_reqs + 1 :].fill(cu_num_tokens[-1])
-        self.query_start_loc.copy_to_gpu()
+        if not fused:
+            self.query_start_loc.copy_to_gpu()
         query_start_loc = self.query_start_loc.gpu[: num_reqs + 1]
 
         # Compute optimistic seq_lens (assumes all draft tokens from previous
@@ -2186,7 +2225,8 @@ class GPUModelRunner(
         self.discard_request_mask.np[:num_reqs] = (
             self.optimistic_seq_lens_cpu[:num_reqs].numpy() < num_tokens_np
         )
-        self.discard_request_mask.copy_to_gpu(num_reqs)
+        if not fused:
+            self.discard_request_mask.copy_to_gpu(num_reqs)
 
         # Sync num_accepted_tokens from CPU (set by
         # _update_states_after_model_execute for hybrid models).
@@ -2222,7 +2262,8 @@ class GPUModelRunner(
             # Default to 1; update_num_computed_tokens_for_batch_change below
             # corrects rows that had drafts from valid_sampled_token_count.
             self.num_accepted_tokens.np.fill(1)
-            self.num_accepted_tokens.gpu.fill_(1)
+            if not fused:
+                self.num_accepted_tokens.gpu.fill_(1)
 
         if self.mamba_prev_last_scheduled_idx is not None:
             mamba_utils.preprocess_mamba_all_specdec(
@@ -2237,7 +2278,9 @@ class GPUModelRunner(
         # CPU values are optimistic (all drafts accepted). The kernel
         # corrects on GPU using the previous step's
         # valid_sampled_token_count_gpu. Otherwise, just copy from CPU.
-        if (
+        if fused:
+            pass
+        elif (
             self.use_async_spec_decode
             and self.valid_sampled_token_count_gpu is not None
             and prev_req_id_to_index
@@ -2261,39 +2304,60 @@ class GPUModelRunner(
                 non_blocking=True,
             )
 
-        if PINNED_SOURCE_GUARDS and self._num_computed_tokens_h2d_event is not None:
+        if (
+            not fused
+            and PINNED_SOURCE_GUARDS
+            and self._num_computed_tokens_h2d_event is not None
+        ):
             self._num_computed_tokens_h2d_event.record()
 
         self.req_indices.np[:total_num_scheduled_tokens] = req_indices
-        self.req_indices.copy_to_gpu(total_num_scheduled_tokens)
-        req_indices_gpu = self.req_indices.gpu[:total_num_scheduled_tokens]
-
-        self.query_pos.copy_to_gpu(total_num_scheduled_tokens)
         self.num_scheduled_tokens.np[:num_reqs] = num_scheduled_tokens
-        self.num_scheduled_tokens.copy_to_gpu(num_reqs)
-        num_scheduled_tokens_gpu = self.num_scheduled_tokens.gpu[:num_reqs]
-        self.positions[:total_num_scheduled_tokens] = (
-            self.num_computed_tokens[req_indices_gpu].to(torch.int64)
-            + self.query_pos.gpu[:total_num_scheduled_tokens]
-        )
-        self.seq_lens[:num_reqs] = (
-            self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
-        )
-        self.seq_lens[num_reqs:].fill_(0)
+        if fused:
+            self._decode_prep.run(self, num_reqs, total_num_scheduled_tokens, fused_d)
+            if PINNED_SOURCE_GUARDS and self._num_computed_tokens_h2d_event is not None:
+                self._num_computed_tokens_h2d_event.record()
+        else:
+            self.req_indices.copy_to_gpu(total_num_scheduled_tokens)
+            req_indices_gpu = self.req_indices.gpu[:total_num_scheduled_tokens]
 
-        self.input_batch.block_table.compute_slot_mapping(
-            num_reqs,
-            self.query_start_loc.gpu[: num_reqs + 1],
-            self.positions[:total_num_scheduled_tokens],
-        )
+            self.query_pos.copy_to_gpu(total_num_scheduled_tokens)
+            self.num_scheduled_tokens.copy_to_gpu(num_reqs)
+            num_scheduled_tokens_gpu = self.num_scheduled_tokens.gpu[:num_reqs]
+            self.positions[:total_num_scheduled_tokens] = (
+                self.num_computed_tokens[req_indices_gpu].to(torch.int64)
+                + self.query_pos.gpu[:total_num_scheduled_tokens]
+            )
+            self.seq_lens[:num_reqs] = (
+                self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
+            )
+            self.seq_lens[num_reqs:].fill_(0)
+
+        if not (fused and self._decode_prep.do_slot):
+            self.input_batch.block_table.compute_slot_mapping(
+                num_reqs,
+                self.query_start_loc.gpu[: num_reqs + 1],
+                self.positions[:total_num_scheduled_tokens],
+            )
 
         # Copy the tensors to the GPU.
-        self._prepare_input_ids(
-            scheduler_output,
-            num_reqs,
-            total_num_scheduled_tokens,
-            cu_num_tokens,
-        )
+        if not fused:
+            self._prepare_input_ids(
+                scheduler_output,
+                num_reqs,
+                total_num_scheduled_tokens,
+                cu_num_tokens,
+            )
+        if prep_check is not None:
+            ref = decode_prep.check_buffers(self, total_num_scheduled_tokens)
+            for t, saved in zip(decode_prep.state_buffers(self), prep_check[1]):
+                t.copy_(saved)
+            self._decode_prep.run(
+                self, num_reqs, total_num_scheduled_tokens, prep_check[0]
+            )
+            got = decode_prep.check_buffers(self, total_num_scheduled_tokens)
+            torch.cuda.synchronize()
+            decode_prep.compare(ref, got)
 
         if self.uses_mrope:
             # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -2351,7 +2415,9 @@ class GPUModelRunner(
             # For DECODE only cuda graph of some attention backends (e.g., GDN).
             self.num_decode_draft_tokens.np[:num_reqs] = num_decode_draft_tokens
             self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
-            self.num_decode_draft_tokens.copy_to_gpu()
+            if fused and copy_batch.ENABLED:
+                copy_batch.get(self.device).begin()
+            copy_batch.copy(self.num_decode_draft_tokens.gpu, self.num_decode_draft_tokens.cpu)
 
         # Hot-Swap lora model
         if self.lora_config:
@@ -3010,8 +3076,15 @@ class GPUModelRunner(
                 draft_index,
                 num_draft_list,
             ) = hit[1]
+            prep = getattr(self, "_decode_prep", None)
+            if (prep is not None and prep.draft_ready >= 0
+                    and num_draft_list == (prep.draft_ready,)
+                    and int(cu_num_scheduled_tokens[0]) == prep.draft_ready + 1):
+                draft_ids = prep.draft_out[: prep.draft_ready]
+            else:
+                draft_ids = self.input_ids.gpu[draft_index]
             md = SpecDecodeMetadata(
-                draft_token_ids=self.input_ids.gpu[draft_index],
+                draft_token_ids=draft_ids,
                 num_draft_tokens=list(num_draft_list),
                 cu_num_draft_tokens=cu_num_draft_tokens,
                 cu_num_sampled_tokens=cu_num_sampled_tokens,
@@ -4683,6 +4756,9 @@ class GPUModelRunner(
             ) = self._preprocess(
                 scheduler_output, num_tokens_padded, intermediate_tensors
             )
+
+        if copy_batch._BATCH is not None:
+            copy_batch._BATCH.flush()
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible

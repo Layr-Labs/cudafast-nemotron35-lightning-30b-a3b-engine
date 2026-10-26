@@ -370,6 +370,14 @@
     {
       "file": "harness/kernels/cmp2 (+ vllm/v1/worker/gpu_model_runner.py)",
       "why": "CMP2=1 (default): transparent generic-compression VMM backing for immutable fp8c codes, apk12 planes, shared Marlin weights/scales and target lm_head including its unit-major scale copy. Full load-time storage byte checks precede pointer rebinding and engine capture. Original storages stay alive; unsupported or failed allocations leave ordinary tensors. CMP2=0 disables. Target and drafter formats and arithmetic are unchanged."
+    },
+    {
+      "file": "harness/kernels/marlinx/csrc/marlinx.cu; harness/kernels/shco/csrc/shx.cu",
+      "why": "fkiene 798532d4, carried: the shared-expert up epilogues of marlinx (verify) and shx (prefill) apply ReLU-square to the rounded BF16 pair with packed non-FTZ max.NaN.bf16x2 against +0 and mul.rn.bf16x2 (round_output2_relu2), the same single rounding of the exact square as the scalar path; round_output<false> is unchanged."
+    },
+    {
+      "file": "vllm/v1/worker/decode_prep.py; vllm/v1/worker/copy_batch.py; vllm/v1/worker/gpu_model_runner.py; vllm/v1/attention/backends/flashinfer.py; vllm/v1/attention/backends/mamba2_attn.py; vllm/model_executor/layers/fused_moe/experts/humming_nvsc.py; vllm/model_executor/layers/fused_moe/experts/humming_relu2_epilogue.py",
+      "why": "i34-9 993e9bec, carried onto terrapinelf c64b6fe5: in the steady one-request speculative step the per-step device prep (query_start_loc, discard mask, accepted counts, positions, seq_lens, slot mapping, input ids incl. drafts) is one H2D of staged host values plus one kernel, and the remaining small metadata copies go through one copy batch flushed before the target forward; non-steady steps take the stock path (where terrapinelf's batch-1 slice copy still applies). Prefill routed-up reads the 6-bit block scales directly. Same values into the same buffers; no format or arithmetic change."
     }
   ]
 }

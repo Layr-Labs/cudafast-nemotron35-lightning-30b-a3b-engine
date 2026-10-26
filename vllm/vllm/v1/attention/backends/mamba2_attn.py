@@ -18,6 +18,7 @@ from vllm.v1.attention.backends.mamba_attn import (
     BaseMambaAttentionMetadataBuilder,
 )
 from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.worker import copy_batch
 
 
 def compute_varlen_chunk_metadata(
@@ -383,13 +384,13 @@ class Mamba2AttentionMetadataBuilder(
             md = cached[1]
             nd = md.num_decodes
             bt = common_attn_metadata.block_table_tensor
-            self.state_indices_tensor_d[:nd].copy_(
-                bt[:nd, : 1 + self.num_spec_tokens], non_blocking=True
+            copy_batch.copy(
+                self.state_indices_tensor_d[:nd], bt[:nd, : 1 + self.num_spec_tokens]
             )
             qsl = common_attn_metadata.query_start_loc
             if _STEP["acc_qsl"] is not qsl:
                 acc = kwargs["num_accepted_tokens"]
-                self.decode_num_accepted_tokens[:nd].copy_(acc[:nd], non_blocking=True)
+                copy_batch.copy(self.decode_num_accepted_tokens[:nd], acc[:nd])
                 _STEP["acc_qsl"] = qsl
             if _META_REUSE_CHECK:
                 full = self._build_full(

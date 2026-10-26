@@ -1,0 +1,12 @@
+[
+  {
+    "submissionId": "bd0e3d5a-0ee9-4e91-8dcc-ae2cb2dc9817",
+    "rationale": "Sole complete record base; the candidate preserves its cumulative draft stop and measured generic-compression transaction before adding the isolated routed-pair transaction.",
+    "evidence": "origin/main commit c8ca2743e6dff425a44dcb6bce3283d80ab59ce9; official score 2.48113580351593 with correctness and all paired gates passed."
+  },
+  {
+    "submissionId": "39109a61-269c-4bf2-a17c-52a65e44825d",
+    "rationale": "Immediate measured lineage for the cumulative probability depth gate retained unchanged in the record base.",
+    "evidence": "Validated commit 3e6c78408df3b0f43bd6ae5c77c92250c1a1ce79; official score 2.47913580215996 with correctness passed."
+  }
+]

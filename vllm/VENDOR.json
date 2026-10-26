@@ -370,6 +370,10 @@
     {
       "file": "harness/kernels/cmp2 (+ vllm/v1/worker/gpu_model_runner.py)",
       "why": "CMP2=1 (default): transparent generic-compression VMM backing for immutable fp8c codes, apk12 planes, shared Marlin weights/scales and target lm_head including its unit-major scale copy. Full load-time storage byte checks precede pointer rebinding and engine capture. Original storages stay alive; unsupported or failed allocations leave ordinary tensors. CMP2=0 disables. Target and drafter formats and arithmetic are unchanged."
+    },
+    {
+      "file": "harness/kernels/cmp2/py/__init__.py",
+      "why": "Own CMP2 routed-pair extension: after the record compression transaction succeeds, target zskip swap2 FP4 codes and FP8 scales enter a separate VMM generic-compression transaction. Full storage byte comparison and metadata preservation precede pointer rebinding; original storages stay alive. Unsupported allocation, verification failure, or less than an 8 GiB post-request reserve keeps the ordinary routed pair while preserving the record arm."
     }
   ]
 }

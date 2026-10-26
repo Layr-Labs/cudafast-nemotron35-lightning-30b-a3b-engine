@@ -1,8 +1,8 @@
 """Input-independent transparent VMM weight storage, before engine capture.
 
 CMP2=0 keeps the ordinary tensors. No codec, format, kernel or arithmetic
-change. All selected storages are byte-checked before any tensor is rebound;
-failed support, allocation or verification leaves every ordinary tensor intact.
+change. Each storage family is fully byte-checked before any tensor in that family is
+rebound; an extension failure leaves the measured record family active.
 Original storages stay alive for boot-time private graphs and any retained view.
 """
 import ctypes
@@ -32,15 +32,16 @@ def _library():
 
 
 def _select(models, torch):
-    """Resolved positive frozen-weight families; no mutable cache or scratch."""
-    selected = []
+    """Frozen families split into the record arm and the routed-pair extension."""
+    base = []
+    routed_pair = []
     seen = set()
 
-    def add(name, tensor):
+    def add(bucket, name, tensor):
         if (isinstance(tensor, torch.Tensor) and tensor.is_cuda
                 and tensor.numel() and id(tensor) not in seen):
             seen.add(id(tensor))
-            selected.append((name, tensor))
+            bucket.append((name, tensor))
 
     for owner, model in zip(("target", "drafter"), models):
         if model is None:
@@ -49,16 +50,16 @@ def _select(models, torch):
             prefix = owner + "." + name
             # Both module buffers and FP8 kernel objects refer to these SAME
             # Tensor objects. Preserve their identity, shape, stride and offset.
-            add(prefix + "._fp8c_weight", getattr(layer, "_fp8c_weight", None))
+            add(base, prefix + "._fp8c_weight", getattr(layer, "_fp8c_weight", None))
             # The attention registry and projection hold the same plane objects.
             for i, plane in enumerate(getattr(layer, "_apk_planes", ())):
-                add(prefix + f"._apk_planes.{i}", plane)
+                add(base, prefix + f"._apk_planes.{i}", plane)
             method = type(getattr(layer, "quant_method", None)).__name__
             if "NvFp4" in method and ("shared_experts" in name or name == "lm_head"):
                 zs = getattr(layer, "_marlinx_zs", None)
-                add(prefix + "._marlinx_zs", zs)
+                add(base, prefix + "._marlinx_zs", zs)
                 su = getattr(layer, "_marlinx_su", None)
-                add(prefix + "._marlinx_su", su)
+                add(base, prefix + "._marlinx_su", su)
                 for field, tensor in layer.named_parameters(recurse=False):
                     # Decode reads the existing zero-skip repack. The ordinary
                     # fallback matrix remains ordinary for its prefill path.
@@ -68,21 +69,24 @@ def _select(models, torch):
                         continue
                     if any(tag in field.lower() for tag in ("workspace", "scratch", "lock")):
                         continue
-                    add(prefix + "." + field, tensor)
-    return selected
+                    add(base, prefix + "." + field, tensor)
+
+            # Own extension: the target M=5 routed-down kernel reads the swap2
+            # pair, not Humming's ordinary store nor the legacy zskip repack.
+            # Select only its immutable FP4 codes and FP8 scales. Keeping this a
+            # separate transaction means an allocation failure cannot disable
+            # the already measured record arm above.
+            pair = getattr(layer, "zskip_pair_w2", None)
+            if owner == "target" and getattr(pair, "layout", None) == "swap2":
+                add(routed_pair, prefix + ".zskip_pair_w2.w", getattr(pair, "w", None))
+                add(routed_pair, prefix + ".zskip_pair_w2.s", getattr(pair, "s", None))
+    return base, routed_pair
 
 
-def prepare(models):
-    """One load-time transaction; every fallback precedes any pointer change."""
-    global _PREPARED
-    if _PREPARED:
-        return
-    _PREPARED = True
-    if os.environ.get("CMP2", "1") == "0":
-        _LOG.info("CMP2 compressed=none reason=disabled")
-        return
-    import torch
-
+def _compress(selected, torch, family, reserve_bytes=0):
+    """Atomically rebind one family; a failed extension leaves the base active."""
+    if not selected:
+        return True
     changes, originals, compressed = [], [], []
     labels = []
     checked_bytes = 0
@@ -97,10 +101,22 @@ def prepare(models):
         capsule_new.restype = ctypes.py_object
         # Gather all aliases before rebinding even one of them.
         storages = {}
-        for name, tensor in _select(models, torch):
+        for name, tensor in selected:
             storage = tensor.untyped_storage()
             key = (tensor.device.index, storage.data_ptr(), storage.nbytes())
             storages.setdefault(key, []).append((name, tensor))
+        requested = sum(key[2] for key in storages)
+        if reserve_bytes:
+            device = next(iter(storages.values()))[0][1].device
+            free_bytes, _ = torch.cuda.mem_get_info(device)
+            if free_bytes < requested + reserve_bytes:
+                _LOG.warning(
+                    "CMP2 family=%s compressed=none reason=memory_reserve "
+                    "requested_bytes=%d free_bytes=%d reserve_bytes=%d "
+                    "ordinary_tensors_retained=True",
+                    family, requested, free_bytes, reserve_bytes,
+                )
+                return False
         for (_, _, nbytes), aliases in storages.items():
             tensor = aliases[0][1]
             source = torch.empty(0, dtype=torch.uint8, device=tensor.device).set_(
@@ -142,10 +158,33 @@ def prepare(models):
         _ORIGINALS.extend(originals)
         _COMPRESSED.extend(compressed)
     except Exception as exc:
-        _LOG.warning("CMP2 compressed=none reason=%r ordinary_tensors_retained=True", exc)
-        return
+        _LOG.warning(
+            "CMP2 family=%s compressed=none reason=%r ordinary_tensors_retained=True",
+            family, exc,
+        )
+        return False
     _LOG.info(
-        "CMP2 compressed=[%s] storages=%d full_byte_checks=%d checked_bytes=%d "
-        "original_storages_retained=True",
-        ",".join(labels), len(compressed), len(compressed), checked_bytes,
+        "CMP2 family=%s compressed=[%s] storages=%d full_byte_checks=%d "
+        "checked_bytes=%d original_storages_retained=True",
+        family, ",".join(labels), len(compressed), len(compressed), checked_bytes,
     )
+    return True
+
+
+def prepare(models):
+    """Run the measured base transaction, then the optional routed pair."""
+    global _PREPARED
+    if _PREPARED:
+        return
+    _PREPARED = True
+    if os.environ.get("CMP2", "1") == "0":
+        _LOG.info("CMP2 compressed=none reason=disabled")
+        return
+    import torch
+
+    base, routed_pair = _select(models, torch)
+    if not _compress(base, torch, "record"):
+        return
+    # Worst-case (incompressible) backing must leave room for graph capture,
+    # scratch and allocator fragmentation. A skipped extension is the record.
+    _compress(routed_pair, torch, "routed_pair", reserve_bytes=8 << 30)

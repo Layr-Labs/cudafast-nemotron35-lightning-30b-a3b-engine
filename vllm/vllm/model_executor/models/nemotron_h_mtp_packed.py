@@ -578,6 +578,14 @@ def packed_small(x,SM,EX,BASE,RI,RAW,y,M,N,K,sxm,sym,gate_ptr,
     kk0=tl.arange(0,BK,layout=SliceLayout(0,ld))
     mm=tl.arange(0,BM,layout=SliceLayout(1,ld))
     acc=tl.full((BM,BN),0,tl.float32,mma)
+    outlayout:tl.constexpr=BlockedLayout([1,4],[4,8],[4,1],[1,0])
+    om=tl.arange(0,BM,layout=SliceLayout(1,outlayout))
+    on=pid*BN+tl.arange(0,BN,layout=SliceLayout(0,outlayout))
+    if GATED:
+        if tl.load(gate_ptr)!=0:
+            z=tl.convert_layout(acc,outlayout)
+            tl.store(y+om[:,None]*sym+on[None,:],z.to(y.dtype.element_ty),mask=(om[:,None]<M)&(on[None,:]<N))
+            return
     for k0 in range(0,K,BK):
         kk=k0+kk0
         wmask=(nn[:,None]<N)&(kk[None,:]<K)
@@ -588,8 +596,5 @@ def packed_small(x,SM,EX,BASE,RI,RAW,y,M,N,K,sxm,sym,gate_ptr,
         a=tl.convert_layout(a,DotOperandLayout(0,mma,2))
         b=tl.convert_layout(tl.permute(w,(1,0)),DotOperandLayout(1,mma,2))
         acc=mma_v2(a,b,acc)
-    outlayout:tl.constexpr=BlockedLayout([1,4],[4,8],[4,1],[1,0])
     acc=tl.convert_layout(acc,outlayout)
-    om=tl.arange(0,BM,layout=SliceLayout(1,outlayout))
-    on=pid*BN+tl.arange(0,BN,layout=SliceLayout(0,outlayout))
     tl.store(y+om[:,None]*sym+on[None,:],acc.to(y.dtype.element_ty),mask=(om[:,None]<M)&(on[None,:]<N))

@@ -116,13 +116,18 @@ class NativePlanBank:
             plan, prefix, scalars = entry
             # Only executable native integer metadata is restored. Current
             # indices and last-page length were refreshed by the builder.
-            wrapper._int_workspace_buffer.view(torch.uint8)[:prefix.numel()].copy_(
-                prefix, non_blocking=True)
+            from vllm.v1.worker import copy_batch
+            copy_batch.copy(
+                wrapper._int_workspace_buffer.view(torch.uint8)[:prefix.numel()], prefix)
             wrapper._plan_info = list(plan)
             for name, value in scalars:
                 setattr(wrapper, name, value)
             self.last_restore = True
             return
+        # A cache miss enters an opaque native planner. Publish any recorded
+        # page metadata before it can consume device buffers or launch work.
+        from vllm.v1.worker import copy_batch
+        copy_batch.materialize()
         self.native(wrapper, **kw)
         self.last_native_key = key
 
@@ -240,7 +245,9 @@ def prepare(p):
 
         # Bound boot work and memory independently of request tokens. Plans for
         # pages outside this generic prefix use the original planner.
-        max_pages = min(blocks, 128)
+        max_pages = min(blocks, 512)
+        timed_pages = min(blocks, 128)
+        calibrated_pages = 0
         raw_float = wrapper._float_workspace_buffer.view(torch.uint8)
         raw_int = wrapper._int_workspace_buffer.view(torch.uint8)
         # Actual installed planner, not a version-string assumption: no
@@ -250,6 +257,8 @@ def prepare(p):
         raw_float.fill_(0xA5)
         total_plan_bytes = 0
         for pages in range(1, max_pages + 1):
+            page_entries, page_bytes = {}, 0
+            budget_full = False
             for residue in range(1, p.block_size + 1):
                 length = (pages - 1) * p.block_size + residue
                 if length > p.max_model_len:
@@ -261,10 +270,20 @@ def prepare(p):
                 torch.cuda.synchronize(p.device)
                 if not bool(torch.all(raw_int[current[1].numel():] == 0xB6).item()):
                     raise ValueError("native integer writes exceed captured prefix")
-                total_plan_bytes += current[1].numel()
-                if total_plan_bytes > 64 * (1 << 20):
-                    raise ValueError("native plan bank exceeds private memory budget")
-                bank.entries[bank.last_native_key] = current
+                size = current[1].numel()
+                if total_plan_bytes + page_bytes + size > 64 * (1 << 20):
+                    budget_full = True
+                    break
+                page_entries[bank.last_native_key] = current
+                page_bytes += size
+            if budget_full:
+                # Keep complete earlier pages; never disable their valid bank
+                # merely because a later optional page would exceed budget.
+                break
+            if page_entries:
+                bank.entries.update(page_entries)
+                total_plan_bytes += page_bytes
+                calibrated_pages = pages
         if not bank.entries:
             raise ValueError("no native plans")
         if not bool(torch.all(raw_float == 0xA5).item()):
@@ -272,7 +291,9 @@ def prepare(p):
         bank.enabled = True
         kwargs = dict(input_ids=p.input_ids[:padded], positions=p._get_positions(padded),
                       inputs_embeds=None, hidden_states=p.hidden_states[:padded])
-        sample_pages = sorted({1, min(2, max_pages), max(1, max_pages // 2), max_pages})
+        timed_pages = min(timed_pages, calibrated_pages)
+        sample_pages = sorted({1, min(2, timed_pages), max(1, timed_pages // 2),
+                               timed_pages, max(1, calibrated_pages // 2), calibrated_pages})
         residues = sorted({1, max(1, p.block_size // 2), p.block_size})
         ratios = []
         # Warm the original stream/event control before either timed arm.
@@ -376,7 +397,11 @@ def prepare(p):
                         raise ValueError("native plan restore changes private model state")
                     if min(original_time, cached_time) <= 0:
                         raise ValueError("invalid private timing")
-                    ratios.append((case, cached_time / original_time))
+                    # Keep the original latency gate's coverage. Extended
+                    # endpoints add full state/bytes checks, not a new timing
+                    # entitlement or a weaker comparison threshold.
+                    if pages <= timed_pages:
+                        ratios.append((case, cached_time / original_time))
                     trial += 1
         if (not ratios or statistics.median([r for _, r in ratios]) >= 0.98
                 or statistics.median([r for case, r in ratios if case != 2]) >= 0.99

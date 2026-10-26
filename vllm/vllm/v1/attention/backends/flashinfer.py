@@ -2467,6 +2467,7 @@ def _reuse_fresh_prefill_plan(wrapper, **kw) -> None:
             return
     except (AttributeError, KeyError, TypeError, ValueError):
         key = None
+    copy_batch.materialize()
     wrapper.plan(**kw)
     stabilize_native_plan(wrapper)
     # plan() may initialize/replace the cached module on this first call. A key
@@ -2479,6 +2480,7 @@ def _fast_plan_spec_prefill(wrapper, builder, **kw) -> None:
         _fast_plan_spec_prefill_impl(wrapper, builder, **kw)
     except (AttributeError, TypeError, KeyError, ValueError, RuntimeError):
         wrapper._vllm_fast_const = None
+        copy_batch.materialize()
         wrapper.plan(**kw)
 
 
@@ -2523,6 +2525,7 @@ def _fast_plan_spec_prefill_impl(wrapper, builder, **kw) -> None:
             and total_num_rows <= wrapper._max_total_num_rows
         )
     if not ok:
+        copy_batch.materialize()
         wrapper.plan(**kw)
         wrapper._vllm_fast_const = const
         wrapper._vllm_fast_qo = qo.clone()
@@ -2533,6 +2536,7 @@ def _fast_plan_spec_prefill_impl(wrapper, builder, **kw) -> None:
     kv_lens = get_seq_lens(indptr, lpl, page_size)
     nk = len(kv_lens)
     if nk > wrapper._kv_lens_buffer.shape[0]:
+        copy_batch.materialize()
         wrapper.plan(**kw)
         return
     copy_batch.copy(wrapper._kv_lens_buffer[:nk], kv_lens)

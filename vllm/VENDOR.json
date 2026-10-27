@@ -642,6 +642,10 @@
     {
       "file": "(composition)",
       "why": "e-man07 composition on the record a1cf20d1-8d18-4f7d-942f-df2e17245deb: our nx2 tree (jungjipdo 96d0992b-4f98-4992-86b7-82174c6ea20f, leech1996 6f6ff439-186f-4cea-97ac-6f3e8f2be9af, ercumentyildirim 456feb71-1622-488c-9487-79ae5b9deaa8, i34-9 55ed2064-a023-4b5e-9fc1-da25829ef0db, terrapinelf ca2ae19c-8f8a-4dff-9c23-88cf297efe51 as carried in leech1996 c5670d92-e925-4a20-ad66-d75e07ada6d5) plus i34-9 8b406fa2-8fbf-4867-a9fb-7a8b40915ae3's fp8ws prefill Mamba in_proj kernel, files byte for byte. No new arithmetic. Re-measurement #1."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_attn_packed.py (ATTN_PACK12_PDL8)",
+      "why": "The attention pack12 per-shape chooser now also offers the eight-deep-ring programmatic-dependency variant of its CUDA kernel: it is bit-checked against the reference linear layer exactly like the ordinary and four-deep variants, and only the fastest bit-equal candidate is used for each shape. ATTN_PACK12_PDL8=0 keeps the previous menu."
     }
   ]
 }

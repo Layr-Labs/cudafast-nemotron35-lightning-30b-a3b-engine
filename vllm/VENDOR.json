@@ -642,6 +642,18 @@
     {
       "file": "(composition)",
       "why": "e-man07 composition on the record a1cf20d1-8d18-4f7d-942f-df2e17245deb: our nx2 tree (jungjipdo 96d0992b-4f98-4992-86b7-82174c6ea20f, leech1996 6f6ff439-186f-4cea-97ac-6f3e8f2be9af, ercumentyildirim 456feb71-1622-488c-9487-79ae5b9deaa8, i34-9 55ed2064-a023-4b5e-9fc1-da25829ef0db, terrapinelf ca2ae19c-8f8a-4dff-9c23-88cf297efe51 as carried in leech1996 c5670d92-e925-4a20-ad66-d75e07ada6d5) plus i34-9 8b406fa2-8fbf-4867-a9fb-7a8b40915ae3's fp8ws prefill Mamba in_proj kernel, files byte for byte. No new arithmetic. Re-measurement #1."
+    },
+    {
+      "file": "model_executor/layers/mamba/ops/{ssd_prefill_fused.py,ssd_prefix_owners.py}",
+      "why": "GPT 6.1 Sol / Codex / effort ultra: optional single-sequence per-chunk-prefix owners for the existing SSD prefill state pass on full4ae55271-d4bd-44f6-adf0-1f731b273822. Each(head,targetchunk) CTA recomputes the original ascending dot and FP32 recurrence only through its target boundary; exactly that owner writes the boundary, and the final valid owner writes the unchanged final-cache sink. No prefix tree reassociation or multi-CTA writes. Trades additional prefix compute/input reads for more independent CTAs; original CB+scan remains. Originalstate/scan fallback byte-exact by undoing wrapper. Complete private original/new state+scan comparison checks all FP32 boundaries/cache/BF16 outputs, readonly inputs, changed content/metadata graphs and warm/pressure timing before use. Only immutable D weight and scalar admission metadata retained; no request data/state/graphs. VLLM_SSD_PREFIX_OWNERS=0 disables. No local execution, compiledresource/activation or gain claim."
+    },
+    {
+      "file": "v1/spec_decode/nemotron_compound_loop.py:_stage",
+      "why": "Selected only stage block from usefulpendingef1fe030-2867-402a-bed0-47635a4d1ddf/PR882, official856d07415d4e1c01304260975cfe32d80ee650df, fullsourceblobc1a99e10360822cb5cc093e0438d4673abf41156. Hoist current sequence-length read next to position read; CTA debugbarrier precedes stores; use savedlength. Enforces read-before-store intent; no claim oldrace was observed. Existing complete compound state/continuation and originallatency admission retained. Flatcapture/relaxedbound/compound-onlyplans/prefillS6off notimported. New SSD+pendingcomposition unverified."
+    },
+    {
+      "file": "harness/kernels/fp8ws/{README.md,csrc/fp8ws.cu,py/__init__.py}; harness/tests/fp8ws_exact.py; model_executor/kernels/linear/scaled_mm/fp8ws.py",
+      "why": "Select only usefulpendinga7707aa4-f2fa-40b5-b52e-adfdd94825a9 /PR884 official7c863fdb62d3314487ee1d10f01d20e23665aa96 out_proj extension: exact5files authenticatedbyGitblob. Originaleightwarp/two-sharedstage FP8kernel templated onN,K now also handlesM496,N2688,K4096 out_proj withsame nativeE4M3 ascendingK FP32chain/scaleBthenA/BF16epilogue andbyteinversion+perweightCUTLASSwordadmission. This is notfailed9warp producer family. No source defaultconditionaloff carried:3d3dddcb public2.67576996369234 below4ae so originalNEMO_MTP_STEP_COND=1 retained. Authorcold68us/82us and230cases areexternalreports, notour evidence. Exactnewtests copied butneverrunlocally. WholeSSD+outproj+stagebarrier combo unverified."
     }
   ]
 }

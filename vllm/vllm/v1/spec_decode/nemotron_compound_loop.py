@@ -36,6 +36,12 @@ def _stage(token, ids, hsrc, hdst, hstride, positions, seq,
     # Original fused MTP input/position/slot arithmetic, batch one. Runtime
     # guards exclude clamp boundaries, but retain the original clamp itself.
     position = tl.load(positions)
+    seq_value = tl.load(seq)
+    # LOCAL PATCH (cudafast-nemotron35): the position and the sequence length are read and
+    # then written in place by this one program; every warp reads them before any warp
+    # stores the advanced values, so no warp computes from an already advanced value (which
+    # would select the next length's plan prefix for its part of the copy).
+    tl.debug_barrier()
     new_position = position + 1
     exceeds = new_position >= MAX_LEN
     clamped = tl.where(exceeds, 0, new_position)
@@ -53,7 +59,7 @@ def _stage(token, ids, hsrc, hdst, hstride, positions, seq,
     padded = tl.arange(0, 8)
     tl.store(slots + padded, tl.where(padded == 0, tl.where(exceeds, PAD, slot), PAD),
              mask=padded < PADDED)
-    length = tl.minimum(tl.where(exceeds, 1, tl.load(seq) + 1), MAX_LEN)
+    length = tl.minimum(tl.where(exceeds, 1, seq_value + 1), MAX_LEN)
     tl.store(seq, length)
 
     # Same current-page values as FlashInferMetadataBuilder, and the exact

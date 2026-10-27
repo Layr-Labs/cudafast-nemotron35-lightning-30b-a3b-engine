@@ -54,6 +54,14 @@ try:
 except ImportError:
     _sctopk = None
 _SCTOPK = os.environ.get("VLLM_MTP_SCREEN_SCTOPK", "1") != "0"
+# LOCAL PATCH (cudafast-nemotron35): the three-level cascade after its first streaming dot
+# (the three per-chunk selections, the mid and rest dots and the survivors' full-K dot) as one
+# CUDA kernel, one CTA per chunk (harness/kernels/scrtail), used only after a load-time bitwise
+# comparison with the cascade below. MTP_SCREEN_TAIL=0 keeps the cascade.
+try:
+    import scrtail as _scrtail
+except ImportError:
+    _scrtail = None
 from vllm.triton_utils import tl, triton
 
 from .nemotron_h_mtp_kernels import (
@@ -792,8 +800,16 @@ class DraftHeadScreen:
                             len(self._next_pf), self._next_max_kept)
         self._h = torch.empty(k, dtype=torch.float32, device=device)
         self._out = torch.empty(1, dtype=torch.int32, device=device)
+        self._tail_debug = False
+        self.fulltail = False
         if device.type == "cuda" and self.cascade and self.fold:
             self.fold = self._fold_matches(k, device)
+        if (device.type == "cuda" and self.cascade and self.fused_topk and self.pre
+                and not self._next_pf
+                and _scrtail is not None and _scrtail.available()):
+            if os.environ.get("MTP_SCREEN_CTA_GATHER", "1") != "0":
+                self.fulltail = self._fulltail_matches(k, device)
+                print(f"MTP_SCREEN_CTA_GATHER admitted={self.fulltail}", flush=True)
         if device.type == "cuda" and screen_graph_enabled():
             # The captured one-row screen is the gated one (depth gate): allocate
             # the gate first so the graph captures its address.
@@ -904,6 +920,139 @@ class DraftHeadScreen:
             num_warps=num_warps, launch_pdl=mtp_pdl(), gate_ptr=tgate, GATED=tgated,
         )
 
+    def _fulltail_row(self, h, gated, out):
+        """One CTA owns first dot through final survivors; input columns are
+        gathered from immutable h inside that CTA instead of a prior grid."""
+        tgate, tok = _gate_args(self.scores)
+        if not _scrtail.run(
+            self.scores, self._hm, self._hr, h, self.w_mid, self.s_mid,
+            self.w_rest, self.s_rest, self.w_full, self.s_full,
+            self._cand, self.cand_logits, self.gscale,
+            gate=tgate if gated and tok else None, win=0, pdl=mtp_pdl(),
+            debug=(self._pre_cand, self.mid_scores, self.scores,
+                   self._coarse_cand, self.refine_scores) if self._tail_debug else None,
+            first=(self._hp, self.w_pre, self.s_pre),
+            columns=(self.pre_cols, self.mid_cols, self.rest_cols),
+        ):
+            return False
+        gate, ok = _gate_args(out)
+        _select_token[(1,)](
+            self.cand_logits, self._cand, out, N=self.cand_logits.numel(),
+            BLOCK=triton.next_power_of_2(self.cand_logits.numel()),
+            gate_ptr=gate, GATED=gated and ok, THETA=DEPTH_THETA,
+            CUM=DEPTH_CUMULATIVE, launch_pdl=mtp_pdl(),
+        )
+        return True
+
+    def _fulltail_matches(self, k, device):
+        """Remote startup only: exact full screen versus the actual selected
+        parent, then changed-input graphs and complete warm/cold timing. The reference
+        is the unchanged highest baseline cascade; no independent tail route
+        is activated if full fusion refuses."""
+        import statistics
+        gate = depth_gate_init(device)
+        names = ("_pre_cand", "mid_scores", "scores", "_coarse_cand",
+                 "refine_scores", "_cand", "cand_logits")
+        guard = torch.full((k + 64,), 1713.25, dtype=torch.float32, device=device)
+        h = guard[32:-32]
+        original_out = torch.empty((), dtype=torch.int32, device=device)
+        proposed_out = torch.empty_like(original_out)
+        gen = torch.Generator(device=device).manual_seed(202610271)
+
+        def reset(stop):
+            if gate is not None:
+                gate.zero_()
+                gate[0] = stop
+
+        def observe(out):
+            return [out.clone()] + [getattr(self, n).contiguous().view(torch.uint8).clone()
+                                   for n in names]
+
+        def same(a, b):
+            return (all(torch.equal(x, y) for x, y in zip(a, b))
+                    and bool((guard[:32] == 1713.25).all())
+                    and bool((guard[-32:] == 1713.25).all()))
+
+        def original():
+            self._greedy_row(h, gated=gate is not None, out=original_out)
+
+        def proposed():
+            if not self._fulltail_row(h, gated=gate is not None, out=proposed_out):
+                raise ValueError("full screen CUDA binding declined")
+
+        try:
+            self.fulltail = False
+            self._tail_debug = True
+            for trial in range(10):
+                h.copy_(torch.randn(k, generator=gen, device=device) * (0.25 * 2 ** (trial % 6)))
+                if trial == 6:
+                    h[::3] = 0.0
+                    h[1::7] = -0.0
+                elif trial == 7:
+                    h.copy_(torch.round(h * 4) / 4)
+                elif trial == 8:
+                    h.mul_(1e-20)
+                source = h.view(torch.int32).clone()
+                for stop in ((0, 1) if gate is not None else (0,)):
+                    results = []
+                    for run, out in ((original, original_out), (proposed, proposed_out)):
+                        reset(stop)
+                        for name in names:
+                            buf = getattr(self, name)
+                            buf.fill_(-7 if buf.dtype == torch.int64 else float("nan"))
+                        run()
+                        results.append(observe(out))
+                    if not same(*results) or not torch.equal(source, h.view(torch.int32)):
+                        return False
+            # Compare actual replay bodies, with production scratch-write policy.
+            self._tail_debug = False
+            reset(0)
+            original()
+            proposed()
+            torch.cuda.synchronize(device)
+            old_graph, new_graph = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
+            with torch.cuda.graph(old_graph):
+                original()
+            with torch.cuda.graph(new_graph):
+                proposed()
+            for trial in range(3):
+                h.copy_(torch.randn(k, generator=gen, device=device) * (trial + 1))
+                reset(0)
+                old_graph.replay()
+                old = original_out.clone()
+                reset(0)
+                new_graph.replay()
+                if not torch.equal(old, proposed_out):
+                    return False
+            flush = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=device)
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            ratios = []
+            for stop in ((0, 1) if gate is not None else (0,)):
+                for cold in (False, True):
+                    times = [[], []]
+                    for trial in range(7):
+                        for which in ((0, 1) if trial % 2 == 0 else (1, 0)):
+                            reset(stop)
+                            if cold:
+                                flush.zero_()
+                            start.record()
+                            (old_graph if which == 0 else new_graph).replay()
+                            end.record()
+                            end.synchronize()
+                            times[which].append(start.elapsed_time(end))
+                    ratios.append(statistics.median(times[1]) / statistics.median(times[0]))
+            admitted = statistics.median(ratios) < 0.98 and max(ratios) < 1.03
+            print(f"MTP_SCREEN_CTA_GATHER ratios={ratios} admitted={admitted}", flush=True)
+            return admitted
+        except Exception as exc:
+            logger.warning("MTP screen cooperative first-dot fusion declined: %r", exc)
+            return False
+        finally:
+            self.fulltail = False
+            self._tail_debug = False
+            if gate is not None:
+                gate.zero_()
+
     def _fold_matches(self, k: int, device: torch.device) -> bool:
         """Load time, before capture: the folded cascade against the unfolded one on
         random rows, bitwise on every stage's scores and on the token."""
@@ -938,6 +1087,8 @@ class DraftHeadScreen:
         if out is None:
             out = torch.empty((), dtype=torch.int32, device=h.device)
         if self.cascade and self.fused_topk and self.pre:
+            if self.fulltail and self._fulltail_row(h, gated, out):
+                return out
             # LOCAL PATCH (cudafast-nemotron35): the three-level cascade
             # (see __init__); the refine stage and everything after it are
             # the two-level cascade's.

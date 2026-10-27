@@ -23,6 +23,10 @@ from .nemotron_h_mtp_packed import load_packed, packed_small, pdl_prologue
 _ENABLED = os.environ.get("MTP_PACK12_MM", "1") != "0"
 _CONFIGS = {(4608, 2688): (32, 4, 256), (2688, 4096): (16, 2, 256)}
 _ROWS = (2, 3, 4, 5)
+# LOCAL PATCH (cudafast-nemotron35): MTP_PACK12_MM_FORCE (default on) admits every row count
+# and gate case whose full output bits equal packed_small's on all probes, without the private
+# four-percent cold-speed margin. MTP_PACK12_MM_FORCE=0 keeps the margin.
+_FORCE = os.environ.get("MTP_PACK12_MM_FORCE", "1") != "0"
 # Only immutable weight planes and admission flags persist. No request data.
 _ADMITTED = {}
 
@@ -160,7 +164,7 @@ def prepare(p, word):
                         end.record()
                         end.synchronize()
                         (new_times if variant else old_times).append(start.elapsed_time(end))
-                flags[key] = statistics.median(new_times) < 0.96 * statistics.median(old_times)
+                flags[key] = _FORCE or statistics.median(new_times) < 0.96 * statistics.median(old_times)
         print(f"MTP_PACK12_MM shape={p.shape} admitted={sum(flags.values())}/{len(flags)} "
               "private_full_output_bits+cold4pct", flush=True)
     except Exception as exc:

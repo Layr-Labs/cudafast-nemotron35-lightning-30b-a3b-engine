@@ -582,6 +582,14 @@
     {
       "file": "harness/protocol-adapter/src/{hotwait.rs,resident.rs,lib.rs,bin/cuda-engine.rs}; harness/vllm_resident/resident.py",
       "why": "i34-9 (ours): hot waits. Before each blocking read of the next line (the adapter's stdin and its resident-socket replies; the resident's request socket) the reader polls the descriptor with a 1 ms timeout, for up to a few seconds, so the read starts when the bytes land instead of after the waiting core wakes from deep idle. Only when the read starts changes: the bytes, framing, timeouts and errors are the reader's own, and no engine work moves between requests or phases. CUDA_ENGINE_HOT_WAIT=0 (adapter) and RESIDENT_HOT_WAIT=0 (resident) restore plain blocking reads."
+    },
+    {
+      "file": "model_executor/layers/fused_moe/experts/humming_zskip.py",
+      "why": "terrapinelf, with i34-9 (ddcdd302) for the decode switch: the 6-bit w2 scale planes are off by default. ZSKIP_S6 defaults to 0, so the lean paired decode keeps config 653 on the 8-bit swap2 plane; PZSKIP_S6 defaults to 0, so the 496-token prefill down keeps pzskip config 369 on the 8-bit swap plane. ZSKIP_S6=1 / PZSKIP_S6=1 build the 6-bit planes and admit configs 663 / 379 through the same bitwise checks as before."
+    },
+    {
+      "file": "(composition)",
+      "why": "terrapinelf: measurement 84 of the promoted main ea229c8 (a1cf20d1) with the 6-bit w2 scale planes off by default (the humming_zskip.py entry above); every other file is the main's. The main carries terrapinelf's 6-bit scale planes (7a22b821, now opt-in), i34-9's hot waits (9c53722c) and ercumentyildirim's bit-equality admission of the wide packed MTP compact-down tiles, on terrapinelf's f5904a37."
     }
   ]
 }

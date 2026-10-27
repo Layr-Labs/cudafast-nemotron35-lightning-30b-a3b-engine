@@ -582,6 +582,42 @@
     {
       "file": "harness/protocol-adapter/src/{hotwait.rs,resident.rs,lib.rs,bin/cuda-engine.rs}; harness/vllm_resident/resident.py",
       "why": "i34-9 (ours): hot waits. Before each blocking read of the next line (the adapter's stdin and its resident-socket replies; the resident's request socket) the reader polls the descriptor with a 1 ms timeout, for up to a few seconds, so the read starts when the bytes land instead of after the waiting core wakes from deep idle. Only when the read starts changes: the bytes, framing, timeouts and errors are the reader's own, and no engine work moves between requests or phases. CUDA_ENGINE_HOT_WAIT=0 (adapter) and RESIDENT_HOT_WAIT=0 (resident) restore plain blocking reads."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_down_packed.py (_slots)",
+      "why": "terrapinelf: the drafter's packed MoE down slot kernel loads chunk c + 1's row ids, values and packed weights before adding chunk c's products (software-pipelined gather). The products, their chunk order, the per-lane accumulators and the final tl.sum are unchanged, so every output bit is; the existing load-time admission still compares the packed slots with the original slots bit for bit."
+    },
+    {
+      "file": "harness/kernels/pkslots (csrc/pkslots.cu, py, build.sh); model_executor/models/nemotron_h_mtp_down_packed.py (_admit_pkslots, maybe_slots)",
+      "why": "ercumentyildirim: the drafter's packed MoE down slot kernel with the admitted (64, 4) tile in CUDA (pkslots): the same accumulator elements per thread as _slots' Triton layout (sizePerThread [1, 16], threadsPerWarp [8, 4], warpsPerCTA [4, 1]), the same fp32 multiplies and adds in the same order (64-row chunks in order, the two row reps, the xor butterfly 16, 8, 4 over the row lanes, then (w0 + w2) + (w1 + w3) over the warps), with 96 instead of 162 registers and a two-deep gather pipeline. Admitted per top-k only when its fp32 output words equal _slots' on every load-time probe; MTP_DOWN_PKSLOTS=0 keeps _slots."
+    },
+    {
+      "file": "harness/kernels/scrtail (csrc/scrtail.cu, py, build.sh); model_executor/models/nemotron_h_mtp_screen.py (_tail_matches, _greedy_row)",
+      "why": "ercumentyildirim: the draft-head screen's three-level cascade after its first streaming dot as one CUDA kernel per 2048-row chunk (scrtail): the top 1024 of the chunk's first scores, the mid dot of those rows plus their first score, the top 256, the rest dot plus the mid score, the top 32 and the full-K dot of the 32 survivors, written to the candidate ids and logits _select_token reads. Each selection writes the ids torch.topk(sorted=False) returns in its order (keys above the K-th largest in ascending index order, then its ties), the K-th largest key from an exact 8-bit radix select. Each dot term is the 16-row tile's term of _nvfp4_rows_dot / _nvfp4_rows_dot_part as compiled: per byte fma(lo, h[2b], hi * h[2b + 1]) (hardware E2M1 decode, zeros as +0), the 8 byte terms of a group in byte order, the group-scale product and the 8-lane xor butterfly 4, 2, 1 whose first level is an fma of the lane's own product, blocks accumulated from +0 in K order, fma(gscale, acc, base) for the mid and rest scores and the in-order block sum times gscale for the logits, the value of the row's lanes 0-3. Admitted at load only after a bitwise comparison with the cascade on random rows (several scales, signed zeros, ties) and on the stopped pass: the token, the candidate ids, their logits and every intermediate buffer. MTP_SCREEN_TAIL=0 keeps the cascade."
+    },
+    {
+      "file": "v1/spec_decode/nemotron_compound_loop.py (_flat_pass, FLAT, the flat admission gate); v1/spec_decode/nemotron_decode_plan.py (compound_only, withdraw_compound_only); v1/spec_decode/llm_base_proposer.py (withdraw_compound_only after the compound prepare)",
+      "why": "ercumentyildirim: jacklightChen's boot-qualified compound native MTP loop (581daccd) captures its three-pass parent graph with the passes' kernels directly: the model forward under CUDAGraphMode.NONE (the full-step child graph's kernels, buffers and order) and the head screen's _greedy_row into its output buffer plus the clone, then the device stage, instead of replaying the full-step and screen child graphs inside the capture (a graph replay inside a stream capture invalidates it). The parent graph is admitted by the loop's existing complete private-state comparison with the original three-pass loop (tokens, positions, inputs, hidden, slots, KV, gate, CPU shadows, page metadata, screen buffers, and an original continuation) and, for the flat body, by its private latency: not slower with live drafts (median ratio below 1.0, every case below 1.03) and faster on a stopped loop (median below 0.9). The native exact structural plans are kept for the compound loop when their own per-step restore gate fails (compound_only) and withdrawn when the compound loop is not admitted. NEMO_MTP_COMPOUND_FLAT=0 keeps the child-graph body; NEMO_MTP_PLAN_BANK_COMPOUND_ONLY=0 keeps the plan gate's original refusal."
+    },
+    {
+      "file": "vllm/model_executor/layers/fused_moe/experts/humming_zskip.py (S6_ENABLED default)",
+      "why": "i34-9 (ours): ZSKIP_S6 defaults to 0, so the lean paired decode keeps config 653 on the 8-bit scale plane (the same admission path selects it); terrapinelf's 6-bit plane config 663 is still built and admitted with ZSKIP_S6=1. Code default only; no kernel, value or format changes."
+    },
+    {
+      "file": "v1/worker/gpu_model_runner.py (_prepare_inputs, _build_attention_metadata._get_block_table, _get_slot_mappings); harness/vllm_resident/test_empty_fill_skip.py",
+      "why": "ours: empty padding fills skipped on the verify path. Four padding writes (optimistic_seq_lens_cpu[num_reqs:], the block-table rows [num_reqs:num_reqs_padded] per KV cache group, is_prefilling[num_reqs:], the slot-mapping tail [unpadded:padded] per group) run only when their slice is non-empty. At one request with an unpadded verify every one of them is empty: a zero-element fill launches no kernel and writes nothing, so the GPU work, its order and its bytes are unchanged and only the host dispatch goes. VLLM_EMPTY_FILL_SKIP=0 restores the calls."
+    },
+    {
+      "file": "harness/protocol-adapter/src/{hotwait.rs,resident.rs,lib.rs,bin/cuda-engine.rs}; harness/vllm_resident/resident.py",
+      "why": "i34-9 (9c53722c-6c9b-4428-a6c0-f3e8416c8d00, carried byte for byte): hot waits. Before each blocking read of the next line (the adapter's stdin and its resident-socket replies; the resident's request socket) the reader polls the descriptor with a 1 ms timeout, for up to a few seconds, so the read starts when the bytes land instead of after the waiting core wakes from deep idle. Only when the read starts changes: the bytes, framing, timeouts and errors are the reader's own, and no engine work moves between requests or phases. CUDA_ENGINE_HOT_WAIT=0 (adapter) and RESIDENT_HOT_WAIT=0 (resident) restore plain blocking reads."
+    },
+    {
+      "file": "harness/kernels/zskip (zskip_lean.cuh F_S6 config 663, zskip.cu, py to_s6/to_s6_swap); harness/kernels/pzskip (smem5_kernel S6 config 379, py); model_executor/layers/fused_moe/experts/humming_zskip.py (_prepare_s6, _prepare_pz_s6)",
+      "why": "terrapinelf (as in 7a22b821-923d-4938-b82b-145985b23560): 6-bit scale planes for the routed w2 zero-row-skipping kernels. Every routed w2 scale byte of the pinned checkpoint lies in [62, 124]; to_s6 (swap2, lean paired decode) and to_s6_swap (swap, pzskip prefill) store each as byte - 62 in a low-nibble plane plus a 2-bit plane, decode every byte back and compare before use, and return None outside [62, 125]. Config 663 is 653 with s6_decode rebuilding the lane's four scale words at consumption; config 379 is 369 with 18 instead of 24 scale pieces per stage and s6_pair rebuilding the lane's 8 bytes. Same dequantised weights, MMA chains and epilogues. Admission by the existing bitwise checks (663: _pair_check against humming and against 653 on the 8-bit plane, plus the verify-prefix check; 379: the 496-token pzskip check). ZSKIP_S6=0 and PZSKIP_S6=0 disable."
+    },
+    {
+      "file": "(composition)",
+      "why": "e-man07 composition on the record a1cf20d1-8d18-4f7d-942f-df2e17245deb: jungjipdo f570d121-011a-48b5-aedb-c98fd9b76793 carried byte for byte. No new arithmetic."
     }
   ]
 }

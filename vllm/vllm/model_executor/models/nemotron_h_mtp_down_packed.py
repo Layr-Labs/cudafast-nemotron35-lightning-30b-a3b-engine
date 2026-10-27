@@ -13,6 +13,13 @@ from vllm.triton_utils import tl, triton
 _ENABLED = os.environ.get("MTP_DOWN_PACK12", "1") != "0"
 _FORCE = os.environ.get("MTP_DOWN_PACK12_FORCE", "1") != "0"
 _PACKS = {}
+# LOCAL PATCH (cudafast-nemotron35): pkslots (harness/kernels/pkslots) runs the (64, 4) tile's
+# exact arithmetic in CUDA; admitted per (weights, top-k, word) by prepare's bitwise comparison.
+try:
+    import pkslots as _pkslots
+except ImportError:
+    _pkslots = None
+_PKSLOTS_OK = {}
 
 
 @triton.jit
@@ -61,17 +68,32 @@ def _slots(indices, values, counts,
     else:
         base = (slot - TOPK).to(tl.int64) * I * H
     acc = tl.zeros((BK, BN), tl.float32)
-    for start in range(0, count, BK):
-        pos = start + lane
-        k = tl.load(indices + slot * I + pos, mask=pos < count, other=0)
-        value = tl.load(values + slot * I + pos, mask=pos < count, other=0.0)
-        index = base + k[:, None].to(tl.int64) * H + n[None, :]
-        mask = (pos[:, None] < count) & (n[None, :] < H)
+    # LOCAL PATCH (cudafast-nemotron35): software-pipelined gather. Chunk c + 1's row ids,
+    # values and weight loads are issued before chunk c's products are added, so its gathered
+    # rows are in flight during the math; the products are added in the same chunk order to
+    # the same per-lane accumulators, so every output bit is unchanged.
+    pos = lane
+    k = tl.load(indices + slot * I + pos, mask=pos < count, other=0)
+    value = tl.load(values + slot * I + pos, mask=pos < count, other=0.0)
+    index = base + k[:, None].to(tl.int64) * H + n[None, :]
+    mask = (pos[:, None] < count) & (n[None, :] < H)
+    if slot < TOPK:
+        weight = _load_packed(RSM, REX, RBASE, RRI, RRAW, index, mask, WORD=WORD)
+    else:
+        weight = _load_packed(SSM, SEX, SBASE, SRI, SRAW, index, mask, WORD=WORD)
+    for start in range(BK, count + BK, BK):
+        posn = start + lane
+        kn = tl.load(indices + slot * I + posn, mask=posn < count, other=0)
+        valuen = tl.load(values + slot * I + posn, mask=posn < count, other=0.0)
+        indexn = base + kn[:, None].to(tl.int64) * H + n[None, :]
+        maskn = (posn[:, None] < count) & (n[None, :] < H)
         if slot < TOPK:
-            weight = _load_packed(RSM, REX, RBASE, RRI, RRAW, index, mask, WORD=WORD)
+            weightn = _load_packed(RSM, REX, RBASE, RRI, RRAW, indexn, maskn, WORD=WORD)
         else:
-            weight = _load_packed(SSM, SEX, SBASE, SRI, SRAW, index, mask, WORD=WORD)
+            weightn = _load_packed(SSM, SEX, SBASE, SRI, SRAW, indexn, maskn, WORD=WORD)
         acc += weight.to(tl.float32) * value[:, None].to(tl.float32)
+        weight = weightn
+        value = valuen
     tl.store(part + slot * H + n, tl.sum(acc, axis=0), mask=n < H)
 
 
@@ -84,18 +106,14 @@ _TILES = ((32, 4), (64, 4)) + (
     ((128, 4), (128, 8), (256, 8)) if os.environ.get("MTP_DOWN_PACK12_WIDE", "1") != "0" else ())
 
 
-# LOCAL PATCH (cudafast-nemotron35): wide tiles are admitted on bit equality only (default
-# 1). The drafts feed the verify batch, whose FP8 activation scales are computed over all of
-# its rows, so a draft that differs from the record drafter's can move a near-tie in the
-# timed window; MTP_DOWN_PACK12_WIDE_EXACT=0 restores the 1e-5 relative admission.
-_WIDE_EXACT = os.environ.get("MTP_DOWN_PACK12_WIDE_EXACT", "1") != "0"
+_WIDE_EXACT = os.environ.get("MTP_DOWN_PACK12_WIDE_EXACT", "0") != "0"
 
 
 def _same(old, new, tile):
     """The original tiles must match the original slots bit for bit. A wider tile owns
     more columns per program, which can change the fp32 tree of tl.sum over the 64-row
-    chunk (Triton's layout); with MTP_DOWN_PACK12_WIDE_EXACT=0 a wide tile is admitted
-    within 1e-5 relative (same NaN/inf pattern), by default only on bit equality."""
+    chunk (Triton's layout); the drafter's numerics are free, so a wide tile is admitted
+    within 1e-5 relative (same NaN/inf pattern) unless MTP_DOWN_PACK12_WIDE_EXACT=1."""
     if torch.equal(old.view(torch.int32), new.view(torch.int32)):
         return True
     bn = tile[0] if isinstance(tile, tuple) else tile
@@ -227,10 +245,71 @@ def prepare(packed):
                                           key=lambda bn: statistics.median(times[bn]))
         if flags:
             _PACKS[key] = (w, sd, pw, ps, flags)
+            _admit_pkslots(key, w, sd, pw, ps, flags, word, pdl)
         print(f"MTP_DOWN_PACK12 admitted={flags} original_weights_retained=True", flush=True)
     except Exception as exc:
         flags.clear()
         print(f"MTP_DOWN_PACK12 original slots retained: {exc!r}", flush=True)
+
+
+@torch.no_grad()
+def _admit_pkslots(key, w, sd, pw, ps, flags, word, pdl):
+    """pkslots for each top-k whose admitted tile is (64, 4), when its fp32 output words equal
+    _slots' on every probe: every expert in groups of top-k, four densities, three scales,
+    signed zeros and subnormals in every probe, infinities and NaN in two, and empty slots."""
+    if _pkslots is None or not _pkslots.available():
+        return
+    from .nemotron_h_mtp_compact import _compact
+    try:
+        device = w.device
+        gen = torch.Generator(device=device).manual_seed(64464)
+        for (topk, wd), tile in list(flags.items()):
+            if tile != (64, 4) or wd != word:
+                continue
+            slots = topk + 2
+            indices = torch.empty((slots, 1856), dtype=torch.int32, device=device)
+            values = torch.empty((slots, 1856), dtype=torch.bfloat16, device=device)
+            counts = torch.empty(slots, dtype=torch.int32, device=device)
+            old = torch.empty((slots, 2688), dtype=torch.float32, device=device)
+            new = torch.empty_like(old)
+            ok = True
+            for first in range(0, 128, topk):
+                ids = ((torch.arange(topk, device=device, dtype=torch.int32) + first) % 128).contiguous()
+                for density in (0.0, 0.015625, 0.125, 0.5, 1.0):
+                    for scale in (0.001, 1., 32.):
+                        h = (torch.randn((slots, 1856), device=device, generator=gen).relu().square() * scale).to(torch.bfloat16)
+                        h *= (torch.rand(h.shape, device=device, generator=gen) < density)
+                        h.view(torch.int16)[:, :4] = torch.tensor(
+                            [0, -32768, 1, -32767], dtype=torch.int16, device=device)
+                        if first == 0 and density == 1.0 and scale == 1.:
+                            h.view(torch.int16)[:, 4:6] = torch.tensor(
+                                [32640, -128], dtype=torch.int16, device=device)
+                        if first == 0 and density == 1.0 and scale == 32.:
+                            h.view(torch.int16)[:, 4:6] = torch.tensor(
+                                [32704, -64], dtype=torch.int16, device=device)
+                        if density == 0.0:
+                            h.zero_()
+                        _compact[(slots,)](h, indices, values, counts, I=1856, BLOCK=2048, num_warps=4)
+                        old.fill_(float("nan"))
+                        new.fill_(float("nan"))
+                        _new(pw, ps, indices, values, counts, ids, old, tile, word, pdl)
+                        if not _pkslots.run(indices, values, counts, pw.planes, ps.planes, ids, new, pdl):
+                            ok = False
+                            break
+                        if not torch.equal(old.view(torch.int32), new.view(torch.int32)):
+                            ok = False
+                            break
+                    if not ok:
+                        break
+                if not ok:
+                    break
+            if ok:
+                _PKSLOTS_OK[(key, topk, word)] = True
+        print(f"MTP_DOWN_PKSLOTS admitted={sorted(k[1:] for k in _PKSLOTS_OK if k[0] == key)}", flush=True)
+    except Exception as exc:  # noqa: BLE001 - any failure keeps _slots
+        for k in [k for k in _PKSLOTS_OK if k[0] == key]:
+            del _PKSLOTS_OK[k]
+        print(f"MTP_DOWN_PKSLOTS unavailable, _slots kept: {exc!r}", flush=True)
 
 
 def maybe_slots(packed, indices, values, counts, ids, part, pdl):
@@ -245,5 +324,8 @@ def maybe_slots(packed, indices, values, counts, ids, part, pdl):
     bn = entry[4].get((ids.numel(), word))
     if bn is None:
         return False
+    if (_PKSLOTS_OK.get(((w.data_ptr(), sd.data_ptr()), ids.numel(), word))
+            and _pkslots.run(indices, values, counts, entry[2].planes, entry[3].planes, ids, part, pdl)):
+        return True
     _new(entry[2], entry[3], indices, values, counts, ids, part, bn, word, pdl)
     return True

@@ -61,17 +61,32 @@ def _slots(indices, values, counts,
     else:
         base = (slot - TOPK).to(tl.int64) * I * H
     acc = tl.zeros((BK, BN), tl.float32)
-    for start in range(0, count, BK):
-        pos = start + lane
-        k = tl.load(indices + slot * I + pos, mask=pos < count, other=0)
-        value = tl.load(values + slot * I + pos, mask=pos < count, other=0.0)
-        index = base + k[:, None].to(tl.int64) * H + n[None, :]
-        mask = (pos[:, None] < count) & (n[None, :] < H)
+    # LOCAL PATCH (cudafast-nemotron35): software-pipelined gather. Chunk c + 1's row ids,
+    # values and weight loads are issued before chunk c's products are added, so its gathered
+    # rows are in flight during the math; the products are added in the same chunk order to
+    # the same per-lane accumulators, so every output bit is unchanged.
+    pos = lane
+    k = tl.load(indices + slot * I + pos, mask=pos < count, other=0)
+    value = tl.load(values + slot * I + pos, mask=pos < count, other=0.0)
+    index = base + k[:, None].to(tl.int64) * H + n[None, :]
+    mask = (pos[:, None] < count) & (n[None, :] < H)
+    if slot < TOPK:
+        weight = _load_packed(RSM, REX, RBASE, RRI, RRAW, index, mask, WORD=WORD)
+    else:
+        weight = _load_packed(SSM, SEX, SBASE, SRI, SRAW, index, mask, WORD=WORD)
+    for start in range(BK, count + BK, BK):
+        posn = start + lane
+        kn = tl.load(indices + slot * I + posn, mask=posn < count, other=0)
+        valuen = tl.load(values + slot * I + posn, mask=posn < count, other=0.0)
+        indexn = base + kn[:, None].to(tl.int64) * H + n[None, :]
+        maskn = (posn[:, None] < count) & (n[None, :] < H)
         if slot < TOPK:
-            weight = _load_packed(RSM, REX, RBASE, RRI, RRAW, index, mask, WORD=WORD)
+            weightn = _load_packed(RSM, REX, RBASE, RRI, RRAW, indexn, maskn, WORD=WORD)
         else:
-            weight = _load_packed(SSM, SEX, SBASE, SRI, SRAW, index, mask, WORD=WORD)
+            weightn = _load_packed(SSM, SEX, SBASE, SRI, SRAW, indexn, maskn, WORD=WORD)
         acc += weight.to(tl.float32) * value[:, None].to(tl.float32)
+        weight = weightn
+        value = valuen
     tl.store(part + slot * H + n, tl.sum(acc, axis=0), mask=n < H)
 
 

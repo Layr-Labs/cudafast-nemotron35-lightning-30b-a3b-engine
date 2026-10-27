@@ -296,3 +296,5 @@ extern "C" int fp8ws_run(const void* a, const void* wp, const void* sa, const vo
   gemm<<<grid, NT, SMEM, (cudaStream_t)stream>>>(map, p);
   return (int)cudaGetLastError();
 }
+
+#include "fp8ws_pipeline.cuh"

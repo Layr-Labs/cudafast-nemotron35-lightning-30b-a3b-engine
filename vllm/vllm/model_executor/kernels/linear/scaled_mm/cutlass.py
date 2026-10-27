@@ -234,6 +234,13 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
                     else:
                         layer.register_buffer("_fp8small_weight", packed, persistent=False)
                         self._fp8small_weight = packed
+                    # LOCAL PATCH (cudafast-nemotron35): the M=496 prefill in_proj reads a packed
+                    # copy admitted bitwise against CUTLASS at load (fp8ws.py); FP8WS=0 disables.
+                    from .fp8ws import register as register_fp8ws
+
+                    _, ws_name, is_name, _ = self.layer_param_names
+                    register_fp8ws(weight, getattr(layer, ws_name, None),
+                                   getattr(layer, is_name, None) if is_name else None)
             return
 
         # B is column-major [K, N]

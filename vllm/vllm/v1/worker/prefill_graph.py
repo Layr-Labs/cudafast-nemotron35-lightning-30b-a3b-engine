@@ -132,6 +132,42 @@ class FreshPrefillGraph:
                 self.graph_lite = graph
             except Exception:  # noqa: BLE001
                 self.graph_lite = None
+        # LOCAL PATCH (cudafast-nemotron35): in-boot A/B of the fp8ws prefill in_proj.
+        # With FP8WS_AB_FILE set (lab only; unset by default), a second graph pair is
+        # captured with fp8ws off, and each replay uses the fp8ws graphs while that file
+        # exists and the CUTLASS ones otherwise.
+        self._ab_file = os.environ.get("FP8WS_AB_FILE", "")
+        self._ab = None
+        if self._ab_file:
+            from vllm.model_executor.kernels.linear.scaled_mm import fp8ws
+            if fp8ws.has_packs():
+                on = (self.graph, self.graph_lite, self.hidden, self.logits,
+                      getattr(self, "hidden_lite", None), getattr(self, "logits_lite", None))
+                fp8ws.active = False
+                try:
+                    self.pool = torch.cuda.graph_pool_handle()
+                    self.graph = torch.cuda.CUDAGraph()
+                    for _ in range(2):
+                        self._forward()
+                    torch.cuda.synchronize()
+                    with torch.cuda.graph(self.graph, pool=self.pool):
+                        self.hidden, self.logits = self._forward()
+                    torch.cuda.synchronize()
+                    if self.graph_lite is not None:
+                        self.pool_lite = torch.cuda.graph_pool_handle()
+                        for _ in range(2):
+                            self._forward(lite=True)
+                        torch.cuda.synchronize()
+                        self.graph_lite = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(self.graph_lite, pool=self.pool_lite):
+                            self.hidden_lite, self.logits_lite = self._forward(lite=True)
+                        torch.cuda.synchronize()
+                finally:
+                    fp8ws.active = True
+                off = (self.graph, self.graph_lite, self.hidden, self.logits,
+                       getattr(self, "hidden_lite", None), getattr(self, "logits_lite", None))
+                self._ab = (on, off)
+                self._ab_select()
         # LOCAL PATCH (cudafast-nemotron35): early launch (gpu_model_runner
         # _fresh_prefill_early). The request tensors above are written only by
         # replay(); early_sig names what the last replay wrote them for: the
@@ -171,6 +207,12 @@ class FreshPrefillGraph:
             model.set_last_moe_row_src(None)
         return hidden, logits
 
+    def _ab_select(self):
+        if self._ab is None:
+            return
+        (self.graph, self.graph_lite, self.hidden, self.logits, self.hidden_lite,
+         self.logits_lite) = self._ab[0 if os.path.exists(self._ab_file) else 1]
+
     def plan_state(self):
         return tuple((id(w), getattr(w, "_vp_plan_calls", 0)) for w in self.wrappers)
 
@@ -185,6 +227,7 @@ class FreshPrefillGraph:
         self.logits_indices.fill_(495)
         self.early_sig = None if sig is None else (sig, self.plan_state())
         self.replays += 1
+        self._ab_select()
         if lite and self.graph_lite is not None:
             self.graph_lite.replay()
             return self.hidden_lite, self.logits_lite
@@ -198,6 +241,7 @@ class FreshPrefillGraph:
         only the prompt ids are new."""
         self.input_ids.copy_(input_ids, non_blocking=True)
         self.replays += 1
+        self._ab_select()
         if lite and self.graph_lite is not None:
             self.graph_lite.replay()
             return self.hidden_lite, self.logits_lite

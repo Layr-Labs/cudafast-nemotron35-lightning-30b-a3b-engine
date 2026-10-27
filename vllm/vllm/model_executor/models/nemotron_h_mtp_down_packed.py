@@ -13,6 +13,13 @@ from vllm.triton_utils import tl, triton
 _ENABLED = os.environ.get("MTP_DOWN_PACK12", "1") != "0"
 _FORCE = os.environ.get("MTP_DOWN_PACK12_FORCE", "1") != "0"
 _PACKS = {}
+# LOCAL PATCH (cudafast-nemotron35): pkslots (harness/kernels/pkslots) runs the (64, 4) tile's
+# exact arithmetic in CUDA; admitted per (weights, top-k, word) by prepare's bitwise comparison.
+try:
+    import pkslots as _pkslots
+except ImportError:
+    _pkslots = None
+_PKSLOTS_OK = {}
 
 
 @triton.jit
@@ -61,17 +68,32 @@ def _slots(indices, values, counts,
     else:
         base = (slot - TOPK).to(tl.int64) * I * H
     acc = tl.zeros((BK, BN), tl.float32)
-    for start in range(0, count, BK):
-        pos = start + lane
-        k = tl.load(indices + slot * I + pos, mask=pos < count, other=0)
-        value = tl.load(values + slot * I + pos, mask=pos < count, other=0.0)
-        index = base + k[:, None].to(tl.int64) * H + n[None, :]
-        mask = (pos[:, None] < count) & (n[None, :] < H)
+    # LOCAL PATCH (cudafast-nemotron35): software-pipelined gather. Chunk c + 1's row ids,
+    # values and weight loads are issued before chunk c's products are added, so its gathered
+    # rows are in flight during the math; the products are added in the same chunk order to
+    # the same per-lane accumulators, so every output bit is unchanged.
+    pos = lane
+    k = tl.load(indices + slot * I + pos, mask=pos < count, other=0)
+    value = tl.load(values + slot * I + pos, mask=pos < count, other=0.0)
+    index = base + k[:, None].to(tl.int64) * H + n[None, :]
+    mask = (pos[:, None] < count) & (n[None, :] < H)
+    if slot < TOPK:
+        weight = _load_packed(RSM, REX, RBASE, RRI, RRAW, index, mask, WORD=WORD)
+    else:
+        weight = _load_packed(SSM, SEX, SBASE, SRI, SRAW, index, mask, WORD=WORD)
+    for start in range(BK, count + BK, BK):
+        posn = start + lane
+        kn = tl.load(indices + slot * I + posn, mask=posn < count, other=0)
+        valuen = tl.load(values + slot * I + posn, mask=posn < count, other=0.0)
+        indexn = base + kn[:, None].to(tl.int64) * H + n[None, :]
+        maskn = (posn[:, None] < count) & (n[None, :] < H)
         if slot < TOPK:
-            weight = _load_packed(RSM, REX, RBASE, RRI, RRAW, index, mask, WORD=WORD)
+            weightn = _load_packed(RSM, REX, RBASE, RRI, RRAW, indexn, maskn, WORD=WORD)
         else:
-            weight = _load_packed(SSM, SEX, SBASE, SRI, SRAW, index, mask, WORD=WORD)
+            weightn = _load_packed(SSM, SEX, SBASE, SRI, SRAW, indexn, maskn, WORD=WORD)
         acc += weight.to(tl.float32) * value[:, None].to(tl.float32)
+        weight = weightn
+        value = valuen
     tl.store(part + slot * H + n, tl.sum(acc, axis=0), mask=n < H)
 
 
@@ -227,10 +249,152 @@ def prepare(packed):
                                           key=lambda bn: statistics.median(times[bn]))
         if flags:
             _PACKS[key] = (w, sd, pw, ps, flags)
+            _admit_pkslots(key, w, sd, pw, ps, flags, word, pdl)
         print(f"MTP_DOWN_PACK12 admitted={flags} original_weights_retained=True", flush=True)
     except Exception as exc:
         flags.clear()
         print(f"MTP_DOWN_PACK12 original slots retained: {exc!r}", flush=True)
+
+
+@torch.no_grad()
+def _admit_pkslots(key, w, sd, pw, ps, flags, word, pdl):
+    """Remote-only admission against the ACTUALLY selected packed tile. Preserve
+    all-expert bits probes, then cover row boundaries, changed graph inputs and
+    output canaries. Admit only after warm/cold timing of the actual alternative.
+    The CUDA kernel retains its (64,4) arithmetic; a different reference tile is
+    eligible only when every private output word is identical."""
+    if _pkslots is None or not _pkslots.available():
+        return
+    from .nemotron_h_mtp_compact import _compact
+    try:
+        device = w.device
+        gen = torch.Generator(device=device).manual_seed(64464)
+        for (topk, wd), tile in list(flags.items()):
+            if wd != word:
+                continue
+            slots = topk + 2
+            indices = torch.empty((slots, 1856), dtype=torch.int32, device=device)
+            values = torch.empty((slots, 1856), dtype=torch.bfloat16, device=device)
+            counts = torch.empty(slots, dtype=torch.int32, device=device)
+            old = torch.empty((slots, 2688), dtype=torch.float32, device=device)
+            guard = torch.empty(slots * 2688 + 64, dtype=torch.float32, device=device)
+            new = guard[32:-32].view(slots, 2688)
+            guard.fill_(1713.25)
+            ok = True
+            for first in range(0, 128, topk):
+                ids = ((torch.arange(topk, device=device, dtype=torch.int32) + first) % 128).contiguous()
+                for density in (0.0, 0.015625, 0.125, 0.5, 1.0):
+                    for scale in (0.001, 1., 32.):
+                        h = (torch.randn((slots, 1856), device=device, generator=gen).relu().square() * scale).to(torch.bfloat16)
+                        h *= (torch.rand(h.shape, device=device, generator=gen) < density)
+                        h.view(torch.int16)[:, :4] = torch.tensor(
+                            [0, -32768, 1, -32767], dtype=torch.int16, device=device)
+                        if first == 0 and density == 1.0 and scale == 1.:
+                            h.view(torch.int16)[:, 4:6] = torch.tensor(
+                                [32640, -128], dtype=torch.int16, device=device)
+                        if first == 0 and density == 1.0 and scale == 32.:
+                            h.view(torch.int16)[:, 4:6] = torch.tensor(
+                                [32704, -64], dtype=torch.int16, device=device)
+                        if density == 0.0:
+                            h.zero_()
+                        _compact[(slots,)](h, indices, values, counts, I=1856, BLOCK=2048, num_warps=4)
+                        old.fill_(float("nan"))
+                        new.fill_(float("nan"))
+                        _new(pw, ps, indices, values, counts, ids, old, tile, word, pdl)
+                        if not _pkslots.run(indices, values, counts, pw.planes, ps.planes, ids, new, pdl):
+                            ok = False
+                            break
+                        if not torch.equal(old.view(torch.int32), new.view(torch.int32)):
+                            ok = False
+                            break
+                    if not ok:
+                        break
+                if not ok:
+                    break
+            if ok:
+                ok = _pkslots_boundaries_and_speed(
+                    pw, ps, indices, values, counts, ids, old, new, guard,
+                    tile, word, pdl, gen)
+            if ok:
+                _PKSLOTS_OK[(key, topk, word)] = True
+        print(f"MTP_DOWN_PKSLOTS admitted={sorted(k[1:] for k in _PKSLOTS_OK if k[0] == key)}", flush=True)
+    except Exception as exc:  # noqa: BLE001 - any failure keeps _slots
+        for k in [k for k in _PKSLOTS_OK if k[0] == key]:
+            del _PKSLOTS_OK[k]
+        print(f"MTP_DOWN_PKSLOTS unavailable, _slots kept: {exc!r}", flush=True)
+
+
+def _pkslots_boundaries_and_speed(pw, ps, indices, values, counts, ids,
+                                 old, new, guard, tile, word, pdl, gen):
+    """Private startup work; no output or cache from a scored request is reused."""
+    from .nemotron_h_mtp_compact import _compact
+    slots = ids.numel() + 2
+    h = torch.empty((slots, 1856), dtype=torch.bfloat16, device=new.device)
+
+    def check():
+        return (torch.equal(old.view(torch.int32), new.view(torch.int32))
+                and bool((guard[:32] == 1713.25).all())
+                and bool((guard[-32:] == 1713.25).all()))
+
+    def original():
+        _new(pw, ps, indices, values, counts, ids, old, tile, word, pdl)
+
+    def proposed():
+        if not _pkslots.run(indices, values, counts, pw.planes, ps.planes, ids, new, pdl):
+            raise ValueError("cooperative pkslots launch declined")
+
+    for count in (0, 1, 63, 64, 65, 127, 128, 129, 1855, 1856):
+        h.copy_((torch.rand(h.shape, device=h.device, generator=gen) + 0.01).to(h.dtype))
+        h[:, count:] = 0
+        _compact[(slots,)](h, indices, values, counts, I=1856, BLOCK=2048, num_warps=4)
+        original()
+        proposed()
+        if not check():
+            return False
+    # Compile and load before capture; replay with changed live ids/values/counts.
+    original()
+    proposed()
+    torch.cuda.synchronize(h.device)
+    old_graph, new_graph = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
+    with torch.cuda.graph(old_graph):
+        original()
+    with torch.cuda.graph(new_graph):
+        proposed()
+    for trial in range(3):
+        ids.copy_(((torch.arange(ids.numel(), device=ids.device) + 17 * trial) % 128).to(ids.dtype))
+        h.copy_(torch.randn(h.shape, device=h.device, generator=gen).relu().square().to(h.dtype))
+        h[:, trial + 63:] = 0
+        _compact[(slots,)](h, indices, values, counts, I=1856, BLOCK=2048, num_warps=4)
+        old_graph.replay()
+        new_graph.replay()
+        if not check():
+            return False
+    # Same selected policy, same private inputs, alternating order, graph replay
+    # as in production. Cache pressure is local private scratch, outside timing.
+    flush = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=h.device)
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    ratios = []
+    for density in (0.015625, 0.125, 0.5, 1.0):
+        h.copy_(torch.randn(h.shape, device=h.device, generator=gen).relu().square().to(h.dtype))
+        h *= (torch.rand(h.shape, device=h.device, generator=gen) < density)
+        _compact[(slots,)](h, indices, values, counts, I=1856, BLOCK=2048, num_warps=4)
+        for cold in (False, True):
+            times = [[], []]
+            for trial in range(5):
+                for which in ((0, 1) if trial % 2 == 0 else (1, 0)):
+                    if cold:
+                        flush.zero_()
+                    start.record()
+                    (old_graph if which == 0 else new_graph).replay()
+                    end.record()
+                    end.synchronize()
+                    times[which].append(start.elapsed_time(end))
+            if not check():
+                return False
+            ratios.append(statistics.median(times[1]) / statistics.median(times[0]))
+    admitted = statistics.median(ratios) < 0.98 and max(ratios) < 1.03
+    print(f"MTP_DOWN_PKSLOTS cooperative tile={tile} ratios={ratios} admitted={admitted}", flush=True)
+    return admitted
 
 
 def maybe_slots(packed, indices, values, counts, ids, part, pdl):
@@ -245,5 +409,8 @@ def maybe_slots(packed, indices, values, counts, ids, part, pdl):
     bn = entry[4].get((ids.numel(), word))
     if bn is None:
         return False
+    if (_PKSLOTS_OK.get(((w.data_ptr(), sd.data_ptr()), ids.numel(), word))
+            and _pkslots.run(indices, values, counts, entry[2].planes, entry[3].planes, ids, part, pdl)):
+        return True
     _new(entry[2], entry[3], indices, values, counts, ids, part, bn, word, pdl)
     return True

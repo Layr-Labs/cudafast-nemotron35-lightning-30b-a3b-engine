@@ -1809,7 +1809,7 @@ static int launch_pair(const Params& p, cudaStream_t stream) {
 // 663 is 653 reading the 6-bit scale plane (to_s6)
 #define ZSKIP_LEAN_CONFIGS(X) X(604, 1, 2, 260) X(613, 1, 2, 2820) X(616, 1, 2, 2824) X(630, 1, 2, 0) \
   X(640, 1, 3, 272) X(645, 1, 4, 272) X(653, 1, 3, 274) X(656, 1, 4, 274) X(658, 1, 2, 274) \
-  X(663, 1, 3, 306)
+  X(663, 1, 3, 306) X(673, 1, 3, 338)
 template <int WPC, int R, int F>
 static int launch_lean(const Params& p, cudaStream_t stream) {
 #ifndef ZSKIP_NO_PDL
@@ -1918,6 +1918,17 @@ static int launch3(const Params& p, cudaStream_t stream, int ctas_per_sm) {
   X(8, 7, 32, 3, 8, 4) X(9, 3, 32, 4, 8, 6)
 
 extern "C" {
+
+// Optional read-only format-helper qualification; writes only private outputs.
+int zskip_fp4_scaled_probe(void* old_words, void* new_words, void* stream) {
+#ifndef ZSKIP_NO_PAIR
+  scaled_fp4_oracle<<<8, 128, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+      static_cast<uint32_t*>(old_words), static_cast<uint32_t*>(new_words));
+  return static_cast<int>(cudaGetLastError());
+#else
+  return -1;
+#endif
+}
 
 int zskip_set_c3lpt(int on) { g_c3lpt = on ? 1 : 0; return 0; }
 

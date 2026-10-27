@@ -51,7 +51,7 @@ CONFIGS4.update({500: (2, 2, 4, 32), 501: (6, 2, 4, 32), 502: (6, 4, 4, 32), 503
 CONFIGS4[108] = (2, 4, 1, 16)
 # swap2 decode pairs: 113/118 (unfused/fused prep) and their empty-half dequant skips 114/119
 # lean paired decode (csrc/zskip_lean.cuh): config -> (warps per CTA, ring depth, flags); default 653
-LEAN_CONFIGS = {604: (1, 2, 260), 613: (1, 2, 2820), 616: (1, 2, 2824), 630: (1, 2, 0), 640: (1, 3, 272), 645: (1, 4, 272), 653: (1, 3, 274), 656: (1, 4, 274), 658: (1, 2, 274), 663: (1, 3, 306)}
+LEAN_CONFIGS = {604: (1, 2, 260), 613: (1, 2, 2820), 616: (1, 2, 2824), 630: (1, 2, 0), 640: (1, 3, 272), 645: (1, 4, 272), 653: (1, 3, 274), 656: (1, 4, 274), 658: (1, 2, 274), 663: (1, 3, 306), 673: (1, 3, 338)}
 # 663: config 653 reading the 6-bit scale plane of to_s6() (S6_BASE must match csrc/zskip_lean.cuh)
 S6_CONFIGS = (663,)
 S6_BASE = 62
@@ -74,6 +74,10 @@ def _load():
         lib.zskip_init.restype = ctypes.c_int
         lib.zskip_config.argtypes = [ctypes.c_int, ctypes.c_void_p]
         lib.zskip_config.restype = ctypes.c_int
+        direct_probe = getattr(lib, "zskip_fp4_scaled_probe", None)
+        if direct_probe is not None:
+            direct_probe.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+            direct_probe.restype = ctypes.c_int
         P, LL, I = ctypes.c_void_p, ctypes.c_longlong, ctypes.c_int
         lib.zskip_down.argtypes = [P, LL, I, P, P, P, I, P, P, P, P, LL, LL, LL, LL, LL, LL, LL, I, P, I, P, P, I, P, P]
         lib.zskip_down.restype = ctypes.c_int
@@ -333,11 +337,26 @@ def to_swapc(pk: Packed) -> Packed:
     return Packed(W, S, pk.gs, "swapc", ((N // 64) * G * 512, G * 512, 512, (N // 64) * G * 64, G * 64, 64))
 
 
+def scaled_fp4_probe(old: torch.Tensor, new: torch.Tensor) -> bool:
+    """Official-remote-only all signed code pairs via actual old GPU arithmetic."""
+    lib = _load()
+    fn = getattr(lib, "zskip_fp4_scaled_probe", None) if lib is not None else None
+    if fn is None:
+        return False
+    if (old.dtype != torch.int32 or new.dtype != torch.int32
+            or old.numel() != 1024 or new.numel() != 1024
+            or not old.is_cuda or old.device != new.device
+            or not old.is_contiguous() or not new.is_contiguous()):
+        return False
+    return fn(old.data_ptr(), new.data_ptr(), torch.cuda.current_stream(old.device).cuda_stream) == 0
+
+
 def down(a: torch.Tensor, sorted_ids: torch.Tensor, expert_ids: torch.Tensor, num_tokens_padded: torch.Tensor,
          packed: Packed, out: torch.Tensor, mode: int = SKIP, config: int | None = None,
          max_blocks: int | None = None, stats: torch.Tensor | None = None, ctas_per_sm: int = 0,
          trace: torch.Tensor | None = None,
-         verify_rows: torch.Tensor | None = None) -> torch.Tensor:
+         verify_rows: torch.Tensor | None = None,
+         allow_pdl_fallback: bool = True) -> torch.Tensor:
     """out[r] = humming w2 output row r for the moe_align layout (block 16) of a <= 4-token call.
     a: bf16 [shape_m, K] (relu^2 activations, rows = token * top_k + slot); out: bf16 [shape_m, N]."""
     global _pdl_on
@@ -373,7 +392,7 @@ def down(a: torch.Tensor, sorted_ids: torch.Tensor, expert_ids: torch.Tensor, nu
             launch = prefix_launch
             args += (verify_rows.data_ptr(),)
     rc = launch(*args)
-    if rc != 0 and _pdl_on and not torch.cuda.is_current_stream_capturing():
+    if rc != 0 and _pdl_on and allow_pdl_fallback and not torch.cuda.is_current_stream_capturing():
         # The PDL launch was rejected (the first calls run eagerly, before any capture):
         # use ordinary launches from now on and redo this call.
         lib.zskip_set_pdl(0)

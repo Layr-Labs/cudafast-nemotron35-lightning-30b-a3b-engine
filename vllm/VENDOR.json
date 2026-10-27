@@ -642,6 +642,18 @@
     {
       "file": "(composition)",
       "why": "e-man07 composition on the record a1cf20d1-8d18-4f7d-942f-df2e17245deb: our nx2 tree (jungjipdo 96d0992b-4f98-4992-86b7-82174c6ea20f, leech1996 6f6ff439-186f-4cea-97ac-6f3e8f2be9af, ercumentyildirim 456feb71-1622-488c-9487-79ae5b9deaa8, i34-9 55ed2064-a023-4b5e-9fc1-da25829ef0db, terrapinelf ca2ae19c-8f8a-4dff-9c23-88cf297efe51 as carried in leech1996 c5670d92-e925-4a20-ad66-d75e07ada6d5) plus i34-9 8b406fa2-8fbf-4867-a9fb-7a8b40915ae3's fp8ws prefill Mamba in_proj kernel, files byte for byte. No new arithmetic. Re-measurement #1."
+    },
+    {
+      "file": "v1/spec_decode/nemotron_step_cond.py (ENABLED default)",
+      "why": "e-man07: NEMO_MTP_STEP_COND defaults to 0 on our record 4ae55271-d4bd-44f6-adf0-1f731b273822, so the drafter loop takes the record's per-pass path (the full-step graph and screen.greedy) instead of leech1996's conditional single-row step graph. NEMO_MTP_STEP_COND=1 restores the step graph. Default only; the step graph's code and its admission are unchanged. Re-measurement #1."
+    },
+    {
+      "file": "harness/kernels/fp8ws (csrc/fp8ws.cu templated on (N,K), py); model_executor/kernels/linear/scaled_mm/fp8ws.py (shape set); harness/tests/fp8ws_exact.py",
+      "why": "e-man07 (ours): i34-9's fp8ws kernel (8b406fa2-8fbf-4867-a9fb-7a8b40915ae3) templated on (N, K) so it also serves the 496-row prefill Mamba out_proj (N=2688, K=4096) with the same 256x112 tiles (48 tiles, one wave on 48 SMs). Same arithmetic as CUTLASS: native e4m3 m16n8k32 MMA, one ascending-K chain per output from +0, FP32 scale-B then scale-A, one RN to BF16. Each layer is still admitted at load only if its pack inverts and its output equals ops.cutlass_scaled_mm bit for bit (46 of 46 projections admitted, 230/230 cases bit-exact on our box); otherwise CUTLASS. Re-measurement #2."
+    },
+    {
+      "file": "vllm/model_executor/layers/mamba/ops/ssd_prefill_fused.py; ssd_causal_cb.py",
+      "why": "Optional causal CB prefix scan: within the original grid, tile0 forms64 columns, tile1 forms128, later tiles retain fullCHUNK. Removes CB values the causal scan never consumes; preserves original K32 dot order, all head arithmetic, state pass/cache and output ownership. One launch with CTA-uniform branches, same warp/stage settings. Full boundary/cache/output word and changed-input graph plus warm/pressure complete-pipeline margin checks on official remote only; refusal retains original. New branch compilation, activation and performance unverified."
     }
   ]
 }

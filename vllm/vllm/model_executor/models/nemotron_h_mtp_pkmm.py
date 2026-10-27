@@ -104,7 +104,7 @@ def prepare(p, word):
     This function executes only in the official remote resident. A failed
     compiler, bit check or four-percent speed check leaves the original path.
     """
-    if (not _ENABLED or tuple(p.shape) not in _CONFIGS
+    if (not _ENABLED or tuple(p.shape) not in _CONFIGS or p.planes[2].dtype == torch.int32
             or torch.cuda.is_current_stream_capturing()):
         return
     identity = _identity(p)

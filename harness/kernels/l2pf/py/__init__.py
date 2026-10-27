@@ -287,6 +287,12 @@ def packed_ranges(planes, budget: int) -> list:
     within budget bytes, the block metadata first (every load reads it before the
     value planes)."""
     sm, ex, base, ri = planes[:4]
+    if base.dtype == torch.int32:
+        values = min(sm.numel(), int(budget / (1.375 + 12 / 128)))
+        values -= values % 256
+        if values <= 0:
+            return []
+        return [(base, values // 128 * 12), (sm, values), (ex, values * 3 // 8)]
     values = min(sm.numel(), int(budget / (1.5 + 5 / 128)))
     values -= values % 256
     if values <= 0:

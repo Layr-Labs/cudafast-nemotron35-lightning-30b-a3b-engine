@@ -8,6 +8,7 @@ same confidence gate as the BF16 kernels: a set stop flag masks every weight
 load, so a stopped draft pass writes zeros and streams no packed weights.
 """
 import os
+import statistics
 import time
 from dataclasses import dataclass
 
@@ -143,7 +144,105 @@ def _admit_group8(packed, original):
 
 
 @gluon.jit
+def _popc(x):
+    return tl.inline_asm_elementwise("popc.b32 $0, $1;", "=r,r", [x], dtype=tl.int32,
+                                     is_pure=True, pack=1)
+
+
+@gluon.jit
+def load_code11(SM, EX, REC, SB, RAW, index, mask, EVICT:tl.constexpr=True,
+                LAST:tl.constexpr=True):
+    """BF16 bits of the 11-bit code. Per 32 values: three bit-plane words of a 3-bit
+    exponent code (1..7: base + code - 1; 0: the block's next listed exponent). Per 128
+    values: a record (base, group starts, raw flag; up to 8 listed exponents). Raw blocks
+    keep their 16-bit values in RAW, located through the per-4096-value mask and start."""
+    words = EX.to(tl.pointer_type(tl.uint32)) + (index // 32) * 3
+    rec = REC + (index // 128) * 3
+    sm = tl.load(SM + index, mask=mask, other=0, eviction_policy='evict_last' if (EVICT == 2 and LAST) else ('evict_first' if EVICT else '')).to(tl.uint32)
+    w0 = tl.load(words, mask=mask, other=0, eviction_policy='evict_last' if (EVICT == 2 and LAST) else ('evict_first' if EVICT else ''))
+    w1 = tl.load(words + 1, mask=mask, other=0, eviction_policy='evict_last' if (EVICT == 2 and LAST) else ('evict_first' if EVICT else ''))
+    w2 = tl.load(words + 2, mask=mask, other=0, eviction_policy='evict_last' if (EVICT == 2 and LAST) else ('evict_first' if EVICT else ''))
+    hdr = tl.load(rec, mask=mask, other=0, eviction_policy='evict_last' if (EVICT == 2 and LAST) else ('evict_first' if EVICT else ''))
+    i0 = tl.load(rec + 1, mask=mask, other=0, eviction_policy='evict_last' if (EVICT == 2 and LAST) else ('evict_first' if EVICT else '')).to(tl.uint32)
+    i1 = tl.load(rec + 2, mask=mask, other=0, eviction_policy='evict_last' if (EVICT == 2 and LAST) else ('evict_first' if EVICT else '')).to(tl.uint32)
+    j = (index % 32).to(tl.uint32)
+    code = ((w0 >> j) & 1) | (((w1 >> j) & 1) << 1) | (((w2 >> j) & 1) << 2)
+    r = (((hdr >> (8 + 4 * ((index // 32) % 4)).to(tl.int32)) & 15).to(tl.uint32)
+         + _popc(~(w0 | w1 | w2) & (((j * 0 + 1) << j) - 1)).to(tl.uint32)) & 7
+    esc = (tl.where(r < 4, i0, i1) >> ((r % 4) * 8)) & 255
+    exp = tl.where(code == 0, esc, (hdr & 255).to(tl.uint32) + code - 1)
+    bits = ((sm & 128) << 8) | (exp << 7) | (sm & 127)
+    sbp = SB + (index // 4096) * 2
+    raw = mask & (hdr < 0)
+    sbm = tl.load(sbp, mask=raw, other=0).to(tl.uint32)
+    sbs = tl.load(sbp + 1, mask=raw, other=0)
+    blk = ((index // 128) % 32).to(tl.uint32)
+    ridx = sbs + _popc(sbm & (((blk * 0 + 1) << blk) - 1))
+    rv = tl.load(RAW + ridx.to(tl.int64) * 128 + index % 128, mask=raw, other=0).to(tl.uint32)
+    bits = tl.where(raw, rv, bits)
+    return tl.where(mask, bits, 0).to(tl.uint16)
+
+
+@gluon.jit
+def _spread8(b):
+    x = (b | (b << 12)) & 0x000F000F
+    x = (x | (x << 6)) & 0x03030303
+    return (x | (x << 3)) & 0x11111111
+
+
+@gluon.jit
+def load_code11_chunks(SM, EX, REC, SB, RAW, index, lane, mask, value_mask,
+                       EVICT:tl.constexpr=True, LAST:tl.constexpr=True):
+    """load_code11 for 8-value chunks: index holds chunk starts (multiples of 8), lane
+    0..7; the chunk's code bits, escape mask and list position are formed once."""
+    words = EX.to(tl.pointer_type(tl.uint32)) + (index // 32) * 3
+    rec = REC + (index // 128) * 3
+    index8 = index[:, None] + lane[None, :]
+    sm = tl.load(SM + index8, mask=value_mask, other=0, eviction_policy='evict_last' if (EVICT == 2 and LAST) else ('evict_first' if EVICT else '')).to(tl.uint32)
+    w0 = tl.load(words, mask=mask, other=0, eviction_policy='evict_last' if (EVICT == 2 and LAST) else ('evict_first' if EVICT else ''))
+    w1 = tl.load(words + 1, mask=mask, other=0, eviction_policy='evict_last' if (EVICT == 2 and LAST) else ('evict_first' if EVICT else ''))
+    w2 = tl.load(words + 2, mask=mask, other=0, eviction_policy='evict_last' if (EVICT == 2 and LAST) else ('evict_first' if EVICT else ''))
+    hdr = tl.load(rec, mask=mask, other=0, eviction_policy='evict_last' if (EVICT == 2 and LAST) else ('evict_first' if EVICT else ''))
+    i0 = tl.load(rec + 1, mask=mask, other=0, eviction_policy='evict_last' if (EVICT == 2 and LAST) else ('evict_first' if EVICT else '')).to(tl.uint32)
+    i1 = tl.load(rec + 2, mask=mask, other=0, eviction_policy='evict_last' if (EVICT == 2 and LAST) else ('evict_first' if EVICT else '')).to(tl.uint32)
+    j0 = (index % 32).to(tl.uint32)
+    b0 = (w0 >> j0) & 255
+    b1 = (w1 >> j0) & 255
+    b2 = (w2 >> j0) & 255
+    codes = _spread8(b0) | (_spread8(b1) << 1) | (_spread8(b2) << 2)
+    m = (b0 | b1 | b2) ^ 255
+    first = (((hdr >> (8 + 4 * ((index // 32) % 4)).to(tl.int32)) & 15).to(tl.uint32)
+             + _popc(~(w0 | w1 | w2) & (((j0 * 0 + 1) << j0) - 1)).to(tl.uint32))
+    lu = lane.to(tl.uint32)
+    code = (codes[:, None] >> (lu[None, :] * 4)) & 7
+    r = (first[:, None] + _popc(m[:, None] & (((lu[None, :] * 0 + 1) << lu[None, :]) - 1)).to(tl.uint32)) & 7
+    esc = (tl.where(r < 4, i0[:, None], i1[:, None]) >> ((r % 4) * 8)) & 255
+    exp = tl.where(code == 0, esc, (hdr & 255).to(tl.uint32)[:, None] + code - 1)
+    bits = ((sm & 128) << 8) | (exp << 7) | (sm & 127)
+    sbp = SB + (index // 4096) * 2
+    raw = mask & (hdr < 0)
+    sbm = tl.load(sbp, mask=raw, other=0).to(tl.uint32)
+    sbs = tl.load(sbp + 1, mask=raw, other=0)
+    blk = ((index // 128) % 32).to(tl.uint32)
+    ridx = sbs + _popc(sbm & (((blk * 0 + 1) << blk) - 1))
+    raw8 = value_mask & raw[:, None]
+    rv = tl.load(RAW + (ridx.to(tl.int64) * 128 + index % 128)[:, None] + lane[None, :], mask=raw8, other=0).to(tl.uint32)
+    bits = tl.where(raw8, rv, bits)
+    return tl.where(value_mask, bits, 0).to(tl.uint16)
+
+
+@gluon.jit
 def load_packed(SM, EX, BASE, RI, RAW, index, mask, EVICT:tl.constexpr=True,
+                WORD:tl.constexpr=False):
+    if BASE.dtype.element_ty == tl.int32:
+        w = load_code11(SM, EX, BASE, RI, RAW, index, mask, EVICT=EVICT).to(tl.bfloat16, bitcast=True)
+    else:
+        w = load_code12(SM, EX, BASE, RI, RAW, index, mask, EVICT=EVICT, WORD=WORD)
+    return w
+
+
+@gluon.jit
+def load_code12(SM, EX, BASE, RI, RAW, index, mask, EVICT:tl.constexpr=True,
                 WORD:tl.constexpr=False):
     # LOCAL PATCH (drafter3): EVICT 1 (or True) loads evict-first, 2 evict-last (a weight
     # every draft pass of a cycle reads), 0 (or False) with the default policy.
@@ -187,6 +286,16 @@ def stopped_zero(ptrs, mask, lay:tl.constexpr, BN:tl.constexpr):
 
 @gluon.jit
 def load_packed_group8(SM, EX, BASE, RI, RAW, index, lane, mask, value_mask,
+                       EVICT:tl.constexpr=True):
+    if BASE.dtype.element_ty == tl.int32:
+        w=load_code11_chunks(SM,EX,BASE,RI,RAW,index,lane,mask,value_mask,EVICT=EVICT,LAST=False).to(tl.bfloat16,bitcast=True)
+    else:
+        w=load_group8_code12(SM,EX,BASE,RI,RAW,index,lane,mask,value_mask,EVICT=EVICT)
+    return w
+
+
+@gluon.jit
+def load_group8_code12(SM, EX, BASE, RI, RAW, index, lane, mask, value_mask,
                        EVICT:tl.constexpr=True):
     bid=index//128
     rawid=tl.load(RI+bid,mask=mask,other=-1,eviction_policy='evict_first' if EVICT else '')
@@ -363,8 +472,252 @@ class PackedBF16:
         return sum(t.numel() * t.element_size() for t in self.planes)
 
 
+_PACK11 = os.environ.get("MTP_PACK11", "1") != "0"
+
+
 @torch.no_grad()
-def pack_bf16(w, check_group8=False):
+def encode_code11(w):
+    """Input-independent GPU encode of BF16 w (rows a multiple of 128 values) into the
+    planes (sm, ex, rec, sb, raw) read by load_code11. Lossless by construction;
+    pack_code11 verifies every value."""
+    n = w.numel()
+    nb = n // 128
+    nsb = (nb + 31) // 32
+    flat = w.view(torch.int16).reshape(-1)
+    dev = w.device
+    sm = torch.empty(n, dtype=torch.uint8, device=dev)
+    ex = torch.empty(nb * 12, dtype=torch.int32, device=dev)
+    rec = torch.zeros((nb, 3), dtype=torch.int64, device=dev)
+    israw = torch.empty(nb, dtype=torch.bool, device=dev)
+    shifts = torch.arange(32, dtype=torch.int64, device=dev)
+    step = 16384
+    for first in range(0, nb, step):
+        last = min(first + step, nb)
+        bits = flat[first * 128:last * 128].to(torch.int32).reshape(-1, 128) & 65535
+        exp = ((bits >> 7) & 255).to(torch.int64)
+        hist = torch.zeros((last - first, 256), dtype=torch.int32, device=dev)
+        hist.scatter_add_(1, exp, torch.ones_like(exp, dtype=torch.int32))
+        csum = torch.nn.functional.pad(hist.cumsum(1), (1, 0))
+        base = (csum[:, 7:257] - csum[:, 0:250]).argmax(1)
+        inwin = (exp >= base[:, None]) & (exp <= base[:, None] + 6)
+        out = ~inwin
+        count = out.sum(1)
+        raw = count > 8
+        code = torch.where(inwin | raw[:, None], exp - base[:, None] + 1, 0)
+        code = torch.where(raw[:, None], 1, code)
+        sm[first * 128:last * 128].copy_((((bits >> 8) & 128) | (bits & 127)).reshape(-1))
+        planes = ((code.reshape(-1, 32, 1) >> torch.arange(3, device=dev)) & 1)
+        words = (planes << shifts[None, :, None]).sum(1)
+        words = torch.where(words >= 2 ** 31, words - 2 ** 32, words)
+        ex[first * 12:last * 12].copy_(words.reshape(-1).to(torch.int32))
+        group = (out & ~raw[:, None]).reshape(-1, 4, 32).sum(2).to(torch.int64)
+        pre = group.cumsum(1)
+        hdr = base | (pre[:, 0] << 12) | (pre[:, 1] << 16) | (pre[:, 2] << 20)
+        hdr = torch.where(raw, -2 ** 31, hdr)
+        # listed exponents in element order, at most 8 per coded block
+        rank = (out.to(torch.int64).cumsum(1) - 1).clamp(min=0)
+        keep = out & ~raw[:, None]
+        slot = torch.full_like(exp, 8)
+        slot = torch.where(keep, rank, slot)
+        lst = torch.zeros((last - first, 9), dtype=torch.int64, device=dev)
+        lst.scatter_(1, slot, torch.where(keep, exp, 0))
+        lo = lst[:, 0] | (lst[:, 1] << 8) | (lst[:, 2] << 16) | (lst[:, 3] << 24)
+        hi = lst[:, 4] | (lst[:, 5] << 8) | (lst[:, 6] << 16) | (lst[:, 7] << 24)
+        rec[first:last, 0] = hdr
+        rec[first:last, 1] = torch.where(lo >= 2 ** 31, lo - 2 ** 32, lo)
+        rec[first:last, 2] = torch.where(hi >= 2 ** 31, hi - 2 ** 32, hi)
+        israw[first:last] = raw
+    nraw = int(israw.sum().item())
+    padded = torch.zeros(nsb * 32, dtype=torch.int64, device=dev)
+    padded[:nb] = israw.to(torch.int64)
+    sbmask = (padded.reshape(nsb, 32) << shifts).sum(1)
+    sbmask = torch.where(sbmask >= 2 ** 31, sbmask - 2 ** 32, sbmask)
+    sbcount = padded.reshape(nsb, 32).sum(1)
+    sb = torch.stack([sbmask, sbcount.cumsum(0) - sbcount], 1).reshape(-1).to(torch.int32)
+    raws = torch.zeros((max(1, nraw), 128), dtype=torch.int16, device=dev)
+    if nraw:
+        sel = torch.nonzero(israw).reshape(-1)
+        raws.index_copy_(0, torch.arange(nraw, device=dev),
+                         flat.reshape(-1, 128).index_select(0, sel))
+    return PackedBF16(tuple(w.shape), (sm, ex, rec.reshape(-1).to(torch.int32), sb,
+                                       raws.reshape(-1).view(torch.uint16))), nraw
+
+
+def _probe_pairs(old, new, k):
+    """Bytewise outputs of every drafter kernel family on old and new planes of the
+    same rows (single-row GEMV with and without grouped loads, gated and stopped,
+    small-M MMA, MoE up)."""
+    dev = old.planes[0].device
+    n = old.shape[0]
+    gen = torch.Generator(device=dev).manual_seed(11056)
+    ids = torch.zeros(1, dtype=torch.int32, device=dev)
+    for scale in (0.001, 1.0, 32.0):
+        x = (torch.randn((5, k), dtype=torch.float32, generator=gen, device=dev)
+             * scale).to(torch.bfloat16)
+        x.view(torch.int16)[:, :8] = torch.tensor(
+            [0, -32768, 1, -32767, 128, -32640, 32640, -128], dtype=torch.int16, device=dev)
+        for stop in (0, 1):
+            gate = torch.zeros(3, dtype=torch.int32, device=dev)
+            gate[0] = stop
+            outs = []
+            for p in (old, new):
+                r = []
+                for word in (False, True):
+                    for grouped in (False, True):
+                        for ev in (True, 2):
+                            y = x.new_empty((1, n))
+                            packed_gemv[(triton.cdiv(n, 8),)](
+                                x, *p.planes, y, n, k, k, gate, BN=8, BK=512,
+                                EVICT=ev, GATED=True, WORD=word, GROUP8=grouped,
+                                num_warps=4, num_stages=3)
+                            r.append(y)
+                    for rows in (2, 5):
+                        y = x.new_empty((rows, n))
+                        packed_small[(triton.cdiv(n, 64),)](
+                            x, *p.planes, y, rows, n, k, x.stride(0), y.stride(0), gate,
+                            GATED=True, WORD=word, num_warps=4, num_stages=4)
+                        r.append(y)
+                    rows = min(n // 2, 64)
+                    for grouped in (False, True):
+                        c = x.new_empty((2, rows))
+                        packed_moe_up[(triton.cdiv(rows, 2), 2)](
+                            x, *p.planes, *p.planes, ids, c, rows, k,
+                            2 * rows * k, k, k, gate, TOPK=1, BN=2, BK=1024,
+                            EVICT=True, GATED=True, WN=2, WORD=word, GROUP8=grouped,
+                            num_warps=8, num_stages=3)
+                        r.append(c)
+                outs.append(r)
+            for a, b in zip(*outs):
+                if not torch.equal(a.view(torch.int16), b.view(torch.int16)):
+                    return False
+    return True
+
+
+_PACK11_SPEED = os.environ.get("MTP_PACK11_SPEED", "1") != "0"
+
+
+def _cold_ratio(run_old, run_new, device, trials=31):
+    """Paired cold (L2-flushed) timings, alternating order: (median of new/old per
+    pair, 80th percentile of it)."""
+    flush = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=device)
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    ratios = []
+    for trial in range(trials + 2):
+        pair = [0.0, 0.0]
+        for which in ((0, 1) if trial % 2 == 0 else (1, 0)):
+            flush.zero_()
+            start.record()
+            (run_old, run_new)[which]()
+            end.record()
+            end.synchronize()
+            pair[which] = start.elapsed_time(end)
+        if trial >= 2:
+            ratios.append(pair[1] / pair[0])
+    ratios.sort()
+    return statistics.median(ratios), ratios[int(0.8 * (len(ratios) - 1))]
+
+
+def _faster(ratio):
+    return ratio[0] < 0.99 and ratio[1] < 1.0
+
+
+def _linear_ratio(old, new, w):
+    n, k = new.shape
+    dev = new.planes[0].device
+    gate = torch.zeros(3, dtype=torch.int32, device=dev)
+    x = torch.randn((5, k), device=dev, generator=torch.Generator(device=dev).manual_seed(5)).to(torch.bfloat16)
+    y = x.new_empty((5, n))
+
+    def run(p, grouped):
+        def f():
+            for _ in range(3):
+                packed_gemv[(triton.cdiv(n, 8),)](
+                    x, *p.planes, y, n, k, k, gate, BN=8, BK=512, EVICT=True,
+                    GATED=True, WORD=False, GROUP8=grouped, num_warps=4, num_stages=3)
+            packed_small[(triton.cdiv(n, 64),)](
+                x, *p.planes, y, 5, n, k, x.stride(0), y.stride(0), gate,
+                GATED=True, num_warps=4, num_stages=4)
+        return f
+    grouped = group8_enabled(dev, n, k)
+    _GROUP8_OK.pop((_device_index(dev), n, k), None)
+    _admit_group8(old, w)
+    old_grouped = group8_enabled(dev, n, k)
+    _GROUP8_OK[(_device_index(dev), n, k)] = grouped
+    return _cold_ratio(run(old, old_grouped), run(new, grouped), dev)
+
+
+@torch.no_grad()
+def pack_moe_up11(up, su):
+    """11-bit planes for the routed and shared up weights, or (None, None): both must
+    pass pack_code11 and the MoE up kernel must run faster on them (cold, at load)."""
+    pu = pack_code11(up)
+    ps = pack_code11(su) if pu is not None else None
+    if pu is None or ps is None or not _PACK11_SPEED:
+        return pu, ps
+    try:
+        dev = up.device
+        sub = up[:16].contiguous()
+        old_u, new_u = pack_bf16(sub, quiet=True), encode_code11(sub)[0]
+        old_s = pack_bf16(su, quiet=True)
+        e, inter, h = up.shape
+        gen = torch.Generator(device=dev).manual_seed(6)
+        ids = torch.randperm(16, generator=gen, device=dev)[:6].to(torch.int32)
+        x = torch.randn((1, h), generator=gen, device=dev).to(torch.bfloat16)
+        out = torch.empty((8, inter), dtype=torch.bfloat16, device=dev)
+        gate = torch.zeros(3, dtype=torch.int32, device=dev)
+
+        def run(a, b):
+            def f():
+                packed_moe_up[(triton.cdiv(inter, 16), 8)](
+                    x, *a.planes, *b.planes, ids, out, inter, h, inter * h, h, h, gate,
+                    TOPK=6, BN=16, BK=1024, EVICT=True, GATED=True, WN=2,
+                    num_warps=8, num_stages=3)
+            return f
+        ratio = _cold_ratio(run(old_u, old_s), run(new_u, ps), dev)
+        print(f"MTP_PACK11 moe_up cold time ratio median={ratio[0]:.4f} p80={ratio[1]:.4f}",
+              flush=True)
+        if _faster(ratio):
+            return pu, ps
+    except Exception as exc:  # noqa: BLE001
+        print(f"MTP_PACK11 moe_up timing failed: {exc!r}", flush=True)
+    return None, None
+
+
+@torch.no_grad()
+def pack_code11(w):
+    """11-bit planes for w, used only when every decoded value equals w's bits and the
+    drafter kernels give bytewise the outputs of the 12-bit planes on w's leading rows.
+    None keeps the 12-bit planes."""
+    if (not _PACK11 or not w.is_cuda or w.dtype != torch.bfloat16 or not w.is_contiguous()
+            or w.dim() < 2 or w.shape[-1] % 128 or w.numel() % 128):
+        return None
+    try:
+        new, escapes = encode_code11(w)
+        n = w.numel()
+        counter = torch.zeros(1, dtype=torch.int32, device=w.device)
+        verify_decoded[(triton.cdiv(n, 4096),)](
+            *new.planes, w.view(torch.uint16), counter, n, 4096, num_warps=4)
+        if int(counter.item()) != 0:
+            raise RuntimeError(f"{int(counter.item())} decoded values differ")
+        k = w.shape[-1]
+        flat = w.reshape(-1, k)
+        rows = min(flat.shape[0], 256)
+        head = flat[:rows].contiguous()
+        old_head = pack_bf16(head, quiet=True)
+        new_head, _ = encode_code11(head)
+        if old_head is None or not _probe_pairs(old_head, new_head, k):
+            raise RuntimeError("kernel outputs differ from the 12-bit planes")
+        del old_head, new_head, head
+        print(f"MTP_PACK11 tensor shape={new.shape} values={n} mismatches=0 "
+              f"raw_bytes={2*n} packed_bytes={new.nbytes} raw_blocks={escapes}", flush=True)
+        return new
+    except Exception as exc:  # noqa: BLE001 - any failure keeps the 12-bit planes
+        print(f"MTP_PACK11 12-bit planes kept shape={tuple(w.shape)}: {exc!r}", flush=True)
+        return None
+
+
+@torch.no_grad()
+def pack_bf16(w, check_group8=False, quiet=False, code11=False):
     """Deterministic input-independent GPU pack with exhaustive bit validation.
 
     Only row-contained 128-value blocks are supported; callers retain the
@@ -374,6 +727,19 @@ def pack_bf16(w, check_group8=False):
     if (not w.is_cuda or w.dtype != torch.bfloat16 or not w.is_contiguous()
             or w.dim() < 2 or w.shape[-1] % 128):
         return None
+    if code11 and not quiet:
+        packed = pack_code11(w)
+        if packed is not None and check_group8:
+            _admit_group8(packed, w)
+            if _PACK11_SPEED:
+                ratio = _linear_ratio(pack_bf16(w, quiet=True), packed, w)
+                print(f"MTP_PACK11 linear shape={packed.shape} cold time ratio "
+                      f"median={ratio[0]:.4f} p80={ratio[1]:.4f}", flush=True)
+                if not _faster(ratio):
+                    _GROUP8_OK.pop((_device_index(w.device),) + tuple(w.shape), None)
+                    packed = None
+        if packed is not None:
+            return packed
     n = w.numel()
     nb = n // 128
     base = torch.empty(nb, dtype=torch.uint8, device=w.device)
@@ -407,6 +773,8 @@ def pack_bf16(w, check_group8=False):
     bad = int(counter.item())
     if bad:
         raise RuntimeError(f"MTP lossless pack failed: {bad}/{n} decoded BF16 bits differ")
+    if quiet:
+        return packed
     _admit_word_decode(packed, w, counter)
     if check_group8:
         _admit_group8(packed, w)
@@ -571,7 +939,7 @@ def prepare_mtp_packed(module):
                      or (_PACK_OPROJ and name.endswith("o_proj")
                          and tuple(w.shape) == (2688, 4096)))
                 and type(getattr(layer, "quant_method", None)).__name__ == "MTPSmallLinearMethod"):
-            p = pack_bf16(w, check_group8=True)
+            p = pack_bf16(w, check_group8=True, code11=True)
             if p is None:
                 continue
             from .nemotron_h_mtp_pkmm import prepare
@@ -593,7 +961,9 @@ def prepare_mtp_packed(module):
         up, down, su, sd, inter, ns = weights
         if tuple(up.shape) != (128, 1856, 2688) or tuple(su.shape) != (3712, 2688):
             continue
-        pu, ps = pack_bf16(up), pack_bf16(su)
+        pu, ps = pack_moe_up11(up, su)
+        if pu is None or ps is None:
+            pu, ps = pack_bf16(up), pack_bf16(su)
         if pu is None or ps is None:
             continue
         for original, packed in ((up, pu), (su, ps)):
@@ -625,13 +995,29 @@ def packed_small(x,SM,EX,BASE,RI,RAW,y,M,N,K,sxm,sym,gate_ptr,
     nn=pid*BN+tl.arange(0,BN,layout=SliceLayout(1,ld))
     kk0=tl.arange(0,BK,layout=SliceLayout(0,ld))
     mm=tl.arange(0,BM,layout=SliceLayout(1,ld))
+    if BASE.dtype.element_ty == tl.int32:
+        chunk_layout:tl.constexpr=BlockedLayout([1,8],[32,1],[4,1],[1,0])
+        chunk=tl.arange(0,BN*(BK//8),layout=SliceLayout(1,chunk_layout))
+        lane=tl.arange(0,8,layout=SliceLayout(0,chunk_layout))
+        chunk_n=pid*BN+chunk//(BK//8)
+        chunk_k=(chunk%(BK//8))*8
     acc=tl.full((BM,BN),0,tl.float32,mma)
     for k0 in range(0,K,BK):
         kk=k0+kk0
         wmask=(nn[:,None]<N)&(kk[None,:]<K)
         if GATED:
             wmask=wmask & (tl.load(gate_ptr)==0)
-        w=load_packed(SM,EX,BASE,RI,RAW,nn[:,None]*K+kk[None,:],wmask,EVICT=EVICT,WORD=WORD)
+        if BASE.dtype.element_ty == tl.int32:
+            gk=k0+chunk_k
+            cmask=(chunk_n<N)&(gk<K)
+            vmask=cmask[:,None]&(gk[:,None]+lane[None,:]<K)
+            if GATED:
+                cmask=cmask&(tl.load(gate_ptr)==0)
+                vmask=vmask&(tl.load(gate_ptr)==0)
+            w8=load_code11_chunks(SM,EX,BASE,RI,RAW,chunk_n*K+gk,lane,cmask,vmask,EVICT=EVICT)
+            w=tl.convert_layout(tl.reshape(w8.to(tl.bfloat16,bitcast=True),(BN,BK)),ld,assert_trivial=True)
+        else:
+            w=load_packed(SM,EX,BASE,RI,RAW,nn[:,None]*K+kk[None,:],wmask,EVICT=EVICT,WORD=WORD)
         a=tl.load(x+mm[:,None]*sxm+kk[None,:],mask=(mm[:,None]<M)&(kk[None,:]<K),other=0.)
         a=tl.convert_layout(a,DotOperandLayout(0,mma,2))
         b=tl.convert_layout(tl.permute(w,(1,0)),DotOperandLayout(1,mma,2))

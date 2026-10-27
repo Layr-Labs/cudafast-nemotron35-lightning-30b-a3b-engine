@@ -582,6 +582,18 @@
     {
       "file": "harness/protocol-adapter/src/{hotwait.rs,resident.rs,lib.rs,bin/cuda-engine.rs}; harness/vllm_resident/resident.py",
       "why": "i34-9 (ours): hot waits. Before each blocking read of the next line (the adapter's stdin and its resident-socket replies; the resident's request socket) the reader polls the descriptor with a 1 ms timeout, for up to a few seconds, so the read starts when the bytes land instead of after the waiting core wakes from deep idle. Only when the read starts changes: the bytes, framing, timeouts and errors are the reader's own, and no engine work moves between requests or phases. CUDA_ENGINE_HOT_WAIT=0 (adapter) and RESIDENT_HOT_WAIT=0 (resident) restore plain blocking reads."
+    },
+    {
+      "file": "harness/kernels/scrtail (csrc/scrtail.cu, py, build.sh); model_executor/models/nemotron_h_mtp_screen.py (_tail_matches, _greedy_row)",
+      "why": "ercumentyildirim: the draft-head screen's three-level cascade after its first streaming dot as one CUDA kernel per 2048-row chunk (scrtail): the top 1024 of the chunk's first scores, the mid dot of those rows plus their first score, the top 256, the rest dot plus the mid score, the top 32 and the full-K dot of the 32 survivors, written to the candidate ids and logits _select_token reads. Each selection writes the ids torch.topk(sorted=False) returns in its order (keys above the K-th largest in ascending index order, then its ties), the K-th largest key from an exact 8-bit radix select. Each dot term is the 16-row tile's term of _nvfp4_rows_dot / _nvfp4_rows_dot_part as compiled: per byte fma(lo, h[2b], hi * h[2b + 1]) (hardware E2M1 decode, zeros as +0), the 8 byte terms of a group in byte order, the group-scale product and the 8-lane xor butterfly 4, 2, 1 whose first level is an fma of the lane's own product, blocks accumulated from +0 in K order, fma(gscale, acc, base) for the mid and rest scores and the in-order block sum times gscale for the logits, the value of the row's lanes 0-3. Admitted at load only after a bitwise comparison with the cascade on random rows (several scales, signed zeros, ties) and on the stopped pass: the token, the candidate ids, their logits and every intermediate buffer. MTP_SCREEN_TAIL=0 keeps the cascade."
+    },
+    {
+      "file": "vllm/v1/spec_decode/nemotron_step_cond.py, vllm/v1/spec_decode/llm_base_proposer.py",
+      "why": "Single-row native MTP draft pass (forward and head screen) captured as one CUDA graph whose body sits in an IF node on the depth-gate stop flag. A live pass runs the same kernels on the same buffers as the full-step graph followed by the screen graph; a stopped pass publishes the stopped screen's token (read from the screen at load and required to be the same for every row, including NaN and infinities) and a zero hidden row, and leaves the gate unchanged. Admitted at load only after a child-process probe of the construct, a plain capture of the body, and a bitwise comparison with the original path on private inputs (token, gate, screen output, inputs, live hidden row, drafter KV blocks; on a stopped pass the KV slot at its own position, which is rewritten before any read, is excluded), and when its timing is not slower. NEMO_MTP_STEP_COND=0 keeps the original path; NEMO_MTP_STEP_COND_SPEED=0 skips the timing condition."
+    },
+    {
+      "file": "(composition)",
+      "why": "The promoted main ea229c8 (a1cf20d1) byte for byte plus ercumentyildirim's scrtail as submitted in a26a82a4 (harness/kernels/scrtail and nemotron_h_mtp_screen.py, files byte for byte; entry above carried unchanged). Plus the conditional single-row draft step entry above."
     }
   ]
 }

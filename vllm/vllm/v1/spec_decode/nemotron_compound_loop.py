@@ -14,6 +14,7 @@ import torch
 
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.models.nemotron_h_mtp_screen import _select_token
 from vllm.triton_utils import tl, triton
 from vllm.v1.spec_decode import mtp_glue
 from vllm.v1.spec_decode.nemotron_full_step import (
@@ -23,6 +24,25 @@ from vllm.v1.spec_decode.utils import PADDING_SLOT_ID
 
 logger = init_logger(__name__)
 ENABLED = os.environ.get("NEMO_MTP_COMPOUND_LOOP", "1") != "0"
+# LOCAL PATCH (cudafast-nemotron35): the three-pass parent graph captures the passes' kernels
+# directly (the model forward with no inner graph and the head screen's row), because a graph
+# replay inside a stream capture invalidates the capture here; the kernels, their order and
+# their buffers are the child graphs'. NEMO_MTP_COMPOUND_FLAT=0 keeps the child-graph body.
+FLAT = os.environ.get("NEMO_MTP_COMPOUND_FLAT", "1") != "0"
+SELECT_STAGE = os.environ.get("NEMO_MTP_COMPOUND_SELECT_STAGE", "1") != "0"
+
+
+def _flat_pass(p, screen, kwargs, md, padded):
+    """One captured native pass: the model forward's kernels and the head screen's row."""
+    from vllm.config import CUDAGraphMode
+    with set_forward_context(md, p.vllm_config, num_tokens=padded,
+                             cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                             slot_mapping=p._get_slot_mapping(padded)):
+        out = p.model(**kwargs)
+    hidden = out if isinstance(out, torch.Tensor) else out[0]
+    screen._h.copy_(hidden[0])
+    screen._greedy_row(screen._h, gated=True, out=screen._out)
+    return hidden, screen._out.clone()
 
 
 @triton.jit
@@ -87,6 +107,62 @@ def _launch_stage(s, p, token, hidden):
         MAX_LEN=p.max_model_len, MAX_PAGES=s.max_pages,
         MAX_PREFIX=s.max_prefix, PAD=PADDING_SLOT_ID, BLOCK=1024, num_warps=4,
     )
+
+
+@triton.jit
+def _select_stage(
+    logits, ids, out, input_ids, hsrc, hdst, hstride, positions, seq,
+    table, slots, indptr, indices, last_page, workspace, prefix_ptrs, prefix_sizes,
+    N: tl.constexpr, BLOCK: tl.constexpr,
+    HID: tl.constexpr, PADDED: tl.constexpr, PAGE: tl.constexpr,
+    MAX_LEN: tl.constexpr, MAX_PAGES: tl.constexpr, MAX_PREFIX: tl.constexpr,
+    PAD: tl.constexpr,
+    gate_ptr=None, GATED: tl.constexpr = False,
+    THETA: tl.constexpr = 0.0, CUM: tl.constexpr = False,
+    launch_pdl: tl.constexpr = False,
+    ref=None, TWO_LEVEL: tl.constexpr = False,
+    CHUNK: tl.constexpr = 1, CPER: tl.constexpr = 1, SPER: tl.constexpr = 1,
+):
+    # Preserve the entire original selection and depth-gate arithmetic. The
+    # old kernel boundary is replaced by a CTA barrier before reloading out;
+    # all state consumed by the next draft pass is published before grid end.
+    _select_token(logits, ids, out, N, BLOCK, gate_ptr, GATED, THETA, CUM,
+                  launch_pdl, ref, TWO_LEVEL, CHUNK, CPER, SPER)
+    tl.debug_barrier()
+    _stage(out, input_ids, hsrc, hdst, hstride, positions, seq, table, slots,
+           indptr, indices, last_page, workspace, prefix_ptrs, prefix_sizes,
+           HID, PADDED, PAGE, MAX_LEN, MAX_PAGES, MAX_PREFIX, PAD, 1024)
+
+
+def _stage_selector(s, p, hidden):
+    # Used only while constructing/capturing a private compound parent. The
+    # resulting graph retains fixed tensor addresses, never request values.
+    def select(logits, ids, out, **kwargs):
+        _select_stage[(1,)](
+            logits, ids, out, p.input_ids, hidden, p.hidden_states, hidden.stride(0),
+            p.positions, s.seq, s.table, p._slot_mapping_buffer,
+            s.builder.paged_kv_indptr.gpu, s.builder.paged_kv_indices.gpu,
+            s.builder.paged_kv_last_page_len.gpu,
+            s.wrapper._int_workspace_buffer.view(torch.uint8),
+            s.prefix_ptrs, s.prefix_sizes,
+            HID=p.hidden_size, PADDED=s.padded, PAGE=p.block_size,
+            MAX_LEN=p.max_model_len, MAX_PAGES=s.max_pages,
+            MAX_PREFIX=s.max_prefix, PAD=PADDING_SLOT_ID, num_warps=4, **kwargs,
+        )
+    return select
+
+
+def _flat_staged_pass(s, p, screen, kwargs, md):
+    from vllm.config import CUDAGraphMode
+    with set_forward_context(md, p.vllm_config, num_tokens=s.padded,
+                             cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                             slot_mapping=p._get_slot_mapping(s.padded)):
+        out = p.model(**kwargs)
+    hidden = out if isinstance(out, torch.Tensor) else out[0]
+    screen._h.copy_(hidden[0])
+    screen._greedy_row(screen._h, gated=True, out=screen._out,
+                       select_token=_stage_selector(s, p, hidden[:1]))
+    return hidden, screen._out.clone()
 
 
 def _family(key):
@@ -417,10 +493,13 @@ def prepare(p):
         def body(md):
             tokens = []
             for step in range(3):
-                hidden = model_graph(p, kwargs, md, s.padded, 1)
-                if hidden is None or not isinstance(hidden, torch.Tensor):
-                    raise ValueError("full model graph declined compound capture")
-                token = screen.greedy(hidden[:1])
+                if FLAT:
+                    hidden, token = _flat_pass(p, screen, kwargs, md, s.padded)
+                else:
+                    hidden = model_graph(p, kwargs, md, s.padded, 1)
+                    if hidden is None or not isinstance(hidden, torch.Tensor):
+                        raise ValueError("full model graph declined compound capture")
+                    token = screen.greedy(hidden[:1])
                 tokens.append(token)
                 if step < 2:
                     _launch_stage(s, p, token, hidden[:1])
@@ -569,12 +648,170 @@ def prepare(p):
                     ratios.append(ratio)
                     if case != 2:
                         active_ratios.append(ratio)
-        if (not active_ratios or statistics.median(ratios) >= 0.98
-                or statistics.median(active_ratios) >= 0.98
-                or max(active_ratios) >= 1.01):
+        stopped_ratios = [r for i, r in enumerate(ratios) if (i // 2) % 3 == 2]
+        if FLAT:
+            # LOCAL PATCH (cudafast-nemotron35): the flat parent graph is admitted when its
+            # complete private loop is not slower with live drafts and clearly faster on a
+            # stopped loop (its launches replace three passes of host submission and graph
+            # boundaries); the state comparison above is unchanged.
+            slower = (not active_ratios or not stopped_ratios
+                      or statistics.median(active_ratios) >= 1.0
+                      or max(active_ratios) >= 1.03
+                      or statistics.median(stopped_ratios) >= 0.9)
+        else:
+            slower = (not active_ratios or statistics.median(ratios) >= 0.98
+                      or statistics.median(active_ratios) >= 0.98
+                      or max(active_ratios) >= 1.01)
+        if slower:
             raise ValueError("compound graph did not improve complete private loop latency")
         s.private_ratios = tuple(ratios)
         admitted = True
+        # Original compound admission above is unchanged. Optional selection
+        # fusion is qualified AGAINST THAT ADMITTED GRAPH, with the same full
+        # state observer and an original-builder/model continuation. Failure
+        # retains the complete original compound graph, not a weaker gate.
+        if FLAT and SELECT_STAGE:
+            baseline_graph, baseline_tokens, baseline_owners = s.graph, s.tokens, s.owners
+            fusion_admitted = False
+            try:
+                # Also exercise the store/barrier/load dependency with BF16
+                # ties, signed zeros, infinities and NaNs. These are private
+                # selector inputs; no model or request runs with these ids.
+                n = screen.cand_logits.numel()
+                private_logits = torch.empty_like(screen.cand_logits)
+                private_ids = (torch.arange(n, device=p.device, dtype=screen._cand.dtype)
+                               * 7 + 11).flip(0).contiguous()
+                private_out = torch.empty((), device=p.device, dtype=torch.int32)
+                selector_kwargs = dict(
+                    N=n, BLOCK=triton.next_power_of_2(n), gate_ptr=gate,
+                    GATED=True, THETA=kernels.DEPTH_THETA,
+                    CUM=kernels.DEPTH_CUMULATIVE, launch_pdl=kernels.mtp_pdl(),
+                )
+                for pattern in range(4):
+                    observed = []
+                    for which in range(2):
+                        cad, _ = setup(s.seed, 2 if pattern == 0 else 0)
+                        if pattern == 0:
+                            private_logits.zero_()
+                            private_logits.flatten()[::2] = -0.0
+                        elif pattern == 1:
+                            private_logits.copy_(1.0 + (torch.arange(n, device=p.device)
+                                                       % 3).reshape(private_logits.shape) / 1024)
+                        else:
+                            private_logits.fill_(-float("inf"))
+                            private_logits.flatten()[-1] = float("inf")
+                            if pattern == 3:
+                                private_logits.flatten()[0] = float("nan")
+                        private_out.fill_(-1)
+                        if which == 0:
+                            _select_token[(1,)](private_logits, private_ids, private_out,
+                                               **selector_kwargs)
+                            _launch_stage(s, p, private_out, private_hidden)
+                        else:
+                            _stage_selector(s, p, private_hidden)(
+                                private_logits, private_ids, private_out, **selector_kwargs)
+                        torch.cuda.synchronize(p.device)
+                        obs, scalar = observation(cad, (private_out,))
+                        obs.extend((s.seq.clone().view(torch.uint8),
+                                    wrapper._int_workspace_buffer.clone().view(torch.uint8)))
+                        observed.append((obs, scalar))
+                    a, b = observed
+                    if (a[1] != b[1] or len(a[0]) != len(b[0])
+                            or not all(torch.equal(u, v) for u, v in zip(a[0], b[0]))):
+                        raise ValueError("selection-stage selector/metadata bytes differ")
+
+                def staged_body(md):
+                    result = []
+                    for step in range(3):
+                        if step < 2:
+                            _, token = _flat_staged_pass(s, p, screen, kwargs, md)
+                        else:
+                            _, token = _flat_pass(p, screen, kwargs, md, s.padded)
+                        result.append(token)
+                    return tuple(result)
+
+                for _ in range(2):
+                    _, md = setup(s.seed, 0)
+                    staged_body(md)
+                _, staged_md = setup(s.seed, 0)
+                torch.cuda.synchronize(p.device)
+                staged_stream = torch.cuda.Stream(device=p.device)
+                staged_stream.wait_stream(torch.cuda.current_stream())
+                staged_graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(staged_graph, stream=staged_stream,
+                                      pool=torch.cuda.graph_pool_handle()):
+                    staged_tokens = staged_body(staged_md)
+                torch.cuda.synchronize(p.device)
+                if len({t.data_ptr() for t in staged_tokens}) != 3:
+                    raise ValueError("selection-stage output slots alias")
+
+                fusion_ratios = []
+                for length in sorted(selected):
+                    for case in range(3):
+                        for cold in (False, True):
+                            samples = [[], []]
+                            for trial in range(5):
+                                observed = {}
+                                for which in ((0, 1) if trial % 2 == 0 else (1, 0)):
+                                    cad, md = setup(length, case)
+                                    s.graph, s.tokens = ((baseline_graph, baseline_tokens)
+                                                        if which == 0 else
+                                                        (staged_graph, staged_tokens))
+                                    if cold:
+                                        pressure.fill_(trial + case)
+                                    begin = torch.cuda.Event(enable_timing=True)
+                                    end = torch.cuda.Event(enable_timing=True)
+                                    torch.cuda.synchronize(p.device)
+                                    begin.record()
+                                    out = _replay(s, p, kwargs, md, cad, s.padded, 1)
+                                    end.record()
+                                    end.synchronize()
+                                    elapsed = begin.elapsed_time(end)
+                                    if out is None or not elapsed > 0:
+                                        raise ValueError("selection-stage private replay refused")
+                                    samples[which].append(elapsed)
+                                    observed[which] = [observation(cad, out)]
+                                    if length + 3 < p.max_model_len:
+                                        final_hidden = p._nemo_full[4][0]
+                                        if not isinstance(final_hidden, torch.Tensor):
+                                            raise ValueError("selection-stage continuation hidden missing")
+                                        p._update_positions_dependent_metadata(
+                                            p.positions[:1], cad, 1, s.padded, p.block_size,
+                                            fused=(out[-1], final_hidden[:1]),
+                                        )
+                                        previous_force = bank.force_native
+                                        bank.force_native = case == 1
+                                        try:
+                                            _, extra_md = p.build_per_group_and_layer_attn_metadata(
+                                                cad, draft_index=0)
+                                        finally:
+                                            bank.force_native = previous_force
+                                        extra_hidden = model_graph(p, kwargs, extra_md, s.padded, 1)
+                                        if extra_hidden is None:
+                                            raise ValueError("selection-stage continuation refused")
+                                        extra_token = screen.greedy(extra_hidden[:1])
+                                        torch.cuda.synchronize(p.device)
+                                        observed[which].append(observation(cad, (extra_token,)))
+                                a, b = observed[0], observed[1]
+                                if (len(a) != len(b) or any(
+                                        x[1] != y[1] or len(x[0]) != len(y[0])
+                                        or not all(torch.equal(u, v) for u, v in zip(x[0], y[0]))
+                                        for x, y in zip(a, b))):
+                                    raise ValueError("selection-stage full private state differs")
+                            fusion_ratios.append(statistics.median(samples[1]) /
+                                                 statistics.median(samples[0]))
+                if (not fusion_ratios or statistics.median(fusion_ratios) >= 0.995
+                        or max(fusion_ratios) >= 1.01):
+                    raise ValueError("selection-stage did not improve admitted parent")
+                s.graph, s.tokens = staged_graph, staged_tokens
+                s.owners = baseline_owners + (staged_stream, staged_md, staged_tokens)
+                s.selection_stage_ratios = tuple(fusion_ratios)
+                fusion_admitted = True
+            except Exception as exc:
+                logger.warning("MTP selection-stage fusion retained original compound: %r", exc)
+            finally:
+                if not fusion_admitted:
+                    s.graph, s.tokens, s.owners = baseline_graph, baseline_tokens, baseline_owners
     except Exception as exc:
         logger.warning("Native MTP compound loop retained original path: %r", exc)
     finally:

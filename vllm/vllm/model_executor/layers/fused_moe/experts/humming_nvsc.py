@@ -514,7 +514,10 @@ def launch_prefill(layer, inputs, outputs, compute_config, tuning_config, sorted
         return False
     logger.info_once("nvsc: 6-bit w13 block scales in the prefill kernel on %d routed layers",
                      len(_STATS["packed"]))
-    ops.launch_kernel(
+    from vllm.model_executor.layers.fused_moe.experts import humming_nvsc_warplut
+
+    humming_nvsc_warplut.launch(
+        layer,
         configs=configs,
         inputs=inputs,
         weight=getattr(layer, meta.weight_name),
@@ -567,7 +570,10 @@ def launch(layer, inputs, outputs, compute_config, tuning_config, sorted_ids,
         len(_STATS["packed"]),
         ", ".join(f"{k} ({v})" for k, v in sorted(_STATS["stock"].items())) or "none",
     )
-    ops.launch_kernel(
+    from vllm.model_executor.layers.fused_moe.experts import humming_nvsc_warplut
+
+    humming_nvsc_warplut.launch(
+        layer,
         configs=configs,
         inputs=inputs,
         weight=getattr(layer, meta.weight_name),

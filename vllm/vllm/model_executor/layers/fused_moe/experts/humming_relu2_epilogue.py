@@ -165,6 +165,11 @@ class Relu2HummingKernel(HummingKernel):
         at = self.code.index(marker)
         extra = self.scheduler_code() if self.dyn_scheduler else ""
         self.code = self.code[:at] + extra + _EPILOGUE + self.code[at:]
+        # Optional derived NVSC lookup transform, after every loader/scheduler
+        # insertion and before the original compiler; absent on references.
+        transform = getattr(self, "nvsc_lut_transform", None)
+        if transform is not None:
+            self.code = transform(self.code)
         super().prepare()
 
 

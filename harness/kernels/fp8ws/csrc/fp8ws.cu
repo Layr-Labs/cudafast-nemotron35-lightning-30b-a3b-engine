@@ -11,8 +11,11 @@
 // A tile (the producer's row-major activation, rows past 496 zero-filled) arrives by a 2-D TMA
 // load with the 128-byte swizzle, and the W tile by one bulk copy from the load-time pack
 // Wp[n_tile][k_tile][112][128], whose 16-byte chunks are pre-swizzled the same way (a byte
-// permutation of the checkpoint weight). Two smem stages, full/empty mbarriers; thread 0 issues
-// the loads. The epilogue transposes within each lane quad so every lane stores 16 contiguous bytes.
+// permutation of the checkpoint weight). Two smem stages, full/empty mbarriers. A ninth warp
+// owns TMA/bulk production; the original eight warps keep all MMA/output ownership. Its elected
+// lane fills both stages ahead and waits only for consumer release before reuse, independently
+// of warp 0's MMA/epilogue instruction stream. No compiled overlap or speed is claimed.
+// The epilogue transposes within each lane quad so every lane stores 16 contiguous bytes.
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -23,7 +26,7 @@ constexpr int M = 496, N = 10304, K = 2688;
 constexpr int KT = 128, CPR = KT / 16, ST = 2;
 constexpr int WM = 4, WN = 2, MW = 4, NW = 7;
 constexpr int BM = WM * MW * 16, BN = WN * NW * 8;           // 256 x 112
-constexpr int NWARP = WM * WN, NT = NWARP * 32;
+constexpr int NWARP = WM * WN, NCOMPUTE = NWARP * 32, NT = NCOMPUTE + 32;
 constexpr int NB = 2, NTN = N / BN, NTILES = NB * NTN;       // 2 x 92 tiles
 constexpr int NKT = K / KT;                                   // 21
 constexpr int ASZ = BM * KT, WSZ = BN * KT, STB = ASZ + WSZ;  // 32768 + 14336 = 46 KiB
@@ -166,8 +169,8 @@ __global__ void __launch_bounds__(NT, 1) gemm(const __grid_constant__ CUtensorMa
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
   }
   __syncthreads();
-  // Loads of iteration gl into stage gl % ST (thread 0); waits until every warp released that
-  // stage's previous use (iteration gl - ST).
+  // Loads of iteration gl into stage gl % ST (the producer warp's lane 0);
+  // waits until every original compute warp released that stage's previous use.
   auto produce = [&](int gl) {
     const int s = gl % ST, n = gl / ST;
     if (gl >= ST) mbar_wait(empty0 + 8 * s, (n - 1) & 1);
@@ -178,9 +181,19 @@ __global__ void __launch_bounds__(NT, 1) gemm(const __grid_constant__ CUtensorMa
     tma2d(dst, &tmA, kt * KT, band * BM, bar);
     bulk(dst + ASZ, p.wp + (size_t)(nt * NKT + kt) * WSZ, WSZ, bar);
   };
-  if (tid == 0) {
-    asm volatile("prefetch.tensormap [%0];" ::"l"(&tmA) : "memory");
-    produce(0);
+  if (warp == NWARP) {
+    if (lane == 0) {
+      asm volatile("prefetch.tensormap [%0];" ::"l"(&tmA) : "memory");
+      for (int gl = 0; gl < total; ++gl) produce(gl);
+      // Drain the last use of each stage. A release means all eight consumer
+      // warps completed their shared reads/MMA; no async write is left live
+      // when this producer exits. Final epilogues use private accumulators.
+      for (int s = 0; s < ST && s < total; ++s) {
+        const int last_phase = (total - 1 - s) / ST;
+        mbar_wait(empty0 + 8 * s, last_phase & 1);
+      }
+    }
+    return;
   }
   const int wm = warp % WM, wn = warp / WM;
   const float sa = __ldg(p.sa), sb = __ldg(p.sb);
@@ -200,7 +213,6 @@ __global__ void __launch_bounds__(NT, 1) gemm(const __grid_constant__ CUtensorMa
     const int s = g % ST, n = g / ST;
     const int t = blockIdx.x + ti * grid, nt = t / NB, band = t - nt * NB;
     const int rb0 = band * BM + wm * MW * 16;  // first output row of this warp
-    if (tid == 0 && g + 1 < total) produce(g + 1);
     mbar_wait(full0 + 8 * s, n & 1);
     const uint32_t abase = sbase + s * STB, wbase = abase + ASZ;
 #pragma unroll

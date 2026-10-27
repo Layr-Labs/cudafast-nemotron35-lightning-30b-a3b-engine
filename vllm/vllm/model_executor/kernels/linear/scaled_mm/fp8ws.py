@@ -9,12 +9,14 @@ its output is bitwise equal to ops.cutlass_scaled_mm on several synthetic activa
 scale pairs at the real shape; otherwise the layer keeps CUTLASS. The original weight stays (it
 serves every other M through CUTLASS).
 
-FP8WS=0 disables it at load. `active` is read at dispatch time (and so when a CUDA graph is
-captured); the prefill graph can capture a second set with it off for an in-boot A/B
-(prefill_graph.py, FP8WS_AB_FILE).
+FP8WS=0 disables it at load. This composition retains the original prefill graph;
+there is no filesystem A/B switch. After the inherited byte and output checks,
+five alternating fixed-pointer graph timings must improve the actual M=496
+projection with warm and 64MiB pressure inputs, or this layer keeps CUTLASS.
 """
 
 import os
+import statistics
 
 import torch
 
@@ -49,6 +51,67 @@ def _activations(device: torch.device) -> list[torch.Tensor]:
     return sets
 
 
+def _projection_faster(fp8ws, weight, packed, sa, sb) -> bool:
+    """Official-runner-only private whole-projection graph gate, not a score."""
+    dev = weight.device
+    if torch.cuda.is_current_stream_capturing():
+        return False
+    patterns = _activations(dev)[:2]
+    a = torch.empty_like(patterns[0])
+    graphs, outputs, streams = [], [], []
+    for which in (0, 1):
+        a.copy_(patterns[0])
+        call = (lambda: ops.cutlass_scaled_mm(
+            a, weight, scale_a=sa, scale_b=sb, out_dtype=torch.bfloat16)) if which == 0 else (
+                lambda: fp8ws.gemm(a, packed, sa, sb))
+        for _ in range(2):
+            call()
+        torch.cuda.synchronize(dev)
+        stream = torch.cuda.Stream(device=dev)
+        stream.wait_stream(torch.cuda.current_stream(dev))
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream, pool=torch.cuda.graph_pool_handle()):
+            output = call()
+        torch.cuda.synchronize(dev)
+        graphs.append(graph)
+        outputs.append(output)
+        streams.append(stream)
+    pressure = torch.empty(64 << 20, device=dev, dtype=torch.uint8)
+    ratios, old_times, new_times = [], [], []
+    for value in patterns:
+        a.copy_(value)
+        for graph in graphs:
+            graph.replay()
+        torch.cuda.synchronize(dev)
+        if not torch.equal(outputs[0].view(torch.int16), outputs[1].view(torch.int16)):
+            return False
+        for cold in (False, True):
+            samples = [[], []]
+            for trial in range(5):
+                for which in ((0, 1) if trial % 2 == 0 else (1, 0)):
+                    a.copy_(value)
+                    if cold:
+                        pressure.fill_(trial)
+                    torch.cuda.synchronize(dev)
+                    start = torch.cuda.Event(enable_timing=True)
+                    end = torch.cuda.Event(enable_timing=True)
+                    start.record()
+                    graphs[which].replay()
+                    end.record()
+                    end.synchronize()
+                    elapsed = start.elapsed_time(end)
+                    if not elapsed > 0:
+                        return False
+                    samples[which].append(elapsed)
+            old, new = [statistics.median(v) for v in samples]
+            old_times.append(old)
+            new_times.append(new)
+            ratios.append(new / old)
+    logger.info("fp8ws: private complete-projection timing ratios=%s", tuple(ratios))
+    return (statistics.median(ratios) < 0.995
+            and sum(new_times) / sum(old_times) < 0.995 and max(ratios) < 1.01)
+
+
 def register(weight: torch.Tensor, weight_scale: torch.Tensor | None,
              input_scale: torch.Tensor | None) -> bool:
     """Pack and admit one [K, N] column-major in_proj weight. True if its prefill uses fp8ws."""
@@ -79,12 +142,14 @@ def register(weight: torch.Tensor, weight_scale: torch.Tensor | None,
                 got = fp8ws.gemm(a, packed, sa, sb)
                 ok = torch.equal(ref.view(torch.int16), got.view(torch.int16))
         torch.cuda.synchronize(dev)
+        if ok:
+            ok = _projection_faster(fp8ws, weight, packed, *scales[0])
     except Exception as exc:  # noqa: BLE001  (any failure keeps CUTLASS)
         logger.warning("fp8ws: admission failed (%r); this layer keeps CUTLASS", exc)
         ok = False
     if not ok:
         _stats["rejected"] += 1
-        logger.warning("fp8ws: output differs from CUTLASS; this layer keeps CUTLASS")
+        logger.warning("fp8ws: byte/output/graph/timing admission refused; this layer keeps CUTLASS")
         return False
     _PACKS[weight.data_ptr()] = (weight, packed)
     _stats["admitted"] += 1

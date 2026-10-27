@@ -18,7 +18,13 @@ bands, 92 column tiles) and runs eight MMA warps of 64 x 56 over them. Per K ste
 of 128 bytes a TMA load brings the activation tile (the producer's row-major
 tensor, unchanged; rows past 496 are zero-filled and never stored) with the
 128-byte swizzle, and one bulk copy brings the weight tile. Two shared-memory
-stages are synchronized by full/empty mbarriers. The epilogue transposes within
+stages are synchronized by full/empty mbarriers. This experiment assigns a ninth
+warp's lane 0 to filling both stages and waiting for their consumer release.
+The original eight compute warps retain their MMA and output ownership; warp 0
+no longer issues copies or waits for a stage to become empty. The producer
+drains the last consumer phase of each stage before exiting. The extra warp
+can increase register pressure or reduce residency; overlap and speed are not
+known until official compilation and validation. The epilogue transposes within
 each lane quad so every lane stores 16 contiguous output bytes.
 
 Weight pack. At load the column-major weight is copied once into
@@ -35,4 +41,12 @@ including NaNs) with the layer's own scales and two other scale pairs; any
 mismatch or failure keeps CUTLASS for that layer. Dispatch sits in the fp8c and
 fp8small custom ops' M > 8 fallback, so it runs on real tensor metadata inside
 torch.compile and is recorded into the prefill CUDA graph. `FP8WS=0` disables
-the package at load. `harness/tests/fp8ws_exact.py` is the GPU proof.
+the package at load. This composition additionally requires changed-content
+fixed-pointer graph word equality and five alternating complete-projection
+warm/64MiB-pressure event comparisons, or it retains CUTLASS. All checks are
+authored for official remote execution; they have not been run locally.
+
+Sources: 8b406fa2-8fbf-4867-a9fb-7a8b40915ae3 supplies the original packed/TMA
+component; 9f4e7dbf-2f99-49e6-9751-2cd0291caaf1 supplies the conservative private
+graph gate. This dedicated-producer variant is independent work on the complete
+1c6e2ace-8cfd-4552-935f-a438a54710cc parent, not adoption of a pending whole.

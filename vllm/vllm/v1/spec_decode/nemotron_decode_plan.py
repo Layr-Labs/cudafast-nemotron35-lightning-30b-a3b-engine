@@ -14,6 +14,8 @@ import time
 from importlib.metadata import PackageNotFoundError, version
 
 logger = logging.getLogger(__name__)
+# LOCAL PATCH (cudafast-nemotron35): see prepare (plans kept for the compound loop's own gate).
+COMPOUND_ONLY = os.environ.get("NEMO_MTP_PLAN_BANK_COMPOUND_ONLY", "1") != "0"
 _SCALARS = ("_q_len_per_req", "_pos_encoding_mode", "_window_left", "_logits_soft_cap",
             "_sm_scale", "_rope_scale", "_rope_theta")
 
@@ -93,6 +95,7 @@ class NativePlanBank:
         self.native = fast_decode_plan
         self.entries = {}
         self.enabled = False
+        self.compound_only = False
         self.force_native = False
         self.last_native_key = None
         self.last_restore = False
@@ -406,11 +409,16 @@ def prepare(p):
                     if pages <= timed_pages:
                         ratios.append((case, cached_time / original_time))
                     trial += 1
+        bank.private_speed_ratios = tuple(ratios)
         if (not ratios or statistics.median([r for _, r in ratios]) >= 0.98
                 or statistics.median([r for case, r in ratios if case != 2]) >= 0.99
                 or statistics.median([r for case, r in ratios if case == 2]) >= 0.99):
-            raise ValueError("native plan restore did not reduce guarded model-step latency")
-        bank.private_speed_ratios = tuple(ratios)
+            # LOCAL PATCH (cudafast-nemotron35): the exact structural plans stay available to
+            # the compound loop, whose own qualification times the complete three-pass loop;
+            # the compound prepare withdraws them when it does not admit (compound_only).
+            if not (COMPOUND_ONLY and os.environ.get("NEMO_MTP_COMPOUND_LOOP", "1") != "0"):
+                raise ValueError("native plan restore did not reduce guarded model-step latency")
+            bank.compound_only = True
         admitted = True
     except Exception as exc:
         logger.warning("Native MTP plan bank unavailable: %r", exc)
@@ -431,3 +439,18 @@ def prepare(p):
         torch.cuda.synchronize(p.device)
     if admitted:
         logger.info("Native MTP FA2 exact structural plans admitted: %d", len(bank.entries))
+
+
+def withdraw_compound_only(p):
+    """LOCAL PATCH (cudafast-nemotron35): plans admitted only for the compound loop are
+    withdrawn when the compound loop was not admitted (the original planner runs again)."""
+    builder = p.draft_attn_groups[0].get_metadata_builder() if p.draft_attn_groups else None
+    wrapper = getattr(builder, "_decode_wrappers_cudagraph", {}).get(1) if builder else None
+    bank = getattr(wrapper, "_nemo_native_plan", None)
+    if (isinstance(bank, NativePlanBank) and bank.compound_only
+            and getattr(p, "_nemo_compound_loop", None) is None):
+        bank.enabled = False
+        wrapper._nemo_native_plan = None
+        logger.info("Native MTP plans withdrawn (compound loop not admitted)")
+    elif isinstance(bank, NativePlanBank) and bank.compound_only:
+        logger.info("Native MTP plans kept for the compound loop")

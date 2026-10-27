@@ -984,7 +984,17 @@ class SpecDecodeBaseProposer:
                 slot_mapping=self._get_slot_mapping(input_batch_size),
             ):
                 ret_hidden_states = None
-                if getattr(self, "_nemo_full", None) is not None:
+                step_token = None
+                if (getattr(self, "_nemo_step", None) is not None
+                        and draft_probs_list is None
+                        and (not self._enable_probabilistic_draft_probs
+                             or sampling_metadata.all_greedy)):
+                    from vllm.v1.spec_decode.nemotron_step_cond import maybe_run as step_run
+                    step = step_run(self, model_kwargs, per_layer_attn_metadata,
+                                    input_batch_size, batch_size)
+                    if step is not None:
+                        ret_hidden_states, step_token = step
+                if ret_hidden_states is None and getattr(self, "_nemo_full", None) is not None:
                     from vllm.v1.spec_decode.nemotron_full_step import maybe_run
                     ret_hidden_states = maybe_run(
                         self, model_kwargs, per_layer_attn_metadata,
@@ -998,9 +1008,12 @@ class SpecDecodeBaseProposer:
                     last_hidden_states, hidden_states = ret_hidden_states
 
             hidden_states = hidden_states[:batch_size]
-            draft_token_ids, draft_probs = self._sample_draft_tokens(
-                last_hidden_states[:batch_size], sampling_metadata
-            )
+            if step_token is not None:
+                draft_token_ids, draft_probs = step_token, None
+            else:
+                draft_token_ids, draft_probs = self._sample_draft_tokens(
+                    last_hidden_states[:batch_size], sampling_metadata
+                )
             if draft_probs is not None:
                 assert draft_probs_list is not None
                 draft_probs_list.append(draft_probs)
@@ -2289,10 +2302,14 @@ class SpecDecodeBaseProposer:
         if is_graph_capturing and not torch.cuda.is_current_stream_capturing():
             from vllm.v1.spec_decode.nemotron_full_step import prepare
             prepare(self)
+            from vllm.v1.spec_decode.nemotron_step_cond import prepare as prepare_step
+            prepare_step(self)
             from vllm.v1.spec_decode.nemotron_decode_plan import prepare as prepare_plan
             prepare_plan(self)
             from vllm.v1.spec_decode.nemotron_compound_loop import prepare as prepare_loop
             prepare_loop(self)
+            from vllm.v1.spec_decode.nemotron_decode_plan import withdraw_compound_only
+            withdraw_compound_only(self)
 
     def _get_eagle3_use_aux_hidden_state_from_config(self) -> bool:
         """

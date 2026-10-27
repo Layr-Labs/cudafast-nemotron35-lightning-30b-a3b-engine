@@ -51,7 +51,8 @@ CONFIGS4.update({500: (2, 2, 4, 32), 501: (6, 2, 4, 32), 502: (6, 4, 4, 32), 503
 CONFIGS4[108] = (2, 4, 1, 16)
 # swap2 decode pairs: 113/118 (unfused/fused prep) and their empty-half dequant skips 114/119
 # lean paired decode (csrc/zskip_lean.cuh): config -> (warps per CTA, ring depth, flags); default 653
-LEAN_CONFIGS = {604: (1, 2, 260), 613: (1, 2, 2820), 616: (1, 2, 2824), 630: (1, 2, 0), 640: (1, 3, 272), 645: (1, 4, 272), 653: (1, 3, 274), 656: (1, 4, 274), 658: (1, 2, 274), 663: (1, 3, 306)}
+LEAN_CONFIGS = {604: (1, 2, 260), 613: (1, 2, 2820), 616: (1, 2, 2824), 630: (1, 2, 0), 640: (1, 3, 272), 645: (1, 4, 272), 653: (1, 3, 274), 656: (1, 4, 274), 658: (1, 2, 274), 663: (1, 3, 306), 693: (1, 3, 274)}
+# 693: oneNT32 perexpertblock producer plusoriginalone-warp/R3/F274 math; DENSE/SKIP only.
 # 663: config 653 reading the 6-bit scale plane of to_s6() (S6_BASE must match csrc/zskip_lean.cuh)
 S6_CONFIGS = (663,)
 S6_BASE = 62
@@ -337,7 +338,9 @@ def down(a: torch.Tensor, sorted_ids: torch.Tensor, expert_ids: torch.Tensor, nu
          packed: Packed, out: torch.Tensor, mode: int = SKIP, config: int | None = None,
          max_blocks: int | None = None, stats: torch.Tensor | None = None, ctas_per_sm: int = 0,
          trace: torch.Tensor | None = None,
-         verify_rows: torch.Tensor | None = None) -> torch.Tensor:
+         verify_rows: torch.Tensor | None = None,
+         allow_pdl_fallback: bool = True,
+         workspace: tuple[torch.Tensor, torch.Tensor] | None = None) -> torch.Tensor:
     """out[r] = humming w2 output row r for the moe_align layout (block 16) of a <= 4-token call.
     a: bf16 [shape_m, K] (relu^2 activations, rows = token * top_k + slot); out: bf16 [shape_m, N]."""
     global _pdl_on
@@ -354,7 +357,13 @@ def down(a: torch.Tensor, sorted_ids: torch.Tensor, expert_ids: torch.Tensor, nu
         max_blocks = shape_m  # every block holds >= 1 valid row
     max_blocks = min(max_blocks, expert_ids.numel())
     assert max_blocks <= MAX_BLOCKS
-    ws, queue = scratch(a.device)
+    if workspace is None:
+        ws, queue = scratch(a.device)
+    else:
+        ws, queue = workspace
+        assert ws.device == queue.device == a.device and ws.is_cuda and queue.is_cuda
+        assert ws.dtype == torch.uint8 and ws.is_contiguous() and ws.numel() >= max_blocks * BI_BYTES
+        assert queue.dtype == torch.int32 and queue.is_contiguous() and queue.numel() >= 36
     args = (
         a.data_ptr(), a.stride(0), shape_m, sorted_ids.data_ptr(), expert_ids.data_ptr(),
         num_tokens_padded.data_ptr(), max_blocks, packed.w.data_ptr(), packed.s.data_ptr(), packed.gs.data_ptr(),
@@ -373,7 +382,7 @@ def down(a: torch.Tensor, sorted_ids: torch.Tensor, expert_ids: torch.Tensor, nu
             launch = prefix_launch
             args += (verify_rows.data_ptr(),)
     rc = launch(*args)
-    if rc != 0 and _pdl_on and not torch.cuda.is_current_stream_capturing():
+    if rc != 0 and _pdl_on and allow_pdl_fallback and not torch.cuda.is_current_stream_capturing():
         # The PDL launch was rejected (the first calls run eagerly, before any capture):
         # use ordinary launches from now on and redo this call.
         lib.zskip_set_pdl(0)

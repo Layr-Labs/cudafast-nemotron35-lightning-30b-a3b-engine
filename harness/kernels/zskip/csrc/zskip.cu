@@ -896,6 +896,7 @@ __global__ void __launch_bounds__(WPC * 32) down4_kernel(const Params p) {
 
 #include "zskip_pair.cuh"
 #include "zskip_lean.cuh"
+#include "zskip_prepared.cuh"
 
 // v6: down4 with the -0 guard moved to the end. With skipped rows read as +0, every step keeps
 // the accumulator equal to stock's or both zero (the two differ at most in the sign of a zero), so
@@ -1825,7 +1826,26 @@ static int launch_lean(const Params& p, cudaStream_t stream) {
   down_lean_kernel<WPC, R, F><<<dim3(21 / WPC, p.max_blocks), WPC * 32, 0, stream>>>(p);
   return (int)cudaGetLastError();
 }
+static int launch_lean_prepared(const Params& p, cudaStream_t stream) {
+  if (p.mode != DENSE && p.mode != SKIP) return -6;
+#ifndef ZSKIP_NO_PDL
+  if (g_pdl) {
+    cudaError_t e = launch_pdl(lean_prepare_kernel, dim3(p.max_blocks), dim3(32), stream, p);
+    if (e == cudaSuccess)
+      e = launch_pdl(down_lean_prepared_kernel, dim3(21, p.max_blocks), dim3(32), stream, p);
+    if (e != cudaSuccess) {
+      cudaGetLastError();
+      return (int)e;
+    }
+    return (int)cudaGetLastError();
+  }
+#endif
+  lean_prepare_kernel<<<p.max_blocks, 32, 0, stream>>>(p);
+  down_lean_prepared_kernel<<<dim3(21, p.max_blocks), 32, 0, stream>>>(p);
+  return (int)cudaGetLastError();
+}
 static bool is_lean_config(int id) {
+  if (id == 693) return true;
 #define XL(ID, W_, R_, F_) if (id == ID) return true;
   ZSKIP_LEAN_CONFIGS(XL)
 #undef XL
@@ -2015,6 +2035,15 @@ int zskip_config(int id, int* info) {
   PAIR_INFO(119, true, true)
 #endif
 #undef PAIR_INFO
+  if (id == 693) {
+    cudaFuncAttributes prep_attr;
+    if (cudaFuncGetAttributes(&prep_attr, lean_prepare_kernel) != cudaSuccess) return -1;
+    if (cudaFuncGetAttributes(&attr, down_lean_prepared_kernel) != cudaSuccess) return -1;
+    info[0] = attr.numRegs; info[1] = 0; info[2] = 1;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&info[3], down_lean_prepared_kernel, 32, 0) != cudaSuccess)
+      return -1;
+    return 0;
+  }
 #define XL(ID, W_, R_, F_) \
   if (id == ID) { \
     if (cudaFuncGetAttributes(&attr, down_lean_kernel<W_, R_, F_>) != cudaSuccess) return -1; \
@@ -2100,6 +2129,7 @@ static int zskip_down_impl(const void* A, long long lda, int shape_m, const int*
   ZSKIP8_CONFIGS(X8)
 #undef X8
 #ifndef ZSKIP_NO_PAIR
+  if (config == 693) return launch_lean_prepared(p, st);
   if (config == 113) return launch_pair<false>(p, st);
   if (config == 114) return launch_pair<false, true>(p, st);
 #ifndef ZSKIP_NO_FUSED

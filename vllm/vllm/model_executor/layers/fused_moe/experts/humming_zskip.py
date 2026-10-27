@@ -51,7 +51,9 @@ PZ_ENABLED = os.environ.get("PZSKIP", "1") != "0"
 # LOCAL PATCH (cudafast-nemotron35, pz S6): the prefill routed down (pzskip 369) reads the
 # 6-bit swap scale plane (zskip to_s6_swap, config 379) when its load-time check is bitwise
 # equal to humming; PZSKIP_S6=0 keeps 369 and the 8-bit plane.
-PZ_S6_ENABLED = os.environ.get("PZSKIP_S6", "1") != "0"
+# LOCAL PATCH (cudafast-nemotron35): default off; the prefill down keeps config 369 on the 8-bit
+# plane. PZSKIP_S6=1 builds the 6-bit swap plane and admits config 379 as before.
+PZ_S6_ENABLED = os.environ.get("PZSKIP_S6", "0") != "0"
 PZ_S6_CONFIG = 379
 PZ_CONFIG = int(os.environ.get(
     "PZSKIP_CONFIG", "369" if os.environ.get("PZSKIP_HALF64", "1") != "0" else "356"))
@@ -80,7 +82,9 @@ LEAN_CONFIG = int(os.environ.get("ZSKIP_LEAN_CONFIG", "653"))
 # LOCAL PATCH (cudafast-nemotron35, zskip S6): the lean config's scale plane as 6-bit offsets
 # (harness/kernels/zskip to_s6, config 663 = 653 with the 6-bit plane decoded to the same bytes
 # in registers). ZSKIP_S6=0 keeps 653 and the 8-bit plane.
-S6_ENABLED = os.environ.get("ZSKIP_S6", "1") != "0"
+# LOCAL PATCH (i34-9 ddcdd302): default off, so the lean paired decode keeps config 653 on the
+# 8-bit plane; ZSKIP_S6=1 builds the 6-bit plane and admits config 663 as before.
+S6_ENABLED = os.environ.get("ZSKIP_S6", "0") != "0"
 S6_CONFIG = 663
 # Prefill: MoE layers whose relu^2 activations are sparse enough for the skip to beat humming's
 # 64-row blocks on GB10 (measured per layer on prefill-length calls; the others lose). Layer 51,
@@ -178,6 +182,7 @@ def finalize(layer: torch.nn.Module) -> None:
     # Preserve all original checks and fallback choices before trying the new decode path.
     layer.zskip_pair_w2 = None
     layer.zskip_pair_config = None
+    layer.zskip_sharedprep_owner = None
     if PAIR_ENABLED:
         _prepare_pair(layer)
     if LEAN_ENABLED and getattr(layer, "zskip_pair_w2", None) is not None:
@@ -194,6 +199,15 @@ def finalize(layer: torch.nn.Module) -> None:
             )
         except Exception as exc:  # optional prefix; original checked pair remains
             logger.warning_once("zskip: prefix check unavailable (%r); full pair retained", exc)
+
+    if getattr(layer, "zskip_pair_config", None) == 653:
+        try:
+            from .humming_zskip_sharedprep import qualify
+
+            if qualify(layer, _zskip, _align):
+                layer.zskip_sharedprep_owner = layer.zskip_pair_w2
+        except Exception as exc:
+            logger.warning_once("zskip: optional shared expertblock prep unavailable (%r); original retained", exc)
 
 
 def _prepare_pair(layer: torch.nn.Module) -> None:
@@ -656,7 +670,10 @@ def maybe_down(
         pair if use_pair else packed,
         outputs,
         mode=_zskip.SKIP,
-        config=layer.zskip_pair_config if use_pair else getattr(layer, "zskip_config", CONFIG),
+        config=(693 if use_pair and layer.zskip_pair_config == 653
+                and getattr(layer, "zskip_sharedprep_owner", None) is pair
+                and inputs.stride(0) == INTER and outputs.stride(0) == HIDDEN
+                else layer.zskip_pair_config if use_pair else getattr(layer, "zskip_config", CONFIG)),
         max_blocks=rows,
         verify_rows=vrows,
     )

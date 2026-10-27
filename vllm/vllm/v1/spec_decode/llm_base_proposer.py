@@ -757,7 +757,8 @@ class SpecDecodeBaseProposer:
         # LOCAL PATCH (cudafast-nemotron35): confidence-gated draft depth (MTP
         # drafter with the head screen, one greedy request): from here the screen
         # counts kept drafts and may stop the loop; see nemotron_h_mtp_kernels.py.
-        depth_gate = self._mtp_depth_gate_begin(batch_size, sampling_metadata)
+        depth_gate = self._mtp_depth_gate_begin(batch_size, sampling_metadata,
+                                                num_rejected_tokens_gpu)
         draft_token_ids, draft_probs = self._sample_draft_tokens(
             sample_hidden_states, sampling_metadata
         )
@@ -1107,7 +1108,8 @@ class SpecDecodeBaseProposer:
         return drafts
 
     def _mtp_depth_gate_begin(
-        self, batch_size: int, sampling_metadata: SamplingMetadata
+        self, batch_size: int, sampling_metadata: SamplingMetadata,
+        num_rejected_tokens_gpu: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         """The MTP depth gate's state when this draft loop is gated, else None:
         only when every draft comes from the head screen's one-row graph."""
@@ -1119,7 +1121,8 @@ class SpecDecodeBaseProposer:
         greedy = (
             not self._enable_probabilistic_draft_probs or sampling_metadata.all_greedy
         )
-        return kernels.depth_gate_begin(batch_size, greedy)
+        return kernels.depth_gate_begin(batch_size, greedy, num_rejected_tokens_gpu,
+                                        self.num_speculative_tokens)
 
     def _copy_num_rejected_to_cpu(
         self, num_rejected_tokens_gpu: torch.Tensor | None
@@ -2308,6 +2311,8 @@ class SpecDecodeBaseProposer:
             prepare_plan(self)
             from vllm.v1.spec_decode.nemotron_compound_loop import prepare as prepare_loop
             prepare_loop(self)
+            from vllm.v1.spec_decode.nemotron_decode_plan import withdraw_compound_only
+            withdraw_compound_only(self)
 
     def _get_eagle3_use_aux_hidden_state_from_config(self) -> bool:
         """

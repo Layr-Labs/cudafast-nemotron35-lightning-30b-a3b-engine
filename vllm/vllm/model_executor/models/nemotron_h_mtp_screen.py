@@ -64,8 +64,9 @@ except ImportError:
     _scrtail = None
 from vllm.triton_utils import tl, triton
 
+from .nemotron_h_mtp_kernels import adapt_args as _adapt_args
 from .nemotron_h_mtp_kernels import (
-    DEPTH_CUMULATIVE, DEPTH_THETA, _gate_args, depth_gate_init, mtp_pdl,
+    DEPTH_CUMULATIVE, DEPTH_THETA, DEPTH_THETA5, _gate_args, depth_gate_init, mtp_pdl,
 )
 
 logger = init_logger(__name__)
@@ -551,6 +552,10 @@ def _select_token(
     gate_ptr=None,
     GATED: tl.constexpr = False,
     THETA: tl.constexpr = 0.0,
+    THETA5: tl.constexpr = 0.0,
+    adapt_ptr=None,
+    ADAPT: tl.constexpr = False,
+    TAU: tl.constexpr = 0.0,
     CUM: tl.constexpr = False,
     launch_pdl: tl.constexpr = False,
     ref=None,
@@ -584,13 +589,18 @@ def _select_token(
         # Depth gate (nemotron_h_mtp_kernels.py): while a draft loop is active and
         # not stopped, count this draft as kept, then stop the loop if its top-1
         if (tl.load(gate_ptr + 2) != 0) & (tl.load(gate_ptr) == 0):
-            tl.store(gate_ptr + 1, tl.load(gate_ptr + 1) + 1)
+            kept = tl.load(gate_ptr + 1) + 1
+            tl.store(gate_ptr + 1, kept)
             denom = tl.sum(tl.where(i < N, tl.exp(v - best), 0.0), axis=0)
             conf = 1.0 / denom
             if CUM:
                 conf = tl.load(gate_ptr + 3).to(tl.float32, bitcast=True) * conf
                 tl.store(gate_ptr + 3, conf.to(tl.int32, bitcast=True))
-            if conf < THETA:
+            thr = tl.where(kept >= 4, THETA5, THETA)
+            stop = conf < thr
+            if ADAPT:
+                stop = stop | ((kept >= 4) & (tl.load(adapt_ptr) < TAU))
+            if stop:
                 tl.store(gate_ptr, 1)
 
 
@@ -1033,7 +1043,8 @@ class DraftHeadScreen:
                 _select_token[(1,)](
                     self.cand_logits, self._cand, out, N=self.cand_logits.numel(),
                     BLOCK=triton.next_power_of_2(self.cand_logits.numel()),
-                    gate_ptr=gate, GATED=gated and ok, THETA=DEPTH_THETA,
+                    gate_ptr=gate, GATED=gated and ok, THETA=DEPTH_THETA, THETA5=DEPTH_THETA5,
+                    adapt_ptr=_adapt_args()[0], ADAPT=_adapt_args()[1], TAU=_adapt_args()[2],
                     CUM=DEPTH_CUMULATIVE, launch_pdl=mtp_pdl(),
                 )
                 return out
@@ -1154,7 +1165,8 @@ class DraftHeadScreen:
             _select_token[(1,)](
                 self.cand_logits, coarse_idx, out, N=self.cand_logits.numel(),
                 BLOCK=triton.next_power_of_2(self.cand_logits.numel()),
-                gate_ptr=gate, GATED=gated and ok, THETA=DEPTH_THETA,
+                gate_ptr=gate, GATED=gated and ok, THETA=DEPTH_THETA, THETA5=DEPTH_THETA5,
+                adapt_ptr=_adapt_args()[0], ADAPT=_adapt_args()[1], TAU=_adapt_args()[2],
                 CUM=DEPTH_CUMULATIVE, launch_pdl=mtp_pdl(),
                 ref=refined, TWO_LEVEL=True, CHUNK=SCREEN_CHUNK, CPER=CASCADE_PER,
                 SPER=SCREEN_PER,
@@ -1210,7 +1222,8 @@ class DraftHeadScreen:
         _select_token[(1,)](
             self.cand_logits, cand, out, N=self.cand_logits.numel(),
             BLOCK=triton.next_power_of_2(self.cand_logits.numel()),
-            gate_ptr=gate, GATED=gated and ok, THETA=DEPTH_THETA,
+            gate_ptr=gate, GATED=gated and ok, THETA=DEPTH_THETA, THETA5=DEPTH_THETA5,
+            adapt_ptr=_adapt_args()[0], ADAPT=_adapt_args()[1], TAU=_adapt_args()[2],
             CUM=DEPTH_CUMULATIVE, launch_pdl=mtp_pdl(),
         )
         if getattr(self, "_finish_next_pf", False):

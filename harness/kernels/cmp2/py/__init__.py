@@ -31,7 +31,16 @@ def _library():
     return _LIB
 
 
-def _select(models, torch):
+def _families():
+    """CMP2_FAMILIES (comma list of fp8,apk,nvfp4,drafter or all). Under
+    expandable segments the default stays off the routed experts, which were
+    never selected here, and keeps every non-routed family."""
+    raw = os.environ.get("CMP2_FAMILIES", "all").replace(" ", "").lower()
+    fams = {f for f in raw.split(",") if f}
+    return {"fp8", "apk", "nvfp4", "drafter"} if "all" in fams else fams
+
+
+def _select(models, torch, fams=frozenset(("fp8", "apk", "nvfp4", "drafter"))):
     """Resolved positive frozen-weight families; no mutable cache or scratch."""
     selected = []
     seen = set()
@@ -49,12 +58,13 @@ def _select(models, torch):
             prefix = owner + "." + name
             # Both module buffers and FP8 kernel objects refer to these SAME
             # Tensor objects. Preserve their identity, shape, stride and offset.
-            add(prefix + "._fp8c_weight", getattr(layer, "_fp8c_weight", None))
+            if "fp8" in fams:
+                add(prefix + "._fp8c_weight", getattr(layer, "_fp8c_weight", None))
             # The attention registry and projection hold the same plane objects.
-            for i, plane in enumerate(getattr(layer, "_apk_planes", ())):
+            for i, plane in enumerate(getattr(layer, "_apk_planes", ()) if "apk" in fams else ()):
                 add(prefix + f"._apk_planes.{i}", plane)
             method = type(getattr(layer, "quant_method", None)).__name__
-            if "NvFp4" in method and ("shared_experts" in name or name == "lm_head"):
+            if "nvfp4" in fams and "NvFp4" in method and ("shared_experts" in name or name == "lm_head"):
                 zs = getattr(layer, "_marlinx_zs", None)
                 add(prefix + "._marlinx_zs", zs)
                 su = getattr(layer, "_marlinx_su", None)
@@ -69,7 +79,7 @@ def _select(models, torch):
                     if any(tag in field.lower() for tag in ("workspace", "scratch", "lock")):
                         continue
                     add(prefix + "." + field, tensor)
-            if owner == "drafter":
+            if owner == "drafter" and "drafter" in fams:
                 # Drafter packed BF16 planes read by every draft pass: the
                 # attention projections' and the eh hidden half's registered
                 # planes, and the shared-expert up planes; the routed-up packs
@@ -82,7 +92,7 @@ def _select(models, torch):
                     for idx, first in ((0, 2), (2, 0)):
                         for j, plane in enumerate(getattr(fast[idx], "planes", ())[first:]):
                             add(prefix + f"._fast_moe_weights.{idx}.planes.{first + j}", plane)
-    if models and models[-1] is not None:
+    if models and models[-1] is not None and "drafter" in fams:
         # The drafter's packed down projections live in the down-pack registry,
         # keyed by the BF16 sources (which stay ordinary); move their planes:
         # the shared slice whole, the routed one's small planes.
@@ -121,9 +131,12 @@ def prepare(models):
     if os.environ.get("CMP2", "1") == "0":
         _LOG.info("CMP2 compressed=none reason=disabled")
         return
-    if os.environ.get("VLLM_EXPANDABLE_SEGMENTS_ACTIVE") == "1":
-        # The weights already sit in VMM-backed expandable segments.
-        _LOG.info("CMP2 compressed=none reason=expandable_segments")
+    # Expandable segments give VMM-backed 2 MiB pages but no compression
+    # attribute (cuMemCreate without CU_MEM_ALLOCATION_COMP_GENERIC), so the
+    # selected frozen families still get their own compressible storages.
+    fams = _families()
+    if not fams:
+        _LOG.info("CMP2 compressed=none reason=no_families")
         return
     import torch
 
@@ -141,7 +154,7 @@ def prepare(models):
         capsule_new.restype = ctypes.py_object
         # Gather all aliases before rebinding even one of them.
         storages = {}
-        for name, tensor in _select(models, torch):
+        for name, tensor in _select(models, torch, fams):
             storage = tensor.untyped_storage()
             key = (tensor.device.index, storage.data_ptr(), storage.nbytes())
             storages.setdefault(key, []).append((name, tensor))
@@ -190,7 +203,8 @@ def prepare(models):
         _LOG.warning("CMP2 compressed=none reason=%r ordinary_tensors_retained=True", exc)
         return
     _LOG.info(
-        "CMP2 compressed=[%s] storages=%d full_byte_checks=%d checked_bytes=%d "
-        "original_storages_retained=True",
+        "CMP2 families=%s expandable=%s compressed=[%s] storages=%d full_byte_checks=%d "
+        "checked_bytes=%d original_storages_retained=True",
+        ",".join(sorted(fams)), os.environ.get("VLLM_EXPANDABLE_SEGMENTS_ACTIVE", "0"),
         ",".join(labels), len(compressed), len(compressed), checked_bytes,
     )

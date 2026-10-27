@@ -32,5 +32,17 @@ if ! test -f "$out/libfp8c.so"; then
     -o "$out/libfp8c.so" "$here/csrc/fp8c.cu" 2>&1 || true
 fi
 test -f "$out/libfp8c.so" || { echo "fp8c: build failed" >&2; exit 1; }
+# fp8e (optional, its own library): a failed build only leaves fp8e off.
+rm -f "$out/libfp8e.so"
+"$nvcc" -O3 -std=c++17 -shared -Xcompiler -fPIC -lineinfo \
+  -gencode "arch=compute_${sm},code=sm_${sm}" \
+  -Xptxas -v \
+  -o "$out/libfp8e.so" "$here/csrc/fp8e.cu" 2>&1 || true
+if ! test -f "$out/libfp8e.so"; then
+  "$nvcc" -O3 -std=c++17 -shared -Xcompiler -fPIC -lineinfo \
+    -gencode "arch=compute_${sm},code=sm_${sm}" -DFP8E_NO_PDL \
+    -o "$out/libfp8e.so" "$here/csrc/fp8e.cu" 2>&1 || true
+fi
+test -f "$out/libfp8e.so" || echo "fp8e: build failed; fp8c only" >&2
 cp "$here/py/__init__.py" "$out/__init__.py"
 echo "fp8c: built $out/libfp8c.so for sm_${sm}"

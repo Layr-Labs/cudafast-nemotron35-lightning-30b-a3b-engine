@@ -582,6 +582,18 @@
     {
       "file": "harness/protocol-adapter/src/{hotwait.rs,resident.rs,lib.rs,bin/cuda-engine.rs}; harness/vllm_resident/resident.py",
       "why": "i34-9 (ours): hot waits. Before each blocking read of the next line (the adapter's stdin and its resident-socket replies; the resident's request socket) the reader polls the descriptor with a 1 ms timeout, for up to a few seconds, so the read starts when the bytes land instead of after the waiting core wakes from deep idle. Only when the read starts changes: the bytes, framing, timeouts and errors are the reader's own, and no engine work moves between requests or phases. CUDA_ENGINE_HOT_WAIT=0 (adapter) and RESIDENT_HOT_WAIT=0 (resident) restore plain blocking reads."
+    },
+    {
+      "file": "harness/kernels/cmp2/py/__init__.py",
+      "why": "Selective CMP2 under expandable segments. Expandable segments give VMM 2 MiB pages without the generic-compression attribute, so the early return on VLLM_EXPANDABLE_SEGMENTS_ACTIVE is replaced by a family filter: CMP2_FAMILIES (fp8,apk,nvfp4,drafter or all; default all) selects which frozen non-routed families get compressible storages. Routed experts are never selected. Same full storage byte checks, all-or-nothing fallback and retained originals; CMP2=0 still disables. No format, kernel or arithmetic change."
+    },
+    {
+      "file": "harness/vllm_resident/backends.py",
+      "why": "Boot warm-up adds bounded free runs (emit target plus step_with_budget, run lengths 128/127/126/125) on the synthetic prompt cut to the 496-token seed length, so the emit-budget tail paths (shortened draft loops, capped verify rows) and the engine core's tail drain are replayed before ready instead of first inside the timed decode window. Input-independent, no state kept; WARMUP_BUDGET_RUNS=0 skips."
+    },
+    {
+      "file": "harness/kernels/fp8c (csrc/fp8e.cu, py/__init__.py, build.sh); vllm/model_executor/kernels/linear/scaled_mm/fp8c.py",
+      "why": "fp8e: a second lossless code for the two Mamba FP8 projections, tried before fp8c. Per output column the exponents are ranked by count: a 2-bit primary code (ranks 0-2, 3 = rest), a 2-bit secondary stream for rest weights (ranks 3-5, 3 = exception) and a 4-bit exponent stream for exceptions, plus the sign|mantissa nibble; about 6.8 bits read per weight against fp8c's 7.19. The decoder rebuilds the exact fp8small words in registers and feeds fp8c's unchanged e4m3 m16n8k32 chain, FP32 scale B, scale A and RN BF16 epilogue. Built as its own libfp8e.so; a failed build, a window overflow or any byte of the load-time full decode that differs from the pack keeps fp8c for that layer. The buffer is [N/32, 1, tile_bytes] so the format travels with the tensor through CMP2 rebinding. FP8E=0 disables."
     }
   ]
 }

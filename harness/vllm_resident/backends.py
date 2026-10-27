@@ -206,12 +206,49 @@ class VllmBackend:
     WARMUP_DECODE_STEPS = 64
     WARMUP_ROUNDS = 3
 
+    # The timed decode is a bounded free run: the resident sets an emit target
+    # and steps with a budget, so its last rounds take the emit-budget paths
+    # (shortened draft loops, verify rows capped below the depth) and the
+    # engine core's tail drain. Plain step() never reaches them, so their first
+    # replays used to land inside the timed window. These rounds run the same
+    # bounded calls on the synthetic prompt at the scored seed length, with a
+    # few run lengths so every tail remainder is reached. Same class of work as
+    # the rounds above: boot-time, input-independent, no state kept.
+    # WARMUP_BUDGET_RUNS=0 skips them.
+    WARMUP_SEED_TOKENS = 496
+    WARMUP_BUDGET_COUNTS = (128, 127, 126, 125)
+
     def _warm_up(self) -> None:
         prompt = [(i * 7919) % 30000 + 1000 for i in range(self.WARMUP_PROMPT_TOKENS)]
         for _ in range(self.WARMUP_ROUNDS):
             self.start(prompt)
             for _ in range(self.WARMUP_DECODE_STEPS):
                 self.step()
+            self.abort()
+        if self.depth > 0 and os.environ.get("WARMUP_BUDGET_RUNS", "1") != "0":
+            try:
+                self._warm_up_budgeted(prompt[: self.WARMUP_SEED_TOKENS])
+            except Exception as exc:  # noqa: BLE001 - optional warm-up; the engine boots without it
+                print(f"resident: budgeted warm-up skipped ({exc!r})", file=sys.stderr, flush=True)
+            finally:
+                self.set_emit_target(None)
+                self.abort()
+
+    def _warm_up_budgeted(self, prompt: list[int]) -> None:
+        for count in self.WARMUP_BUDGET_COUNTS:
+            self.start(prompt)
+            # As ResidentSession.spec_run: the context, the frontier, count more.
+            self.set_emit_target(len(prompt) + 1 + count)
+            produced, ahead = 0, 0
+            while produced < count:
+                if ahead <= 0:
+                    if self.tail_drained():
+                        break
+                    ahead = len(self.step_with_budget(count - produced))
+                taken = min(ahead, count - produced)
+                ahead -= taken
+                produced += taken
+            self.set_emit_target(None)
             self.abort()
 
     def _params(self, prompt_len: int, max_tokens: int | None = None, logprobs: bool = True):

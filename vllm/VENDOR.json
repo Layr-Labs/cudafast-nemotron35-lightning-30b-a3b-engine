@@ -582,6 +582,10 @@
     {
       "file": "harness/protocol-adapter/src/{hotwait.rs,resident.rs,lib.rs,bin/cuda-engine.rs}; harness/vllm_resident/resident.py",
       "why": "i34-9 (ours): hot waits. Before each blocking read of the next line (the adapter's stdin and its resident-socket replies; the resident's request socket) the reader polls the descriptor with a 1 ms timeout, for up to a few seconds, so the read starts when the bytes land instead of after the waiting core wakes from deep idle. Only when the read starts changes: the bytes, framing, timeouts and errors are the reader's own, and no engine work moves between requests or phases. CUDA_ENGINE_HOT_WAIT=0 (adapter) and RESIDENT_HOT_WAIT=0 (resident) restore plain blocking reads."
+    },
+    {
+      "file": "v1/worker/gpu_model_runner.py (_prepare_inputs, _build_attention_metadata._get_block_table, _get_slot_mappings); harness/vllm_resident/test_empty_fill_skip.py",
+      "why": "ours: empty padding fills skipped on the verify path. Four padding writes (optimistic_seq_lens_cpu[num_reqs:], the block-table rows [num_reqs:num_reqs_padded] per KV cache group, is_prefilling[num_reqs:], the slot-mapping tail [unpadded:padded] per group) run only when their slice is non-empty. At one request with an unpadded verify every one of them is empty: a zero-element fill launches no kernel and writes nothing, so the GPU work, its order and its bytes are unchanged and only the host dispatch goes. VLLM_EMPTY_FILL_SKIP=0 restores the calls."
     }
   ]
 }

@@ -1,9 +1,9 @@
-# fp8ws: prefill Mamba in_proj FP8 GEMM
+# fp8ws: prefill Mamba in_proj and out_proj FP8 GEMMs
 
-The 496-token prefill runs the Mamba `in_proj` projection, (N,K) = (10304,2688), as
-an FP8 GEMM with M = 496 on every Mamba layer. This package replaces the pinned
-CUTLASS call for exactly that shape with a persistent kernel that keeps the
-CUTLASS arithmetic:
+The 496-token prefill runs the Mamba `in_proj` projection, (N,K) = (10304,2688), and
+the `out_proj` projection, (N,K) = (2688,4096), as FP8 GEMMs with M = 496 on every
+Mamba layer. This package replaces the pinned CUTLASS call for exactly these two
+shapes with a persistent kernel that keeps the CUTLASS arithmetic:
 
 1. The original E4M3 activation and weight bytes enter native
    `mma.sync.aligned.kind::f8f6f4.m16n8k32.row.col.f32.e4m3.e4m3.f32`.
@@ -14,7 +14,9 @@ CUTLASS arithmetic:
    as in fp8small).
 
 Layout. One CTA per SM claims output tiles of 256 rows x 112 columns (two row
-bands, 92 column tiles) and runs eight MMA warps of 64 x 56 over them. Per K step
+bands; 92 column tiles for the in_proj, 24 for the out_proj) and runs eight MMA
+warps of 64 x 56 over them. The kernel is one template instantiated for the two
+(N, K) pairs; everything but the tile counts and the K step count is shared. Per K step
 of 128 bytes a TMA load brings the activation tile (the producer's row-major
 tensor, unchanged; rows past 496 are zero-filled and never stored) with the
 128-byte swizzle, and one bulk copy brings the weight tile. Two shared-memory

@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""GPU proof for the fp8ws prefill in_proj GEMM against the pinned CUTLASS operator.
+"""GPU proof for the fp8ws prefill in_proj and out_proj GEMMs against the pinned CUTLASS operator.
 
 Run inside the pinned image with staged overlay/kernels on PYTHONPATH:
   python3 harness/tests/fp8ws_exact.py --weights SNAPSHOT [--captures FILE]
-For every Mamba in_proj weight of the snapshot: the load-time admission (pack inverse + bitwise
-CUTLASS comparison on synthetic activations), then the runtime dispatch (fp8c/fp8small custom-op
-fallback at M=496) on fresh random activations, compared as integer BF16 bits. --captures adds a
-file of real activations ({"a": [prompts][23] uint8 [496, 2688], "sa": ..., "sb": ..., "w": [23]}).
+For every Mamba in_proj and out_proj weight of the snapshot: the load-time admission (pack inverse
++ bitwise CUTLASS comparison on synthetic activations), then the runtime dispatch (fp8c/fp8small
+custom-op fallback at M=496) on fresh random activations, compared as integer BF16 bits. --captures
+adds a file of real in_proj activations ({"a": [prompts][23] uint8 [496, 2688], "sa": ..., "sb": ...,
+"w": [23]}).
 """
 
 import argparse
@@ -27,8 +28,8 @@ snap = check.Snapshot(args.weights)
 layers = sorted(int(k.split(".")[2]) for k in snap.weight_map if k.endswith(".mixer.in_proj.weight"))
 assert len(layers) == 23
 cases = 0
-for li in layers:
-    p = f"backbone.layers.{li}.mixer.in_proj"
+for li, proj in [(li, proj) for li in layers for proj in ("in_proj", "out_proj")]:
+    p = f"backbone.layers.{li}.mixer.{proj}"
     names = [p + "." + s for s in ["weight", "weight_scale", "input_scale"]]
     t = snap.load(names, "cuda")
     w = t[names[0]].contiguous()  # [N, K]
@@ -37,17 +38,17 @@ for li in layers:
     b = w.t()  # column-major [K, N], as the linear layer holds it
     torch.set_default_dtype(torch.bfloat16)  # as during vLLM model loading
     try:
-        assert fp8ws.register(b, sb, sa), (li, "admission")
+        assert fp8ws.register(b, sb, sa), (li, proj, "admission")
     finally:
         torch.set_default_dtype(torch.float32)
     for kind in ["random", "small", "extreme"]:
         scale = {"random": 20, "small": 0.02, "extreme": 150}[kind]
-        a = (torch.randn((496, 2688), device="cuda") * scale).clamp(-448, 448).to(f8)
+        a = (torch.randn((496, b.shape[0]), device="cuda") * scale).clamp(-448, 448).to(f8)
         ref = ops.cutlass_scaled_mm(a, b, scale_a=sa, scale_b=sb, out_dtype=torch.bfloat16)
         got = torch.ops.vllm.fp8c_scaled_mm(a, b, torch.empty(1, dtype=torch.uint8, device="cuda"), sa, sb)
-        assert torch.equal(ref.view(torch.int16), got.view(torch.int16)), (li, kind)
+        assert torch.equal(ref.view(torch.int16), got.view(torch.int16)), (li, proj, kind)
         cases += 1
-    print("layer exact", li, "cases", cases, flush=True)
+    print("layer exact", li, proj, "cases", cases, flush=True)
 assert fp8ws._stats["dispatched"] == cases, fp8ws._stats
 
 if args.captures:

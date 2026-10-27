@@ -48,6 +48,7 @@ struct Params {
   int part1_cols;          // columns reduced by a single Marlin block
   int iters;               // Marlin stripe length (k-tiles per block) in part 2
   const uint2* SU;         // optional unit-major copy of S, [N/64][K/16][8] uint2 (or null)
+  const int* vrows;        // lean only: live verify rows (device int; rows >= it read as zero), or null
 };
 
 __device__ __forceinline__ uint4 ld_stream_v4(const uint4* p) {
@@ -582,7 +583,7 @@ __global__ void __launch_bounds__(128) lean_kernel(const Params p) {
   const uint2* Sw = p.S + (16 * col + 8 * h + tok + 2 * w * NS);
   const uint32_t* Zw = nullptr;
   if constexpr (ZS) Zw = p.Z + (unit * 8 + tok + (32 * w + 2 * t4) * ZST);
-  const bool arow = tok < p.M;
+  bool arow = tok < p.M;
   const uint32_t* Aw =
       reinterpret_cast<const uint32_t*>(p.A + (arow ? (long long)tok * p.lda : 0)) + (t4 + 16 * w);
 
@@ -639,6 +640,12 @@ __global__ void __launch_bounds__(128) lean_kernel(const Params p) {
     pdl_wait();
   }
 #endif
+  // Live verify rows (written by the spec loop before the verify; read after the PDL wait):
+  // rows at or past the count read as zero activations.
+  if (p.vrows != nullptr) {
+    const int live = *p.vrows;
+    if (live >= 1 && tok >= live) arow = false;
+  }
 #pragma unroll
   for (int s = 0; s < PA; ++s) load_a(s);
   if constexpr (ZS || !PDL) {
@@ -856,6 +863,7 @@ static int marlinx_gemm_impl(const void* A, long long lda, int M, const void* B,
   p.k_tiles = K / 128;
   p.Z = static_cast<const uint32_t*>(Z);
   p.SU = static_cast<const uint2*>(SU);
+  p.vrows = nullptr;
   if (SU && ((K >> 4) * 64 > 48 * 1024 || (reinterpret_cast<uintptr_t>(SU) & 15))) return -9;
   // Marlin's stripe partition with parallel = 1 and grid = sms.
   int part2 = p.n_tiles;
@@ -934,9 +942,9 @@ int marlinx_gemm_zs_pdl(const void* A, long long lda, int M, const void* B, cons
 // MARLINX_LEAN: shared up (relu2 = 1: N 3712, K 2688) or shared down (N 2688,
 // K 3712; Z2 = py z2_repack(B) for the zero-row skip, or null for dense). Same
 // arithmetic and output bits as marlinx_gemm_relu2 / marlinx_gemm_zs / marlinx_gemm.
-int marlinx_gemm_lean(const void* A, long long lda, int M, const void* B, const void* S,
+static int marlinx_gemm_lean_impl(const void* A, long long lda, int M, const void* B, const void* S,
                       const void* GS, void* C, long long ldc, int N, int K, int sms,
-                      void* stream, const void* Z2, int relu2, int pdl) {
+                      void* stream, const void* Z2, int relu2, int pdl, const int* vrows) {
 #ifdef MARLINX_NO_PDL
   if (pdl) return -10;
 #endif
@@ -958,6 +966,7 @@ int marlinx_gemm_lean(const void* A, long long lda, int M, const void* B, const 
   p.k_tiles = K / 128;
   p.Z = static_cast<const uint32_t*>(Z2);
   p.SU = nullptr;
+  p.vrows = vrows;
   int part2 = p.n_tiles;
   if (p.n_tiles > sms) {
     part2 = p.n_tiles % sms;
@@ -973,6 +982,22 @@ int marlinx_gemm_lean(const void* A, long long lda, int M, const void* B, const 
   if (N != 2688 || K != 3712) return -7;
   if (Z2) return marlinx::launch_lean<2688, 3712, false, true, MX_LEAN_PW>(p, st, pdl != 0);
   return marlinx::launch_lean<2688, 3712, false, false, MX_LEAN_PW>(p, st, pdl != 0);
+}
+
+int marlinx_gemm_lean(const void* A, long long lda, int M, const void* B, const void* S,
+                      const void* GS, void* C, long long ldc, int N, int K, int sms,
+                      void* stream, const void* Z2, int relu2, int pdl) {
+  return marlinx_gemm_lean_impl(A, lda, M, B, S, GS, C, ldc, N, K, sms, stream, Z2, relu2, pdl, nullptr);
+}
+
+// marlinx_gemm_lean for the verify's shared down with a live-row count (device int, the spec
+// loop's verify_rows): rows at or past it read as zero activations, so they add no zero-skip rows
+// and their outputs are zero; live rows are computed exactly as by marlinx_gemm_lean.
+int marlinx_gemm_lean_v(const void* A, long long lda, int M, const void* B, const void* S,
+                        const void* GS, void* C, long long ldc, int N, int K, int sms,
+                        void* stream, const void* Z2, int relu2, int pdl, const int* vrows) {
+  if (!vrows || !Z2 || relu2) return -11;
+  return marlinx_gemm_lean_impl(A, lda, M, B, S, GS, C, ldc, N, K, sms, stream, Z2, relu2, pdl, vrows);
 }
 
 // Unit-major scale variant (any mode): SU = py su_repack(S). Same arithmetic.

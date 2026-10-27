@@ -582,6 +582,10 @@
     {
       "file": "harness/protocol-adapter/src/{hotwait.rs,resident.rs,lib.rs,bin/cuda-engine.rs}; harness/vllm_resident/resident.py",
       "why": "i34-9 (ours): hot waits. Before each blocking read of the next line (the adapter's stdin and its resident-socket replies; the resident's request socket) the reader polls the descriptor with a 1 ms timeout, for up to a few seconds, so the read starts when the bytes land instead of after the waiting core wakes from deep idle. Only when the read starts changes: the bytes, framing, timeouts and errors are the reader's own, and no engine work moves between requests or phases. CUDA_ENGINE_HOT_WAIT=0 (adapter) and RESIDENT_HOT_WAIT=0 (resident) restore plain blocking reads."
+    },
+    {
+      "file": "(composition)",
+      "why": "terrapinelf: a byte-for-byte copy of the promoted main ea229c8 (a1cf20d1) whose only addition is this composition entry. It carries terrapinelf's 6-bit scale planes for the routed w2 zero-row-skipping kernels (7a22b821), i34-9's hot waits (9c53722c) and ercumentyildirim's bit-equality admission of the wide packed MTP compact-down tiles, on terrapinelf's f5904a37."
     }
   ]
 }

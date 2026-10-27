@@ -62,6 +62,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     launch_pdl: tl.constexpr,
+    TOKEN_PACKET: tl.constexpr = False,
 ):
     conv_states_ptr = initial_states_ptr
     conv_state_indices_ptr = cache_indices_ptr
@@ -423,61 +424,109 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     if launch_pdl:
         tl.extra.cuda.gdc_launch_dependents()
 
-    for idx_token in range(segment_len):
-        acc = acc_preload
-
-        matrix_w = w_col0
-        matrix_x = col0
+    if TOKEN_PACKET and KERNEL_WIDTH >= 2 and KERNEL_WIDTH <= 4:
+        # Fetch the complete eight-token packet once. The original halo,
+        # cache reads/writes, weight loads and PDL boundary above are kept.
+        # Each feature owns the same ordered KERNEL_WIDTH accumulation;
+        # independent tokens expose their load/math/store work together.
+        tt = tl.arange(0, BLOCK_M)
+        packet = tl.load(
+            x_base_1d[None, :] + tt[:, None] * stride_x_token,
+            (tt < segment_len)[:, None] & mask_x_1d[None, :],
+            other=0.0,
+        )
+        acc = tl.broadcast_to(acc_preload[None, :], (BLOCK_M, BLOCK_N))
         for j in tl.static_range(KERNEL_WIDTH):
-            if KERNEL_WIDTH == 2:
-                if j == 1:  # KERNEL_WIDTH-1:
-                    matrix_w = w_col1
-                    x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
-            elif KERNEL_WIDTH == 3:
-                if j == 1:
-                    matrix_w = w_col1
-                    matrix_x = col1
-                elif j == 2:
-                    matrix_w = w_col2
-                    x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
-            elif KERNEL_WIDTH == 4:
-                if j == 1:
-                    matrix_w = w_col1
-                    matrix_x = col1
-                elif j == 2:
-                    matrix_w = w_col2
-                    matrix_x = col2
-                elif j == 3:
-                    matrix_w = w_col3
-                    x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
-
-            acc += matrix_x * matrix_w  # [BLOCK_N]
-
-        if KERNEL_WIDTH == 2:
-            col0 = matrix_x
-        elif KERNEL_WIDTH == 3:
-            col0 = col1
-            col1 = matrix_x
-        elif KERNEL_WIDTH == 4:
-            col0 = col1
-            col1 = col2
-            col2 = matrix_x
-
+            indices = tl.broadcast_to(
+                tl.maximum(tt - (KERNEL_WIDTH - 1 - j), 0)[:, None],
+                (BLOCK_M, BLOCK_N),
+            )
+            matrix_x = tl.gather(packet, indices, axis=0)
+            if j < KERNEL_WIDTH - 1:
+                # For t < lag the sample is in the already loaded halo,
+                # at index t+j. No cross-CTA dependency or extra input load.
+                halo = tl.broadcast_to(col0[None, :], (BLOCK_M, BLOCK_N))
+                if KERNEL_WIDTH >= 3:
+                    halo = tl.where((tt + j == 1)[:, None], col1[None, :], halo)
+                if KERNEL_WIDTH >= 4:
+                    halo = tl.where((tt + j == 2)[:, None], col2[None, :], halo)
+                matrix_x = tl.where(
+                    (tt < KERNEL_WIDTH - 1 - j)[:, None], halo, matrix_x,
+                )
+            if j == 0:
+                matrix_w = w_col0
+            elif j == 1:
+                matrix_w = w_col1
+            elif j == 2:
+                matrix_w = w_col2
+            elif j == 3:
+                matrix_w = w_col3
+            acc += matrix_x * matrix_w[None, :]
         if SILU_ACTIVATION:
             acc = acc / (1 + tl.exp(-acc))
-        mask_1d = (idx_token < segment_len) & (
-            idx_feats < dim
-        )  # token-index  # feature-index
-        o_ptrs = (
+        tl.store(
             o_ptr
-            + (sequence_start_index + token_offset + idx_token) * stride_o_token
-            + (idx_feats * stride_o_dim)
+            + (sequence_start_index + token_offset + tt[:, None]) * stride_o_token
+            + idx_feats[None, :] * stride_o_dim,
+            acc,
+            (tt < segment_len)[:, None] & (idx_feats < dim)[None, :],
         )
+    else:
+        for idx_token in range(segment_len):
+            acc = acc_preload
 
-        tl.store(o_ptrs, acc, mask=mask_1d)
+            matrix_w = w_col0
+            matrix_x = col0
+            for j in tl.static_range(KERNEL_WIDTH):
+                if KERNEL_WIDTH == 2:
+                    if j == 1:  # KERNEL_WIDTH-1:
+                        matrix_w = w_col1
+                        x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
+                        matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                elif KERNEL_WIDTH == 3:
+                    if j == 1:
+                        matrix_w = w_col1
+                        matrix_x = col1
+                    elif j == 2:
+                        matrix_w = w_col2
+                        x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
+                        matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                elif KERNEL_WIDTH == 4:
+                    if j == 1:
+                        matrix_w = w_col1
+                        matrix_x = col1
+                    elif j == 2:
+                        matrix_w = w_col2
+                        matrix_x = col2
+                    elif j == 3:
+                        matrix_w = w_col3
+                        x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
+                        matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+
+                acc += matrix_x * matrix_w  # [BLOCK_N]
+
+            if KERNEL_WIDTH == 2:
+                col0 = matrix_x
+            elif KERNEL_WIDTH == 3:
+                col0 = col1
+                col1 = matrix_x
+            elif KERNEL_WIDTH == 4:
+                col0 = col1
+                col1 = col2
+                col2 = matrix_x
+
+            if SILU_ACTIVATION:
+                acc = acc / (1 + tl.exp(-acc))
+            mask_1d = (idx_token < segment_len) & (
+                idx_feats < dim
+            )  # token-index  # feature-index
+            o_ptrs = (
+                o_ptr
+                + (sequence_start_index + token_offset + idx_token) * stride_o_token
+                + (idx_feats * stride_o_dim)
+            )
+
+            tl.store(o_ptrs, acc, mask=mask_1d)
 
 
 def causal_conv1d_fn(
@@ -711,53 +760,84 @@ def causal_conv1d_fn(
         batch_ptr = batch_ptr.to(x.device)
         token_chunk_offset_ptr = token_chunk_offset_ptr.to(x.device)
 
-    _causal_conv1d_fwd_kernel[grid](
-        # Pointers to matrices
-        x,
-        weight,
-        bias,
-        conv_states,
-        cache_indices,
-        has_initial_state,
-        query_start_loc,
-        batch_ptr,
-        token_chunk_offset_ptr,
-        block_idx_first_scheduled_token,
-        block_idx_last_scheduled_token,
-        initial_state_idx,
-        num_computed_tokens,
-        out,
-        # Matrix dimensions
-        dim,
-        num_cache_lines,
-        # stride
-        stride_x_dim,
-        stride_x_token,
-        stride_w_dim,
-        stride_w_width,
-        stride_istate_seq,
-        stride_istate_dim,
-        stride_istate_token,
-        stride_cache_indices,
-        stride_o_dim,
-        stride_o_token,
-        block_size_to_align // BLOCK_M,
-        # others
-        pad_slot_id,
-        null_block_id,
-        # META
-        HAS_BIAS=bias is not None,
-        KERNEL_WIDTH=width,
-        SILU_ACTIVATION=activation in ["silu", "swish"],
-        IS_APC_ENABLED=block_idx_last_scheduled_token is not None,
-        HAS_NULL_BLOCK=null_block_id is not None,
-        NP2_STATELEN=np2_statelen,
-        # launch_cooperative_grid=True
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=256,
-        num_stages=2,
-        launch_pdl=current_platform.is_arch_support_pdl(),
-    )
+    def launch_packet(token_packet, packet_x, packet_states, packet_initial, packet_out):
+        _causal_conv1d_fwd_kernel[grid](
+            # Pointers to matrices
+            packet_x,
+            weight,
+            bias,
+            packet_states,
+            cache_indices,
+            packet_initial,
+            query_start_loc,
+            batch_ptr,
+            token_chunk_offset_ptr,
+            block_idx_first_scheduled_token,
+            block_idx_last_scheduled_token,
+            initial_state_idx,
+            num_computed_tokens,
+            packet_out,
+            # Matrix dimensions
+            dim,
+            num_cache_lines,
+            # stride
+            stride_x_dim,
+            stride_x_token,
+            stride_w_dim,
+            stride_w_width,
+            stride_istate_seq,
+            stride_istate_dim,
+            stride_istate_token,
+            stride_cache_indices,
+            stride_o_dim,
+            stride_o_token,
+            block_size_to_align // BLOCK_M,
+            # others
+            pad_slot_id,
+            null_block_id,
+            # META
+            HAS_BIAS=bias is not None,
+            KERNEL_WIDTH=width,
+            SILU_ACTIVATION=activation in ["silu", "swish"],
+            IS_APC_ENABLED=block_idx_last_scheduled_token is not None,
+            HAS_NULL_BLOCK=null_block_id is not None,
+            NP2_STATELEN=np2_statelen,
+            # launch_cooperative_grid=True
+            TOKEN_PACKET=token_packet,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=256,
+            num_stages=2,
+            launch_pdl=current_platform.is_arch_support_pdl(),
+        )
+
+    packet_admitted = False
+    if (
+        width in (2, 3, 4)
+        and BLOCK_M == 8
+        and metadata is not None
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and conv_states.dtype == torch.bfloat16
+        and has_initial_state is not None
+    ):
+        try:
+            from vllm.model_executor.layers.mamba.ops.conv_token_packet import (
+                admit_token_packet,
+            )
+            packet_admitted = admit_token_packet(
+                launch_packet, x, conv_states, has_initial_state, out, weight, bias,
+                block_idx_last_scheduled_token is not None,
+            )
+        except Exception as packet_error:
+            # Optional import/compile/qualification refusal retains the old
+            # scalar-token kernel and its actual state ownership unchanged.
+            from vllm.logger import init_logger
+
+            init_logger(__name__).warning_once(
+                "Conv token packet optional path refused: %s", type(packet_error).__name__,
+            )
+            packet_admitted = False
+    launch_packet(packet_admitted, x, conv_states, has_initial_state, out)
     return out.to(original_x_dtype)
 
 

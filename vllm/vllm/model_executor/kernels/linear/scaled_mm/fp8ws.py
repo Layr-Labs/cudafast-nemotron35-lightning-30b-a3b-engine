@@ -87,6 +87,13 @@ def register(weight: torch.Tensor, weight_scale: torch.Tensor | None,
         logger.warning("fp8ws: output differs from CUTLASS; this layer keeps CUTLASS")
         return False
     _PACKS[weight.data_ptr()] = (weight, packed)
+    # Optional new variant is qualified against this already-admitted original.
+    # Any refusal retains the original entry and its dispatch below.
+    try:
+        from .fp8ws_pipeline import qualify
+        qualify(fp8ws, weight, packed, scales, _activations)
+    except Exception as exc:
+        logger.warning("fp8ws pipeline unavailable; original retained: %r", exc)
     _stats["admitted"] += 1
     if _stats["admitted"] in (1, 23):
         logger.info("fp8ws: %d Mamba in_proj weights admitted for the M=496 prefill (%d rejected); "
@@ -117,4 +124,11 @@ def maybe_gemm(a: torch.Tensor, b: torch.Tensor, sa: torch.Tensor,
     if not _stats["dispatched"]:
         logger.info("fp8ws: M=496 in_proj dispatched to the packed kernel")
     _stats["dispatched"] += 1
+    try:
+        from .fp8ws_pipeline import maybe_gemm as maybe_pipeline
+    except Exception:
+        return fp8ws.gemm(a, packed, sa, sb)
+    piped = maybe_pipeline(a, weight, packed, sa, sb)
+    if piped is not None:
+        return piped
     return fp8ws.gemm(a, packed, sa, sb)

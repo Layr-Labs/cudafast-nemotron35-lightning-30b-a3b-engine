@@ -642,6 +642,14 @@
     {
       "file": "(composition)",
       "why": "e-man07 composition on the record a1cf20d1-8d18-4f7d-942f-df2e17245deb: our nx2 tree (jungjipdo 96d0992b-4f98-4992-86b7-82174c6ea20f, leech1996 6f6ff439-186f-4cea-97ac-6f3e8f2be9af, ercumentyildirim 456feb71-1622-488c-9487-79ae5b9deaa8, i34-9 55ed2064-a023-4b5e-9fc1-da25829ef0db, terrapinelf ca2ae19c-8f8a-4dff-9c23-88cf297efe51 as carried in leech1996 c5670d92-e925-4a20-ad66-d75e07ada6d5) plus i34-9 8b406fa2-8fbf-4867-a9fb-7a8b40915ae3's fp8ws prefill Mamba in_proj kernel, files byte for byte. No new arithmetic. Re-measurement #1."
+    },
+    {
+      "file": "harness/kernels/fp8ws/csrc/fp8ws_pipeline.cuh; appendonlyfp8ws.cu/pybinding; model_executor/kernels/linear/scaled_mm/fp8ws_pipeline.py andtwooptionalhooks",
+      "why": "ENTIRE newhighest4ae55271-d4bd-44f6-adf0-1f731b273822 officialbcd22b8349419881715577076414d5165e7f5858/rootad5e29788033c13568a481f59c539353c7d54891 retained. Optional9thTMAproducer andtwoexplicitregisterfragment packets fromownf5f1fee6-0923-4709-ad14-befd2e1199ff/ownnextdbb75ef direction(original8b406fa2-8fbf-4867-a9fb-7a8b40915ae3 FP8method; own9f4e7dbf-2f99-49e6-9751-2cd0291caaf1 conservativegate/evidence). OriginalCUDA TU/ABI/binding andregisterwordchecks retained. OnlyafteroriginalFP8admission, privateguarded actualoldFP8/newFP8 fullword andchangedcontentgraphs/5alternatingwarm64MiBpressure timings mayselectnewkernel; refusalkeepsexactoriginalFP8. RetainsALL highestsource conditionalstep/FORCE/PDL8off/SHX36/prefillS6on/decodeS6off andoriginalnonflatcompoundsource, exceptseparatelyselectedqualifiedPDL8 menuaddition. No localexecution oractualregister/spill/runtimeactivation/gainclaim."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_attn_packed.py",
+      "why": "Select usefulcompatiblepending345d65de-e79d-44e5-a2e2-bf69c7318c51 /PR876 exact1line: ATTN_PACK12_PDL8 default1 reoffers existing8deep-ring kernel tooriginalper-shape fullword+CUDAGraph timingchooser. Originalmath/probe/chooser unchanged, source8d43bba441654344dc40ea806cf65245a8300951. Mechanismusefulpotentiallatencyhiding andfileindependentofMambaFP8variant; combinationunverified. Do notadopt claimed canonlyimprove: timingnoise, cache/occupancyinteraction andfullwholemayregress. ATTN_PACK12_PDL8=0 restoreshighestmenu."
     }
   ]
 }

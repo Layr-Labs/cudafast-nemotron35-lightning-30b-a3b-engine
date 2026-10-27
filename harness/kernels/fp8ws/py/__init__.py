@@ -83,3 +83,41 @@ def gemm(a: torch.Tensor, packed: torch.Tensor, sa: torch.Tensor, sb: torch.Tens
     if rc:
         raise RuntimeError(f"fp8ws launch failed: {rc}")
     return out
+
+
+# Optional separate variant; the original functions above remain the fallback.
+_pipeline_ready_devices = set()
+
+
+def pipeline_available(device: torch.device) -> bool:
+    lib = _load()
+    if lib is None or torch.cuda.get_device_capability(device) != (12, 1):
+        return False
+    init = getattr(lib, "fp8ws_pipeline_init", None)
+    run = getattr(lib, "fp8ws_run_pipeline", None)
+    if init is None or run is None:
+        return False
+    init.argtypes, init.restype = [], ctypes.c_int
+    run.argtypes, run.restype = lib.fp8ws_run.argtypes, ctypes.c_int
+    with torch.cuda.device(device):
+        index = torch.cuda.current_device()
+        if index not in _pipeline_ready_devices:
+            if not _ready(device) or init() != 0:
+                return False
+            _pipeline_ready_devices.add(index)
+    return True
+
+
+def gemm_pipeline(a, packed, sa, sb, out=None):
+    """Called only after direct original/new private admission; optional guarded out."""
+    if out is None:
+        out = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
+    if (tuple(out.shape) != (M, N) or out.dtype != torch.bfloat16
+            or out.device != a.device or not out.is_contiguous() or out.data_ptr() % 16):
+        raise ValueError("invalid fp8ws pipeline output owner")
+    rc = _lib.fp8ws_run_pipeline(a.data_ptr(), packed.data_ptr(), sa.data_ptr(), sb.data_ptr(),
+                               out.data_ptr(), M, N, K,
+                               torch.cuda.current_stream(a.device).cuda_stream)
+    if rc:
+        raise RuntimeError(f"fp8ws pipeline launch failed: {rc}")
+    return out

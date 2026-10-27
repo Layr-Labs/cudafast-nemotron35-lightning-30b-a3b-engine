@@ -54,6 +54,14 @@ try:
 except ImportError:
     _sctopk = None
 _SCTOPK = os.environ.get("VLLM_MTP_SCREEN_SCTOPK", "1") != "0"
+# LOCAL PATCH (cudafast-nemotron35): the three-level cascade after its first streaming dot
+# (the three per-chunk selections, the mid and rest dots and the survivors' full-K dot) as one
+# CUDA kernel, one CTA per chunk (harness/kernels/scrtail), used only after a load-time bitwise
+# comparison with the cascade below. MTP_SCREEN_TAIL=0 keeps the cascade.
+try:
+    import scrtail as _scrtail
+except ImportError:
+    _scrtail = None
 from vllm.triton_utils import tl, triton
 
 from .nemotron_h_mtp_kernels import (
@@ -792,8 +800,14 @@ class DraftHeadScreen:
                             len(self._next_pf), self._next_max_kept)
         self._h = torch.empty(k, dtype=torch.float32, device=device)
         self._out = torch.empty(1, dtype=torch.int32, device=device)
+        self.tail = False
+        self._tail_debug = False
         if device.type == "cuda" and self.cascade and self.fold:
             self.fold = self._fold_matches(k, device)
+        if (device.type == "cuda" and self.pre and self.sctopk and not self._next_pf
+                and _scrtail is not None and _scrtail.available()):
+            self.tail = self._tail_matches(k, device)
+            print(f"MTP_SCREEN_TAIL admitted={self.tail}", flush=True)
         if device.type == "cuda" and screen_graph_enabled():
             # The captured one-row screen is the gated one (depth gate): allocate
             # the gate first so the graph captures its address.
@@ -904,6 +918,60 @@ class DraftHeadScreen:
             num_warps=num_warps, launch_pdl=mtp_pdl(), gate_ptr=tgate, GATED=tgated,
         )
 
+    def _tail_matches(self, k: int, device: torch.device) -> bool:
+        """Load time, before capture: scrtail against the three-level cascade on random rows
+        (several scales, signed zeros, ties) and on the stopped (gated) pass, bitwise on the
+        candidate ids, their logits, every intermediate buffer and the token."""
+        gate = depth_gate_init(device)
+        try:
+            gen = torch.Generator(device=device)
+            gen.manual_seed(20261027)
+            out = torch.empty((), dtype=torch.int32, device=device)
+            names = ("_pre_cand", "mid_scores", "scores", "_coarse_cand", "refine_scores",
+                     "_cand", "cand_logits")
+            self._tail_debug = True
+            for trial in range(10):
+                h = torch.randn(k, generator=gen, device=device) * (0.25 * 2 ** (trial % 6))
+                if trial == 6:
+                    h[::3] = 0.0
+                    h[1::7] = -0.0
+                elif trial == 7:
+                    h = torch.round(h * 4) / 4
+                elif trial == 8:
+                    h = h * 1e-20
+                h = h.float().contiguous()
+                for stop in ((0, 1) if gate is not None else (0,)):
+                    outs = []
+                    for tail in (False, True):
+                        if gate is not None:
+                            gate.zero_()
+                            gate[0] = stop
+                        for name in names:
+                            buf = getattr(self, name)
+                            buf.fill_(-7 if buf.dtype == torch.int64 else float("nan"))
+                        self.tail = tail
+                        tok = self._greedy_row(h, gated=gate is not None, out=out)
+                        torch.cuda.synchronize(device)
+                        outs.append([tok.clone()] + [getattr(self, n).clone() for n in names])
+                    for a, b in zip(*outs):
+                        if a.dtype == torch.float32:
+                            a, b = a.view(torch.int32), b.view(torch.int32)
+                        if not torch.equal(a, b):
+                            logger.warning("MTP screen: scrtail differs from the cascade; "
+                                           "cascade kept")
+                            return False
+            logger.info("MTP screen: scrtail admitted (cascade after the first dot in one "
+                        "kernel per chunk)")
+            return True
+        except Exception as exc:  # noqa: BLE001 - any failure keeps the cascade
+            logger.warning("MTP screen: scrtail unavailable (%r); cascade kept", exc)
+            return False
+        finally:
+            self.tail = False
+            self._tail_debug = False
+            if gate is not None:
+                gate.zero_()
+
     def _fold_matches(self, k: int, device: torch.device) -> bool:
         """Load time, before capture: the folded cascade against the unfolded one on
         random rows, bitwise on every stage's scores and on the token."""
@@ -954,6 +1022,21 @@ class DraftHeadScreen:
             nchunk = self.n // SCREEN_CHUNK
             tgate, tok = _gate_args(self.scores)
             tgated = gated and tok
+            if self.tail and _scrtail.run(
+                self.scores, self._hm, self._hr, h, self.w_mid, self.s_mid, self.w_rest,
+                self.s_rest, self.w_full, self.s_full, self._cand, self.cand_logits,
+                self.gscale, gate=tgate if tgated else None, win=0, pdl=mtp_pdl(),
+                debug=(self._pre_cand, self.mid_scores, self.scores, self._coarse_cand,
+                       self.refine_scores) if self._tail_debug else None,
+            ):
+                gate, ok = _gate_args(out)
+                _select_token[(1,)](
+                    self.cand_logits, self._cand, out, N=self.cand_logits.numel(),
+                    BLOCK=triton.next_power_of_2(self.cand_logits.numel()),
+                    gate_ptr=gate, GATED=gated and ok, THETA=DEPTH_THETA,
+                    CUM=DEPTH_CUMULATIVE, launch_pdl=mtp_pdl(),
+                )
+                return out
             # LOCAL PATCH (drafter3): each top-k selection below leaves DRAM idle: a
             # piece of what the next draft pass reads first is queued as each streaming
             # dot ends (skipped on the device for a stopped loop and for the last pass);

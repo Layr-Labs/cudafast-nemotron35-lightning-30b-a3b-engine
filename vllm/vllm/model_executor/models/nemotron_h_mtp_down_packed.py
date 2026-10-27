@@ -316,6 +316,15 @@ def _admit_pkslots(key, w, sd, pw, ps, flags, word, pdl):
         print(f"MTP_DOWN_PKSLOTS unavailable, _slots kept: {exc!r}", flush=True)
 
 
+    # Optional independent owner-qualified warp pipeline; preserve the entire
+    # original pkslots admission even if preparation/import fails.
+    try:
+        from .nemotron_h_mtp_down_split import prepare as prepare_split
+        prepare_split(w, sd, pw, ps, flags, word, pdl, _PKSLOTS_OK)
+    except Exception as exc:
+        print(f"MTP_DOWN_PKSPLIT preparation unavailable: {exc!r}; original kept", flush=True)
+
+
 def maybe_slots(packed, indices, values, counts, ids, part, pdl):
     if not _ENABLED:
         return False
@@ -328,6 +337,10 @@ def maybe_slots(packed, indices, values, counts, ids, part, pdl):
     bn = entry[4].get((ids.numel(), word))
     if bn is None:
         return False
+    from .nemotron_h_mtp_down_split import maybe_run as maybe_split
+    if maybe_split(w, sd, entry[2], entry[3], word,
+                   indices, values, counts, ids, part, pdl):
+        return True
     if (_PKSLOTS_OK.get(((w.data_ptr(), sd.data_ptr()), ids.numel(), word))
             and _pkslots.run(indices, values, counts, entry[2].planes, entry[3].planes, ids, part, pdl)):
         return True

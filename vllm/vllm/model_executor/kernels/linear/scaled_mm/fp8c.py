@@ -49,10 +49,10 @@ def _log_once(fp8c) -> None:
     s = fp8c.stats
     raw = max(s["raw_bytes"], 1)
     logger.info(
-        "fp8c active: %d Mamba FP8 projections read from the lossless 7-bit code "
-        "(%.1f MB -> %.1f MB, %.3f bits/weight, %d kept fp8small); FP8C=0 disables",
+        "fp8c active: %d Mamba FP8 projections use lossless codes "
+        "(%.1f MB -> %.1f MB, %.3f stored bits/weight, %d kept fp8small, %d two-level); FP8C=0 disables",
         s["tensors"], s["raw_bytes"] / 1e6, s["bytes"] / 1e6, 8.0 * s["bytes"] / raw,
-        s["rejected"],
+        s["rejected"], s.get("fp8e", 0),
     )
 
 

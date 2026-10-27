@@ -975,6 +975,12 @@ def _mtp_moe_single_row_dispatch(
     )
     ids = topk_ids.reshape(-1)
     tw = topk_weights.reshape(-1).to(torch.float32)
+    from .nemotron_h_mtp_adaptive_slots import maybe_run as adaptive_slots
+    adaptive_out = adaptive_slots(layer, x, ids, tw, M, residual)
+    if adaptive_out is not None:
+        if shared_pf:
+            _l2pf.join(x.device)
+        return adaptive_out
     if 0 < _DRAFT_TOPK < ids.numel():
         # LOCAL PATCH (cudafast-nemotron35): the draft keeps the _DRAFT_TOPK
         # highest-weight routed experts of the MTP layer (drafter-only).

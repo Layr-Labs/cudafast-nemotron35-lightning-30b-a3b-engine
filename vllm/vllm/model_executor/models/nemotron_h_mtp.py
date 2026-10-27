@@ -541,13 +541,19 @@ class NemotronHMTP(nn.Module, SupportsPP):
         spec = getattr(self.vllm_config, "speculative_config", None)
         depth = getattr(spec, "num_speculative_tokens", None)
         try:
-            return DraftHeadScreen(
+            screen = DraftHeadScreen(
                 self.vllm_config.model_config.model, self.lm_head.weight.device,
                 depth=depth,
             )
         except Exception as e:  # noqa: BLE001 - any mismatch keeps the stock head
             logger.warning("MTP draft-head screen disabled: %r", e)
             return None
+        # The real screen's prefetch planes must exist before complete-work
+        # admission captures either MoE arm. Do not qualify at early weight load.
+        from .nemotron_h_mtp_adaptive_slots import prepare_all as prepare_adaptive_slots
+
+        prepare_adaptive_slots(self.model)
+        return screen
 
     def prepare_eh_table(self) -> bool:
         """Build the drafter's projected-embedding table once the embeddings

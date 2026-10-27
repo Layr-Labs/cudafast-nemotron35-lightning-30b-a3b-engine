@@ -582,6 +582,10 @@
     {
       "file": "harness/protocol-adapter/src/{hotwait.rs,resident.rs,lib.rs,bin/cuda-engine.rs}; harness/vllm_resident/resident.py",
       "why": "i34-9 (ours): hot waits. Before each blocking read of the next line (the adapter's stdin and its resident-socket replies; the resident's request socket) the reader polls the descriptor with a 1 ms timeout, for up to a few seconds, so the read starts when the bytes land instead of after the waiting core wakes from deep idle. Only when the read starts changes: the bytes, framing, timeouts and errors are the reader's own, and no engine work moves between requests or phases. CUDA_ENGINE_HOT_WAIT=0 (adapter) and RESIDENT_HOT_WAIT=0 (resident) restore plain blocking reads."
+    },
+    {
+      "file": "vllm/model_executor/layers/fused_moe/experts/humming_zskip.py (S6_ENABLED default)",
+      "why": "i34-9 (ours): ZSKIP_S6 defaults to 0, so the lean paired decode keeps config 653 on the 8-bit scale plane (the same admission path selects it); terrapinelf's 6-bit plane config 663 is still built and admitted with ZSKIP_S6=1. Code default only; no kernel, value or format changes."
     }
   ]
 }

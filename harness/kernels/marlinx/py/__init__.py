@@ -365,7 +365,7 @@ def _admit_vrows(layer, k: int) -> bool:
         n = layer.output_size_per_partition
         dev = layer.weight.device
         gen = torch.Generator(device=dev).manual_seed(5126)
-        for m in (5, 6):
+        for m in (5, 6, 7):
             for scale in (0.001, 1.0, 30.0):
                 h = torch.randn((m, k), device=dev, generator=gen) * scale
                 keep = torch.rand((m, k), device=dev, generator=gen) < 0.4
@@ -417,7 +417,7 @@ def maybe_apply(layer, x: torch.Tensor) -> torch.Tensor | None:
     if not _ready and not _init():
         return None
     n = layer.output_size_per_partition
-    vrows = _live_rows(layer, x2) if m in (5, 6) else None
+    vrows = _live_rows(layer, x2) if m in (5, 6, 7) else None
     out = gemm(x2, layer.weight, layer.weight_scale, layer.weight_global_scale, n, k,
                zs=getattr(layer, "_marlinx_zs", None), su=getattr(layer, "_marlinx_su", None),
                lean=getattr(layer, "_marlinx_lean", False), vrows=vrows)

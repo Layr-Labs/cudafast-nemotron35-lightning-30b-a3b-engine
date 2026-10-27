@@ -582,6 +582,30 @@
     {
       "file": "harness/protocol-adapter/src/{hotwait.rs,resident.rs,lib.rs,bin/cuda-engine.rs}; harness/vllm_resident/resident.py",
       "why": "i34-9 (ours): hot waits. Before each blocking read of the next line (the adapter's stdin and its resident-socket replies; the resident's request socket) the reader polls the descriptor with a 1 ms timeout, for up to a few seconds, so the read starts when the bytes land instead of after the waiting core wakes from deep idle. Only when the read starts changes: the bytes, framing, timeouts and errors are the reader's own, and no engine work moves between requests or phases. CUDA_ENGINE_HOT_WAIT=0 (adapter) and RESIDENT_HOT_WAIT=0 (resident) restore plain blocking reads."
+    },
+    {
+      "file": "vllm/model_executor/layers/fused_moe/experts/humming_zskip.py (S6_ENABLED default)",
+      "why": "i34-9 (ours): ZSKIP_S6 defaults to 0, so the lean paired decode keeps config 653 on the 8-bit scale plane (the same admission path selects it); terrapinelf's 6-bit plane config 663 is still built and admitted with ZSKIP_S6=1. Code default only; no kernel, value or format changes."
+    },
+    {
+      "file": "v1/worker/gpu_model_runner.py (_prepare_inputs, _build_attention_metadata._get_block_table, _get_slot_mappings); harness/vllm_resident/test_empty_fill_skip.py",
+      "why": "ours: empty padding fills skipped on the verify path. Four padding writes (optimistic_seq_lens_cpu[num_reqs:], the block-table rows [num_reqs:num_reqs_padded] per KV cache group, is_prefilling[num_reqs:], the slot-mapping tail [unpadded:padded] per group) run only when their slice is non-empty. At one request with an unpadded verify every one of them is empty: a zero-element fill launches no kernel and writes nothing, so the GPU work, its order and its bytes are unchanged and only the host dispatch goes. VLLM_EMPTY_FILL_SKIP=0 restores the calls."
+    },
+    {
+      "file": "harness/protocol-adapter/src/{hotwait.rs,resident.rs,lib.rs,bin/cuda-engine.rs}; harness/vllm_resident/resident.py",
+      "why": "i34-9 (9c53722c-6c9b-4428-a6c0-f3e8416c8d00, carried byte for byte): hot waits. Before each blocking read of the next line (the adapter's stdin and its resident-socket replies; the resident's request socket) the reader polls the descriptor with a 1 ms timeout, for up to a few seconds, so the read starts when the bytes land instead of after the waiting core wakes from deep idle. Only when the read starts changes: the bytes, framing, timeouts and errors are the reader's own, and no engine work moves between requests or phases. CUDA_ENGINE_HOT_WAIT=0 (adapter) and RESIDENT_HOT_WAIT=0 (resident) restore plain blocking reads."
+    },
+    {
+      "file": "harness/kernels/zskip (zskip_lean.cuh F_S6 config 663, zskip.cu, py to_s6/to_s6_swap); harness/kernels/pzskip (smem5_kernel S6 config 379, py); model_executor/layers/fused_moe/experts/humming_zskip.py (_prepare_s6, _prepare_pz_s6)",
+      "why": "terrapinelf (as in 7a22b821-923d-4938-b82b-145985b23560): 6-bit scale planes for the routed w2 zero-row-skipping kernels. Every routed w2 scale byte of the pinned checkpoint lies in [62, 124]; to_s6 (swap2, lean paired decode) and to_s6_swap (swap, pzskip prefill) store each as byte - 62 in a low-nibble plane plus a 2-bit plane, decode every byte back and compare before use, and return None outside [62, 125]. Config 663 is 653 with s6_decode rebuilding the lane's four scale words at consumption; config 379 is 369 with 18 instead of 24 scale pieces per stage and s6_pair rebuilding the lane's 8 bytes. Same dequantised weights, MMA chains and epilogues. Admission by the existing bitwise checks (663: _pair_check against humming and against 653 on the 8-bit plane, plus the verify-prefix check; 379: the 496-token pzskip check). ZSKIP_S6=0 and PZSKIP_S6=0 disable."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_down_packed.py (_slots)",
+      "why": "terrapinelf: the drafter's packed MoE down slot kernel loads chunk c + 1's row ids, values and packed weights before adding chunk c's products (software-pipelined gather). The products, their chunk order, the per-lane accumulators and the final tl.sum are unchanged, so every output bit is; the existing load-time admission still compares the packed slots with the original slots bit for bit."
+    },
+    {
+      "file": "(composition)",
+      "why": "e-man07 composition on the record a1cf20d1-8d18-4f7d-942f-df2e17245deb: jungjipdo f570d121-011a-48b5-aedb-c98fd9b76793 carried byte for byte. No new arithmetic."
     }
   ]
 }

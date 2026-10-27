@@ -6,6 +6,8 @@ import torch
 from vllm import _custom_ops as ops
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from .fp8ws import maybe_gemm as fp8ws_maybe_gemm
+
 
 def prepare_weight(weight: torch.Tensor) -> torch.Tensor | None:
     try:
@@ -39,6 +41,10 @@ def _scaled_mm(
         import fp8small
 
         return fp8small.gemm(a, packed, sa, sb)
+    # LOCAL PATCH (cudafast-nemotron35): the M=496 prefill of an admitted in_proj (fp8ws.py).
+    out = fp8ws_maybe_gemm(a, b, sa, sb)
+    if out is not None:
+        return out
     return ops.cutlass_scaled_mm(a, b, scale_a=sa, scale_b=sb, out_dtype=torch.bfloat16)
 
 

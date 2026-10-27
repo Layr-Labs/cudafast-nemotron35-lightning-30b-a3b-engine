@@ -582,6 +582,34 @@
     {
       "file": "harness/protocol-adapter/src/{hotwait.rs,resident.rs,lib.rs,bin/cuda-engine.rs}; harness/vllm_resident/resident.py",
       "why": "i34-9 (ours): hot waits. Before each blocking read of the next line (the adapter's stdin and its resident-socket replies; the resident's request socket) the reader polls the descriptor with a 1 ms timeout, for up to a few seconds, so the read starts when the bytes land instead of after the waiting core wakes from deep idle. Only when the read starts changes: the bytes, framing, timeouts and errors are the reader's own, and no engine work moves between requests or phases. CUDA_ENGINE_HOT_WAIT=0 (adapter) and RESIDENT_HOT_WAIT=0 (resident) restore plain blocking reads."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_down_packed.py (_slots)",
+      "why": "terrapinelf: the drafter's packed MoE down slot kernel loads chunk c + 1's row ids, values and packed weights before adding chunk c's products (software-pipelined gather). The products, their chunk order, the per-lane accumulators and the final tl.sum are unchanged, so every output bit is; the existing load-time admission still compares the packed slots with the original slots bit for bit."
+    },
+    {
+      "file": "harness/kernels/pkslots (csrc/pkslots.cu, py, build.sh); model_executor/models/nemotron_h_mtp_down_packed.py (_admit_pkslots, maybe_slots)",
+      "why": "ercumentyildirim: the drafter's packed MoE down slot kernel with the admitted (64, 4) tile in CUDA (pkslots): the same accumulator elements per thread as _slots' Triton layout (sizePerThread [1, 16], threadsPerWarp [8, 4], warpsPerCTA [4, 1]), the same fp32 multiplies and adds in the same order (64-row chunks in order, the two row reps, the xor butterfly 16, 8, 4 over the row lanes, then (w0 + w2) + (w1 + w3) over the warps), with 96 instead of 162 registers and a two-deep gather pipeline. Admitted per top-k only when its fp32 output words equal _slots' on every load-time probe; MTP_DOWN_PKSLOTS=0 keeps _slots."
+    },
+    {
+      "file": "harness/kernels/scrtail (csrc/scrtail.cu, py, build.sh); model_executor/models/nemotron_h_mtp_screen.py (_tail_matches, _greedy_row)",
+      "why": "ercumentyildirim: the draft-head screen's three-level cascade after its first streaming dot as one CUDA kernel per 2048-row chunk (scrtail): the top 1024 of the chunk's first scores, the mid dot of those rows plus their first score, the top 256, the rest dot plus the mid score, the top 32 and the full-K dot of the 32 survivors, written to the candidate ids and logits _select_token reads. Each selection writes the ids torch.topk(sorted=False) returns in its order (keys above the K-th largest in ascending index order, then its ties), the K-th largest key from an exact 8-bit radix select. Each dot term is the 16-row tile's term of _nvfp4_rows_dot / _nvfp4_rows_dot_part as compiled: per byte fma(lo, h[2b], hi * h[2b + 1]) (hardware E2M1 decode, zeros as +0), the 8 byte terms of a group in byte order, the group-scale product and the 8-lane xor butterfly 4, 2, 1 whose first level is an fma of the lane's own product, blocks accumulated from +0 in K order, fma(gscale, acc, base) for the mid and rest scores and the in-order block sum times gscale for the logits, the value of the row's lanes 0-3. Admitted at load only after a bitwise comparison with the cascade on random rows (several scales, signed zeros, ties) and on the stopped pass: the token, the candidate ids, their logits and every intermediate buffer. MTP_SCREEN_TAIL=0 keeps the cascade."
+    },
+    {
+      "file": "vllm/model_executor/layers/fused_moe/experts/humming_zskip.py (S6_ENABLED default)",
+      "why": "i34-9 (ours): ZSKIP_S6 defaults to 0, so the lean paired decode keeps config 653 on the 8-bit scale plane (the same admission path selects it); terrapinelf's 6-bit plane config 663 is still built and admitted with ZSKIP_S6=1. Code default only; no kernel, value or format changes."
+    },
+    {
+      "file": "harness/kernels/l2pf/py/__init__.py; model_executor/models/nemotron_h_mtp_packed.py (load_packed); model_executor/models/nemotron_h_mtp_screen.py; v1/spec_decode/llm_base_proposer.py; v1/worker/gpu_model_runner.py; model_executor/layers/fused_moe/experts/humming_nvsc.py",
+      "why": "terrapinelf composition: dadon c5d82720-0817-4e93-be60-21f9d18038e5 merged into terrapinelf 8b419137-21fd-4c28-97a3-ce2ba73fa278 (ercumentyildirim 77315793 + prefill pre-launch), merge base de290fa. Files both changed: l2pf __all__ carries both sides' names; load_packed loads its planes under the bounds mask (77315793) with the three-valued EVICT policy (c5d82720); the screen admits 8-bit Triton digits (c5d82720) and then sctopk (77315793), launches c5d82720's next-pass prefetch pieces before each cascade top-k and runs each top-k through DraftHeadScreen._topk, whose Triton fallback uses _radix_for; the proposer keeps both sides' switches, uses 77315793's first-pass copy batch (c5d82720's side-stream plan, default off, only without it) and c5d82720's launch-argument backup token for one request outside stream capture, else 77315793's zero-copy read; the runner's draft-window prefetch launches c5d82720's gated table when present, else 77315793's paced prefetch, else the plain one, then c5d82720's follow-up table. humming_nvsc._prefill_configs asserts isinstance (not type identity) for the record entry, which humming_pfup.build now derives, so the 6-bit-scale prefill class is admitted with pfup's scheduler text as c5d82720 builds it. Third measurement of this composition (earlier: 906311d3-040f-4e14-a595-655d80fb7ec7, d02971ba-1983-4dd5-9755-3ccd20dec6b7)."
+    },
+    {
+      "file": "v1/worker/gpu_model_runner.py (_prepare_inputs, _build_attention_metadata._get_block_table, _get_slot_mappings); harness/vllm_resident/test_empty_fill_skip.py",
+      "why": "ours: empty padding fills skipped on the verify path. Four padding writes (optimistic_seq_lens_cpu[num_reqs:], the block-table rows [num_reqs:num_reqs_padded] per KV cache group, is_prefilling[num_reqs:], the slot-mapping tail [unpadded:padded] per group) run only when their slice is non-empty. At one request with an unpadded verify every one of them is empty: a zero-element fill launches no kernel and writes nothing, so the GPU work, its order and its bytes are unchanged and only the host dispatch goes. VLLM_EMPTY_FILL_SKIP=0 restores the calls."
+    },
+    {
+      "file": "(composition)",
+      "why": "e-man07 re-measurement of jungjipdo's 96d0992b (stack of 4 measured levers) carried byte for byte on ercumentyildirim's record a1cf20d1 (commit ea229c8). No new arithmetic. Re-measurement #3."
     }
   ]
 }

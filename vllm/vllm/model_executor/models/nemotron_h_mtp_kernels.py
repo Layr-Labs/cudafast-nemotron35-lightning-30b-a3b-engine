@@ -914,6 +914,10 @@ def mtp_moe_row(
 # LOCAL PATCH (cudafast-nemotron35): routed experts the MTP draft evaluates per
 # token (the router's top 6 by weight, highest first); MTP_DRAFT_TOPK=0 keeps all.
 _DRAFT_TOPK = int(os.environ.get("MTP_DRAFT_TOPK", "3"))
+# LOCAL PATCH (cudafast-nemotron35, first-pass top-k): the first draft pass of a cycle (the
+# catch-up call, more than one row) keeps MTP_DRAFT_TOPK_FIRST routed experts; the later
+# single-row passes keep MTP_DRAFT_TOPK. 0 or a value equal to MTP_DRAFT_TOPK restores one count.
+_DRAFT_TOPK_FIRST = int(os.environ.get("MTP_DRAFT_TOPK_FIRST", "4"))
 # MTP_TOPK_KEEP_KERNEL=0 keeps torch.sort + slice + index_select for the selection.
 _TOPK_KEEP_KERNEL = os.environ.get("MTP_TOPK_KEEP_KERNEL", "1") != "0"
 
@@ -975,22 +979,23 @@ def _mtp_moe_single_row_dispatch(
     )
     ids = topk_ids.reshape(-1)
     tw = topk_weights.reshape(-1).to(torch.float32)
-    if 0 < _DRAFT_TOPK < ids.numel():
-        # LOCAL PATCH (cudafast-nemotron35): the draft keeps the _DRAFT_TOPK
+    keep = _DRAFT_TOPK_FIRST if (M > 1 and _DRAFT_TOPK_FIRST > 0) else _DRAFT_TOPK
+    if 0 < keep < ids.numel():
+        # LOCAL PATCH (cudafast-nemotron35): the draft keeps the `keep`
         # highest-weight routed experts of the MTP layer (drafter-only).
         if _TOPK_KEEP_KERNEL and tw.is_cuda and ids.numel() <= 16:
-            tw_k = torch.empty(_DRAFT_TOPK, dtype=tw.dtype, device=tw.device)
-            ids_k = torch.empty(_DRAFT_TOPK, dtype=ids.dtype, device=ids.device)
+            tw_k = torch.empty(keep, dtype=tw.dtype, device=tw.device)
+            ids_k = torch.empty(keep, dtype=ids.dtype, device=ids.device)
             _topk_keep_kernel[(1,)](
                 tw.contiguous(), ids.contiguous(), tw_k, ids_k,
-                K=ids.numel(), BK=triton.next_power_of_2(ids.numel()), KEEP=_DRAFT_TOPK,
+                K=ids.numel(), BK=triton.next_power_of_2(ids.numel()), KEEP=keep,
                 num_warps=1, launch_pdl=mtp_pdl(),
             )
             tw, ids = tw_k, ids_k
         else:
             tw, order = torch.sort(tw, descending=True)
-            tw = tw[:_DRAFT_TOPK].contiguous()
-            ids = ids.index_select(0, order[:_DRAFT_TOPK]).contiguous()
+            tw = tw[:keep].contiguous()
+            ids = ids.index_select(0, order[:keep]).contiguous()
     out = mtp_moe_row(
         x,
         ids,

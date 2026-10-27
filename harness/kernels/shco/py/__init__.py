@@ -295,9 +295,9 @@ HALF_GRID = os.environ.get("HPF_SHX", "1") != "0"
 
 
 def _worker_grid(sms: int) -> int:
-    # SHX_GRID (default: the half grid above) sets the persistent worker count directly; the
-    # unit tables keep Marlin's partition over all SMs, so the outputs are unchanged.
-    grid = int(os.environ.get("SHX_GRID", "0"))
+    # SHX_GRID (default 36; 0 = the half grid above) sets the persistent worker count directly;
+    # the unit tables keep Marlin's partition over all SMs, so the outputs are unchanged.
+    grid = int(os.environ.get("SHX_GRID", "36"))
     if grid > 0:
         return min(grid, sms)
     return max(1, sms // 2) if HALF_GRID else sms

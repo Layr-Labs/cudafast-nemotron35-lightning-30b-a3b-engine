@@ -77,6 +77,11 @@ def _load():
             lib.marlinx_gemm_lean.argtypes = lib.marlinx_gemm.argtypes[:11] + [
                 ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]  # stream Z2 relu2 pdl
             lib.marlinx_gemm_lean.restype = ctypes.c_int
+        if hasattr(lib, "marlinx_gemm_lean_v"):
+            lib.marlinx_gemm_lean_v.argtypes = lib.marlinx_gemm.argtypes[:11] + [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                ctypes.c_void_p]  # stream Z2 relu2 pdl vrows
+            lib.marlinx_gemm_lean_v.restype = ctypes.c_int
         lib.marlinx_hog.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
                                     ctypes.c_longlong, ctypes.c_void_p, ctypes.c_void_p]
         lib.marlinx_hog.restype = ctypes.c_int
@@ -264,8 +269,10 @@ def z2_repack(w: torch.Tensor, n: int, k: int) -> torch.Tensor:
 def gemm(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
          global_scale: torch.Tensor, n: int, k: int, depth: int = DEPTH,
          relu2: bool = False, zs: torch.Tensor | None = None,
-         su: torch.Tensor | None = None, lean: bool = False) -> torch.Tensor:
-    """out[M, n] for a 2-D bf16 x[M, k] (1 <= M <= 8); no guard beyond the C side's."""
+         su: torch.Tensor | None = None, lean: bool = False,
+         vrows: torch.Tensor | None = None) -> torch.Tensor:
+    """out[M, n] for a 2-D bf16 x[M, k] (1 <= M <= 8); no guard beyond the C side's.
+    vrows (lean zero-row-skip down only): live verify rows, rows at or past it read as zero."""
     global _pdl_active
     lib = _load()
     assert lib is not None, _load_error
@@ -286,6 +293,14 @@ def gemm(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
     if lean and su is None:
         # zs is then the z2_repack copy
         lean_args = args[:11] + (args[12], zs.data_ptr() if zs is not None else None, int(relu2))
+        if vrows is not None:
+            rc = lib.marlinx_gemm_lean_v(*lean_args, int(use_pdl), vrows.data_ptr())
+            if rc and use_pdl and not torch.cuda.is_current_stream_capturing():
+                _pdl_active = False
+                rc = lib.marlinx_gemm_lean_v(*lean_args, 0, vrows.data_ptr())
+            if rc != 0:
+                raise RuntimeError(f"marlinx_gemm_lean_v failed: {rc} (M={m} N={n} K={k})")
+            return out
         rc = lib.marlinx_gemm_lean(*lean_args, int(use_pdl))
         if rc and use_pdl and not torch.cuda.is_current_stream_capturing():
             _pdl_active = False
@@ -314,6 +329,73 @@ def gemm(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
     return out
 
 
+# Verify-row prefix for the lean zero-row-skip down (MARLINX_LEAN_VROWS=0 disables): the 5- or
+# 6-row verify's shared down reads the spec loop's live-row count (smallk.live_verify_rows), so
+# padded rows add no zero-skip weight rows. Admitted per layer only after a bitwise comparison
+# of the live rows with the unmasked lean call, every live count, signed and empty-row probes.
+LEAN_VROWS = os.environ.get("MARLINX_LEAN_VROWS", "1") != "0"
+
+
+def _live_rows(layer, x2: torch.Tensor):
+    if (not LEAN_VROWS or getattr(layer, "_marlinx_zs", None) is None
+            or not getattr(layer, "_marlinx_lean", False)
+            or getattr(layer, "_marlinx_su", None) is not None):
+        return None
+    ok = getattr(layer, "_marlinx_vrows_ok", None)
+    if ok is None:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        ok = _admit_vrows(layer, x2.shape[1])
+        layer._marlinx_vrows_ok = ok
+    if not ok:
+        return None
+    import sys as _sys
+    smallk = _sys.modules.get("smallk")
+    if smallk is None or not hasattr(smallk, "live_verify_rows"):
+        return None
+    return smallk.live_verify_rows(x2.device)
+
+
+@torch.no_grad()
+def _admit_vrows(layer, k: int) -> bool:
+    lib = _load()
+    if lib is None or not hasattr(lib, "marlinx_gemm_lean_v"):
+        return False
+    try:
+        n = layer.output_size_per_partition
+        dev = layer.weight.device
+        gen = torch.Generator(device=dev).manual_seed(5126)
+        for m in (5, 6):
+            for scale in (0.001, 1.0, 30.0):
+                h = torch.randn((m, k), device=dev, generator=gen) * scale
+                keep = torch.rand((m, k), device=dev, generator=gen) < 0.4
+                x = (h.relu().square() * keep).to(torch.bfloat16).contiguous()
+                x.view(torch.int16)[:, :4] = torch.tensor([0, -32768, 1, -32767], dtype=torch.int16,
+                                                          device=dev)
+                x[1].zero_()
+                base = gemm(x, layer.weight, layer.weight_scale, layer.weight_global_scale, n, k,
+                            zs=layer._marlinx_zs, lean=True)
+                for live in range(1, m + 1):
+                    vr = torch.tensor([live], dtype=torch.int32, device=dev)
+                    out = gemm(x, layer.weight, layer.weight_scale, layer.weight_global_scale, n, k,
+                               zs=layer._marlinx_zs, lean=True, vrows=vr)
+                    torch.cuda.synchronize(dev)
+                    if not torch.equal(out[:live].view(torch.int16), base[:live].view(torch.int16)):
+                        return False
+                    if not torch.equal(out[live:].view(torch.int16),
+                                       torch.zeros_like(out[live:]).view(torch.int16)):
+                        return False
+                all_rows = torch.tensor([1 << 30], dtype=torch.int32, device=dev)
+                out = gemm(x, layer.weight, layer.weight_scale, layer.weight_global_scale, n, k,
+                           zs=layer._marlinx_zs, lean=True, vrows=all_rows)
+                torch.cuda.synchronize(dev)
+                if not torch.equal(out.view(torch.int16), base.view(torch.int16)):
+                    return False
+        return True
+    except Exception:  # noqa: BLE001 - the unmasked lean call stays
+        return False
+
+
 def maybe_apply(layer, x: torch.Tensor) -> torch.Tensor | None:
     """Marlin-exact output for an eligible layer and input, or None (caller runs Marlin)."""
     if not ENABLED or not getattr(layer, "_marlinx_ok", False):
@@ -335,9 +417,10 @@ def maybe_apply(layer, x: torch.Tensor) -> torch.Tensor | None:
     if not _ready and not _init():
         return None
     n = layer.output_size_per_partition
+    vrows = _live_rows(layer, x2) if m in (5, 6) else None
     out = gemm(x2, layer.weight, layer.weight_scale, layer.weight_global_scale, n, k,
                zs=getattr(layer, "_marlinx_zs", None), su=getattr(layer, "_marlinx_su", None),
-               lean=getattr(layer, "_marlinx_lean", False))
+               lean=getattr(layer, "_marlinx_lean", False), vrows=vrows)
     return out.reshape(*x.shape[:-1], n)
 
 

@@ -582,6 +582,26 @@
     {
       "file": "harness/protocol-adapter/src/{hotwait.rs,resident.rs,lib.rs,bin/cuda-engine.rs}; harness/vllm_resident/resident.py",
       "why": "i34-9 (ours): hot waits. Before each blocking read of the next line (the adapter's stdin and its resident-socket replies; the resident's request socket) the reader polls the descriptor with a 1 ms timeout, for up to a few seconds, so the read starts when the bytes land instead of after the waiting core wakes from deep idle. Only when the read starts changes: the bytes, framing, timeouts and errors are the reader's own, and no engine work moves between requests or phases. CUDA_ENGINE_HOT_WAIT=0 (adapter) and RESIDENT_HOT_WAIT=0 (resident) restore plain blocking reads."
+    },
+    {
+      "file": "vllm/model_executor/layers/fused_moe/experts/humming_zskip.py (S6_ENABLED default)",
+      "why": "i34-9 (ours): ZSKIP_S6 defaults to 0, so the lean paired decode keeps config 653 on the 8-bit scale plane (the same admission path selects it); terrapinelf's 6-bit plane config 663 is still built and admitted with ZSKIP_S6=1. Code default only; no kernel, value or format changes."
+    },
+    {
+      "file": "harness/kernels/shco/py/__init__.py (_worker_grid)",
+      "why": "i34-9 (ours): SHX_GRID defaults to 36 persistent workers for the prefill shared-expert shx kernel that runs on the aux stream beside the routed up/down GEMMs (was the half grid, 24 of 48 SMs). The unit tables keep Marlin's partition over all SMs and every unit is still summed whole by one CTA, so every output word is unchanged; only how many CTAs claim units changes. SHX_GRID=0 restores the half grid (HPF_SHX)."
+    },
+    {
+      "file": "harness/kernels/scrtail (csrc/scrtail.cu, py, build.sh); model_executor/models/nemotron_h_mtp_screen.py (_tail_matches, _greedy_row)",
+      "why": "ercumentyildirim: the draft-head screen's three-level cascade after its first streaming dot as one CUDA kernel per 2048-row chunk (scrtail): the top 1024 of the chunk's first scores, the mid dot of those rows plus their first score, the top 256, the rest dot plus the mid score, the top 32 and the full-K dot of the 32 survivors, written to the candidate ids and logits _select_token reads. Each selection writes the ids torch.topk(sorted=False) returns in its order (keys above the K-th largest in ascending index order, then its ties), the K-th largest key from an exact 8-bit radix select. Each dot term is the 16-row tile's term of _nvfp4_rows_dot / _nvfp4_rows_dot_part as compiled: per byte fma(lo, h[2b], hi * h[2b + 1]) (hardware E2M1 decode, zeros as +0), the 8 byte terms of a group in byte order, the group-scale product and the 8-lane xor butterfly 4, 2, 1 whose first level is an fma of the lane's own product, blocks accumulated from +0 in K order, fma(gscale, acc, base) for the mid and rest scores and the in-order block sum times gscale for the logits, the value of the row's lanes 0-3. Admitted at load only after a bitwise comparison with the cascade on random rows (several scales, signed zeros, ties) and on the stopped pass: the token, the candidate ids, their logits and every intermediate buffer. MTP_SCREEN_TAIL=0 keeps the cascade."
+    },
+    {
+      "file": "harness/kernels/marlinx (csrc/marlinx.cu Params.vrows, lean_kernel, marlinx_gemm_lean_v; py gemm(vrows), _live_rows, _admit_vrows, maybe_apply)",
+      "why": "terrapinelf: the shared expert's zero-row-skip down (the lean kernel) reads the spec loop's live verify-row count (smallk.live_verify_rows, the buffer the router, zskip, the gated norm and the replay already read) on 5- and 6-row verifies: after the PDL wait, token rows at or past it load zero activations, so a padded verify row (a cycle whose depth gate stopped early) adds no zero-skip weight rows of its own and its output is zero; live rows are computed exactly as before. Admitted per layer at the first eligible call outside capture only after a bitwise comparison of the live rows with the unmasked lean call for M = 5 and 6, every live count, signed-zero and empty-row probes (padded rows must be exact zeros, the all-rows sentinel must reproduce the unmasked call). MARLINX_LEAN_VROWS=0 keeps the unmasked call."
+    },
+    {
+      "file": "(composition)",
+      "why": "The promoted main ea229c8 (a1cf20d1) byte for byte plus ercumentyildirim's scrtail as submitted in a26a82a4 (harness/kernels/scrtail and nemotron_h_mtp_screen.py, files byte for byte; entry above carried unchanged). Plus i34-9's ZSKIP_S6 default (ddcdd302) and SHX_GRID default (55ed2064), each as its one-file diff with its entry above carried unchanged. Plus terrapinelf's live verify-row prefix for the lean shared-expert down (ca2ae19c, harness/kernels/marlinx as its diff against its base 866ac171), entry above carried unchanged. No other file changes. Measurement 10."
     }
   ]
 }

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""LOCAL PATCH (cudafast-nemotron35): the prefill (M=496) Mamba in_proj FP8 GEMM read from a
-load-time packed copy of the weight (harness/kernels/fp8ws).
+"""LOCAL PATCH (cudafast-nemotron35): the prefill (M=496) Mamba in_proj and out_proj FP8 GEMMs read
+from a load-time packed copy of the weight (harness/kernels/fp8ws).
 
 Same arithmetic as the pinned CUTLASS kernel: one ascending-K e4m3 m16n8k32 chain per output from
 +0, then fp32 x scale_b, x scale_a, one RN to BF16. The pack is a byte permutation of the weight;
@@ -22,7 +22,9 @@ from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
-M, N, K = 496, 10304, 2688
+M = 496
+# (K, N) of the column-major weights served: Mamba in_proj (2688 -> 10304), out_proj (4096 -> 2688)
+SHAPES = {(2688, 10304), (4096, 2688)}
 ENABLED = os.environ.get("FP8WS", "1") != "0"
 active = True
 # weight storage address -> (weight, pack); the weight reference keeps the address valid
@@ -34,7 +36,7 @@ def has_packs() -> bool:
     return bool(_PACKS)
 
 
-def _activations(device: torch.device) -> list[torch.Tensor]:
+def _activations(device: torch.device, K: int) -> list[torch.Tensor]:
     g = torch.Generator(device=device)
     g.manual_seed(20261027)
     sets = []
@@ -51,9 +53,10 @@ def _activations(device: torch.device) -> list[torch.Tensor]:
 
 def register(weight: torch.Tensor, weight_scale: torch.Tensor | None,
              input_scale: torch.Tensor | None) -> bool:
-    """Pack and admit one [K, N] column-major in_proj weight. True if its prefill uses fp8ws."""
-    if not ENABLED or tuple(weight.shape) != (K, N):
+    """Pack and admit one [K, N] column-major in_proj/out_proj weight. True if its prefill uses fp8ws."""
+    if not ENABLED or tuple(weight.shape) not in SHAPES:
         return False
+    K = weight.shape[0]
     try:
         import fp8ws
     except ImportError:
@@ -71,7 +74,7 @@ def register(weight: torch.Tensor, weight_scale: torch.Tensor | None,
             scales.insert(0, (input_scale.detach().float().reshape(1).contiguous(),
                               weight_scale.detach().float().reshape(1).contiguous()))
         ok = torch.equal(fp8ws.unpack_reference(packed), weight.t().view(torch.uint8))
-        for a in _activations(dev):
+        for a in _activations(dev, K):
             for sa, sb in scales:
                 if not ok:
                     break
@@ -88,8 +91,8 @@ def register(weight: torch.Tensor, weight_scale: torch.Tensor | None,
         return False
     _PACKS[weight.data_ptr()] = (weight, packed)
     _stats["admitted"] += 1
-    if _stats["admitted"] in (1, 23):
-        logger.info("fp8ws: %d Mamba in_proj weights admitted for the M=496 prefill (%d rejected); "
+    if _stats["admitted"] in (1, 23, 46):
+        logger.info("fp8ws: %d Mamba in_proj/out_proj weights admitted for the M=496 prefill (%d rejected); "
                     "FP8WS=0 disables", _stats["admitted"], _stats["rejected"])
     return True
 
@@ -105,7 +108,7 @@ def maybe_gemm(a: torch.Tensor, b: torch.Tensor, sa: torch.Tensor,
     weight, packed = entry
     if not (
         b.shape == weight.shape and b.stride() == weight.stride()
-        and a.dtype == torch.float8_e4m3fn and a.shape[1] == K and a.is_contiguous()
+        and a.dtype == torch.float8_e4m3fn and a.shape[1] == weight.shape[0] and a.is_contiguous()
         and a.data_ptr() % 16 == 0 and a.device == packed.device
         and sa.dtype == sb.dtype == torch.float32 and sa.numel() == sb.numel() == 1
         and sa.is_contiguous() and sb.is_contiguous()
@@ -115,6 +118,6 @@ def maybe_gemm(a: torch.Tensor, b: torch.Tensor, sa: torch.Tensor,
     import fp8ws
 
     if not _stats["dispatched"]:
-        logger.info("fp8ws: M=496 in_proj dispatched to the packed kernel")
+        logger.info("fp8ws: M=496 Mamba projection dispatched to the packed kernel")
     _stats["dispatched"] += 1
     return fp8ws.gemm(a, packed, sa, sb)

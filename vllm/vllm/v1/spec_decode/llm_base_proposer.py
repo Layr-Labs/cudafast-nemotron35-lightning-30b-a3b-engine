@@ -985,7 +985,16 @@ class SpecDecodeBaseProposer:
             ):
                 ret_hidden_states = None
                 step_token = None
-                if (getattr(self, "_nemo_step", None) is not None
+                if (getattr(self, "_nemo_paired_step", None) is not None
+                        and draft_probs_list is None
+                        and (not self._enable_probabilistic_draft_probs
+                             or sampling_metadata.all_greedy)):
+                    from vllm.v1.spec_decode.nemotron_paired_step import maybe_run as paired_run
+                    paired = paired_run(self, model_kwargs, per_layer_attn_metadata,
+                                        input_batch_size, batch_size, token_index)
+                    if paired is not None:
+                        ret_hidden_states, step_token = paired
+                if (ret_hidden_states is None and getattr(self, "_nemo_step", None) is not None
                         and draft_probs_list is None
                         and (not self._enable_probabilistic_draft_probs
                              or sampling_metadata.all_greedy)):
@@ -2308,6 +2317,8 @@ class SpecDecodeBaseProposer:
             prepare_plan(self)
             from vllm.v1.spec_decode.nemotron_compound_loop import prepare as prepare_loop
             prepare_loop(self)
+            from vllm.v1.spec_decode.nemotron_paired_step import prepare as prepare_paired
+            prepare_paired(self)
 
     def _get_eagle3_use_aux_hidden_state_from_config(self) -> bool:
         """

@@ -410,7 +410,10 @@ def forward_relu2(
         evict_first=evict_first,
         dyn=dyn,
     )
-    return ops.launch_kernel(
+    from vllm.model_executor.layers.fused_moe.experts import humming_claim_publication
+
+    return humming_claim_publication.launch(
+        layer,
         configs=configs,
         inputs=inputs,
         weight=getattr(layer, meta.weight_name),

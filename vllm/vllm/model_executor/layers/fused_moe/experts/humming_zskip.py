@@ -51,7 +51,10 @@ PZ_ENABLED = os.environ.get("PZSKIP", "1") != "0"
 # LOCAL PATCH (cudafast-nemotron35, pz S6): the prefill routed down (pzskip 369) reads the
 # 6-bit swap scale plane (zskip to_s6_swap, config 379) when its load-time check is bitwise
 # equal to humming; PZSKIP_S6=0 keeps 369 and the 8-bit plane.
-PZ_S6_ENABLED = os.environ.get("PZSKIP_S6", "1") != "0"
+# LOCAL PATCH (cudafast-nemotron35): default off for the prefill only - config 369 on the 8-bit
+# swap plane; the lean paired decode keeps its 6-bit plane (ZSKIP_S6, config 663).
+# PZSKIP_S6=1 restores config 379.
+PZ_S6_ENABLED = os.environ.get("PZSKIP_S6", "0") != "0"
 PZ_S6_CONFIG = 379
 PZ_CONFIG = int(os.environ.get(
     "PZSKIP_CONFIG", "369" if os.environ.get("PZSKIP_HALF64", "1") != "0" else "356"))

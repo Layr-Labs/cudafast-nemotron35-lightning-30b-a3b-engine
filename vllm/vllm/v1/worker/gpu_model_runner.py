@@ -305,6 +305,12 @@ PINNED_SOURCE_GUARDS = True
 _L2PF_DRAFT_PACE_NS = int(os.environ.get("L2PF_DRAFT_PACE_NS", "400"))
 _L2PF_DRAFT_PACE_BURST = int(os.environ.get("L2PF_DRAFT_PACE_BURST", "2"))
 
+# LOCAL PATCH (cudafast-nemotron35): the verify path skips padding fills whose
+# slice is empty (at one request and an unpadded verify every one of them is):
+# a zero-element fill_ launches no kernel and writes no byte, so only the host
+# dispatch goes. VLLM_EMPTY_FILL_SKIP=0 restores the record's calls.
+_EMPTY_FILL_SKIP = os.environ.get("VLLM_EMPTY_FILL_SKIP", "1") != "0"
+
 # LOCAL PATCH (cudafast-nemotron35): spec-decode metadata cache (_calc_spec_decode_metadata).
 _SPEC_META_CACHE = os.environ.get("VLLM_SPEC_META_CACHE", "1") != "0"
 _SPEC_META_CACHE_CHECK = os.environ.get("VLLM_SPEC_META_CACHE_CHECK", "0") == "1"
@@ -2225,7 +2231,8 @@ class GPUModelRunner(
             torch.from_numpy(num_scheduled_tokens),
             out=self.optimistic_seq_lens_cpu[:num_reqs],
         )
-        self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
+        if not _EMPTY_FILL_SKIP or num_reqs < self.optimistic_seq_lens_cpu.shape[0]:
+            self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
 
         # Build prev_positions mapping: current pos -> prev pos (-1 if new).
         # Used for gathering from previous iteration's GPU tensors.
@@ -2516,7 +2523,8 @@ class GPUModelRunner(
 
             # Fill unused block table entries with NULL_BLOCK_ID (null block)
             # for CUDAGraph padding. Block 0 is reserved for padding.
-            blk_table_tensor[num_reqs:num_reqs_padded].fill_(NULL_BLOCK_ID)
+            if not _EMPTY_FILL_SKIP or num_reqs < num_reqs_padded:
+                blk_table_tensor[num_reqs:num_reqs_padded].fill_(NULL_BLOCK_ID)
             return blk_table_tensor
 
         assert slot_mappings is not None
@@ -2551,7 +2559,8 @@ class GPUModelRunner(
         is_prefilling = num_computed_tokens_cpu < num_prompt_tokens_cpu
         # Zero out padded rows so stale data from condense() doesn't
         # misclassify padding as prefill in CUDA graph mode.
-        is_prefilling[num_reqs:] = False
+        if not _EMPTY_FILL_SKIP or num_reqs < is_prefilling.shape[0]:
+            is_prefilling[num_reqs:] = False
 
         if self.use_async_spec_decode:
             # GPU tensors are authoritative in async mode.
@@ -4493,7 +4502,8 @@ class GPUModelRunner(
 
             # Fill unused with -1. Needed for reshape_and_cache in full cuda
             # graph mode. `blk_table_tensor` -1 to match mamba PAD_SLOT_ID
-            slot_mapping[num_tokens_unpadded:num_tokens_padded].fill_(-1)
+            if not _EMPTY_FILL_SKIP or num_tokens_unpadded < num_tokens_padded:
+                slot_mapping[num_tokens_unpadded:num_tokens_padded].fill_(-1)
 
             return slot_mapping
 

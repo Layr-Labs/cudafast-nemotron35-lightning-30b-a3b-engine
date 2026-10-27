@@ -51,6 +51,9 @@ PZ_ENABLED = os.environ.get("PZSKIP", "1") != "0"
 # LOCAL PATCH (cudafast-nemotron35, pz S6): the prefill routed down (pzskip 369) reads the
 # 6-bit swap scale plane (zskip to_s6_swap, config 379) when its load-time check is bitwise
 # equal to humming; PZSKIP_S6=0 keeps 369 and the 8-bit plane.
+# LOCAL PATCH (cudafast-nemotron35): default on, as the live record has it: the prefill down
+# reads the 6-bit swap plane when its load-time check is bitwise equal to humming. PZSKIP_S6=0
+# keeps config 369 and the 8-bit plane.
 PZ_S6_ENABLED = os.environ.get("PZSKIP_S6", "1") != "0"
 PZ_S6_CONFIG = 379
 PZ_CONFIG = int(os.environ.get(
@@ -80,6 +83,8 @@ LEAN_CONFIG = int(os.environ.get("ZSKIP_LEAN_CONFIG", "653"))
 # LOCAL PATCH (cudafast-nemotron35, zskip S6): the lean config's scale plane as 6-bit offsets
 # (harness/kernels/zskip to_s6, config 663 = 653 with the 6-bit plane decoded to the same bytes
 # in registers). ZSKIP_S6=0 keeps 653 and the 8-bit plane.
+# LOCAL PATCH (cudafast-nemotron35): default on, as the live record has it: the lean paired
+# decode keeps the 6-bit plane (config 663). ZSKIP_S6=0 keeps 653 and the 8-bit plane.
 S6_ENABLED = os.environ.get("ZSKIP_S6", "1") != "0"
 S6_CONFIG = 663
 # Prefill: MoE layers whose relu^2 activations are sparse enough for the skip to beat humming's

@@ -602,6 +602,12 @@ def prepare_mtp_packed(module):
             values += original.numel()
             original.data = torch.empty(0, dtype=original.dtype, device=original.device)
         layer._fast_moe_weights = (pu, down, ps, sd, inter, ns)
+        try:
+            from .nemotron_h_mtp_up_rowwarp import prepare as prepare_row_warp
+
+            prepare_row_warp(pu, ps)
+        except Exception as exc:
+            print(f"MTP packed up row-warp optional gate unavailable: {exc!r}", flush=True)
     torch.cuda.synchronize()
     print(f"MTP_PACK12 ready values={values} mismatches=0 raw_bytes={raw_bytes} "
           f"packed_bytes={packed_bytes} retained_bf16_bytes={retained_bytes} seconds={time.monotonic()-start:.6f} "

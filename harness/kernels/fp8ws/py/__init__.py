@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Prefill (M=496) Mamba in_proj FP8 GEMM with the pinned CUTLASS arithmetic.
+"""Prefill (M=496) Mamba in_proj and out_proj FP8 GEMMs with the pinned CUTLASS arithmetic.
 
 The weight is packed once at load (a byte permutation, see README.md); the activation is the
 producer's row-major tensor, unchanged. Callers admit a pack with a bitwise comparison against
@@ -11,7 +11,10 @@ from pathlib import Path
 
 import torch
 
-M, N, K = 496, 10304, 2688
+M = 496
+# (N, K) of the supported weights: Mamba in_proj and out_proj
+SHAPES = ((10304, 2688), (2688, 4096))
+_BY_SIZE = {n * k: (n, k) for n, k in SHAPES}
 _lib = None
 _load_failed = False
 _ready_devices = set()
@@ -46,11 +49,11 @@ def _ready(device: torch.device) -> bool:
 
 
 def prepare(weight: torch.Tensor) -> torch.Tensor | None:
-    """Pack a column-major [K, N] FP8 in_proj weight; None if unsupported. No byte changes value."""
+    """Pack a column-major [K, N] FP8 in_proj/out_proj weight; None if unsupported. No byte changes value."""
     if not weight.is_cuda or weight.dtype != torch.float8_e4m3fn or weight.ndim != 2:
         return None
     k, n = weight.shape
-    if (n, k) != (N, K) or weight.stride() != (1, k) or weight.data_ptr() % 16:
+    if (n, k) not in SHAPES or weight.stride() != (1, k) or weight.data_ptr() % 16:
         return None
     if torch.cuda.get_device_capability(weight.device) != (12, 1) or _load() is None:
         return None
@@ -65,6 +68,7 @@ def prepare(weight: torch.Tensor) -> torch.Tensor | None:
 
 def unpack_reference(packed: torch.Tensor) -> torch.Tensor:
     """Inverse permutation of the pack as a pure tensor reshape ([N, K] uint8), for proofs."""
+    N, K = _BY_SIZE[packed.numel()]
     kt, bn, cpr = 128, 112, 8
     p = packed.view(N // bn, K // kt, bn, cpr, 16)
     r = torch.arange(bn, device=packed.device).view(bn, 1)
@@ -76,7 +80,8 @@ def unpack_reference(packed: torch.Tensor) -> torch.Tensor:
 
 
 def gemm(a: torch.Tensor, packed: torch.Tensor, sa: torch.Tensor, sb: torch.Tensor) -> torch.Tensor:
-    """C[496, 10304] in BF16; called only after the caller's shape/dtype guard."""
+    """C[496, N] in BF16; called only after the caller's shape/dtype guard."""
+    N, K = _BY_SIZE[packed.numel()]
     out = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
     rc = _lib.fp8ws_run(a.data_ptr(), packed.data_ptr(), sa.data_ptr(), sb.data_ptr(), out.data_ptr(),
                         M, N, K, torch.cuda.current_stream(a.device).cuda_stream)

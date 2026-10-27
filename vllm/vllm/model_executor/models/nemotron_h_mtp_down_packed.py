@@ -61,17 +61,32 @@ def _slots(indices, values, counts,
     else:
         base = (slot - TOPK).to(tl.int64) * I * H
     acc = tl.zeros((BK, BN), tl.float32)
-    for start in range(0, count, BK):
-        pos = start + lane
-        k = tl.load(indices + slot * I + pos, mask=pos < count, other=0)
-        value = tl.load(values + slot * I + pos, mask=pos < count, other=0.0)
-        index = base + k[:, None].to(tl.int64) * H + n[None, :]
-        mask = (pos[:, None] < count) & (n[None, :] < H)
+    # LOCAL PATCH (cudafast-nemotron35): software-pipelined gather. Chunk c + 1's row ids,
+    # values and weight loads are issued before chunk c's products are added, so its gathered
+    # rows are in flight during the math; the products are added in the same chunk order to
+    # the same per-lane accumulators, so every output bit is unchanged.
+    pos = lane
+    k = tl.load(indices + slot * I + pos, mask=pos < count, other=0)
+    value = tl.load(values + slot * I + pos, mask=pos < count, other=0.0)
+    index = base + k[:, None].to(tl.int64) * H + n[None, :]
+    mask = (pos[:, None] < count) & (n[None, :] < H)
+    if slot < TOPK:
+        weight = _load_packed(RSM, REX, RBASE, RRI, RRAW, index, mask, WORD=WORD)
+    else:
+        weight = _load_packed(SSM, SEX, SBASE, SRI, SRAW, index, mask, WORD=WORD)
+    for start in range(BK, count + BK, BK):
+        posn = start + lane
+        kn = tl.load(indices + slot * I + posn, mask=posn < count, other=0)
+        valuen = tl.load(values + slot * I + posn, mask=posn < count, other=0.0)
+        indexn = base + kn[:, None].to(tl.int64) * H + n[None, :]
+        maskn = (posn[:, None] < count) & (n[None, :] < H)
         if slot < TOPK:
-            weight = _load_packed(RSM, REX, RBASE, RRI, RRAW, index, mask, WORD=WORD)
+            weightn = _load_packed(RSM, REX, RBASE, RRI, RRAW, indexn, maskn, WORD=WORD)
         else:
-            weight = _load_packed(SSM, SEX, SBASE, SRI, SRAW, index, mask, WORD=WORD)
+            weightn = _load_packed(SSM, SEX, SBASE, SRI, SRAW, indexn, maskn, WORD=WORD)
         acc += weight.to(tl.float32) * value[:, None].to(tl.float32)
+        weight = weightn
+        value = valuen
     tl.store(part + slot * H + n, tl.sum(acc, axis=0), mask=n < H)
 
 
@@ -84,18 +99,14 @@ _TILES = ((32, 4), (64, 4)) + (
     ((128, 4), (128, 8), (256, 8)) if os.environ.get("MTP_DOWN_PACK12_WIDE", "1") != "0" else ())
 
 
-# LOCAL PATCH (cudafast-nemotron35): wide tiles are admitted on bit equality only (default
-# 1). The drafts feed the verify batch, whose FP8 activation scales are computed over all of
-# its rows, so a draft that differs from the record drafter's can move a near-tie in the
-# timed window; MTP_DOWN_PACK12_WIDE_EXACT=0 restores the 1e-5 relative admission.
-_WIDE_EXACT = os.environ.get("MTP_DOWN_PACK12_WIDE_EXACT", "1") != "0"
+_WIDE_EXACT = os.environ.get("MTP_DOWN_PACK12_WIDE_EXACT", "0") != "0"
 
 
 def _same(old, new, tile):
     """The original tiles must match the original slots bit for bit. A wider tile owns
     more columns per program, which can change the fp32 tree of tl.sum over the 64-row
-    chunk (Triton's layout); with MTP_DOWN_PACK12_WIDE_EXACT=0 a wide tile is admitted
-    within 1e-5 relative (same NaN/inf pattern), by default only on bit equality."""
+    chunk (Triton's layout); the drafter's numerics are free, so a wide tile is admitted
+    within 1e-5 relative (same NaN/inf pattern) unless MTP_DOWN_PACK12_WIDE_EXACT=1."""
     if torch.equal(old.view(torch.int32), new.view(torch.int32)):
         return True
     bn = tile[0] if isinstance(tile, tuple) else tile

@@ -5,7 +5,7 @@
   "subtree": "vllm",
   "container_image": "docker.io/vllm/vllm-openai:v0.27.1",
   "container_digest_arm64": "sha256:1c8e60a0841b333c700488cb029d3664807249da0c071e862191b00fe34b228c",
-  "note": "Upstream Python package at the tag. The compiled extensions (csrc) come from the pinned container's install of the same tag; tools/stage-vllm-overlay.sh layers this tree over that install. vllm/vllm/config/fault_tolerance.py is stored LF-normalized (upstream has CRLF). Draw 4. Draw 1.",
+  "note": "Upstream Python package at the tag. The compiled extensions (csrc) come from the pinned container's install of the same tag; tools/stage-vllm-overlay.sh layers this tree over that install. vllm/vllm/config/fault_tolerance.py is stored LF-normalized (upstream has CRLF). Draw 3.",
   "local_patches": [
     {
       "file": "vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py",
@@ -582,6 +582,34 @@
     {
       "file": "harness/protocol-adapter/src/{hotwait.rs,resident.rs,lib.rs,bin/cuda-engine.rs}; harness/vllm_resident/resident.py",
       "why": "i34-9 (ours): hot waits. Before each blocking read of the next line (the adapter's stdin and its resident-socket replies; the resident's request socket) the reader polls the descriptor with a 1 ms timeout, for up to a few seconds, so the read starts when the bytes land instead of after the waiting core wakes from deep idle. Only when the read starts changes: the bytes, framing, timeouts and errors are the reader's own, and no engine work moves between requests or phases. CUDA_ENGINE_HOT_WAIT=0 (adapter) and RESIDENT_HOT_WAIT=0 (resident) restore plain blocking reads."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_down_packed.py (_slots)",
+      "why": "terrapinelf: the drafter's packed MoE down slot kernel loads chunk c + 1's row ids, values and packed weights before adding chunk c's products (software-pipelined gather). The products, their chunk order, the per-lane accumulators and the final tl.sum are unchanged, so every output bit is; the existing load-time admission still compares the packed slots with the original slots bit for bit."
+    },
+    {
+      "file": "harness/kernels/pkslots (csrc/pkslots.cu, py, build.sh); model_executor/models/nemotron_h_mtp_down_packed.py (_admit_pkslots, maybe_slots)",
+      "why": "ercumentyildirim: the drafter's packed MoE down slot kernel with the admitted (64, 4) tile in CUDA (pkslots): the same accumulator elements per thread as _slots' Triton layout (sizePerThread [1, 16], threadsPerWarp [8, 4], warpsPerCTA [4, 1]), the same fp32 multiplies and adds in the same order (64-row chunks in order, the two row reps, the xor butterfly 16, 8, 4 over the row lanes, then (w0 + w2) + (w1 + w3) over the warps), with 96 instead of 162 registers and a two-deep gather pipeline. Admitted per top-k only when its fp32 output words equal _slots' on every load-time probe; MTP_DOWN_PKSLOTS=0 keeps _slots."
+    },
+    {
+      "file": "harness/kernels/scrtail (csrc/scrtail.cu, py, build.sh); model_executor/models/nemotron_h_mtp_screen.py (_tail_matches, _greedy_row)",
+      "why": "ercumentyildirim: the draft-head screen's three-level cascade after its first streaming dot as one CUDA kernel per 2048-row chunk (scrtail): the top 1024 of the chunk's first scores, the mid dot of those rows plus their first score, the top 256, the rest dot plus the mid score, the top 32 and the full-K dot of the 32 survivors, written to the candidate ids and logits _select_token reads. Each selection writes the ids torch.topk(sorted=False) returns in its order (keys above the K-th largest in ascending index order, then its ties), the K-th largest key from an exact 8-bit radix select. Each dot term is the 16-row tile's term of _nvfp4_rows_dot / _nvfp4_rows_dot_part as compiled: per byte fma(lo, h[2b], hi * h[2b + 1]) (hardware E2M1 decode, zeros as +0), the 8 byte terms of a group in byte order, the group-scale product and the 8-lane xor butterfly 4, 2, 1 whose first level is an fma of the lane's own product, blocks accumulated from +0 in K order, fma(gscale, acc, base) for the mid and rest scores and the in-order block sum times gscale for the logits, the value of the row's lanes 0-3. Admitted at load only after a bitwise comparison with the cascade on random rows (several scales, signed zeros, ties) and on the stopped pass: the token, the candidate ids, their logits and every intermediate buffer. MTP_SCREEN_TAIL=0 keeps the cascade."
+    },
+    {
+      "file": "v1/spec_decode/nemotron_compound_loop.py (_flat_pass, FLAT, the flat admission gate, _stage barrier); v1/spec_decode/nemotron_decode_plan.py (compound_only, withdraw_compound_only); v1/spec_decode/llm_base_proposer.py (withdraw_compound_only after the compound prepare)",
+      "why": "ercumentyildirim: jacklightChen's boot-qualified compound native MTP loop (581daccd) captures its three-pass parent graph with the passes' kernels directly: the model forward under CUDAGraphMode.NONE (the full-step child graph's kernels, buffers and order) and the head screen's _greedy_row into its output buffer plus the clone, then the device stage, instead of replaying the full-step and screen child graphs inside the capture (a graph replay inside a stream capture invalidates it). The parent graph is admitted by the loop's existing complete private-state comparison with the original three-pass loop (tokens, positions, inputs, hidden, slots, KV, gate, CPU shadows, page metadata, screen buffers, and an original continuation) and, for the flat body, by its private latency: not slower with live drafts (median ratio below 1.0, 90th percentile of the case ratios below 1.03) and faster on a stopped loop (median below 0.9). The native exact structural plans are kept for the compound loop when their own per-step restore gate fails (compound_only) and withdrawn when the compound loop is not admitted. NEMO_MTP_COMPOUND_FLAT=0 keeps the child-graph body; NEMO_MTP_PLAN_BANK_COMPOUND_ONLY=0 keeps the plan gate's original refusal. The device stage reads the position and the sequence length it advances in place before any warp stores the advanced values (a CTA barrier), so no warp of the stage can compute from an already advanced value."
+    },
+    {
+      "file": "model_executor/layers/fused_moe/experts/humming_zskip.py (PZ_S6_ENABLED default)",
+      "why": "ercumentyildirim: PZSKIP_S6 defaults to off, so the 496-token prefill's routed down projection runs pzskip config 369 on the 8-bit swap scale plane instead of config 379 on the 6-bit plane; the decode verify's lean paired down keeps its 6-bit plane (ZSKIP_S6 on, config 663). Both prefill configs are admitted by the same 496-token bitwise check against humming, so the prefill outputs are the same; PZSKIP_S6=1 restores config 379."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_pkmm.py (_FORCE)",
+      "why": "ercumentyildirim: MTP_PACK12_MM_FORCE (default on) admits packed_mm for every row count (2-5) and gate case of the draft head's packed QKV and output projections whose full output bits equal packed_small's on all private probes (three scales and the edge-value probe, live and stopped), without the additional four-percent private cold-speed margin. The bitwise checks are unchanged, so the drafted rows are the same; MTP_PACK12_MM_FORCE=0 restores the margin."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_attn_packed.py (_PDL8)",
+      "why": "ercumentyildirim: ATTN_PACK12_PDL8 (default off) leaves the eight-deep-ring PDL CUDA variant (apk12_pdl8) out of the target attention projections' per-shape timing choice, which then picks among the ordinary and four-deep-ring PDL CUDA kernels and the Triton configurations as before. Every candidate is still admitted only after the same equality check against F.linear, so the projections' outputs are unchanged; ATTN_PACK12_PDL8=1 restores the eight-deep variant to the choice."
     }
   ]
 }

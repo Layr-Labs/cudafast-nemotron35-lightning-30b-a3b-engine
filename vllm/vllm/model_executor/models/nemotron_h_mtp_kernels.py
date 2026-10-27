@@ -70,21 +70,40 @@ def mtp_pdl() -> bool:
 # --------------------------------------------------------------------------- #
 DEPTH_GATE = os.environ.get("MTP_DEPTH_GATE", "1") != "0"
 DEPTH_THETA = float(os.environ.get("MTP_DEPTH_THETA", "0.5"))
+# LOCAL PATCH (cudafast-nemotron35, depth 5): the threshold for drafting past the 4th draft
+# (kept count >= 4); at depth 4 the loop ends there and it has no effect. MTP_DEPTH_THETA5 sets it.
+DEPTH_THETA5 = float(os.environ.get("MTP_DEPTH_THETA5", "0.6"))
 DEPTH_CUMULATIVE = os.environ.get("MTP_DEPTH_CUMULATIVE", "1") != "0"
 GATE_PROD_ONE = 0x3F800000
 _GATE: torch.Tensor | None = None
 _GATE_START: torch.Tensor | None = None
+# Adaptive deepest draft (depth >= 5): per request, the device counts the cycles that drafted
+# num_speculative_tokens drafts (_ADAPT[1]) and those whose deepest draft was accepted (_ADAPT[2]),
+# and keeps drafting past the 4th draft only while (accepted + PRIOR) / (drafted + PRIOR) >= TAU
+# (_ADAPT[0] = 1.0 allowed, 0.0 not). Reset at each request's first proposal. Default on (MTP_ADAPT5_MODE below); MTP_ADAPT5=0 disables.
+ADAPT5 = os.environ.get("MTP_ADAPT5", "1") != "0"
+ADAPT_PRIOR = float(os.environ.get("MTP_ADAPT5_PRIOR", "1.0"))
+ADAPT_TAU = float(os.environ.get("MTP_ADAPT5_TAU", "0.25"))
+# LOCAL PATCH (cudafast-nemotron35): MTP_ADAPT5_MODE selects the rule: "lowacc" (default, see
+# _gate_begin_lowacc_kernel) or "deep" (the deepest-draft average above).
+ADAPT_MODE = os.environ.get("MTP_ADAPT5_MODE", "lowacc")
+ADAPT_LOWACC_THR = float(os.environ.get("MTP_ADAPT5_LOWACC_THR", "1.9"))
+ADAPT_LOWACC_THR_OFF = float(os.environ.get("MTP_ADAPT5_LOWACC_THR_OFF", "2.1"))
+ADAPT_MIN_CYCLES = int(os.environ.get("MTP_ADAPT5_MIN_CYCLES", "4"))
+_ADAPT: torch.Tensor | None = None
 
 
 def depth_gate_init(device: torch.device) -> torch.Tensor | None:
     """Allocates the gate (at load, before any graph that reads it is captured)
     and asks smallk for its verify-row buffer."""
-    global _GATE, _GATE_START
+    global _GATE, _GATE_START, _ADAPT
     if DEPTH_GATE and _GATE is None and device.type == "cuda":
         _GATE = torch.zeros(4, dtype=torch.int32, device=device)
         _GATE_START = torch.tensor(
             [0, 0, 1, GATE_PROD_ONE], dtype=torch.int32, device=device
         )
+        if ADAPT5:
+            _ADAPT = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float32, device=device)
         try:
             import smallk
 
@@ -130,10 +149,79 @@ def gated_prefetch(ranges, device: torch.device, name: str = "",
     return table.launch(_GATE, max_kept)
 
 
-def depth_gate_begin(batch_size: int, all_greedy: bool) -> torch.Tensor | None:
+@triton.jit
+def _gate_begin_adapt_kernel(gate_ptr, adapt_ptr, rej_ptr, HAS_REJ: tl.constexpr,
+                             NSPEC: tl.constexpr, PRIOR: tl.constexpr, TAU: tl.constexpr,
+                             PROD_ONE: tl.constexpr):
+    if HAS_REJ:
+        kept_prev = tl.load(gate_ptr + 1)
+        rej = tl.load(rej_ptr)
+        made = tl.load(adapt_ptr + 1)
+        acc = tl.load(adapt_ptr + 2)
+        deep = kept_prev >= NSPEC
+        made = made + deep.to(tl.float32)
+        acc = acc + (deep & (rej == 0)).to(tl.float32)
+        tl.store(adapt_ptr + 1, made)
+        tl.store(adapt_ptr + 2, acc)
+        ok = (acc + PRIOR) >= TAU * (made + PRIOR)
+        tl.store(adapt_ptr, ok.to(tl.float32))
+    else:
+        tl.store(adapt_ptr, 1.0)
+        tl.store(adapt_ptr + 1, 0.0)
+        tl.store(adapt_ptr + 2, 0.0)
+    tl.store(gate_ptr, 0)
+    tl.store(gate_ptr + 1, 0)
+    tl.store(gate_ptr + 2, 1)
+    tl.store(gate_ptr + 3, PROD_ONE)
+
+
+@triton.jit
+def _gate_begin_lowacc_kernel(gate_ptr, adapt_ptr, rej_ptr, HAS_REJ: tl.constexpr,
+                              THR: tl.constexpr, THR_OFF: tl.constexpr, MIN_CYCLES: tl.constexpr,
+                              PROD_ONE: tl.constexpr):
+    # LOCAL PATCH (cudafast-nemotron35): MTP_ADAPT5_MODE=lowacc. The previous verify's
+    # accepted count among the first 4 drafts is accumulated per request (_ADAPT[1] cycles,
+    # _ADAPT[2] sum); drafting past the 4th draft turns on once at least MIN_CYCLES cycles were
+    # seen and the running mean is below THR, and turns off again when the mean reaches THR_OFF.
+    # Starts off; re-evaluated every cycle.
+    if HAS_REJ:
+        kept_prev = tl.load(gate_ptr + 1)
+        rej = tl.load(rej_ptr)
+        acc4 = tl.minimum(tl.maximum(kept_prev - rej, 0), 4).to(tl.float32)
+        cycles = tl.load(adapt_ptr + 1) + 1.0
+        total = tl.load(adapt_ptr + 2) + acc4
+        tl.store(adapt_ptr + 1, cycles)
+        tl.store(adapt_ptr + 2, total)
+        was_on = tl.load(adapt_ptr) > 0.5
+        ok = (cycles >= MIN_CYCLES) & (total < tl.where(was_on, THR_OFF, THR) * cycles)
+        tl.store(adapt_ptr, ok.to(tl.float32))
+    else:
+        tl.store(adapt_ptr, 0.0)
+        tl.store(adapt_ptr + 1, 0.0)
+        tl.store(adapt_ptr + 2, 0.0)
+    tl.store(gate_ptr, 0)
+    tl.store(gate_ptr + 1, 0)
+    tl.store(gate_ptr + 2, 1)
+    tl.store(gate_ptr + 3, PROD_ONE)
+
+
+def adapt_args():
+    """(adapt buffer or the gate, ADAPT, TAU) for the screen's _select_token."""
+    a = _ADAPT
+    if a is None:
+        return _GATE, False, 0.0
+    # At depth 4 the check after the 4th draft is moot (the loop ends there) and the flag
+    # stays 1.0; only depth >= 5 updates it (depth_gate_begin).
+    return a, True, 0.5
+
+
+def depth_gate_begin(batch_size: int, all_greedy: bool,
+                     num_rejected: torch.Tensor | None = None,
+                     num_spec: int = 0) -> torch.Tensor | None:
     """Start of a draft loop: clear the stop flag and the kept count, and mark the
     loop active (the screen counts and stops only then). Only for one greedy
-    request, the case the screen's captured graph serves."""
+    request, the case the screen's captured graph serves. At depth >= 5 the deepest
+    draft's acceptance average is first updated from the previous verify."""
     g = _GATE
     if (
         g is None
@@ -142,6 +230,21 @@ def depth_gate_begin(batch_size: int, all_greedy: bool) -> torch.Tensor | None:
         or torch.cuda.is_current_stream_capturing()
     ):
         return None
+    if _ADAPT is not None and num_spec >= 5:
+        rej = num_rejected
+        has = (rej is not None and rej.is_cuda and rej.dtype == torch.int32
+               and rej.numel() >= 1 and rej.device == g.device)
+        if ADAPT_MODE == "lowacc":
+            _gate_begin_lowacc_kernel[(1,)](
+                g, _ADAPT, rej if has else g, HAS_REJ=has, THR=ADAPT_LOWACC_THR,
+                THR_OFF=ADAPT_LOWACC_THR_OFF, MIN_CYCLES=ADAPT_MIN_CYCLES, PROD_ONE=GATE_PROD_ONE,
+            )
+        else:
+            _gate_begin_adapt_kernel[(1,)](
+                g, _ADAPT, rej if has else g, HAS_REJ=has, NSPEC=num_spec,
+                PRIOR=ADAPT_PRIOR, TAU=ADAPT_TAU, PROD_ONE=GATE_PROD_ONE,
+            )
+        return g
     g.copy_(_GATE_START)
     return g
 

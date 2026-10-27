@@ -901,8 +901,11 @@ class Platform:
         else:
             # Without prefix caching, use minimum block size that satisfies
             # both backend alignment and mamba page size compatibility
+            # LOCAL PATCH (cudafast-nemotron35, depth 5): reserve one 4-byte word after the
+            # last mamba state (the spec-replay prefill tag lives in the page padding); at
+            # depth 4 the block size is unchanged (4272), at depth 5 4288 -> 4304.
             attn_block_size = kernel_block_alignment_size * cdiv(
-                mamba_page_size,
+                mamba_page_size + 4,
                 kernel_block_alignment_size * attn_page_size_1_token,
             )
 

@@ -22,7 +22,7 @@ from .nemotron_h_mtp_packed import load_packed, packed_small, pdl_prologue
 
 _ENABLED = os.environ.get("MTP_PACK12_MM", "1") != "0"
 _CONFIGS = {(4608, 2688): (32, 4, 256), (2688, 4096): (16, 2, 256)}
-_ROWS = (2, 3, 4, 5)
+_ROWS = (2, 3, 4, 5, 6)
 # Only immutable weight planes and admission flags persist. No request data.
 _ADMITTED = {}
 

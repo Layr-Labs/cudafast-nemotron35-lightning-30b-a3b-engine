@@ -642,6 +642,10 @@
     {
       "file": "(composition)",
       "why": "e-man07 composition on the record a1cf20d1-8d18-4f7d-942f-df2e17245deb: our nx2 tree (jungjipdo 96d0992b-4f98-4992-86b7-82174c6ea20f, leech1996 6f6ff439-186f-4cea-97ac-6f3e8f2be9af, ercumentyildirim 456feb71-1622-488c-9487-79ae5b9deaa8, i34-9 55ed2064-a023-4b5e-9fc1-da25829ef0db, terrapinelf ca2ae19c-8f8a-4dff-9c23-88cf297efe51 as carried in leech1996 c5670d92-e925-4a20-ad66-d75e07ada6d5) plus i34-9 8b406fa2-8fbf-4867-a9fb-7a8b40915ae3's fp8ws prefill Mamba in_proj kernel, files byte for byte. No new arithmetic. Re-measurement #1."
+    },
+    {
+      "file": "model_executor/layers/mamba/ops/{causal_conv1d.py,conv_token_packet.py}",
+      "why": "GPT 6.1 Sol / Codex / effort ultra: optional eight-token packet for BF16 prefill causal convolution on sm_121. Original metadata, initial halo, terminal and APC cache writes, PDL boundary and ordered width accumulation retained; one 8x256 input load with register tensor gathers exposes independent tokens together instead of the original serial token load/math/store loop. Original scalar-token path is retained and used unless private full-output/full-cache owner word checks, both initial-state branches, changed-content graph replay and alternating warm/pressure graph timing pass. No numerical-format, SSM, decoder, native MTP or speculation-depth change. VLLM_CONV_TOKEN_PACKET=0 disables. Complete parent 4ae55271-d4bd-44f6-adf0-1f731b273822 preserved. No local execution or measured-gain claim."
     }
   ]
 }

@@ -23,6 +23,24 @@ from vllm.v1.spec_decode.utils import PADDING_SLOT_ID
 
 logger = init_logger(__name__)
 ENABLED = os.environ.get("NEMO_MTP_COMPOUND_LOOP", "1") != "0"
+# LOCAL PATCH (cudafast-nemotron35): the three-pass parent graph captures the passes' kernels
+# directly (the model forward with no inner graph and the head screen's row), because a graph
+# replay inside a stream capture invalidates the capture here; the kernels, their order and
+# their buffers are the child graphs'. NEMO_MTP_COMPOUND_FLAT=0 keeps the child-graph body.
+FLAT = os.environ.get("NEMO_MTP_COMPOUND_FLAT", "1") != "0"
+
+
+def _flat_pass(p, screen, kwargs, md, padded):
+    """One captured native pass: the model forward's kernels and the head screen's row."""
+    from vllm.config import CUDAGraphMode
+    with set_forward_context(md, p.vllm_config, num_tokens=padded,
+                             cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                             slot_mapping=p._get_slot_mapping(padded)):
+        out = p.model(**kwargs)
+    hidden = out if isinstance(out, torch.Tensor) else out[0]
+    screen._h.copy_(hidden[0])
+    screen._greedy_row(screen._h, gated=True, out=screen._out)
+    return hidden, screen._out.clone()
 
 
 @triton.jit
@@ -417,10 +435,13 @@ def prepare(p):
         def body(md):
             tokens = []
             for step in range(3):
-                hidden = model_graph(p, kwargs, md, s.padded, 1)
-                if hidden is None or not isinstance(hidden, torch.Tensor):
-                    raise ValueError("full model graph declined compound capture")
-                token = screen.greedy(hidden[:1])
+                if FLAT:
+                    hidden, token = _flat_pass(p, screen, kwargs, md, s.padded)
+                else:
+                    hidden = model_graph(p, kwargs, md, s.padded, 1)
+                    if hidden is None or not isinstance(hidden, torch.Tensor):
+                        raise ValueError("full model graph declined compound capture")
+                    token = screen.greedy(hidden[:1])
                 tokens.append(token)
                 if step < 2:
                     _launch_stage(s, p, token, hidden[:1])
@@ -569,9 +590,21 @@ def prepare(p):
                     ratios.append(ratio)
                     if case != 2:
                         active_ratios.append(ratio)
-        if (not active_ratios or statistics.median(ratios) >= 0.98
-                or statistics.median(active_ratios) >= 0.98
-                or max(active_ratios) >= 1.01):
+        stopped_ratios = [r for i, r in enumerate(ratios) if (i // 2) % 3 == 2]
+        if FLAT:
+            # LOCAL PATCH (cudafast-nemotron35): the flat parent graph is admitted when its
+            # complete private loop is not slower with live drafts and clearly faster on a
+            # stopped loop (its launches replace three passes of host submission and graph
+            # boundaries); the state comparison above is unchanged.
+            slower = (not active_ratios or not stopped_ratios
+                      or statistics.median(active_ratios) >= 1.0
+                      or max(active_ratios) >= 1.03
+                      or statistics.median(stopped_ratios) >= 0.9)
+        else:
+            slower = (not active_ratios or statistics.median(ratios) >= 0.98
+                      or statistics.median(active_ratios) >= 0.98
+                      or max(active_ratios) >= 1.01)
+        if slower:
             raise ValueError("compound graph did not improve complete private loop latency")
         s.private_ratios = tuple(ratios)
         admitted = True

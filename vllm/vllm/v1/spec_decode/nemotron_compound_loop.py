@@ -23,6 +23,39 @@ from vllm.v1.spec_decode.utils import PADDING_SLOT_ID
 
 logger = init_logger(__name__)
 ENABLED = os.environ.get("NEMO_MTP_COMPOUND_LOOP", "1") != "0"
+# LOCAL PATCH (cudafast-nemotron35): the three-pass parent graph captures the passes' kernels
+# directly (the model forward with no inner graph and the head screen's row), replacing
+# child-graph replay during capture. Capturability, identical behavior and gain require the
+# complete remote private gate. NEMO_MTP_COMPOUND_FLAT=0 keeps the child-graph body.
+FLAT = os.environ.get("NEMO_MTP_COMPOUND_FLAT", "1") != "0"
+# Exact input/output slots and one-ahead immutable prefix loads within this graph.
+READY = os.environ.get("NEMO_MTP_COMPOUND_READY", "1") != "0"
+
+
+def _flat_pass(p, screen, kwargs, md, padded, token_out=None, publish_hidden=False):
+    """One captured native pass: the model forward's kernels and the head screen's row."""
+    from vllm.config import CUDAGraphMode
+    with set_forward_context(md, p.vllm_config, num_tokens=padded,
+                             cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                             slot_mapping=p._get_slot_mapping(padded)):
+        out = p.model(**kwargs)
+    hidden = out if isinstance(out, torch.Tensor) else out[0]
+    if token_out is None:
+        screen._h.copy_(hidden[0])
+        screen._greedy_row(screen._h, gated=True, out=screen._out)
+        return hidden, screen._out.clone()
+    if (hidden.dtype != torch.bfloat16 or hidden.ndim != 2
+            or hidden.shape[0] < 1 or hidden.shape[1] != screen._h.numel()
+            or hidden.stride(1) != 1):
+        raise ValueError("direct compound head requires a contiguous BF16 hidden row")
+    # The original head first widened this same BF16 row to FP32. The selected
+    # pre cascade gathers into the same FP32 scratch, and the final full dot's
+    # FP32 weight products widen its loads. All arithmetic/reductions stay put.
+    # Each selector writes its final slot directly; no per-pass token clone.
+    screen._greedy_row(hidden[0], gated=True, out=token_out)
+    if publish_hidden:
+        screen._h.copy_(hidden[0])  # preserve the original final observable row
+    return hidden, token_out
 
 
 @triton.jit
@@ -32,19 +65,36 @@ def _stage(token, ids, hsrc, hdst, hstride, positions, seq,
            HID: tl.constexpr, PADDED: tl.constexpr, PAGE: tl.constexpr,
            MAX_LEN: tl.constexpr, MAX_PAGES: tl.constexpr,
            MAX_PREFIX: tl.constexpr, PAD: tl.constexpr,
-           BLOCK: tl.constexpr):
+           BLOCK: tl.constexpr, PREFETCH_PREFIX: tl.constexpr = False):
     # Original fused MTP input/position/slot arithmetic, batch one. Runtime
     # guards exclude clamp boundaries, but retain the original clamp itself.
     position = tl.load(positions)
+    seq_value = tl.load(seq)
+    # LOCAL PATCH (cudafast-nemotron35): the position and the sequence length are read and
+    # then written in place by this one program; every warp reads them before any warp
+    # stores the advanced values, so no warp computes from an already advanced value (which
+    # would select the next length's plan prefix for its part of the copy).
+    tl.debug_barrier()
     new_position = position + 1
     exceeds = new_position >= MAX_LEN
     clamped = tl.where(exceeds, 0, new_position)
     block = tl.minimum(clamped // PAGE, MAX_PAGES - 1)
     slot = tl.load(table + block) * PAGE + clamped % PAGE
+    length = tl.minimum(tl.where(exceeds, 1, seq_value + 1), MAX_LEN)
+    pages = (length + PAGE - 1) // PAGE
+    page_offsets = tl.arange(0, MAX_PAGES)
+    offsets = tl.arange(0, BLOCK)
+    if PREFETCH_PREFIX:
+        # Issue the indirect immutable plan-prefix read and page table loads
+        # before the hidden-row copy, instead of waiting for its stores.
+        pointer = tl.load(prefix_ptrs + length).to(tl.uint64)
+        source = pointer.to(tl.pointer_type(tl.uint8))
+        size = tl.load(prefix_sizes + length)
+        current_prefix = tl.load(source + offsets, mask=offsets < size, other=0)
+        page_values = tl.load(table + page_offsets, mask=page_offsets < pages, other=0)
     tl.store(ids, tl.load(token).to(tl.int32))
     source_bits = hsrc.to(tl.pointer_type(tl.uint16))
     dest_bits = hdst.to(tl.pointer_type(tl.uint16))
-    offsets = tl.arange(0, BLOCK)
     for start in range(0, HID, BLOCK):
         mask = start + offsets < HID
         tl.store(dest_bits + start + offsets,
@@ -53,26 +103,39 @@ def _stage(token, ids, hsrc, hdst, hstride, positions, seq,
     padded = tl.arange(0, 8)
     tl.store(slots + padded, tl.where(padded == 0, tl.where(exceeds, PAD, slot), PAD),
              mask=padded < PADDED)
-    length = tl.minimum(tl.where(exceeds, 1, tl.load(seq) + 1), MAX_LEN)
     tl.store(seq, length)
 
     # Same current-page values as FlashInferMetadataBuilder, and the exact
     # used integer prefix the installed native planner produced for length.
-    pages = (length + PAGE - 1) // PAGE
     tl.store(indptr, 0)
     tl.store(indptr + 1, pages)
     residue = length % PAGE
     tl.store(last_page, tl.where(residue == 0, PAGE, residue))
-    page_offsets = tl.arange(0, MAX_PAGES)
-    tl.store(indices + page_offsets, tl.load(table + page_offsets,
-             mask=page_offsets < pages, other=0), mask=page_offsets < pages)
-    pointer = tl.load(prefix_ptrs + length).to(tl.uint64)
-    source = pointer.to(tl.pointer_type(tl.uint8))
-    size = tl.load(prefix_sizes + length)
-    for start in range(0, MAX_PREFIX, BLOCK):
-        mask = start + offsets < size
-        tl.store(workspace + start + offsets,
-                 tl.load(source + start + offsets, mask=mask, other=0), mask=mask)
+    if not PREFETCH_PREFIX:
+        page_values = tl.load(table + page_offsets, mask=page_offsets < pages, other=0)
+    tl.store(indices + page_offsets, page_values, mask=page_offsets < pages)
+    if PREFETCH_PREFIX:
+        final_start = ((MAX_PREFIX - 1) // BLOCK) * BLOCK
+        for start in range(0, final_start, BLOCK):
+            # One-ahead load, then the current store, with the exact same byte
+            # ranges. The source prefixes are immutable, disjoint bank clones.
+            next_offsets = start + BLOCK + offsets
+            next_prefix = tl.load(source + next_offsets,
+                                  mask=next_offsets < size, other=0)
+            tl.store(workspace + start + offsets, current_prefix,
+                     mask=start + offsets < size)
+            current_prefix = next_prefix
+        # Drain the final block without issuing a useless next-block load.
+        tl.store(workspace + final_start + offsets, current_prefix,
+                 mask=final_start + offsets < size)
+    else:
+        pointer = tl.load(prefix_ptrs + length).to(tl.uint64)
+        source = pointer.to(tl.pointer_type(tl.uint8))
+        size = tl.load(prefix_sizes + length)
+        for start in range(0, MAX_PREFIX, BLOCK):
+            mask = start + offsets < size
+            tl.store(workspace + start + offsets,
+                     tl.load(source + start + offsets, mask=mask, other=0), mask=mask)
 
 
 def _launch_stage(s, p, token, hidden):
@@ -85,7 +148,8 @@ def _launch_stage(s, p, token, hidden):
         s.prefix_ptrs, s.prefix_sizes,
         HID=p.hidden_size, PADDED=s.padded, PAGE=p.block_size,
         MAX_LEN=p.max_model_len, MAX_PAGES=s.max_pages,
-        MAX_PREFIX=s.max_prefix, PAD=PADDING_SLOT_ID, BLOCK=1024, num_warps=4,
+        MAX_PREFIX=s.max_prefix, PAD=PADDING_SLOT_ID, BLOCK=1024,
+        PREFETCH_PREFIX=READY, num_warps=4,
     )
 
 
@@ -291,7 +355,9 @@ def prepare(p):
               p._slot_mapping_buffer[:5], gate]
     values.extend(t[:4] for t in caches)
     values.extend(t[:5] for t in p.model._moe_row_src_buffers())
-    for name in ("_h", "_out", "scores", "refine_scores", "cand_logits"):
+    for name in ("_h", "_out", "scores", "refine_scores", "cand_logits",
+                 "_hp", "_hm", "_hr", "_hc", "_hs", "_pre_cand",
+                 "_coarse_cand", "_cand", "mid_scores", "_full_part"):
         value = getattr(screen, name, None)
         if isinstance(value, torch.Tensor):
             values.append(value)
@@ -414,21 +480,39 @@ def prepare(p):
                                        private_hidden.view(torch.int16))):
                 raise ValueError("compound native metadata stage differs")
 
+        s.direct_head = bool(READY and FLAT and screen.cascade and screen.fused_topk
+                             and screen.pre and screen._h.dtype == torch.float32
+                             and screen._out.dtype == torch.int32
+                             and screen._out.shape == (1,))
+        # Two graph-owned slots plus the existing final head slot. They remain
+        # distinct and every invocation overwrites all three before returning.
+        s.token_slots = ((torch.empty_like(screen._out),
+                          torch.empty_like(screen._out), screen._out)
+                         if s.direct_head else None)
+
         def body(md):
             tokens = []
             for step in range(3):
-                hidden = model_graph(p, kwargs, md, s.padded, 1)
-                if hidden is None or not isinstance(hidden, torch.Tensor):
-                    raise ValueError("full model graph declined compound capture")
-                token = screen.greedy(hidden[:1])
+                if FLAT:
+                    hidden, token = _flat_pass(
+                        p, screen, kwargs, md, s.padded,
+                        token_out=s.token_slots[step] if s.direct_head else None,
+                        publish_hidden=step == 2,
+                    )
+                else:
+                    hidden = model_graph(p, kwargs, md, s.padded, 1)
+                    if hidden is None or not isinstance(hidden, torch.Tensor):
+                        raise ValueError("full model graph declined compound capture")
+                    token = screen.greedy(hidden[:1])
                 tokens.append(token)
                 if step < 2:
                     _launch_stage(s, p, token, hidden[:1])
+            s.compound_last_hidden = hidden
             return tuple(tokens)
 
-        # Warm Triton, the existing model/head child graphs and clone outputs
-        # before capturing the three-pass parent. Each token clone has its own
-        # strong owner within this parent graph, including across replays.
+        # Warm the selected direct or child body before capturing the parent.
+        # The direct token slots have strong graph-lifetime owners and distinct
+        # addresses; the fallback retains the original cloned output slots.
         for _ in range(2):
             cad, md = setup(s.seed, 0)
             body(md)
@@ -446,7 +530,7 @@ def prepare(p):
         s.graph, s.tokens = graph, tokens
         s.owners = (kwargs, capture_md, row_zero, capture_stream)
 
-        def original(cad, md):
+        def original_body(cad, md):
             tokens = []
             mode, _, across = p._determine_batch_execution_and_padding(1)
             for step in range(3):
@@ -479,9 +563,22 @@ def prepare(p):
                             ready.record(side)
                         for value in {id(v): v for v in md.values()}.values():
                             value.plan_ready_event = ready
+            s.reference_last_hidden = hidden
             return tuple(tokens)
 
-        def observation(cad, tokens):
+        def original(cad, md):
+            # A bank retained ONLY for this candidate is not the baseline's
+            # selected per-pass path. Time the actual native planner in that
+            # case; an independently admitted baseline bank remains enabled.
+            previous_force = bank.force_native
+            if bank.compound_only:
+                bank.force_native = True
+            try:
+                return original_body(cad, md)
+            finally:
+                bank.force_native = previous_force
+
+        def observation(cad, tokens, final_hidden=None):
             result = [torch.stack(tokens), p.positions[:s.padded],
                       p.input_ids[:s.padded], p.hidden_states[:s.padded],
                       p._slot_mapping_buffer[:s.padded], cad.seq_lens, gate]
@@ -493,8 +590,12 @@ def prepare(p):
                            builder.paged_kv_indptr.gpu[:2],
                            builder.paged_kv_last_page_len.gpu[:1]))
             result.extend(getattr(screen, n) for n in (
-                "_h", "_out", "scores", "refine_scores", "cand_logits")
+                "_h", "_out", "scores", "refine_scores", "cand_logits",
+                "_hp", "_hm", "_hr", "_hc", "_hs", "_pre_cand",
+                "_coarse_cand", "_cand", "mid_scores", "_full_part")
                           if isinstance(getattr(screen, n, None), torch.Tensor))
+            if final_hidden is not None:
+                result.append(final_hidden[:1])
             return ([t.contiguous().view(torch.uint8).clone() for t in result],
                     cad.max_seq_len)
 
@@ -531,13 +632,14 @@ def prepare(p):
                             if not elapsed > 0:
                                 raise ValueError("invalid compound private timing")
                             samples[which].append(elapsed)
-                            observed[which] = [observation(cad, out)]
+                            final_hidden = (s.reference_last_hidden if which == 0
+                                            else s.compound_last_hidden)
+                            observed[which] = [observation(cad, out, final_hidden)]
                             # Exercise a subsequent ORIGINAL builder and model
                             # after the compound path, including reuse of a
                             # different pinned staging set. This is outside the
                             # timed three-pass comparison.
                             if length + 3 < p.max_model_len:
-                                final_hidden = p._nemo_full[4][0]
                                 if not isinstance(final_hidden, torch.Tensor):
                                     raise ValueError("compound continuation hidden is not a tensor")
                                 p._update_positions_dependent_metadata(
@@ -569,9 +671,27 @@ def prepare(p):
                     ratios.append(ratio)
                     if case != 2:
                         active_ratios.append(ratio)
-        if (not active_ratios or statistics.median(ratios) >= 0.98
-                or statistics.median(active_ratios) >= 0.98
-                or max(active_ratios) >= 1.01):
+        stopped_ratios = [r for i, r in enumerate(ratios) if (i // 2) % 3 == 2]
+        if READY:
+            # Preserve the highest whole's strict complete-loop requirement;
+            # independent outputs/copies are removed only if this full path wins.
+            slower = (not active_ratios or statistics.median(ratios) >= 0.98
+                      or statistics.median(active_ratios) >= 0.98
+                      or max(active_ratios) >= 1.01)
+        elif FLAT:
+            # LOCAL PATCH (cudafast-nemotron35): the flat parent graph is admitted when its
+            # complete private loop is not slower with live drafts and clearly faster on a
+            # stopped loop (its launches replace three passes of host submission and graph
+            # boundaries); the state comparison above is unchanged.
+            slower = (not active_ratios or not stopped_ratios
+                      or statistics.median(active_ratios) >= 1.0
+                      or max(active_ratios) >= 1.03
+                      or statistics.median(stopped_ratios) >= 0.9)
+        else:
+            slower = (not active_ratios or statistics.median(ratios) >= 0.98
+                      or statistics.median(active_ratios) >= 0.98
+                      or max(active_ratios) >= 1.01)
+        if slower:
             raise ValueError("compound graph did not improve complete private loop latency")
         s.private_ratios = tuple(ratios)
         admitted = True

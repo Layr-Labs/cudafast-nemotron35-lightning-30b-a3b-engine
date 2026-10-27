@@ -582,6 +582,38 @@
     {
       "file": "harness/protocol-adapter/src/{hotwait.rs,resident.rs,lib.rs,bin/cuda-engine.rs}; harness/vllm_resident/resident.py",
       "why": "i34-9 (ours): hot waits. Before each blocking read of the next line (the adapter's stdin and its resident-socket replies; the resident's request socket) the reader polls the descriptor with a 1 ms timeout, for up to a few seconds, so the read starts when the bytes land instead of after the waiting core wakes from deep idle. Only when the read starts changes: the bytes, framing, timeouts and errors are the reader's own, and no engine work moves between requests or phases. CUDA_ENGINE_HOT_WAIT=0 (adapter) and RESIDENT_HOT_WAIT=0 (resident) restore plain blocking reads."
+    },
+    {
+      "file": "vllm/model_executor/layers/fused_moe/experts/humming_zskip.py (S6_ENABLED default)",
+      "why": "i34-9 (ours): ZSKIP_S6 defaults to 0, so the lean paired decode keeps config 653 on the 8-bit scale plane (the same admission path selects it); terrapinelf's 6-bit plane config 663 is still built and admitted with ZSKIP_S6=1. Code default only; no kernel, value or format changes."
+    },
+    {
+      "file": "v1/worker/gpu_model_runner.py (_prepare_inputs, _build_attention_metadata._get_block_table, _get_slot_mappings); harness/vllm_resident/test_empty_fill_skip.py",
+      "why": "ours: empty padding fills skipped on the verify path. Four padding writes (optimistic_seq_lens_cpu[num_reqs:], the block-table rows [num_reqs:num_reqs_padded] per KV cache group, is_prefilling[num_reqs:], the slot-mapping tail [unpadded:padded] per group) run only when their slice is non-empty. At one request with an unpadded verify every one of them is empty: a zero-element fill launches no kernel and writes nothing, so the GPU work, its order and its bytes are unchanged and only the host dispatch goes. VLLM_EMPTY_FILL_SKIP=0 restores the calls."
+    },
+    {
+      "file": "harness/protocol-adapter/src/{hotwait.rs,resident.rs,lib.rs,bin/cuda-engine.rs}; harness/vllm_resident/resident.py",
+      "why": "i34-9 (9c53722c-6c9b-4428-a6c0-f3e8416c8d00, carried byte for byte): hot waits. Before each blocking read of the next line (the adapter's stdin and its resident-socket replies; the resident's request socket) the reader polls the descriptor with a 1 ms timeout, for up to a few seconds, so the read starts when the bytes land instead of after the waiting core wakes from deep idle. Only when the read starts changes: the bytes, framing, timeouts and errors are the reader's own, and no engine work moves between requests or phases. CUDA_ENGINE_HOT_WAIT=0 (adapter) and RESIDENT_HOT_WAIT=0 (resident) restore plain blocking reads."
+    },
+    {
+      "file": "harness/kernels/zskip (zskip_lean.cuh F_S6 config 663, zskip.cu, py to_s6/to_s6_swap); harness/kernels/pzskip (smem5_kernel S6 config 379, py); model_executor/layers/fused_moe/experts/humming_zskip.py (_prepare_s6, _prepare_pz_s6)",
+      "why": "terrapinelf (as in 7a22b821-923d-4938-b82b-145985b23560): 6-bit scale planes for the routed w2 zero-row-skipping kernels. Every routed w2 scale byte of the pinned checkpoint lies in [62, 124]; to_s6 (swap2, lean paired decode) and to_s6_swap (swap, pzskip prefill) store each as byte - 62 in a low-nibble plane plus a 2-bit plane, decode every byte back and compare before use, and return None outside [62, 125]. Config 663 is 653 with s6_decode rebuilding the lane's four scale words at consumption; config 379 is 369 with 18 instead of 24 scale pieces per stage and s6_pair rebuilding the lane's 8 bytes. Same dequantised weights, MMA chains and epilogues. Admission by the existing bitwise checks (663: _pair_check against humming and against 653 on the 8-bit plane, plus the verify-prefix check; 379: the 496-token pzskip check). ZSKIP_S6=0 and PZSKIP_S6=0 disable."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_down_packed.py (_slots)",
+      "why": "terrapinelf: the drafter's packed MoE down slot kernel loads chunk c + 1's row ids, values and packed weights before adding chunk c's products (software-pipelined gather). The products, their chunk order, the per-lane accumulators and the final tl.sum are unchanged, so every output bit is; the existing load-time admission still compares the packed slots with the original slots bit for bit."
+    },
+    {
+      "file": "harness/kernels/zskip/csrc/zskip_lean.cuh; csrc/zskip.cu; py/__init__.py; vllm/model_executor/layers/fused_moe/experts/humming_zskip.py; humming_zskip_stream.py",
+      "why": "Independent streamed per-output dequantisation/MMA scheduling twin674 of original653 on completef570d121-011a-48b5-aedb-c98fd9b76793. Original lean arithmetic/source from f0fcab75-b0b3-4a4c-893d-850ef447c110 and paired chain12f98e36-35d1-41c0-ba8d-8fd101ffeee1 retained. Same WPC1/R3/F274+STREAM64, raw loads, per-output K16 MMA order, previous-nonempty halves, per-output old-acc negative-zero checks and dense retry, masks/prefix/PDL/epilogue. Each of8independent output tiles issues its MMA immediately after its own dequantisation; no launch/grid/tile/ring/prefetch sweep. Actual selected653 plus humming/whole backing/changed graph and complete warm/cold timing qualification remote only; fallback653 on decline. No compiled resource, occupancy, engagement or gain claim."
+    },
+    {
+      "file": "vllm/v1/spec_decode/nemotron_compound_loop.py; vllm/v1/spec_decode/nemotron_decode_plan.py; vllm/v1/spec_decode/llm_base_proposer.py",
+      "why": "Native MTP direct-slot flat compound graph on complete f570d121-011a-48b5-aedb-c98fd9b76793. Retains selected flat capture, stage read barrier and compound-only bank withdrawal from 131614a1-7e0e-484c-8179-da5ab9e89e24, also reviewed in fd5696c6-0b61-477c-9e28-d4caca4659e3 and pending 5771c352-5d4e-43a8-8081-9d73c34cd53f. Own NEMO_MTP_COMPOUND_READY hoists immutable prefix/page loads before hidden stores, pipelines prefix copy one block ahead, passes BF16 hidden rows directly to the existing FP32 screen computation and writes three graph-owned token slots without clones. Publishes final head scratch, qualifies all intermediates and actual final hidden plus native continuation. Actual selected standalone reference and original strict complete-loop timing gate. No pkslots/scrtail or Mamba coefficient experiment copied; all runtime qualification official remote only, no activation/gain claimed."
+    },
+    {
+      "file": "zskip streamed MMA +native MTP ready graph composition",
+      "why": "Carry useful compatible graph/readiness mechanism from own6398ea79-5074-4011-9304-9b1cc742a353 (official unscored serial-control band failure, not a validated whole) alongside new per-output MMA674 on ENTIREf570. Graph source exact3files from frozen d01f86f, officialroot7ba5216; target zskip6file delta and draft native-loop3file delta do not overlap except VENDOR. Current pendinge32dd067-4de9-403c-9b40-be13ce8f894c reinforces useful flat route carried experimentally; no additive score or activation claim. Whole combined source remains unvalidated; retain complete2.7068948850 base."
     }
   ]
 }

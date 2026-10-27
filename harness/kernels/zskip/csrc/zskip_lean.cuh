@@ -31,6 +31,8 @@ constexpr int F_ZHALF = 1, F_NOSPLIT = 2, F_BPF = 4, F_RPF = 8, F_WPF = 16;
 // then at 64 + 4 * g8 the u32 of their high 2-bit parts (bits 2i..2i+1). s6_decode rebuilds the
 // same 16 bytes the 8-bit plane's 16-byte load gives, before any use.
 constexpr int F_S6 = 32;
+// Interleave one independent output tile's dequantisation and MMA at a time.
+constexpr int F_STREAM_MMA = 64;
 constexpr uint32_t S6_BASE = 62u;
 // F_WPF: with group j's loads, each lane requests its own pieces of group j + R + D into L2 (the
 // k rows of its mask bits, 8 bytes each, and its 16 scale bytes)
@@ -183,6 +185,49 @@ __device__ __forceinline__ void lean_group(float (&acc)[8][4], uint32_t (&alo)[8
   for (int i = 0; i < 8; ++i) mma_bf16(acc[i], alo[i][0], alo[i][1], ahi[i][0], ahi[i][1], x[0], x[1]);
 }
 
+// Same per-output recurrence as lean_group, but expose each tile's MMA as soon
+// as its two fragments are ready. Independent tiles need not wait for all eight
+// dequantisations. Keep last-nonempty half fragments and the exact old-acc -0
+// checks per tile; no reassociation, output mapping or warp/grid/ring change.
+template <bool ZH, bool NR1>
+__device__ __forceinline__ void lean_group_stream_mma(
+    float (&acc)[8][4], uint32_t (&alo)[8][2], uint32_t (&ahi)[8][2],
+    const uint32_t (&w)[8], const uint32_t (&s)[4],
+    const uint32_t (&x)[2], uint32_t m, bool& neg0) {
+#pragma unroll
+  for (int tt = 0; tt < 2; ++tt) {
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+      const int i = tt * 4 + c;
+      const uint32_t sxx = c < 2 ? s[2 * tt] : s[2 * tt + 1];
+      const uint32_t sp = hmul2_u32(
+          fp8_to_bf16x2(__byte_perm(sxx, 0u, (c & 1) == 0 ? 0x1404 : 0x3424)), kExp120);
+      const uint32_t sel = c | (c << 4) | ((c + 4) << 8) | ((c + 4) << 12);
+      if (m & 0x00FFu) {
+        const uint32_t x01 = __byte_perm(w[0 + tt], w[2 + tt], sel);
+        alo[i][0] = hmul2_lo(hmul2_u32(fp4_to_bf16x2(x01 << 12), kExp124), sp);
+        alo[i][1] = hmul2_hi(hmul2_u32(fp4_to_bf16x2(x01), kExp124), sp);
+      } else if constexpr (ZH) {
+        alo[i][0] = alo[i][1] = 0u;
+      }
+      if (m & 0xFF00u) {
+        const uint32_t x23 = __byte_perm(w[4 + tt], w[6 + tt], sel);
+        ahi[i][0] = hmul2_lo(hmul2_u32(fp4_to_bf16x2(x23 << 12), kExp124), sp);
+        ahi[i][1] = hmul2_hi(hmul2_u32(fp4_to_bf16x2(x23), kExp124), sp);
+      } else if constexpr (ZH) {
+        ahi[i][0] = ahi[i][1] = 0u;
+      }
+      // Each old accumulator is inspected before its own overwrite, just as
+      // the original all-tiles check. Earlier tiles do not feed this tile.
+#pragma unroll
+      for (int q = 0; q < 4; ++q)
+        if (!NR1 || (q & 1) == 0)
+          neg0 |= __float_as_uint(acc[i][q]) == 0x80000000u;
+      mma_bf16(acc[i], alo[i][0], alo[i][1], ahi[i][0], ahi[i][1], x[0], x[1]);
+    }
+  }
+}
+
 // The main loop over the block's active groups (dense: all 116 groups, every row loaded).
 template <int R, bool NR1, int F>
 __device__ __forceinline__ void lean_main(float (&acc)[8][4], const Params& p, const uint32_t* list, int nag,
@@ -283,7 +328,10 @@ __device__ __forceinline__ void lean_main(float (&acc)[8][4], const Params& p, c
           // refill before the math: the loads of group j + R start before group j's math
           if (j0 + i + R < nsteps) issue((i + R) % NS, j0 + i + R);
           if (math) {
-            lean_group<(F & F_ZHALF) != 0, NR1>(acc, alo, ahi, w_, s_, x_, m_, neg0);
+            if constexpr ((F & F_STREAM_MMA) != 0)
+              lean_group_stream_mma<(F & F_ZHALF) != 0, NR1>(acc, alo, ahi, w_, s_, x_, m_, neg0);
+            else
+              lean_group<(F & F_ZHALF) != 0, NR1>(acc, alo, ahi, w_, s_, x_, m_, neg0);
           } else if (p.mode == LOADONLY) {
             // consume the loads so that each slot waits for its data like the math path
             const uint32_t v = w_[0] ^ w_[3] ^ w_[4] ^ w_[7] ^ s_[0] ^ s_[3] ^ x_[0] ^ x_[1];

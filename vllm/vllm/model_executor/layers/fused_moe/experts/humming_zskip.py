@@ -80,7 +80,9 @@ LEAN_CONFIG = int(os.environ.get("ZSKIP_LEAN_CONFIG", "653"))
 # LOCAL PATCH (cudafast-nemotron35, zskip S6): the lean config's scale plane as 6-bit offsets
 # (harness/kernels/zskip to_s6, config 663 = 653 with the 6-bit plane decoded to the same bytes
 # in registers). ZSKIP_S6=0 keeps 653 and the 8-bit plane.
-S6_ENABLED = os.environ.get("ZSKIP_S6", "1") != "0"
+# LOCAL PATCH (i34-9): default off, so the lean paired decode keeps config 653 on the 8-bit plane;
+# ZSKIP_S6=1 builds the 6-bit plane and admits config 663 as before.
+S6_ENABLED = os.environ.get("ZSKIP_S6", "0") != "0"
 S6_CONFIG = 663
 # Prefill: MoE layers whose relu^2 activations are sparse enough for the skip to beat humming's
 # 64-row blocks on GB10 (measured per layer on prefill-length calls; the others lose). Layer 51,
@@ -194,6 +196,15 @@ def finalize(layer: torch.nn.Module) -> None:
             )
         except Exception as exc:  # optional prefix; original checked pair remains
             logger.warning_once("zskip: prefix check unavailable (%r); full pair retained", exc)
+    # Try the scheduling twin only after the actual original config/prefix
+    # policy is fully selected. Any exception or guard decline leaves it intact.
+    if (getattr(layer, "zskip_pair_config", None) == 653
+            and os.environ.get("ZSKIP_STREAM_MMA", "1") != "0"):
+        try:
+            from vllm.model_executor.layers.fused_moe.experts.humming_zskip_stream import prepare
+            prepare(layer)
+        except Exception as exc:
+            logger.warning_once("zskip: streamed MMA unavailable (%r); original653 retained", exc)
 
 
 def _prepare_pair(layer: torch.nn.Module) -> None:

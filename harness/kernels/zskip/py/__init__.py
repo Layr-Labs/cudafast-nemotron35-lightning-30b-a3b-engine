@@ -51,7 +51,7 @@ CONFIGS4.update({500: (2, 2, 4, 32), 501: (6, 2, 4, 32), 502: (6, 4, 4, 32), 503
 CONFIGS4[108] = (2, 4, 1, 16)
 # swap2 decode pairs: 113/118 (unfused/fused prep) and their empty-half dequant skips 114/119
 # lean paired decode (csrc/zskip_lean.cuh): config -> (warps per CTA, ring depth, flags); default 653
-LEAN_CONFIGS = {604: (1, 2, 260), 613: (1, 2, 2820), 616: (1, 2, 2824), 630: (1, 2, 0), 640: (1, 3, 272), 645: (1, 4, 272), 653: (1, 3, 274), 656: (1, 4, 274), 658: (1, 2, 274), 663: (1, 3, 306)}
+LEAN_CONFIGS = {604: (1, 2, 260), 613: (1, 2, 2820), 616: (1, 2, 2824), 630: (1, 2, 0), 640: (1, 3, 272), 645: (1, 4, 272), 653: (1, 3, 274), 656: (1, 4, 274), 658: (1, 2, 274), 663: (1, 3, 306), 674: (1, 3, 338)}
 # 663: config 653 reading the 6-bit scale plane of to_s6() (S6_BASE must match csrc/zskip_lean.cuh)
 S6_CONFIGS = (663,)
 S6_BASE = 62

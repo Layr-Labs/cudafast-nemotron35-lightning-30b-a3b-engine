@@ -2293,6 +2293,8 @@ class SpecDecodeBaseProposer:
             prepare_plan(self)
             from vllm.v1.spec_decode.nemotron_compound_loop import prepare as prepare_loop
             prepare_loop(self)
+            from vllm.v1.spec_decode.nemotron_decode_plan import withdraw_compound_only
+            withdraw_compound_only(self)
 
     def _get_eagle3_use_aux_hidden_state_from_config(self) -> bool:
         """

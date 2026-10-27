@@ -198,6 +198,14 @@ def finalize(layer: torch.nn.Module) -> None:
             logger.warning_once("zskip: prefix check unavailable (%r); full pair retained", exc)
 
 
+    layer._zskip_scale_ready = None
+    try:
+        from .humming_zskip_scale_ready import qualify
+        layer._zskip_scale_ready = qualify(layer, _zskip, _align)
+    except Exception as exc:  # optional independent library: old checked owner remains
+        logger.warning("zskip: immutable prepared scales unavailable (%r); original653 retained", exc)
+
+
 def _prepare_pair(layer: torch.nn.Module) -> None:
     """New buffers and kernels are optional; any failure leaves checked 108/100 intact."""
     try:
@@ -650,6 +658,12 @@ def maybe_down(
         smallk = sys.modules.get("smallk")
         if smallk is not None and hasattr(smallk, "live_verify_rows"):
             vrows = smallk.live_verify_rows(inputs.device)
+    if use_pair and getattr(layer, "_zskip_scale_ready", None) is not None:
+        from .humming_zskip_scale_ready import maybe_down as _maybe_ready_down
+        if _maybe_ready_down(layer, _zskip, inputs, moe_kwargs["sorted_ids"],
+                             moe_kwargs["expert_ids"], moe_kwargs["num_tokens_padded"],
+                             pair, outputs, vrows):
+            return True
     _zskip.down(
         inputs,
         moe_kwargs["sorted_ids"],

@@ -71,6 +71,9 @@ def _start_projection(
     if embeds_projected:
         # W_h (14.5 MB) is read by every draft pass of a cycle; ordinary loads
         # let it stay in L2 between passes while the rest stream evict-first.
+        if previous_hidden_states_normed.shape[0] in getattr(layer, "_mtp_eh_add_rows", ()):
+            return torch.ops.vllm.mtp_eh_add(
+                previous_hidden_states_normed, layer.eh_w_h, inputs_embeds)
         if hasattr(layer, "_mtp_eh_pk_sm"):
             h_part = torch.ops.vllm.mtp_packed_linear_keep(
                 previous_hidden_states_normed,
@@ -429,6 +432,13 @@ class NemotronHMultiTokenPredictor(nn.Module):
         from .nemotron_h_mtp_packed import prepare_eh_hidden_packed
 
         prepare_eh_hidden_packed(layer)
+        layer._mtp_eh_add_rows = ()
+        if not hasattr(layer, "_mtp_eh_pk_sm"):
+            try:
+                from .nemotron_h_mtp_eh_add import prepare as _prepare_eh_add
+                layer._mtp_eh_add_rows = _prepare_eh_add(layer.eh_w_h, table)
+            except Exception as exc:  # optional: preserve the original visible model branch
+                logger.warning("MTP EH add fusion unavailable (%r); original branch retained", exc)
         self.register_buffer("eh_table", table, persistent=False)
         return True
 

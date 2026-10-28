@@ -111,6 +111,34 @@ class VllmConfig:
         )
 
 
+def _prechurn() -> None:
+    """LOCAL PATCH (cudafast-nemotron35): before the engine allocates its weights, KV cache and
+    graph pools, fault in and release one large anonymous CPU buffer (RESIDENT_PRECHURN_GB,
+    default 16, at most half of MemAvailable; 0 disables), so those allocations are served
+    from freshly released memory rather than whatever the previous process left fragmented.
+    Boot only: no weight, kernel, timed window or output is touched."""
+    try:
+        gb = float(os.environ.get("RESIDENT_PRECHURN_GB", "16"))
+        if gb <= 0:
+            return
+        avail = 0
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    avail = int(line.split()[1]) * 1024
+                    break
+        n = int(min(gb * (1 << 30), avail // 2))
+        if n < (1 << 30):
+            return
+        import numpy as np
+
+        buf = np.empty(n, dtype=np.uint8)
+        buf.fill(1)
+        del buf
+    except Exception:  # noqa: BLE001 - best effort, never fatal
+        pass
+
+
 class VllmBackend:
     """One `LLMEngine`, one greedy request at a time.
 
@@ -127,6 +155,7 @@ class VllmBackend:
         from vllm.usage.usage_lib import UsageContext
         from vllm.v1.executor.abstract import Executor
 
+        globals().get("_prechurn", lambda: None)()
         spec = None
         if cfg.depth > 0:
             spec = {"method": "mtp", "num_speculative_tokens": cfg.depth}

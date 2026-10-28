@@ -681,15 +681,19 @@
     },
     {
       "file": "vllm/vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
-      "why": "i34-9: PZSKIP_S6 defaults to off (the prefill routed down keeps pzskip config 369 on the 8-bit plane, as in ercumentyildirim's ef1fe030-2867-402a-bed0-47635a4d1ddf). PZSKIP_S6=1 restores config 379. Measurement 2 of 593041c6-13bc-4e1f-80f1-c8ab630521a3 (code identical)."
+      "why": "i34-9: PZSKIP_S6 defaults to off (the prefill routed down keeps pzskip config 369 on the 8-bit plane, as in ercumentyildirim's ef1fe030-2867-402a-bed0-47635a4d1ddf). PZSKIP_S6=1 restores config 379."
     },
     {
-      "file": "harness/kernels/bf16ws, vllm/vllm/model_executor/models/nemotron_h_attn_packed.py",
-      "why": "i34-9: ercumentyildirim's bf16ws persistent BF16 prefill kernel for the attention projections (5cde980b-5695-4014-bb4d-172d93cbdf9b), as composed on our record by jungjipdo (a3156eaa-e034-4660-8e4c-1f3c84719164); carried byte for byte. BF16WS=0 disables it."
+      "file": "layers/fused_moe/experts/humming_zskip.py (ZSKIP_S6)",
+      "why": "kaankolcu (ec646c34-10c7-43b1-8993-136f354e076c, also in 778d1d36-5adf-497f-babb-832df9b0f24b): the lean paired decode's routed down projection builds the 6-bit swap-scale plane (config 663) and admits it only when its load-time bitwise check against config 653 on the layer's own weights passes at M=4/5/8, independent and crowded routing, including the live-row prefix; any failure keeps config 653 with the 8-bit plane. ZSKIP_S6=0 keeps the previous default. Carried byte for byte from ec646c34."
     },
     {
-      "file": "vllm/vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
-      "why": "i34-9: ZSKIP_S6 defaults to on (the lean paired decode routed down reads the 6-bit scale plane, config 663, under its load-time bitwise check), as in kaankolcu's 778d1d36-5adf-497f-babb-832df9b0f24b and e-man07's a4b5cd6b-f239-4842-b66d-b1b3c20a58cd. ZSKIP_S6=0 keeps config 653 on the 8-bit plane. Measurement 2 (code identical)."
+      "file": "model_executor/models/nemotron_h_attn_packed.py (WS_ENABLED, _ws, _ws_activations, _prepare_ws, _ws_gemm, the 496-row branch of _linear_impl, apply for a bf16ws-only projection, prepare calls _prepare_ws); harness/kernels/bf16ws; harness/tests/bf16ws_exact.py",
+      "why": "ercumentyildirim: the 496-row prefill call of each attention qkv_proj (4608x2688) and o_proj (2688x4096) runs bf16ws, the fp8ws persistent TMA/mbarrier kernel with the BF16 MMA, instead of F.linear, with the same arithmetic: native bf16 m16n8k16 MMA, one ascending-K chain per output from +0, one RN to BF16. The activation keeps its layout; the weight gets a load-time, input-independent byte-permuted copy (tiles of BN x 128 bytes, BN 96 or 112, row-swizzled 16-byte chunks; the original stays for every other row count). Each projection is admitted at load only if the pack inverts to the original bytes and its output equals F.linear bit for bit on five synthetic activation sets (four Gaussian scales and every BF16 bit pattern); otherwise F.linear. Dispatch is in the nemo_attn_pk_linear custom op. BF16WS=0 disables."
+    },
+    {
+      "file": "(composition)",
+      "why": "ercumentyildirim: i34-9's 593041c6-13bc-4e1f-80f1-c8ab630521a3 (draft depth 5 with the lowacc adaptive deepest draft at thresholds 1.8/2.0, burn-in 4 cycles and per-cycle cap 3, on i34-9's eb48e2f0-50e6-4c39-a1f3-0ac305d17c5b and 4e50f234-264f-41c3-ac8b-d8903a9f5d32 and terrapinelf's depth-5 tree f7425ba8-32af-4067-9de1-fb3183269d2e over the promoted main bcd22b8) byte for byte, plus kaankolcu's ZSKIP_S6 default on (ec646c34-10c7-43b1-8993-136f354e076c, carried byte for byte) and bf16ws for the 496-row prefill attention qkv_proj and o_proj (the two entries above). No other file changes."
     }
   ]
 }

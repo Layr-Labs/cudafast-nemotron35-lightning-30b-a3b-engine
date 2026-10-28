@@ -690,6 +690,14 @@
     {
       "file": "vllm/vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
       "why": "i34-9: ZSKIP_S6 defaults to on (the lean paired decode routed down reads the 6-bit scale plane, config 663, under its load-time bitwise check), as in kaankolcu's 778d1d36-5adf-497f-babb-832df9b0f24b and e-man07's a4b5cd6b-f239-4842-b66d-b1b3c20a58cd. ZSKIP_S6=0 keeps config 653 on the 8-bit plane. Measurement 2 (code identical)."
+    },
+    {
+      "file": "vllm/model_executor/models/{nemotron_h_mtp.py,nemotron_h_mtp_compact.py,nemotron_h_mtp_kernels.py,nemotron_h_mtp_combine_norm.py}",
+      "why": "jacklightChen's 05d752d0-8e9b-4323-b33a-4ad1b5ce525f, carried as published: the native MTP compact routed-down combine, BF16 residual addition and final RMS norm in one kernel, admitted per row by full-word comparison and timing at load; MTP_DOWN_COMBINE_NORM=0 keeps the original path."
+    },
+    {
+      "file": "vllm/v1/spec_decode/nemotron_step_cond.py, vllm/model_executor/models/nemotron_h_attn_packed.py",
+      "why": "Defaults NEMO_MTP_STEP_COND=0 (the single-row draft pass runs off the conditional step graph, as e-man07's 1faceed1 and kaankolcu's/jungjipdo's stacks set it) and ATTN_PACK12_PDL8=1 (the eight-deep-ring PDL attention kernels are offered to the load-time choice, as kaankolcu's 0e5727ea and jungjipdo's 770c6815 set it). Both select among existing exact paths; neither changes any arithmetic."
     }
   ]
 }

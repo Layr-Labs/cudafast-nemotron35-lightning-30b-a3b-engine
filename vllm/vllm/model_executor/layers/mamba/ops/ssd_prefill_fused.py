@@ -368,78 +368,107 @@ def fused_prefill(
     if write_final and not _final_logged:
         _final_logged = True
         logger.info("ssd prefill: terminal state stored by the state kernel (cache sink active)")
-    with torch.accelerator.device_index(x.device.index):
-        nsplit = _SSD_STATE_NSPLIT if dstate % (16 * _SSD_STATE_NSPLIT) == 0 else 1
-        hsplit = _SSD_SCAN_HSPLIT if (heads // groups) % _SSD_SCAN_HSPLIT == 0 else 1
-        _state_pass_kernel[(last.numel(), heads, nsplit)](
-            x,
-            B,
-            dt,
-            dA,
-            cu,
-            last,
-            initial,
-            states,
-            final_cache if write_final else None,
-            final_index if write_final else None,
-            H=hdim,
-            N=dstate,
-            RATIO=heads // groups,
-            CHUNK=chunk,
-            XS=x.stride(),
-            BS=B.stride(),
-            TS=dt.stride(),
-            AS=dA.stride(),
-            IS=initial_strides,
-            OS=states.stride(),
-            HAS_INIT=initial is not None,
-            WRITE_FINAL=write_final,
-            FS=final_strides,
-            CACHE_SLOTS=final_cache.shape[0] if write_final else 0,
-            BM=64,
-            BN=128 // nsplit,
-            BK=32,
-            num_warps=4,
-            num_stages=4,
-        )
-        _cb_scan_kernel[(triton.cdiv(chunk, 64), chunks, groups * hsplit)](
-            x,
-            B,
-            C,
-            dt,
-            dA,
-            cu,
-            seq,
-            states,
-            initial,
-            D,
-            z,
-            out,
-            H=hdim,
-            N=dstate,
-            RATIO=heads // groups,
-            CHUNK=chunk,
-            XS=x.stride(),
-            BS=B.stride(),
-            CS=C.stride(),
-            TS=dt.stride(),
-            AS=dA.stride(),
-            SS=states.stride(),
-            IS=initial_strides,
-            OS=out.stride(),
-            ZS=z.stride() if z is not None else (0, 0, 0),
-            DS=D.stride(0) if D is not None else 0,
-            HAS_INIT=initial is not None,
-            HAS_D=D is not None,
-            D_VECTOR=D.dim() == 2 if D is not None else False,
-            HAS_Z=z is not None,
-            BM=64,
-            BN=64,
-            BK=64,
-            BC=32,
-            DN=128,
-            HSPLIT=hsplit,
-            num_warps=8,
-            num_stages=1,
-        )
+    def launch_ssd(
+        use_lookahead, px, pb, pc, pdt, pda, pcu, plast, pseq,
+        pinit, pstates, pout, pfinal, pindex,
+    ):
+        with torch.accelerator.device_index(px.device.index):
+            nsplit = _SSD_STATE_NSPLIT if dstate % (16 * _SSD_STATE_NSPLIT) == 0 else 1
+            hsplit = _SSD_SCAN_HSPLIT if (heads // groups) % _SSD_SCAN_HSPLIT == 0 else 1
+            _state_pass_kernel[(plast.numel(), heads, nsplit)](
+                px,
+                pb,
+                pdt,
+                pda,
+                pcu,
+                plast,
+                pinit,
+                pstates,
+                pfinal if write_final else None,
+                pindex if write_final else None,
+                H=hdim,
+                N=dstate,
+                RATIO=heads // groups,
+                CHUNK=chunk,
+                XS=px.stride(),
+                BS=pb.stride(),
+                TS=pdt.stride(),
+                AS=pda.stride(),
+                IS=initial_strides,
+                OS=pstates.stride(),
+                HAS_INIT=pinit is not None,
+                WRITE_FINAL=write_final,
+                FS=final_strides,
+                CACHE_SLOTS=pfinal.shape[0] if write_final else 0,
+                BM=64,
+                BN=128 // nsplit,
+                BK=32,
+                num_warps=4,
+                num_stages=4,
+            )
+            scan_kernel = _cb_scan_kernel
+            if use_lookahead:
+                from .ssd_head_lookahead_prototype import _cb_scan_head_lookahead_kernel
+
+                scan_kernel = _cb_scan_head_lookahead_kernel
+            scan_kernel[(triton.cdiv(chunk, 64), chunks, groups * hsplit)](
+                px,
+                pb,
+                pc,
+                pdt,
+                pda,
+                pcu,
+                pseq,
+                pstates,
+                pinit,
+                D,
+                z,
+                pout,
+                H=hdim,
+                N=dstate,
+                RATIO=heads // groups,
+                CHUNK=chunk,
+                XS=px.stride(),
+                BS=pb.stride(),
+                CS=pc.stride(),
+                TS=pdt.stride(),
+                AS=pda.stride(),
+                SS=pstates.stride(),
+                IS=initial_strides,
+                OS=pout.stride(),
+                ZS=z.stride() if z is not None else (0, 0, 0),
+                DS=D.stride(0) if D is not None else 0,
+                HAS_INIT=pinit is not None,
+                HAS_D=D is not None,
+                D_VECTOR=D.dim() == 2 if D is not None else False,
+                HAS_Z=z is not None,
+                BM=64,
+                BN=64,
+                BK=64,
+                BC=32,
+                DN=128,
+                HSPLIT=hsplit,
+                num_warps=8,
+                num_stages=1,
+            )
+
+    use_lookahead = False
+    if last.numel() == 1 and 0 < chunks <= 4 and z is None:
+        try:
+            from .ssd_head_lookahead_gate import admit_head_lookahead
+
+            use_lookahead = admit_head_lookahead(
+                launch_ssd, x, B, C, dt, dA, cu, last, seq, initial, states, out,
+                final_cache if write_final else None,
+                final_index if write_final else None, D,
+            )
+        except Exception as lookahead_error:
+            logger.warning_once(
+                "SSD head lookahead optional path refused: %s",
+                type(lookahead_error).__name__,
+            )
+    launch_ssd(
+        use_lookahead, x, B, C, dt, dA, cu, last, seq, initial, states, out,
+        final_cache, final_index,
+    )
     return None if write_final else states

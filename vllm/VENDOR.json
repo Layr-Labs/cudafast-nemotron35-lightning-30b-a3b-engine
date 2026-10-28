@@ -640,8 +640,40 @@
       "why": "fp8ws (ours): the M=496 prefill Mamba in_proj (10304x2688) runs a persistent TMA/mbarrier kernel instead of CUTLASS, with the same arithmetic: native e4m3 m16n8k32 MMA, one ascending-K chain per output from +0, FP32 scale-B then scale-A, one RN to BF16. The activation keeps its layout; the weight gets a load-time, input-independent byte-permuted copy (tiles of 112x128 bytes, row-swizzled 16-byte chunks; the original stays for CUTLASS at other M). Each layer is admitted at load only if the pack inverts to the original bytes and its output equals ops.cutlass_scaled_mm bit for bit on five synthetic activation sets x three scale pairs; otherwise CUTLASS. Dispatch is in the fp8c/fp8small custom-op fallback. FP8WS=0 disables. FP8WS_AB_FILE (unset by default) makes the prefill graph also capture a CUTLASS pair and pick per replay, for lab A/B only."
     },
     {
+      "file": "mtp-head.manifest.json (spec.num_speculative_tokens); v1/worker/gpu_model_runner.py (_capture_fresh_prefill_graph); platforms/interface.py (_align_hybrid_block_size)",
+      "why": "terrapinelf: draft depth 5. The manifest declares 5 speculative tokens, so every verify carries up to six rows (the depth gate still stops drafting per cycle exactly as before, theta 0.5 cumulative). The whole-forward fresh-prefill graph is captured at depth 5 as at depths 3 and 4 (same 496-token forward; only the depth list grew). The hybrid block-size alignment adds one 4-byte word to the mamba page before rounding: at depth 4 nothing changes (4272-token attention blocks), at depth 5 the blocks grow from 4288 to 4304 tokens so the page keeps the padding word after each slot's SSM state that the spec-replay prefill tag uses (mamba_ssm_spec_replay.prefill_tag_view); without it the lazy checkpointed anchor would be refused at depth 5."
+    },
+    {
+      "file": "harness/kernels/smallk (csrc/smallk.cu router_launch, py ROUTER_SHAPES / maybe_router_gemm)",
+      "why": "terrapinelf: the fp32 router GEMM kernel is also instantiated for M = 6 (the depth-5 verify), the same independent per-row fma chain as M = 4 and 5; checked bitwise against torch F.linear (cuBLAS fp32) at M = 4, 5 and 6 on the checkpoint's gate weights, and it honours verify_rows exactly as before (rows past the live count take the last live row's logits)."
+    },
+    {
+      "file": "harness/kernels/zskip (csrc/zskip.cu prefix_row_limit and the prefix launch gate, py down); model_executor/layers/fused_moe/experts/humming_zskip.py (maybe_down, _pair_check)",
+      "why": "terrapinelf: the paired lean decode (swap2 layout, the admitted pair config) also serves 6-token verifies, with the live-row prefix: prefix_row_limit takes the token count from shape_m (36 or 30) instead of assuming 5, and the prefix launch accepts shape_m 36. The load-time prefix check runs M = 5 and 6 with every live-row count 1..M, bitwise against humming's w2 on the live rows and exact zeros past them, as before for M = 5."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_attn_packed_kernel.py (ROWS); model_executor/layers/attention/attention.py (_prefetch_ahead); model_executor/models/nemotron_h_mtp_pkmm.py (_ROWS)",
+      "why": "terrapinelf: the 12-bit attention projections serve the 6-row verify (ROWS = 6; apk12's exact BF16 chain covers 1..8 rows and the existing admission compares it bit for bit with F.linear at ROWS rows); the attention op's L2 prefetch of o_proj reads the packed planes for 5- and 6-row calls; the drafter's packed small GEMM admits 6 rows through its existing per-row-count bitwise admission."
+    },
+    {
+      "file": "model_executor/layers/mamba/ops/gated_norm_fp8.py; model_executor/layers/mamba/ops/mamba_ssm_spec_replay.py (prefill_tag_view, the verify-row prefix)",
+      "why": "terrapinelf: the gated norm and the spec-replay kernel apply the live-row prefix to 6-token verifies as to 5-token ones (rows past the live count are skipped; live rows are unchanged). prefill_tag_view returns None when the last slot's padding word would fall outside the cache storage instead of building an out-of-bounds view (the lazy anchor is then refused rather than writing into the next page)."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_kernels.py (DEPTH_THETA5, the adaptive deepest draft, depth_gate_begin); model_executor/models/nemotron_h_mtp_screen.py (_select_token); v1/spec_decode/llm_base_proposer.py (_mtp_depth_gate_begin)",
+      "why": "terrapinelf: two drafter-only rules for depth 5. (1) The decision to draft past the 4th draft uses its own cumulative-confidence threshold MTP_DEPTH_THETA5 (0.6; the other drafts keep MTP_DEPTH_THETA 0.5). (2) Per request the device counts the cycles that drafted the deepest draft and those whose deepest draft was accepted (from the verify's num_rejected_tokens at the start of the next draft loop) and keeps drafting past the 4th draft only while (accepted + 1) / (drafted + 1) >= 0.25; the counts reset at each request's first proposal; off by default (MTP_ADAPT5=1 enables). At depth 4 both rules act after the last draft and change nothing. Drafts only: the target verifies every committed token as before."
+    },
+    {
+      "file": "harness/kernels/fp8ws (csrc/fp8ws.cu templated on (N, K), py prepare/unpack_reference/gemm); model_executor/kernels/linear/scaled_mm/fp8ws.py (register, maybe_gemm)",
+      "why": "terrapinelf, on i34-9's fp8ws (8b406fa2): the persistent prefill FP8 GEMM is templated on (N, K) and also serves the Mamba out_proj (N 2688, K 4096) with the same 256x112 tiles (48 tiles, one wave on 48 SMs), the same arithmetic (e4m3 m16n8k32 MMA, one ascending-K chain from +0, scale-B then scale-A, one RN to BF16) and the same per-layer load-time admission: the pack must invert and the output must equal ops.cutlass_scaled_mm bit for bit on the synthetic activation sets and scale pairs at the real shape, else that layer keeps CUTLASS."
+    },
+    {
+      "file": "v1/spec_decode/nemotron_step_cond.py (_prepare speed gate)",
+      "why": "terrapinelf, on leech1996's conditional draft step (6f6ff439): at depth >= 5 the speed gate admits the conditional step when the live pass costs at most 30 us more and the stopped pass gains at least twice that (depth 4 keeps 15 us and four times). The exactness checks are unchanged."
+    },
+    {
       "file": "(composition)",
-      "why": "e-man07 composition on the record a1cf20d1-8d18-4f7d-942f-df2e17245deb: our nx2 tree (jungjipdo 96d0992b-4f98-4992-86b7-82174c6ea20f, leech1996 6f6ff439-186f-4cea-97ac-6f3e8f2be9af, ercumentyildirim 456feb71-1622-488c-9487-79ae5b9deaa8, i34-9 55ed2064-a023-4b5e-9fc1-da25829ef0db, terrapinelf ca2ae19c-8f8a-4dff-9c23-88cf297efe51 as carried in leech1996 c5670d92-e925-4a20-ad66-d75e07ada6d5) plus i34-9 8b406fa2-8fbf-4867-a9fb-7a8b40915ae3's fp8ws prefill Mamba in_proj kernel, files byte for byte. No new arithmetic. Re-measurement #1."
+      "why": "terrapinelf: measurement 17 of: the promoted main bcd22b8 (e-man07's composition 4ae55271-d4bd-44f6-adf0-1f731b273822 on the record a1cf20d1) byte for byte, plus draft depth 5 (the six-row verify paths, the 5th-draft threshold MTP_DEPTH_THETA5 and the optional adaptive deepest draft, off by default), plus fp8ws serving the prefill out_proj and the depth-aware conditional-step speed gate, listed in the entries above."
     }
   ]
 }

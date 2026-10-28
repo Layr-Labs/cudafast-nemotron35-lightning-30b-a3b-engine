@@ -139,7 +139,15 @@ def maybe_gated_norm_fp8(norm, projection, x: torch.Tensor, gate: torch.Tensor):
         or gate.device != x.device
         or x.ndim != 2
         or x.shape[1] != 4096
-        or not 1 <= x.shape[0] <= 8
+        or not (
+            1 <= x.shape[0] <= 8
+            or (
+                x.shape[0] == 496
+                and getattr(norm, "_prefill_fp8_qualified", False)
+                and gate.stride(0) == getattr(norm, "_prefill_fp8_gate_stride", -1)
+                and id(projection) == getattr(norm, "_prefill_fp8_projection_id", -1)
+            )
+        )
         or gate.shape != x.shape
         or x.stride(-1) != 1
         or gate.stride(-1) != 1
@@ -161,6 +169,10 @@ def maybe_gated_norm_fp8(norm, projection, x: torch.Tensor, gate: torch.Tensor):
         or scale.device != x.device
     ):
         return None
+    if x.shape[0] == 496:
+        refs = getattr(norm, "_prefill_fp8_bound_params", ())
+        if len(refs) != 2 or norm.weight is not refs[0] or scale is not refs[1]:
+            return None
     data = torch.ops.vllm.mamba_gated_norm_static_fp8(
         x, gate, norm.weight, scale, norm.variance_epsilon
     )

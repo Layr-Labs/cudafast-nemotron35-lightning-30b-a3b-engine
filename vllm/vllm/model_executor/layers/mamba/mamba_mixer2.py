@@ -1227,6 +1227,20 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     is_blackwell=self.is_blackwell,
                 )
 
+    def prepare_prefill_norm_fp8(self, enabled: bool = True) -> None:
+        self.norm._prefill_fp8_qualified = False
+        if not enabled:
+            return
+        try:
+            from vllm.model_executor.layers.mamba.ops.prefill_norm_fp8_qualify import (
+                prepare,
+            )
+
+            prepare(self)
+        except Exception as exc:  # noqa: BLE001 -- preserve the original path
+            self.norm._prefill_fp8_qualified = False
+            logger.warning("Mamba prefill norm+FP8 qualification refused: %r", exc)
+
     def prepare_spec_replay_pipeline(self, enabled: bool = True) -> None:
         """Qualify only with real bound layout and loaded immutable parameters."""
         self._spec_replay_pipeline = False

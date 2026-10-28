@@ -8586,6 +8586,9 @@ class GPUModelRunner(
             prepare_pipeline = getattr(layer, "prepare_spec_replay_pipeline", None)
             if prepare_pipeline is not None:
                 prepare_pipeline(enabled=not is_profiling)
+            prepare_prefill = getattr(layer, "prepare_prefill_norm_fp8", None)
+            if prepare_prefill is not None:
+                prepare_prefill(enabled=not is_profiling)
 
         if (
             self.speculative_config

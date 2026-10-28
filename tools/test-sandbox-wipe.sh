@@ -25,6 +25,8 @@
 #  11. the runner-owned job, adapter-home and sock directories are trusted
 #      only with fixed metadata and empty state directories;
 #  12. each wipe clears the persistent and user keyrings as the sandbox user.
+#  13. ENOENT-only find failures retry without leaking partial output; all
+#      other find failures fail at once, and three ENOENT failures fail closed.
 #
 # Hermetic: no root, no real IPC objects touched.
 set -uo pipefail
@@ -445,6 +447,96 @@ for access in owned writable; do
     && ok "case 8: an unreadable ${access} directory fails closed" \
     || fail "case 8: unreadable ${access}: status ${status}, '${out}'"
 done
+rm -f "${WORK}/bin/find"
+
+# --- case 13: retry only a walk that failed only because an entry vanished --
+cat > "${WORK}/bin/find" <<EOF
+#!/usr/bin/env bash
+if [[ -n "\${STUB_FIND_CASE:-}" && " \$* " == *" \${STUB_FIND_DIR:-} "* ]]; then
+  count=0
+  [[ ! -f "\${STUB_FIND_COUNT}" ]] || read -r count < "\${STUB_FIND_COUNT}"
+  printf '%s\n' "\$((count + 1))" > "\${STUB_FIND_COUNT}"
+  if [[ " \$* " == *" -exec chmod "* ]]; then
+    chmod_count=0
+    [[ ! -f "\${STUB_FIND_COUNT}.chmod" ]] || read -r chmod_count < "\${STUB_FIND_COUNT}.chmod"
+    printf '%s\n' "\$((chmod_count + 1))" > "\${STUB_FIND_COUNT}.chmod"
+  fi
+  inject=1
+  if [[ "\${STUB_FIND_CASE}" == partial_then_ok && " \$* " != *" -print0 "* ]]; then
+    inject=0
+  fi
+  if [[ "\${inject}" -eq 1 && ( "\${STUB_FIND_CASE}" == enoent_always || ! -e "\${STUB_FIND_COUNT}.injected" ) ]]; then
+    : > "\${STUB_FIND_COUNT}.injected"
+    case "\${STUB_FIND_CASE}" in
+      enoent_once|enoent_always)
+        echo "find: '\${STUB_FIND_DIR}/gone': No such file or directory" >&2
+        exit 1
+        ;;
+      eacces_once)
+        echo "find: '\${STUB_FIND_DIR}/x': Permission denied" >&2
+        exit 1
+        ;;
+      mixed_once)
+        echo "find: '\${STUB_FIND_DIR}/gone': No such file or directory" >&2
+        echo "find: '\${STUB_FIND_DIR}/x': Permission denied" >&2
+        exit 1
+        ;;
+      rc_silent_once)
+        exit 1
+        ;;
+      partial_then_ok)
+        printf '%s\0' "\${STUB_FIND_DECOY}"
+        echo "find: '\${STUB_FIND_DIR}/gone': No such file or directory" >&2
+        exit 1
+        ;;
+    esac
+  fi
+fi
+exec ${REAL_FIND@Q} "\$@"
+EOF
+chmod +x "${WORK}/bin/find"
+seed_ipc_clean
+FIND_COUNT="${WORK}/find-count"
+run_find_case() {
+  rm -f -- "${FIND_COUNT}" "${FIND_COUNT}.chmod" "${FIND_COUNT}.injected"
+  run_wipe STUB_FIND_CASE="$1" STUB_FIND_DIR="${WORK}/tmp" \
+    STUB_FIND_COUNT="${FIND_COUNT}" STUB_FIND_DECOY="${WORK}/decoy/should-not-be-deleted" 2>&1
+}
+
+# Baseline: the same wipe with no injected error, so the retry shows as exactly one extra call.
+out="$(run_find_case none)"; status=$?
+base_calls="$(cat "${FIND_COUNT}")"; base_chmod="$(cat "${FIND_COUNT}.chmod")"
+[[ "${status}" -eq 0 ]] || fail "case 13: baseline wipe: status ${status}, '${out}'"
+out="$(run_find_case enoent_once)"; status=$?
+[[ "${status}" -eq 0 && "$(cat "${FIND_COUNT}")" -eq $((base_calls + 1)) \
+   && "$(cat "${FIND_COUNT}.chmod")" -eq $((base_chmod + 1)) ]] \
+  && ok "case 13: one ENOENT-only failure retries the whole walk once" \
+  || fail "case 13: one ENOENT: status ${status}, calls $(cat "${FIND_COUNT}" 2>/dev/null), '${out}'"
+
+out="$(run_find_case enoent_always)"; status=$?
+calls="$(cat "${FIND_COUNT}" 2>/dev/null)"
+# Each chmod walk runs once in the baseline, so exactly 3 attempts each here.
+[[ "${status}" -ne 0 && "${calls}" -ge 3 && "$((calls % 3))" -eq 0 \
+   && "$(cat "${FIND_COUNT}.chmod")" -eq $((base_chmod * 3)) ]] \
+  && grep -q "cannot enumerate ${WORK}/tmp" <<<"${out}" \
+  && ok "case 13: three ENOENT-only failures fail closed" \
+  || fail "case 13: repeated ENOENT: status ${status}, calls ${calls}, '${out}'"
+
+for mode in eacces_once mixed_once rc_silent_once; do
+  out="$(run_find_case "${mode}")"; status=$?
+  calls="$(cat "${FIND_COUNT}.chmod" 2>/dev/null)"
+  [[ "${status}" -ne 0 && "${calls}" -eq 1 ]] \
+    && grep -q "cannot enumerate ${WORK}/tmp" <<<"${out}" \
+    && ok "case 13: ${mode} fails without retry" \
+    || fail "case 13: ${mode}: status ${status}, first-walk calls ${calls}, '${out}'"
+done
+
+mkdir -p "${WORK}/decoy"
+echo keep > "${WORK}/decoy/should-not-be-deleted"
+out="$(run_find_case partial_then_ok)"; status=$?
+[[ "${status}" -eq 0 && -f "${WORK}/decoy/should-not-be-deleted" ]] \
+  && ok "case 13: a failed attempt's partial stdout never reaches the delete list" \
+  || fail "case 13: partial stdout: status ${status}, decoy present $([[ -f "${WORK}/decoy/should-not-be-deleted" ]] && echo yes || echo no), '${out}'"
 rm -f "${WORK}/bin/find"
 
 if [[ "${failures}" -eq 0 ]]; then

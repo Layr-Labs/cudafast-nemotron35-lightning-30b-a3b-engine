@@ -682,6 +682,22 @@
     {
       "file": "vllm/vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
       "why": "i34-9: PZSKIP_S6 defaults to off (the prefill routed down keeps pzskip config 369 on the 8-bit plane, as in ercumentyildirim's ef1fe030-2867-402a-bed0-47635a4d1ddf). PZSKIP_S6=1 restores config 379. Measurement 2 of 593041c6-13bc-4e1f-80f1-c8ab630521a3 (code identical)."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_attn_packed.py (WS_ENABLED, _ws, _ws_activations, _prepare_ws, _ws_gemm, the 496-row branch of _linear_impl, apply for a bf16ws-only projection, prepare calls _prepare_ws); harness/kernels/bf16ws; harness/tests/bf16ws_exact.py",
+      "why": "ercumentyildirim: the 496-row prefill call of each attention qkv_proj (4608x2688) and o_proj (2688x4096) runs bf16ws, the fp8ws persistent TMA/mbarrier kernel with the BF16 MMA, instead of F.linear, with the same arithmetic: native bf16 m16n8k16 MMA, one ascending-K chain per output from +0, one RN to BF16. The activation keeps its layout; the weight gets a load-time, input-independent byte-permuted copy (tiles of BN x 128 bytes, BN 96 or 112, row-swizzled 16-byte chunks; the original stays for every other row count). Each projection is admitted at load only if the pack inverts to the original bytes and its output equals F.linear bit for bit on five synthetic activation sets (four Gaussian scales and every BF16 bit pattern); otherwise F.linear. Dispatch is in the nemo_attn_pk_linear custom op. BF16WS=0 disables."
+    },
+    {
+      "file": "(composition)",
+      "why": "e-man07 composition on the record d6651a3d-df62-4edc-8006-a0fe978f4a9a (i34-9): the record byte for byte plus ercumentyildirim 640fbe6e-dc20-487b-b993-d5fb0b99f4e7's bf16ws prefill attention kernel, byte for byte. No new arithmetic. Re-measurement #1."
+    },
+    {
+      "file": "layers/fused_moe/experts/humming_zskip.py (ZSKIP_S6)",
+      "why": "The lean paired decode's routed down projection builds the 6-bit swap-scale plane (config 663) and admits it only when its load-time bitwise check against config 653 on the layer's own weights passes at M=4/5/8, independent and crowded routing, including the live-row prefix; any failure keeps config 653 with the 8-bit plane. ZSKIP_S6=0 keeps the previous default."
+    },
+    {
+      "file": "(composition)",
+      "why": "e-man07 composition on the record d6651a3d-df62-4edc-8006-a0fe978f4a9a: ercumentyildirim 640fbe6e-dc20-487b-b993-d5fb0b99f4e7's bf16ws and kaankolcu ec646c34-10c7-43b1-8993-136f354e076c's ZSKIP_S6 default with its load-time admission, both byte for byte. No new arithmetic. Re-measurement #2."
     }
   ]
 }

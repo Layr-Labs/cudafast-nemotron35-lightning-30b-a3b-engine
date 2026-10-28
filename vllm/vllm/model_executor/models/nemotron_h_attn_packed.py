@@ -60,9 +60,14 @@ KERNEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nemotron
 CUDA = ("apk12",)
 CUDA_PDL = ("apk12_pdl",)
 CUDA_PDL8 = ("apk12_pdl8",)
+CUDA_STAGE = ("apk12_stage",)
+CUDA_STAGE_PDL = ("apk12_stage_pdl",)
+CUDA_CONFIGS = (CUDA, CUDA_PDL, CUDA_PDL8, CUDA_STAGE, CUDA_STAGE_PDL)
 _cuda_ok = False
 _cuda_pdl_ok = False
 _cuda_pdl8_ok = False
+_cuda_stage_ok = False
+_cuda_stage_pdl_ok = False
 
 _chosen: dict[tuple[int, int], tuple] = {}
 _word_ok = False
@@ -110,9 +115,11 @@ spec = importlib.util.spec_from_file_location("apk12", sys.argv[1])
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 dev = torch.device("cuda")
-pdl = sys.argv[2] in ("apk12_pdl", "apk12_pdl8")
+pdl = sys.argv[2] in ("apk12_pdl", "apk12_pdl8", "apk12_stage_pdl")
+staged = sys.argv[2] in ("apk12_stage", "apk12_stage_pdl")
 ring = 8 if sys.argv[2] == "apk12_pdl8" else 4
 assert (m.ready_pdl(dev) if pdl else m.ready(dev))
+assert not staged or m.ready_staged(dev)
 for n, k in ((4608, 2688), (2688, 4096)):
     nb = n * k // 128
     sm = torch.randint(0, 256, (n * k,), dtype=torch.uint8, device=dev)
@@ -132,7 +139,7 @@ for n, k in ((4608, 2688), (2688, 4096)):
     assert m.check(cp, w, n, k) == 0
     x = torch.randn(5, k, device=dev, dtype=torch.bfloat16)
     reference = m.gemm(x, cp, n, k)
-    y = m.gemm(x, cp, n, k, pdl=pdl, ring=ring)
+    y = m.gemm_staged(x, cp, n, k, pdl=pdl) if staged else m.gemm(x, cp, n, k, pdl=pdl, ring=ring)
     torch.cuda.synchronize()
     assert y.shape == (5, n)
     assert torch.equal(y.view(torch.uint8), reference.view(torch.uint8))
@@ -141,6 +148,11 @@ print("probe-ok")
 
 
 def _run(x: torch.Tensor, planes, n: int, k: int, cfg: tuple) -> torch.Tensor:
+    if cfg in (CUDA_STAGE, CUDA_STAGE_PDL):
+        out = _apk12.gemm_staged(x, planes, n, k, pdl=cfg == CUDA_STAGE_PDL)
+        if out is None:
+            raise ValueError("staged apk12 input is not aligned")
+        return out
     if cfg in (CUDA, CUDA_PDL, CUDA_PDL8):
         return _apk12.gemm(x, planes, n, k, pdl=cfg != CUDA, ring=8 if cfg == CUDA_PDL8 else 4)
     return run(x, *planes, n, k, cfg)
@@ -148,7 +160,7 @@ def _run(x: torch.Tensor, planes, n: int, k: int, cfg: tuple) -> torch.Tensor:
 
 def _planes(item, cfg: tuple):
     """An item is (proj, codec planes, apk12's copy of them or None)."""
-    return item[2] if cfg in (CUDA, CUDA_PDL, CUDA_PDL8) else item[1]
+    return item[2] if cfg in CUDA_CONFIGS else item[1]
 
 
 def _ws_gemm(x: torch.Tensor, w: torch.Tensor, n: int, k: int) -> torch.Tensor | None:
@@ -188,6 +200,8 @@ def _linear_impl(x: torch.Tensor, w: torch.Tensor, n: int, k: int, pid: int) -> 
         or x.shape[0] != ROWS
         or x.shape[1] != k
         or x.stride(1) != 1
+        or (cfg in (CUDA_STAGE, CUDA_STAGE_PDL)
+            and (x.data_ptr() % 16 or x.stride(0) % 8))
     ):
         return F.linear(x, w)
     return _run(x, planes, n, k, cfg)
@@ -240,7 +254,7 @@ def _probe() -> bool:
 
 
 def _probe_cuda(dev: torch.device) -> bool:
-    global _cuda_ok, _cuda_pdl_ok, _cuda_pdl8_ok
+    global _cuda_ok, _cuda_pdl_ok, _cuda_pdl8_ok, _cuda_stage_ok, _cuda_stage_pdl_ok
     ordinary = (_apk12 is not None
                 and _probe_group(CUDA[0], _PROBE_CUDA, _apk12.__file__)
                 and _apk12.ready(dev))
@@ -252,6 +266,15 @@ def _probe_cuda(dev: torch.device) -> bool:
     _cuda_pdl8_ok = bool(
         _PDL8 and _cuda_pdl_ok and _probe_group(CUDA_PDL8[0], _PROBE_CUDA, _apk12.__file__)
         and _apk12.ready_pdl(dev)
+    )
+    _cuda_stage_ok = bool(
+        ordinary and hasattr(_apk12, "ready_staged")
+        and _probe_group(CUDA_STAGE[0], _PROBE_CUDA, _apk12.__file__)
+        and _apk12.ready_staged(dev)
+    )
+    _cuda_stage_pdl_ok = bool(
+        _cuda_stage_ok and _cuda_pdl_ok
+        and _probe_group(CUDA_STAGE_PDL[0], _PROBE_CUDA, _apk12.__file__)
     )
     # ENTIRE fc043 carries the ordinary CUDA path. Retain that qualified
     # baseline choice while independently admitting the new PDL variants.
@@ -339,13 +362,53 @@ def _exact(items, n: int, k: int, cfg: tuple[int, int]) -> bool:
                 x = torch.randn(ROWS, k, device=dev, dtype=torch.float32, generator=gen)
                 x = (x * scale).to(torch.bfloat16)
                 actual, expected = _run(x, planes, n, k, cfg), F.linear(x, proj.weight)
-                if cfg in (CUDA, CUDA_PDL, CUDA_PDL8):
+                if cfg in CUDA_CONFIGS:
                     if not torch.equal(actual.view(torch.uint8), expected.view(torch.uint8)):
                         return False
                 elif not torch.equal(actual, expected):
                     return False
-    if cfg in (CUDA, CUDA_PDL, CUDA_PDL8):
+    if cfg in CUDA_CONFIGS:
         return _exact_cuda_graph(items, n, k, cfg)
+    return True
+
+
+@torch.no_grad()
+def _exact_staged_owners(items, n: int, k: int, cfg: tuple) -> bool:
+    """Qualify private padded inputs and guarded outputs on every real weight."""
+    dev = items[0][0].weight.device
+    gen = torch.Generator(device=dev).manual_seed(708131)
+    for proj, _, planes in items:
+        for scale in (1.0, 0.001):
+            stride = k + 8
+            owner = torch.full((16 + ROWS * stride + 16,), -7.0,
+                               device=dev, dtype=torch.bfloat16)
+            x = owner[16:16 + ROWS * stride].view(ROWS, stride)[:, :k]
+            x.copy_((torch.randn((ROWS, k), device=dev, generator=gen,
+                                 dtype=torch.float32) * scale).to(torch.bfloat16))
+            x.view(torch.int16)[:, :8] = torch.tensor(
+                [0, -32768, 1, -32767, 128, -32640, 16256, -16512],
+                dtype=torch.int16, device=dev).view(1, 8)
+            before = owner.clone()
+            plane_before = [t.clone() for t in planes]
+            out_owner = torch.full((16 + ROWS * n + 16,), -13.0,
+                                   device=dev, dtype=torch.bfloat16)
+            out = out_owner[16:16 + ROWS * n].view(ROWS, n)
+            before_out = out_owner.clone()
+            actual = _apk12.gemm_staged(x, planes, n, k,
+                                        pdl=cfg == CUDA_STAGE_PDL, out=out)
+            if actual is None:
+                return False
+            expected = F.linear(x, proj.weight)
+            torch.cuda.synchronize(dev)
+            if (not torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+                    or not torch.equal(owner.view(torch.uint8), before.view(torch.uint8))
+                    or not torch.equal(out_owner[:16].view(torch.uint8),
+                                       before_out[:16].view(torch.uint8))
+                    or not torch.equal(out_owner[-16:].view(torch.uint8),
+                                       before_out[-16:].view(torch.uint8))
+                    or any(not torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+                           for a, b in zip(planes, plane_before))):
+                return False
     return True
 
 
@@ -392,6 +455,25 @@ def _graph_us(fns, reps: int = 24, rounds: int = 7) -> float:
     return sorted(ms)[rounds // 2] * 1000.0 / reps
 
 
+def _staged_warm_wins(items, n: int, k: int, cfg: tuple, baseline) -> bool:
+    """Require a per-layer warm graph win as well as the rotating-weight win."""
+    ratios = []
+    for index, item in enumerate(items):
+        x = torch.randn(ROWS, k, device=item[0].weight.device, dtype=torch.bfloat16)
+        candidate = lambda: _run(x, _planes(item, cfg), n, k, cfg)
+        reference = (lambda: F.linear(x, item[0].weight)) if baseline is None else (
+            lambda: _run(x, _planes(item, baseline), n, k, baseline))
+        if index % 2:
+            ref_us, cand_us = _graph_us([reference]), _graph_us([candidate])
+        else:
+            cand_us, ref_us = _graph_us([candidate]), _graph_us([reference])
+        if ref_us <= 0:
+            return False
+        ratios.append(cand_us / ref_us)
+    ratios.sort()
+    return ratios[len(ratios) // 2] < 0.99 and ratios[-1] < 1.01
+
+
 def _choose(items, n: int, k: int, flush: torch.Tensor):
     proj = items[0][0]
     x = torch.randn(ROWS, k, device=proj.weight.device, dtype=torch.bfloat16)
@@ -405,11 +487,13 @@ def _choose(items, n: int, k: int, flush: torch.Tensor):
     choices = []
     cuda = (([CUDA] if _cuda_ok else [])
             + ([CUDA_PDL] if _cuda_pdl_ok else [])
-            + ([CUDA_PDL8] if _cuda_pdl8_ok else [])) if all(it[2] is not None for it in items) else []
+            + ([CUDA_PDL8] if _cuda_pdl8_ok else [])
+            + ([CUDA_STAGE] if _cuda_stage_ok else [])
+            + ([CUDA_STAGE_PDL] if _cuda_stage_pdl_ok else [])) if all(it[2] is not None for it in items) else []
     for cfg in cuda + (list(CONFIGS) if _triton_ok else []):
         if len(cfg) == 4 and not _word_ok:
             continue
-        if cfg not in (CUDA, CUDA_PDL, CUDA_PDL8) and n % cfg[0]:
+        if cfg not in CUDA_CONFIGS and n % cfg[0]:
             continue
         try:
             if use_graph:
@@ -427,6 +511,16 @@ def _choose(items, n: int, k: int, flush: torch.Tensor):
             break
         try:
             if _exact(items, n, k, cfg):
+                if cfg in (CUDA_STAGE, CUDA_STAGE_PDL):
+                    if not use_graph or not _exact_staged_owners(items, n, k, cfg):
+                        continue
+                    baseline = None
+                    for _, other in choices:
+                        if other not in (CUDA_STAGE, CUDA_STAGE_PDL) and _exact(items, n, k, other):
+                            baseline = other
+                            break
+                    if not _staged_warm_wins(items, n, k, cfg, baseline):
+                        continue
                 return cfg
         except Exception as exc:  # noqa: BLE001
             logger.warning("attention pack12 %dx%d: equality failed for %s (%r)", n, k, cfg, exc)

@@ -140,6 +140,95 @@ __global__ __launch_bounds__(128, (R > 4 ? 2 : 3)) void gemm(P p) {
     *(__nv_bfloat162*)(p.y + (size_t)row * N + col) = v;
   }
 }
+#ifndef APK12_NO_STAGED
+// Experimental activation staging.  The original four warps independently
+// read identical row fragments.  All threads cooperatively stage each block
+// of R K-groups once, then each warp reads the same shared words.  The next
+// block copies asynchronously while the current block's original ascending-K
+// MMA chain executes.  A separate ABI exposes it to runtime qualification;
+// the original implementation remains the fallback.
+template<int K, int R>
+__device__ __forceinline__ void stage_activation(const P& p, int g0,
+                                                 uint16_t (&s)[R][8][64]) {
+  constexpr int GN = K / 64;
+  for (int i = threadIdx.x; i < R * 8 * 8; i += blockDim.x) {
+    int r = i / 64, row = (i / 8) % 8, vec = i % 8;
+    int group = g0 + r;
+    if (row < p.m && group < GN) {
+      unsigned dst = static_cast<unsigned>(__cvta_generic_to_shared(&s[r][row][vec * 8]));
+      const __nv_bfloat16* src = p.x + (size_t)row * p.ldx + group * 64 + vec * 8;
+      asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" :: "r"(dst), "l"(src) : "memory");
+    }
+  }
+  asm volatile("cp.async.commit_group;" ::: "memory");
+}
+
+__device__ __forceinline__ void wait_activation() {
+  asm volatile("cp.async.wait_group 0;" ::: "memory");
+  __syncthreads();
+}
+
+__device__ __forceinline__ void staged_a(const uint16_t* s, int row, int m,
+                                         int lane, uint32_t (&a)[8]) {
+  const uint16_t* q = s + row * 64 + (lane % 4) * 2;
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    a[2 * j] = row < m ? *reinterpret_cast<const uint32_t*>(q + 16 * j) : 0u;
+    a[2 * j + 1] = row < m ? *reinterpret_cast<const uint32_t*>(q + 16 * j + 8) : 0u;
+  }
+}
+
+template<int N, int K, int R, bool PDL>
+__global__ __launch_bounds__(128, (R > 4 ? 2 : 3)) void gemm_staged(P p) {
+  constexpr int GN = K / 64;
+  static_assert(N % 32 == 0 && K % 128 == 0 && R <= GN, "shape");
+  __shared__ __align__(16) uint16_t stage[2][R][8][64];
+  int lane = threadIdx.x % 32, warp = threadIdx.x / 32, tile = blockIdx.x;
+  uint4 s[R];
+  uint2 x[R];
+  uint32_t b[R];
+  float c[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+  for (int r = 0; r < R; ++r) load_w<K>(p, tile, warp, lane, r, s[r], x[r], b[r]);
+#ifndef APK12_NO_PDL
+  if constexpr (PDL) pdl_wait();
+#endif
+  stage_activation<K, R>(p, 0, stage[0]);
+  wait_activation();
+  int bank = 0;
+  for (int g0 = 0; g0 < GN; g0 += R) {
+    if (g0 + R < GN) stage_activation<K, R>(p, g0 + R, stage[bank ^ 1]);
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+      int G = g0 + r;
+      if (G < GN) {
+        uint32_t w[8], a[8];
+        staged_a(&stage[bank][r][0][0], lane / 4, p.m, lane, a);
+        fragment<K>(p, tile, warp, lane, G, s[r], x[r], b[r], w);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) mma(a[2 * j], a[2 * j + 1], w[2 * j], w[2 * j + 1], c);
+        if (G + R < GN) load_w<K>(p, tile, warp, lane, G + R, s[r], x[r], b[r]);
+      }
+    }
+    if (g0 + R < GN) {
+      wait_activation();
+      bank ^= 1;
+    }
+  }
+#ifndef APK12_NO_PDL
+  if constexpr (PDL) pdl_launch_dependents();
+#endif
+  int row = lane / 4, col = tile * 32 + warp * 8 + (lane % 4) * 2;
+  if (row < p.m) {
+    __nv_bfloat162 v;
+    v.x = __float2bfloat16_rn(c[0]);
+    v.y = __float2bfloat16_rn(c[1]);
+    *(__nv_bfloat162*)(p.y + (size_t)row * N + col) = v;
+  }
+}
+
+#endif  // APK12_NO_STAGED
+
 // Load-time check: every lane's fragment for every group, through load_w and fragment,
 // against the original weight bits at its K positions. Counts differing registers.
 template<int N, int K>
@@ -183,6 +272,64 @@ static int launch_pdl(const P& p, cudaStream_t stream) {
 #endif
 }  // namespace apk12
 using apk12::P;
+#ifndef APK12_NO_STAGED
+// Separate opt-in ABI.  Until the caller has qualified this variant, the
+// original apk12_run / apk12_run_pdl remain the only production dispatches.
+extern "C" int apk12_init_staged() {
+  cudaFuncAttributes attr;
+  cudaError_t rc = cudaFuncGetAttributes(&attr, apk12::gemm_staged<4608, 2688, 4, false>);
+  if (rc == cudaSuccess)
+    rc = cudaFuncGetAttributes(&attr, apk12::gemm_staged<2688, 4096, 4, false>);
+#ifndef APK12_NO_PDL
+  if (rc == cudaSuccess)
+    rc = cudaFuncGetAttributes(&attr, apk12::gemm_staged<4608, 2688, 4, true>);
+  if (rc == cudaSuccess)
+    rc = cudaFuncGetAttributes(&attr, apk12::gemm_staged<2688, 4096, 4, true>);
+#endif
+  return (int)rc;
+}
+
+template<int N, int K>
+static int launch_staged(const P& p, bool pdl, cudaStream_t stream) {
+#ifndef APK12_NO_PDL
+  if (pdl) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(N / 32);
+    cfg.blockDim = dim3(128);
+    cfg.stream = stream;
+    cudaLaunchAttribute attr[1] = {};
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = attr;
+    cfg.numAttrs = 1;
+    cudaError_t rc = cudaLaunchKernelEx(&cfg, apk12::gemm_staged<N, K, 4, true>, p);
+    if (rc != cudaSuccess) { cudaGetLastError(); return (int)rc; }
+    return (int)cudaGetLastError();
+  }
+#else
+  if (pdl) return (int)cudaErrorNotSupported;
+#endif
+  apk12::gemm_staged<N, K, 4, false><<<N / 32, 128, 0, stream>>>(p);
+  return (int)cudaGetLastError();
+}
+
+extern "C" int apk12_run_staged(const void* x, const void* sm, const void* ex,
+                                const void* meta, const void* ri, const void* raw,
+                                void* y, int m, int n, int k, int ldx, int pdl,
+                                void* stream) {
+  // 16-byte copies must be aligned independently for every input row.  The
+  // higher-level dispatch must retain the original path for all other inputs.
+  if (m < 1 || m > 8 || ldx % 8 || (reinterpret_cast<uintptr_t>(x) & 15))
+    return (int)cudaErrorInvalidValue;
+  P p{(const __nv_bfloat16*)x, (const uint4*)sm, (const uint2*)ex, (const uint8_t*)meta,
+      (const int32_t*)ri, (const uint16_t*)raw, (__nv_bfloat16*)y, m, ldx};
+  cudaStream_t st = (cudaStream_t)stream;
+  if (n == 4608 && k == 2688) return launch_staged<4608, 2688>(p, pdl != 0, st);
+  if (n == 2688 && k == 4096) return launch_staged<2688, 4096>(p, pdl != 0, st);
+  return (int)cudaErrorInvalidValue;
+}
+#endif  // APK12_NO_STAGED
+
 extern "C" int apk12_init() {
   cudaFuncAttributes attr;
   cudaError_t rc = cudaFuncGetAttributes(&attr, apk12::gemm<4608, 2688, 4>);

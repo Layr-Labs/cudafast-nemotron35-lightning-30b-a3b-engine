@@ -12,6 +12,7 @@ _lib = None
 _load_failed = False
 _ready_devices = set()
 _pdl_devices = set()
+_staged_devices = set()
 _PDL = os.environ.get("APK12_PDL", "1") != "0"
 # Codec plane [n, k] -> (n/32, 4 warps, 8 columns, k/64, step j, half h, t, pair p) ->
 # (tile, group, warp, lane = 4 * column + t, byte 4j + 2h + p): K = 64G + 16j + 8h + 2t + p.
@@ -33,6 +34,11 @@ def _load():
             lib.apk12_init_pdl.restype = ctypes.c_int
             lib.apk12_run_pdl.argtypes = [ctypes.c_void_p] * 7 + [ctypes.c_int] * 5 + [ctypes.c_void_p]
             lib.apk12_run_pdl.restype = ctypes.c_int
+        if hasattr(lib, "apk12_init_staged") and hasattr(lib, "apk12_run_staged"):
+            lib.apk12_init_staged.argtypes = []
+            lib.apk12_init_staged.restype = ctypes.c_int
+            lib.apk12_run_staged.argtypes = [ctypes.c_void_p] * 7 + [ctypes.c_int] * 5 + [ctypes.c_void_p]
+            lib.apk12_run_staged.restype = ctypes.c_int
         lib.apk12_check.argtypes = [ctypes.c_void_p] * 7 + [ctypes.c_int] * 2 + [ctypes.c_void_p]
         lib.apk12_check.restype = ctypes.c_int
         _lib = lib
@@ -65,6 +71,19 @@ def ready_pdl(device) -> bool:
             if _lib.apk12_init_pdl():
                 return False
             _pdl_devices.add(index)
+    return True
+
+
+def ready_staged(device) -> bool:
+    """Initialize the experimental ABI; not a production admission decision."""
+    if not ready(device) or not hasattr(_lib, "apk12_init_staged"):
+        return False
+    with torch.cuda.device(device):
+        index = torch.cuda.current_device()
+        if index not in _staged_devices:
+            if _lib.apk12_init_staged():
+                return False
+            _staged_devices.add(index)
     return True
 
 
@@ -107,4 +126,31 @@ def gemm(x: torch.Tensor, cp, n: int, k: int, pdl: bool = False, ring: int = 4) 
     rc = op(*args, ring, _stream(x)) if pdl else op(*args, _stream(x))
     if rc:
         raise RuntimeError(f"apk12 launch failed: {rc}, M={x.shape[0]}, N={n}, K={k}")
+    return y
+
+
+def gemm_staged(x: torch.Tensor, cp, n: int, k: int, pdl: bool = False,
+                out: torch.Tensor | None = None) -> torch.Tensor | None:
+    """Private candidate only; an unsupported layout declines without copying."""
+    if (x.device.index not in _staged_devices or not x.is_cuda
+            or x.dtype != torch.bfloat16 or x.ndim != 2 or not 1 <= x.shape[0] <= 8
+            or (n, k) not in SHAPES or x.shape[1] != k or x.stride(1) != 1
+            or x.stride(0) % 8 or x.data_ptr() % 16
+            or (pdl and (not _PDL or x.device.index not in _pdl_devices))):
+        return None
+    if out is None:
+        y = torch.empty((x.shape[0], n), device=x.device, dtype=torch.bfloat16)
+    else:
+        y = out
+        if (y.device != x.device or y.dtype != x.dtype or y.shape != (x.shape[0], n)
+                or not y.is_contiguous() or y.data_ptr() % 4
+                or y.untyped_storage().data_ptr() == x.untyped_storage().data_ptr()
+                or any(y.untyped_storage().data_ptr() == t.untyped_storage().data_ptr()
+                       for t in cp)):
+            return None
+    rc = _lib.apk12_run_staged(
+        x.data_ptr(), *(t.data_ptr() for t in cp), y.data_ptr(),
+        x.shape[0], n, k, x.stride(0), int(pdl), _stream(x))
+    if rc:
+        raise RuntimeError(f"apk12 staged launch failed: {rc}, M={x.shape[0]}, N={n}, K={k}")
     return y

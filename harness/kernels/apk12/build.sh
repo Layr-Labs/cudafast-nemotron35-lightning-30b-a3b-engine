@@ -19,7 +19,7 @@ sm=${arch/./}
 # Only the official worker executes this build. Keep the original reference ABI if
 # this toolchain cannot compile the optional PDL ABI; production then keeps record Triton.
 rm -f "$out/libapk12.so"
-for flags in "" "-DAPK12_NO_PDL"; do
+for flags in "" "-DAPK12_NO_PDL" "-DAPK12_NO_STAGED" "-DAPK12_NO_STAGED -DAPK12_NO_PDL"; do
   # shellcheck disable=SC2086
   if "$nvcc" -O3 -std=c++17 -shared -Xcompiler -fPIC -lineinfo $flags \
     -gencode "arch=compute_${sm},code=sm_${sm}" \

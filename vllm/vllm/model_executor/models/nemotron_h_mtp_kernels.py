@@ -87,8 +87,8 @@ ADAPT_TAU = float(os.environ.get("MTP_ADAPT5_TAU", "0.25"))
 # LOCAL PATCH (cudafast-nemotron35): MTP_ADAPT5_MODE selects the rule: "lowacc" (default, see
 # _gate_begin_lowacc_kernel) or "deep" (the deepest-draft average above).
 ADAPT_MODE = os.environ.get("MTP_ADAPT5_MODE", "lowacc")
-ADAPT_LOWACC_THR = float(os.environ.get("MTP_ADAPT5_LOWACC_THR", "1.8"))
-ADAPT_LOWACC_THR_OFF = float(os.environ.get("MTP_ADAPT5_LOWACC_THR_OFF", "2.0"))
+ADAPT_LOWACC_THR = float(os.environ.get("MTP_ADAPT5_LOWACC_THR", "2.5"))
+ADAPT_LOWACC_THR_OFF = float(os.environ.get("MTP_ADAPT5_LOWACC_THR_OFF", "2.7"))
 ADAPT_MIN_CYCLES = int(os.environ.get("MTP_ADAPT5_MIN_CYCLES", "4"))
 ADAPT_BURN = float(os.environ.get("MTP_ADAPT5_BURN", "4"))
 ADAPT_CAP = int(os.environ.get("MTP_ADAPT5_CAP", "3"))

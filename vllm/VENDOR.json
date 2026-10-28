@@ -5,7 +5,7 @@
   "subtree": "vllm",
   "container_image": "docker.io/vllm/vllm-openai:v0.27.1",
   "container_digest_arm64": "sha256:1c8e60a0841b333c700488cb029d3664807249da0c071e862191b00fe34b228c",
-  "note": "Upstream Python package at the tag. The compiled extensions (csrc) come from the pinned container's install of the same tag; tools/stage-vllm-overlay.sh layers this tree over that install. vllm/vllm/config/fault_tolerance.py is stored LF-normalized (upstream has CRLF). Draw 4. Draw 1.",
+  "note": "Upstream Python package at the tag. The compiled extensions (csrc) come from the pinned container's install of the same tag; tools/stage-vllm-overlay.sh layers this tree over that install. vllm/vllm/config/fault_tolerance.py is stored LF-normalized (upstream has CRLF). Draw 4. Draw 1. Draw 8.",
   "local_patches": [
     {
       "file": "vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py",
@@ -642,6 +642,22 @@
     {
       "file": "(composition)",
       "why": "e-man07 composition on the record a1cf20d1-8d18-4f7d-942f-df2e17245deb: our nx2 tree (jungjipdo 96d0992b-4f98-4992-86b7-82174c6ea20f, leech1996 6f6ff439-186f-4cea-97ac-6f3e8f2be9af, ercumentyildirim 456feb71-1622-488c-9487-79ae5b9deaa8, i34-9 55ed2064-a023-4b5e-9fc1-da25829ef0db, terrapinelf ca2ae19c-8f8a-4dff-9c23-88cf297efe51 as carried in leech1996 c5670d92-e925-4a20-ad66-d75e07ada6d5) plus i34-9 8b406fa2-8fbf-4867-a9fb-7a8b40915ae3's fp8ws prefill Mamba in_proj kernel, files byte for byte. No new arithmetic. Re-measurement #1."
+    },
+    {
+      "file": "v1/spec_decode/nemotron_compound_loop.py (_flat_pass, FLAT, the flat admission gate, _stage barrier); v1/spec_decode/nemotron_decode_plan.py (compound_only, withdraw_compound_only); v1/spec_decode/llm_base_proposer.py (withdraw_compound_only after the compound prepare)",
+      "why": "ercumentyildirim: jacklightChen's boot-qualified compound native MTP loop (581daccd) captures its three-pass parent graph with the passes' kernels directly: the model forward under CUDAGraphMode.NONE (the full-step child graph's kernels, buffers and order) and the head screen's _greedy_row into its output buffer plus the clone, then the device stage, instead of replaying the full-step and screen child graphs inside the capture (a graph replay inside a stream capture invalidates it). The parent graph is admitted by the loop's existing complete private-state comparison with the original three-pass loop (tokens, positions, inputs, hidden, slots, KV, gate, CPU shadows, page metadata, screen buffers, and an original continuation) and, for the flat body, by its private latency: not slower with live drafts (median ratio below 1.0, 90th percentile of the case ratios below 1.03) and faster on a stopped loop (median below 0.9). The native exact structural plans are kept for the compound loop when their own per-step restore gate fails (compound_only) and withdrawn when the compound loop is not admitted. NEMO_MTP_COMPOUND_FLAT=0 keeps the child-graph body; NEMO_MTP_PLAN_BANK_COMPOUND_ONLY=0 keeps the plan gate's original refusal. The device stage reads the position and the sequence length it advances in place before any warp stores the advanced values (a CTA barrier), so no warp of the stage can compute from an already advanced value."
+    },
+    {
+      "file": "model_executor/layers/fused_moe/experts/humming_zskip.py (PZ_S6_ENABLED default)",
+      "why": "ercumentyildirim: PZSKIP_S6 defaults to off, so the 496-token prefill's routed down projection runs pzskip config 369 on the 8-bit swap scale plane instead of config 379 on the 6-bit plane. Both configs are admitted by the same 496-token bitwise check against humming, so the prefill outputs are the same; PZSKIP_S6=1 restores config 379."
+    },
+    {
+      "file": "model_executor/kernels/linear/scaled_mm/fp8ws.py (SHAPES, register, maybe_gemm); harness/kernels/fp8ws (the kernel as a template over (N, K), the pack and run entry points per shape, py/__init__.py); harness/tests/fp8ws_exact.py",
+      "why": "ercumentyildirim: i34-9's fp8ws prefill kernel (8b406fa2) also serves the M=496 Mamba out_proj, (N, K) = (2688, 4096). The kernel, its load-time byte-permuted weight pack and its bitwise admission against ops.cutlass_scaled_mm are unchanged; the kernel is one template instantiated for the in_proj (10304, 2688) and the out_proj (2688, 4096), whose 2 x 24 output tiles of 256 x 112 and 32 K steps of 128 bytes follow the same ascending-K e4m3 m16n8k32 chain from +0, FP32 scale-B then scale-A and one RN to BF16. Each out_proj layer is admitted only if its pack inverts to the original bytes and its output equals CUTLASS bit for bit on the same five synthetic activation sets x three scale pairs; otherwise it keeps CUTLASS. FP8WS=0 disables both."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_attn_packed.py (WS_ENABLED, _ws, _ws_activations, _prepare_ws, _ws_gemm, the 496-row branch of _linear_impl, apply for a bf16ws-only projection, prepare calls _prepare_ws); harness/kernels/bf16ws; harness/tests/bf16ws_exact.py",
+      "why": "ercumentyildirim: the 496-row prefill call of each attention qkv_proj (4608x2688) and o_proj (2688x4096) runs bf16ws, the fp8ws persistent TMA/mbarrier kernel with the BF16 MMA, instead of F.linear, with the same arithmetic: native bf16 m16n8k16 MMA, one ascending-K chain per output from +0, one RN to BF16. The activation keeps its layout; the weight gets a load-time, input-independent byte-permuted copy (tiles of BN x 128 bytes, BN 96 or 112, row-swizzled 16-byte chunks; the original stays for every other row count). Each projection is admitted at load only if the pack inverts to the original bytes and its output equals F.linear bit for bit on five synthetic activation sets (four Gaussian scales and every BF16 bit pattern); otherwise F.linear. Dispatch is in the nemo_attn_pk_linear custom op. BF16WS=0 disables."
     }
   ]
 }

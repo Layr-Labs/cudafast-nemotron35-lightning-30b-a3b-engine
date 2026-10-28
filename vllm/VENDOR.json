@@ -642,6 +642,30 @@
     {
       "file": "(composition)",
       "why": "e-man07 composition on the record a1cf20d1-8d18-4f7d-942f-df2e17245deb: our nx2 tree (jungjipdo 96d0992b-4f98-4992-86b7-82174c6ea20f, leech1996 6f6ff439-186f-4cea-97ac-6f3e8f2be9af, ercumentyildirim 456feb71-1622-488c-9487-79ae5b9deaa8, i34-9 55ed2064-a023-4b5e-9fc1-da25829ef0db, terrapinelf ca2ae19c-8f8a-4dff-9c23-88cf297efe51 as carried in leech1996 c5670d92-e925-4a20-ad66-d75e07ada6d5) plus i34-9 8b406fa2-8fbf-4867-a9fb-7a8b40915ae3's fp8ws prefill Mamba in_proj kernel, files byte for byte. No new arithmetic. Re-measurement #1."
+    },
+    {
+      "file": "v1/spec_decode/nemotron_step_cond.py (ENABLED default)",
+      "why": "e-man07: NEMO_MTP_STEP_COND defaults to 0 on our record 4ae55271-d4bd-44f6-adf0-1f731b273822, so the drafter loop takes the record's per-pass path (the full-step graph and screen.greedy) instead of leech1996's conditional single-row step graph. NEMO_MTP_STEP_COND=1 restores the step graph. Default only; the step graph's code and its admission are unchanged. Re-measurement #1."
+    },
+    {
+      "file": "harness/kernels/fp8ws (csrc/fp8ws.cu templated on (N,K), py); model_executor/kernels/linear/scaled_mm/fp8ws.py (shape set); harness/tests/fp8ws_exact.py",
+      "why": "e-man07 (ours): i34-9's fp8ws kernel (8b406fa2-8fbf-4867-a9fb-7a8b40915ae3) templated on (N, K) so it also serves the 496-row prefill Mamba out_proj (N=2688, K=4096) with the same 256x112 tiles (48 tiles, one wave on 48 SMs). Same arithmetic as CUTLASS: native e4m3 m16n8k32 MMA, one ascending-K chain per output from +0, FP32 scale-B then scale-A, one RN to BF16. Each layer is still admitted at load only if its pack inverts and its output equals ops.cutlass_scaled_mm bit for bit (46 of 46 projections admitted, 230/230 cases bit-exact on our box); otherwise CUTLASS. Re-measurement #2."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_gather_first.py (+ nemotron_h_mtp_screen.py)",
+      "why": "Optional actual-screen-admitted gather-three + FIRSTcoarseNVFP4dot fusion. CTA0 preservesall originalhp/hm/hr copies BEFORE stoppedearlyreturn; originalBR64/BB64/4warps/2stages firstdot reads fullh through originalHCOLS map. Originaltail/select/finalnorm/EH/depth remain. Complete firstscores/aux plusfullscreen token/candidates/logits/gate/debugstate/originalcontinuation/readonly andguarded thenactualpointer changed8-outputgraphs;gate resetoutsidecompletebodywarm-pressuretiming; median<.995/worst<1.01 before registration. No localexecution or activation/resources/gainclaim. MTP_SCREEN_GATHER_FIRST=0 restores."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_attn_packed.py",
+      "why": "Compatible publicoptional8ring chooser idea d7255b03-0b3a-46f3-a4e0-f2aa8121f283/de86be13-e6f1-49b0-8920-5c0cf9e8a400/16c5420b-c49e-40a2-b2be-bd946d5d4089 retained as exactown929 file24c0a681fc095c61f4fdccc136bf5593f7d4b798. Original actualshape timing/bitwise/changedgraph chooser unchanged; own929negativewhole excluded and no isolatedmenu gain inferred. No adaptive3vs6/pkcompact runtime carried. Entire1fa retained exceptnewgatherfirstfusion+thismenu."
+    },
+    {
+      "file": "harness/kernels/scrfirst (csrc/scrfirst.cu, py, build.sh); model_executor/models/nemotron_h_mtp_gather_tail.py; nemotron_h_mtp_screen.py",
+      "why": "Independent direct-full-h gather + existing scrtail STAGE1 first coarse dot and original cascade. Each original512thread/2048row CTA loads fullh into unchanged Smem, gathers pre/mid/rest there after a barrier, then runs original first-dot/radix/mid/rest/full-dot arithmetic. CTA0 preserves ungated globalauxcopies before stoppedreturn; all originalscores/candidates/logits/debug writes preserved. Removes originalgather and coarse-dot kernel boundaries plus coarse-score globalread, not coarse-score/auxstores or matrixproducts. Original scrtail/select kept; full-body actual-owner equality/read-only/guards/continuation/changed8outputgraphs and median<.995/worst<1.01 warm-pressure gate authored remoteonly. Prefer if admitted; otherwise independentlyqualified946gather-first then original. No activation/resources/gainclaim; MTP_SCREEN_GATHER_TAIL=0 disables. Source originalscrtail fd5696c6-0b61-477c-9e28-d4caca4659e3 through entirehighest1faceed1-7860-4e8d-b734-96600d6629aa; gather-first qualification/fallback eca713b1-34f1-4a68-b96a-daed18115493 (platform failed prebuild)."
+    },
+    {
+      "file": "v1/spec_decode/nemotron_compound_loop.py (_stage)",
+      "why": "Useful compatible public pending scalar-read-before-write barrier idea from f4df6a37-d447-4f9a-beda-470259afcb70/7308a4b8-6440-4786-9d2b-63aa75af1bce (same explanation as earlier flat-loop family): all warps load current position and sequence length before tl.debug_barrier, then retain original advance/clamp/plan-prefix arithmetic and stores. No flat-body/admission relaxation/compound-only plan/prefill-switch/BF16WS runtime copied. No observed old race or component speed/correctness claim; existing full-state compound admission remains."
     }
   ]
 }

@@ -808,6 +808,13 @@ class DraftHeadScreen:
                 and _scrtail is not None and _scrtail.available()):
             self.tail = self._tail_matches(k, device)
             print(f"MTP_SCREEN_TAIL admitted={self.tail}", flush=True)
+        if device.type == "cuda" and self.tail:
+            from .nemotron_h_mtp_gather_first import prepare as prepare_gather_first
+
+            from .nemotron_h_mtp_gather_tail import prepare as prepare_gather_tail
+
+            if not prepare_gather_tail(self):
+                prepare_gather_first(self)
         if device.type == "cuda" and screen_graph_enabled():
             # The captured one-row screen is the gated one (depth gate): allocate
             # the gate first so the graph captures its address.
@@ -1009,16 +1016,21 @@ class DraftHeadScreen:
             # LOCAL PATCH (cudafast-nemotron35): the three-level cascade
             # (see __init__); the refine stage and everything after it are
             # the two-level cascade's.
-            _gather_three[(1,)](
-                h, self.pre_cols, self._hp, self.mid_cols, self._hm,
-                self.rest_cols, self._hr,
-                NA=self.pre_cols.numel(), NB=self.mid_cols.numel(),
-                NC=self.rest_cols.numel(), launch_pdl=mtp_pdl(),
-            )
-            _rows_dot(
-                self._hp, self.w_pre, self.s_pre, None,
-                self.gscale, self.scores, False, gated,
-            )
+            from .nemotron_h_mtp_gather_tail import maybe_full as gather_tail
+            if gather_tail(self, h, gated, out):
+                return out
+            from .nemotron_h_mtp_gather_first import maybe_first as gather_first
+            if not gather_first(self, h, gated):
+                _gather_three[(1,)](
+                    h, self.pre_cols, self._hp, self.mid_cols, self._hm,
+                    self.rest_cols, self._hr,
+                    NA=self.pre_cols.numel(), NB=self.mid_cols.numel(),
+                    NC=self.rest_cols.numel(), launch_pdl=mtp_pdl(),
+                )
+                _rows_dot(
+                    self._hp, self.w_pre, self.s_pre, None,
+                    self.gscale, self.scores, False, gated,
+                )
             nchunk = self.n // SCREEN_CHUNK
             tgate, tok = _gate_args(self.scores)
             tgated = gated and tok

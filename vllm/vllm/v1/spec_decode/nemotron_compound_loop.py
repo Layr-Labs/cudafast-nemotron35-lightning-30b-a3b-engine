@@ -113,8 +113,10 @@ def _state(p, builder, wrapper, bank, layout):
     if not families:
         return None
     family, entries = max(families.items(), key=lambda item: len(item[1]))
-    starts = sorted(n for n in entries if n + 1 in entries and n + 2 in entries
-                    and n + 2 < p.max_model_len)
+    moves = p.num_speculative_tokens - 2
+    starts = sorted(n for n in entries
+                    if all(n + i in entries for i in range(moves + 1))
+                    and n + moves < p.max_model_len)
     if not starts:
         return None
     # Strong prefix owners make the device pointer lookup immutable. These
@@ -132,7 +134,7 @@ def _state(p, builder, wrapper, bank, layout):
         max_prefix=max(sizes),
         max_pages=triton.next_power_of_2(
             (p.max_model_len + p.block_size - 1) // p.block_size),
-        padded=p._nemo_full[1],
+        padded=p._nemo_full[1], moves=moves,
         table=torch.zeros((1, triton.next_power_of_2(
             (p.max_model_len + p.block_size - 1) // p.block_size)),
             dtype=torch.int32, device=p.device),
@@ -141,9 +143,9 @@ def _state(p, builder, wrapper, bank, layout):
     )
 
 
-def _advance_cpu(cad):
+def _advance_cpu(cad, moves):
     # Preserve the original field order, including any CPU aliasing.
-    for _ in range(2):
+    for _ in range(moves):
         cad.max_seq_len += 1
         for name in ("_seq_lens_cpu", "_num_computed_tokens_cpu",
                      "seq_lens_cpu_upper_bound"):
@@ -164,7 +166,11 @@ def _ready(metadata):
 
 
 def _check(s, p, kwargs, metadata, cad, padded, batch_size):
-    if (batch_size != 1 or padded != s.padded or p.num_speculative_tokens != 4
+    if (batch_size != 1 or padded != s.padded
+            or p.num_speculative_tokens not in (4, 5)
+            or s.moves != p.num_speculative_tokens - 2
+            or (p.num_speculative_tokens == 5
+                and getattr(p, "_nemo_step", None) is not None)
             or p._nemo_full is None or s.wrapper._nemo_native_plan is not s.bank
             or not s.bank.enabled or s.bank.force_native
             or _inputs(kwargs) != s.inputs or _metadata(p, metadata) != s.signature
@@ -177,7 +183,7 @@ def _check(s, p, kwargs, metadata, cad, padded, batch_size):
             or cpu.numel() != 1 or cad.seq_lens.dtype != torch.int32
             or not cad.seq_lens.is_cuda or cad.seq_lens.numel() != 1
             or not cad.seq_lens.is_contiguous()
-            or cad.max_seq_len + 2 >= p.max_model_len):
+            or cad.max_seq_len + s.moves >= p.max_model_len):
         return None
     length = int(cpu[0])
     shadows = [getattr(cad, name) for name in (
@@ -190,10 +196,10 @@ def _check(s, p, kwargs, metadata, cad, padded, batch_size):
     if (length not in s.starts
             or s.bank.last_restore_key != s.entries[length][0]
             or any(s.bank.entries.get(s.entries[n][0], (None, None))[1]
-                   is not s.entries[n][1] for n in (length, length + 1, length + 2))):
+                   is not s.entries[n][1] for n in range(length, length + s.moves + 1))):
         return None
     table = cad.block_table_tensor
-    pages = (length + 2 + p.block_size - 1) // p.block_size
+    pages = (length + s.moves + p.block_size - 1) // p.block_size
     if (not table.is_cuda or table.dtype != torch.int32 or table.ndim != 2
             or table.shape[0] != 1 or table.shape[1] < pages
             or table.stride(1) != 1 or table.device != s.table.device
@@ -216,7 +222,7 @@ def _replay(s, p, kwargs, metadata, cad, padded, batch_size):
     # The caller's original seq buffer is preserved as an observable output,
     # although the captured metadata stages use a private stable sequence ptr.
     cad.seq_lens.copy_(s.seq)
-    _advance_cpu(cad)
+    _advance_cpu(cad, s.moves)
     s.bank.last_restore_key = s.entries[int(cad._seq_lens_cpu[0])][0]
     return s.tokens
 
@@ -252,7 +258,9 @@ def prepare(p):
     if (not ENABLED or getattr(p, "_nemo_compound_attempted", False)
             or torch.cuda.is_current_stream_capturing()
             or getattr(p, "_nemo_full", None) is None
-            or getattr(p, "_nemo_full_native_layout", None) is None):
+            or getattr(p, "_nemo_full_native_layout", None) is None
+            or p.num_speculative_tokens not in (4, 5)
+            or (p.num_speculative_tokens == 5 and getattr(p, "_nemo_step", None) is not None)):
         return
     from vllm.v1.spec_decode.nemotron_decode_plan import _eligible, _SCALARS
     if not _eligible(p):
@@ -265,7 +273,7 @@ def prepare(p):
     sets = p._hostfast_draft_sets()
     if (wrapper is not layout[0] or bank is None or not bank.enabled
             or bank.force_native or screen is None or screen.graph is None
-            or sets is None or len(sets.sets) < 4):
+            or sets is None or len(sets.sets) < p.num_speculative_tokens):
         return
     p._nemo_compound_attempted = True
     p._nemo_compound_loop = None
@@ -287,10 +295,11 @@ def prepare(p):
     if any(not isinstance(t, torch.Tensor) or t.ndim != 4 or t.shape[0] < 4
            for t in caches):
         return
-    values = [p.input_ids[:5], p.positions[:5], p.hidden_states[:5],
-              p._slot_mapping_buffer[:5], gate]
+    saved_rows = max(5, p._nemo_full[1])
+    values = [p.input_ids[:saved_rows], p.positions[:saved_rows], p.hidden_states[:saved_rows],
+              p._slot_mapping_buffer[:saved_rows], gate]
     values.extend(t[:4] for t in caches)
-    values.extend(t[:5] for t in p.model._moe_row_src_buffers())
+    values.extend(t[:saved_rows] for t in p.model._moe_row_src_buffers())
     for name in ("_h", "_out", "scores", "refine_scores", "cand_logits"):
         value = getattr(screen, name, None)
         if isinstance(value, torch.Tensor):
@@ -416,19 +425,19 @@ def prepare(p):
 
         def body(md):
             tokens = []
-            for step in range(3):
+            for step in range(s.moves + 1):
                 hidden = model_graph(p, kwargs, md, s.padded, 1)
                 if hidden is None or not isinstance(hidden, torch.Tensor):
                     raise ValueError("full model graph declined compound capture")
                 token = screen.greedy(hidden[:1])
                 tokens.append(token)
-                if step < 2:
+                if step < s.moves:
                     _launch_stage(s, p, token, hidden[:1])
             return tuple(tokens)
 
         # Warm Triton, the existing model/head child graphs and clone outputs
-        # before capturing the three-pass parent. Each token clone has its own
-        # strong owner within this parent graph, including across replays.
+        # before capturing the remaining-pass parent. Each token clone has its
+        # own strong owner within this parent graph, including across replays.
         for _ in range(2):
             cad, md = setup(s.seed, 0)
             body(md)
@@ -441,7 +450,7 @@ def prepare(p):
                               pool=torch.cuda.graph_pool_handle()):
             tokens = body(capture_md)
         torch.cuda.synchronize(p.device)
-        if len({t.data_ptr() for t in tokens}) != 3:
+        if len({t.data_ptr() for t in tokens}) != s.moves + 1:
             raise ValueError("compound draft output slots alias")
         s.graph, s.tokens = graph, tokens
         s.owners = (kwargs, capture_md, row_zero, capture_stream)
@@ -449,7 +458,9 @@ def prepare(p):
         def original(cad, md):
             tokens = []
             mode, _, across = p._determine_batch_execution_and_padding(1)
-            for step in range(3):
+            for step in range(s.moves + 1):
+                if p.num_speculative_tokens == 5 and step:
+                    p._mtp_step_prefetch(gate)
                 with set_forward_context(
                     md, p.vllm_config, num_tokens=s.padded,
                     num_tokens_across_dp=across, cudagraph_runtime_mode=mode,
@@ -460,7 +471,7 @@ def prepare(p):
                     raise ValueError("original full graph declined private comparison")
                 token = screen.greedy(hidden[:1])
                 tokens.append(token)
-                if step < 2:
+                if step < s.moves:
                     p._update_positions_dependent_metadata(
                         p.positions[:1], cad, 1, s.padded, p.block_size,
                         fused=(token, hidden[:1]),
@@ -506,7 +517,7 @@ def prepare(p):
                                        page * p.block_size + 1) if n in s.starts)
         pressure = torch.empty(64 << 20, dtype=torch.uint8, device=p.device)
         ratios, active_ratios = [], []
-        # Actual three-pass production path: current plan first, normal side
+        # Actual remaining-pass production path: current plan first, normal side
         # stream staging later, full model child graphs and original head.
         # Compare complete private state, then wall latency including host
         # submission and CPU metadata work, in alternating order.
@@ -535,8 +546,8 @@ def prepare(p):
                             # Exercise a subsequent ORIGINAL builder and model
                             # after the compound path, including reuse of a
                             # different pinned staging set. This is outside the
-                            # timed three-pass comparison.
-                            if length + 3 < p.max_model_len:
+                            # timed remaining-pass comparison.
+                            if length + s.moves + 1 < p.max_model_len:
                                 final_hidden = p._nemo_full[4][0]
                                 if not isinstance(final_hidden, torch.Tensor):
                                     raise ValueError("compound continuation hidden is not a tensor")

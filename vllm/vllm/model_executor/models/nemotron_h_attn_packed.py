@@ -68,10 +68,9 @@ _chosen: dict[tuple[int, int], tuple] = {}
 _word_ok = False
 _triton_ok = False
 _WORD = os.environ.get("ATTN_PACK12_WORDLOAD", "1") != "0"
-# LOCAL PATCH (cudafast-nemotron35): ATTN_PACK12_PDL8 (default off) offers the eight-deep-ring PDL
-# variant to the per-shape timing choice; off, the choice is between the ordinary and the
-# four-deep-ring PDL CUDA kernels and the Triton configurations. ATTN_PACK12_PDL8=1 restores it.
-_PDL8 = os.environ.get("ATTN_PACK12_PDL8", "0") != "0"
+# LOCAL PATCH (cudafast-nemotron35): offer the eight-deep-ring PDL variant to
+# the existing exactness and timing choice. ATTN_PACK12_PDL8=0 removes it.
+_PDL8 = os.environ.get("ATTN_PACK12_PDL8", "1") != "0"
 _registry: dict[int, tuple[torch.Tensor, ...]] = {}
 # bf16ws: weight storage address -> (weight, pack); the weight reference keeps the address valid
 WS_ENABLED = os.environ.get("BF16WS", "1") != "0"

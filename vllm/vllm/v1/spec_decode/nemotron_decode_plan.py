@@ -154,7 +154,7 @@ def _eligible(p):
         package_ok = False
     return (os.environ.get("NEMO_MTP_NATIVE_PLAN_BANK", "1") != "0" and package_ok
             and type(p.model).__name__ == "NemotronHMTP" and p.method == "mtp"
-            and p.speculative_config.num_speculative_tokens == 4
+            and p.speculative_config.num_speculative_tokens in (4, 5)
             and not p.speculative_config.enforce_eager
             and not p.parallel_drafting and not p.constant_draft_positions
             and not p.needs_extra_input_slots and p.pass_hidden_states_to_model
@@ -202,6 +202,8 @@ def prepare(p):
     p._nemo_plan_attempted = True
     values = [p.input_ids[:padded], p.positions[:padded], p.hidden_states[:padded],
               p._slot_mapping_buffer[:padded], gate]
+    if p.num_speculative_tokens == 5 and getattr(p, "_nemo_step", None) is not None:
+        values.extend((p._nemo_step.hidden, p._nemo_step.live))
     values.extend(t[:4] for t in caches)
     values.extend(b[:max(5, padded)] for b in p.model._moe_row_src_buffers())
     for name in ("_h", "_out", "scores", "refine_scores", "cand_logits"):
@@ -301,6 +303,8 @@ def prepare(p):
         ratios = []
         # Warm the original stream/event control before either timed arm.
         p._draft_plan_side_stream()
+        if p.num_speculative_tokens == 5:
+            p._mtp_step_prefetch(gate)
 
         def run_case(length, case, native):
             # Both arms get identical private model inputs/KV and integer
@@ -331,6 +335,8 @@ def prepare(p):
             wrapper._nemo_native_plan = None if native else bank
             torch.cuda.synchronize(p.device)
             start = time.perf_counter()
+            if p.num_speculative_tokens == 5:
+                p._mtp_step_prefetch(gate)
             side = p._draft_plan_side_stream()
             if side is not None:
                 main = torch.cuda.current_stream()
@@ -348,10 +354,18 @@ def prepare(p):
             with set_forward_context(metadata, p.vllm_config, num_tokens=padded,
                                      cudagraph_runtime_mode=mode,
                                      slot_mapping=p._get_slot_mapping(padded)):
-                hidden = model_graph(p, kwargs, metadata, padded, 1)
-                if hidden is None:
-                    hidden = p.model(**kwargs)
-            token = screen.greedy(hidden[:1])
+                step = None
+                if p.num_speculative_tokens == 5 and getattr(p, "_nemo_step", None) is not None:
+                    from vllm.v1.spec_decode.nemotron_step_cond import maybe_run as step_run
+                    step = step_run(p, kwargs, metadata, padded, 1)
+                if step is None:
+                    hidden = model_graph(p, kwargs, metadata, padded, 1)
+                    if hidden is None:
+                        hidden = p.model(**kwargs)
+                else:
+                    hidden, token = step
+            if step is None:
+                token = screen.greedy(hidden[:1])
             torch.cuda.synchronize(p.device)
             elapsed = time.perf_counter() - start
             extent = _extent(tuple(int(v) for v in wrapper._plan_info),

@@ -19,6 +19,9 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.spec_decode.nemotron_full_step import _inputs, _metadata
 
 logger = init_logger(__name__)
+# Public pending 7c9c41ae-9d61-49ab-a160-e200a493ec74 and
+# 58453a26-8303-4c0d-a3a9-5ac9221d9f64 keep the inherited conditional step.
+# Its existing full-state, graph and timing admission remains authoritative.
 ENABLED = os.environ.get("NEMO_MTP_STEP_COND", "1") != "0"
 SPEED = os.environ.get("NEMO_MTP_STEP_COND_SPEED", "1") != "0"
 

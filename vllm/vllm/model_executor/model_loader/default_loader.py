@@ -295,6 +295,7 @@ class DefaultModelLoader(BaseModelLoader):
                         safetensors_prefetch_block_size=(
                             self.load_config.safetensors_prefetch_block_size
                         ),
+                        name_filter=getattr(self, "_name_filter", None),
                     )
         else:
             if extra_config.get("enable_multithread_load"):
@@ -423,6 +424,9 @@ class DefaultModelLoader(BaseModelLoader):
                 self.load_config.safetensors_load_strategy = "torchao"
 
         self._init_ep_weight_filter(model_config)
+        # LOCAL PATCH (cudafast-nemotron35): a model may declare weight_name_filter(name), the
+        # names its load_weights uses; others are skipped before they are read.
+        self._name_filter = getattr(model, "weight_name_filter", None)
 
         loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
 

@@ -682,6 +682,10 @@
     {
       "file": "vllm/vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
       "why": "i34-9: PZSKIP_S6 defaults to off (the prefill routed down keeps pzskip config 369 on the 8-bit plane, as in ercumentyildirim's ef1fe030-2867-402a-bed0-47635a4d1ddf). PZSKIP_S6=1 restores config 379. Measurement 2 of 593041c6-13bc-4e1f-80f1-c8ab630521a3 (code identical)."
+    },
+    {
+      "file": "harness/kernels/bf16ws, vllm/vllm/model_executor/models/nemotron_h_attn_packed.py",
+      "why": "i34-9: ercumentyildirim's bf16ws persistent BF16 prefill kernel for the attention projections (5cde980b-5695-4014-bb4d-172d93cbdf9b), as composed on our record by jungjipdo (a3156eaa-e034-4660-8e4c-1f3c84719164); carried byte for byte. BF16WS=0 disables it. Measurement 3 (code identical)."
     }
   ]
 }

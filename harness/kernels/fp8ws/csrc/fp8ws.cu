@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// fp8ws: the prefill Mamba in_proj FP8 GEMM, C[496,10304] = A[496,2688] x W[10304,2688]^T, BF16 out.
+// fp8ws: the prefill (M=496) Mamba FP8 GEMMs, C[496,N] = A[496,K] x W[N,K]^T, BF16 out, for
+// in_proj (N,K) = (10304,2688) and out_proj (N,K) = (2688,4096).
 //
 // Arithmetic (identical to the pinned SM120 CUTLASS kernel and to fp8small): every output starts at
 // +0.0f and follows one ascending-K chain of native
@@ -19,16 +20,31 @@
 #include <stdint.h>
 
 namespace fp8ws {
-constexpr int M = 496, N = 10304, K = 2688;
-constexpr int KT = 128, CPR = KT / 16, ST = 2;
-constexpr int WM = 4, WN = 2, MW = 4, NW = 7;
-constexpr int BM = WM * MW * 16, BN = WN * NW * 8;           // 256 x 112
+constexpr int M = 496;
+constexpr int KT = 128, CPR = KT / 16;
+constexpr int WM = 4, WN = 2, NW = 7;
+constexpr int BN = WN * NW * 8;                               // 112 columns
 constexpr int NWARP = WM * WN, NT = NWARP * 32;
-constexpr int NB = 2, NTN = N / BN, NTILES = NB * NTN;       // 2 x 92 tiles
-constexpr int NKT = K / KT;                                   // 21
-constexpr int ASZ = BM * KT, WSZ = BN * KT, STB = ASZ + WSZ;  // 32768 + 14336 = 46 KiB
-constexpr int SMEM = ST * STB + 1024;                         // + alignment slack
-static_assert(N % BN == 0 && K % KT == 0 && STB % 1024 == 0, "shape");
+constexpr int WSZ = BN * KT;
+// Per shape: MW m16 blocks per warp (BM = 64 MW rows per tile), ST smem stages, NB row bands,
+// NTN column tiles of BN, NKT K steps of KT.
+//   in_proj  (10304, 2688): MW 4, ST 2 -> 256 x 112 tiles, 2 x 92, 21 K steps, 46 KiB stages
+//   out_proj (2688, 4096):  MW 4, ST 2 -> 256 x 112 tiles, 2 x 24 (one wave on 48 SMs), 32 K steps.
+//   Measured on GB10 with cold weights (all 23 layers rotating): 68 us vs 82 us CUTLASS; 128-row tiles
+//   with 3 stages 75.5 us, 64-row tiles 106 us.
+#ifndef FP8WS_OUT_MW
+#define FP8WS_OUT_MW 4
+#endif
+#ifndef FP8WS_OUT_ST
+#define FP8WS_OUT_ST 2
+#endif
+template <int N, int K> struct Shape {
+  static constexpr int MW = N == 10304 ? 4 : FP8WS_OUT_MW, ST = N == 10304 ? 2 : FP8WS_OUT_ST;
+  static constexpr int BM = WM * MW * 16, NB = (M + BM - 1) / BM;
+  static constexpr int ASZ = BM * KT, STB = ASZ + WSZ, SMEM = ST * STB + 1024;
+  static constexpr int NTN = N / BN, NTILES = NB * NTN, NKT = K / KT;
+  static_assert(N % BN == 0 && K % KT == 0 && STB % 1024 == 0 && SMEM <= 101376, "shape");
+};
 
 // 16-byte chunk c of row r lands at chunk c ^ (r & 7) (TMA SWIZZLE_128B on 128-byte rows,
 // 1024-byte aligned stage base).
@@ -92,7 +108,9 @@ __device__ __forceinline__ uint32_t sel4(uint32_t v0, uint32_t v1, uint32_t v2, 
 }
 
 // Wp[nt][kt][r][c'] (16-byte chunks) = W[nt*BN + r][kt*KT + swz(r, c')*16 ...]; W is [N][K].
+template <int N, int K>
 __global__ void pack_kernel(const uint4* __restrict__ W, uint4* __restrict__ Wp) {
+  constexpr int NKT = Shape<N, K>::NKT;
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= (size_t)N * K / 16) return;
   const int cp = i % CPR;
@@ -111,6 +129,7 @@ struct Params {
 // (rows r, r+8 x two blocks); a 4x4 transpose within the quad gives every lane one chunk.
 // wn==0: pairs (0,1)(2,3)(4,5) and block 6 alone; wn==1: block 0 alone and pairs (1,2)(3,4)(5,6),
 // so every pair starts on a 32-byte boundary. The lone block is stored as 8-byte halves.
+template <int N>
 __device__ __forceinline__ void epilogue(const float (&acc)[NW][4], __nv_bfloat16* out, int row0, int col0,
                                          int lane, int wn, float sa, float sb, bool st) {
   const int q = lane & 3, rq = lane >> 2;
@@ -150,7 +169,11 @@ __device__ __forceinline__ void epilogue(const float (&acc)[NW][4], __nv_bfloat1
   if (st) *reinterpret_cast<uint2*>(out + (size_t)row * N + col) = w;
 }
 
+template <int N, int K>
 __global__ void __launch_bounds__(NT, 1) gemm(const __grid_constant__ CUtensorMap tmA, const Params p) {
+  using S = Shape<N, K>;
+  constexpr int NTILES = S::NTILES, NKT = S::NKT, ST = S::ST, MW = S::MW, BM = S::BM, NB = S::NB;
+  constexpr int ASZ = S::ASZ, STB = S::STB;
   extern __shared__ uint8_t sm_raw[];
   __shared__ __align__(8) unsigned long long bars[2 * ST];
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -235,7 +258,7 @@ __global__ void __launch_bounds__(NT, 1) gemm(const __grid_constant__ CUtensorMa
       const int col0 = nt * BN + wn * NW * 8;
 #pragma unroll
       for (int i = 0; i < MW; ++i) {
-        epilogue(acc[i], p.out, rb0 + i * 16, col0, lane, wn, sa, sb, rb0 + i * 16 < M);
+        epilogue<N>(acc[i], p.out, rb0 + i * 16, col0, lane, wn, sa, sb, rb0 + i * 16 < M);
 #pragma unroll
         for (int j = 0; j < NW; ++j)
 #pragma unroll
@@ -264,35 +287,51 @@ extern "C" int fp8ws_init() {
   int dev = 0;
   cudaError_t e = cudaGetDevice(&dev);
   if (e == cudaSuccess) e = cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev);
-  if (e == cudaSuccess) e = cudaFuncSetAttribute(gemm, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+  if (e == cudaSuccess)
+    e = cudaFuncSetAttribute(gemm<10304, 2688>, cudaFuncAttributeMaxDynamicSharedMemorySize, Shape<10304, 2688>::SMEM);
+  if (e == cudaSuccess)
+    e = cudaFuncSetAttribute(gemm<2688, 4096>, cudaFuncAttributeMaxDynamicSharedMemorySize, Shape<2688, 4096>::SMEM);
   return (int)e;
 }
 
 // w: [N][K] E4M3 bytes (the column-major [K,N] weight's storage); wp: N*K bytes.
 extern "C" int fp8ws_pack(const void* w, void* wp, int n, int k, void* stream) {
   using namespace fp8ws;
-  if (n != N || k != K) return (int)cudaErrorInvalidValue;
-  const size_t chunks = (size_t)N * K / 16;
-  pack_kernel<<<(unsigned)((chunks + 255) / 256), 256, 0, (cudaStream_t)stream>>>((const uint4*)w, (uint4*)wp);
+  const size_t chunks = (size_t)n * k / 16;
+  const unsigned blocks = (unsigned)((chunks + 255) / 256);
+  if (n == 10304 && k == 2688)
+    pack_kernel<10304, 2688><<<blocks, 256, 0, (cudaStream_t)stream>>>((const uint4*)w, (uint4*)wp);
+  else if (n == 2688 && k == 4096)
+    pack_kernel<2688, 4096><<<blocks, 256, 0, (cudaStream_t)stream>>>((const uint4*)w, (uint4*)wp);
+  else
+    return (int)cudaErrorInvalidValue;
   return (int)cudaGetLastError();
 }
 
 extern "C" int fp8ws_run(const void* a, const void* wp, const void* sa, const void* sb, void* c, int m, int n,
                          int k, void* stream) {
   using namespace fp8ws;
-  if (m != M || n != N || k != K || !encode || num_sms <= 0) return (int)cudaErrorInvalidValue;
+  const bool in_proj = n == 10304 && k == 2688, out_proj = n == 2688 && k == 4096;
+  if (m != M || !(in_proj || out_proj) || !encode || num_sms <= 0) return (int)cudaErrorInvalidValue;
   if (((uintptr_t)a & 15) || ((uintptr_t)wp & 15) || ((uintptr_t)c & 15)) return (int)cudaErrorInvalidValue;
   CUtensorMap map;
-  cuuint64_t dims[2] = {(cuuint64_t)K, (cuuint64_t)M};
-  cuuint64_t strides[1] = {(cuuint64_t)K};
-  cuuint32_t box[2] = {(cuuint32_t)KT, (cuuint32_t)BM};
+  cuuint64_t dims[2] = {(cuuint64_t)k, (cuuint64_t)M};
+  cuuint64_t strides[1] = {(cuuint64_t)k};
+  cuuint32_t box[2] = {(cuuint32_t)KT, (cuuint32_t)(in_proj ? Shape<10304, 2688>::BM : Shape<2688, 4096>::BM)};
   cuuint32_t es[2] = {1, 1};
   if (encode(&map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, const_cast<void*>(a), dims, strides, box, es,
              CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
              CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) != CUDA_SUCCESS)
     return -3;
   Params p{(const uint8_t*)wp, (const float*)sa, (const float*)sb, (__nv_bfloat16*)c};
-  const int grid = num_sms < NTILES ? num_sms : NTILES;
-  gemm<<<grid, NT, SMEM, (cudaStream_t)stream>>>(map, p);
+  if (in_proj) {
+    constexpr int NTILES = Shape<10304, 2688>::NTILES;
+    const int grid = num_sms < NTILES ? num_sms : NTILES;
+    gemm<10304, 2688><<<grid, NT, Shape<10304, 2688>::SMEM, (cudaStream_t)stream>>>(map, p);
+  } else {
+    constexpr int NTILES = Shape<2688, 4096>::NTILES;
+    const int grid = num_sms < NTILES ? num_sms : NTILES;
+    gemm<2688, 4096><<<grid, NT, Shape<2688, 4096>::SMEM, (cudaStream_t)stream>>>(map, p);
+  }
   return (int)cudaGetLastError();
 }

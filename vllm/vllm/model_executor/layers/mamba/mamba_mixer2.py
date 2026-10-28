@@ -35,6 +35,8 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
 from vllm.model_executor.layers.mamba.ops.layernorm_gated import rms_norm_gated
 from vllm.model_executor.layers.mamba.ops.gated_norm_fp8 import maybe_gated_norm_fp8
 from vllm.model_executor.layers.mamba.ops.mamba_ssm_spec_replay import (
+    LAZY_PERIOD,
+    live_spec_verify_rows,
     selective_state_update_spec_replay,
     spec_replay_enabled,
     prefill_tag_view,
@@ -572,6 +574,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
         self._spec_replay_ok: bool | None = None
         self._spec_replay_lazy: bool | None = None
         self._spec_replay_pipeline = False
+        self._conv_ring_ok = False
         if self.use_spec_replay:
             logger.info_once(
                 "Mamba2 spec decode: anchor-state replay (ring of %d tokens).",
@@ -1100,6 +1103,47 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 state_indices_tensor_d_input = state_indices_tensor_d
                 state_indices_tensor_d_output = state_indices_tensor_d
 
+            # The private admission gate has checked this layer's real weights
+            # and the complete conv+SSM chain. Both calls must receive the same
+            # device prefix pointer and must select the replay path together.
+            ring_sink = None
+            ring_verify_rows = None
+            row_stride = (self.tped_intermediate_size + self.tped_conv_size
+                          + self.tped_dt_size)
+            if (self._conv_ring_ok and not has_prefill and not is_mamba_cache_all
+                    and not self.use_replayssm and num_decodes == 1
+                    and num_accepted_tokens is not None
+                    and num_accepted_tokens.numel() == 1
+                    and query_start_loc_d is not None and query_start_loc_d.numel() == 2
+                    and state_indices_tensor_d.dim() == 2
+                    and tuple(state_indices_tensor_d.shape) == (1, 6)
+                    and num_decode_tokens == 6
+                    and hidden_states_B_C_d.dtype == conv_state.dtype
+                    and hidden_states_B_C_d.stride() == (row_stride, 1)):
+                raw_x, raw_b, _ = self.split_hidden_states_B_C_fn(hidden_states_B_C_d)
+                raw_x = raw_x.view(-1, self.num_heads // self.tp_size, self.head_dim)
+                groups = self.n_groups // self.tp_size
+                raw_b = raw_b.view(-1, groups, raw_b.shape[1] // groups)
+                ready_dt = dt_d[:, :, None].expand(-1, -1, self.head_dim)
+                ready_A = self.A[:, None, None].expand(-1, self.head_dim, self.ssm_state_size).to(torch.float32)
+                ready_bias = self.dt_bias[:, None].expand(-1, self.head_dim)
+                if self._spec_replay_ready(ssm_state, raw_x, ready_dt, ready_A,
+                                           raw_b, ready_bias, state_indices_tensor_d):
+                    ring_verify_rows = live_spec_verify_rows(raw_x.device, 1, 6, 6)
+                    if ring_verify_rows is not None:
+                        ring_sink = {
+                            "state": ssm_state, "ring": ssm_state.view(raw_x.dtype),
+                            "seq_lens": attn_metadata.seq_lens,
+                            "verify_rows": ring_verify_rows,
+                            "slot_elems": (ssm_state.shape[1] * ssm_state.shape[2]
+                                           * ssm_state.shape[3]),
+                            "ring_len": self.spec_replay_ring_len,
+                            "max_rows": 6, "lazy": self._lazy_anchor(ssm_state),
+                            "lazy_period": LAZY_PERIOD,
+                            "x_features": self.tped_intermediate_size,
+                            "b_features": self.groups_ssm_state_size // self.tp_size,
+                        }
+
             # 2. Convolution sequence transformation
             hidden_states_B_C_d = causal_conv1d_update(
                 hidden_states_B_C_d,
@@ -1113,6 +1157,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 num_accepted_tokens=num_accepted_tokens,
                 query_start_loc=query_start_loc_d,
                 max_query_len=state_indices_tensor_d.size(-1),
+                **({"_private_ring_sink": ring_sink} if ring_sink is not None else {}),
             )
 
             hidden_states_d, B_d, C_d = self.split_hidden_states_B_C_fn(
@@ -1207,6 +1252,9 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     is_blackwell=self.is_blackwell,
                     lazy=self._lazy_anchor(ssm_state),
                     _pipeline=self._spec_replay_pipeline,
+                    _private_verify_rows=ring_verify_rows,
+                    _private_no_prefix=(ring_sink is not None and ring_verify_rows is None),
+                    _private_ring_producer=ring_sink is not None,
                 )
             else:
                 selective_state_update(
@@ -1226,6 +1274,32 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     cu_seqlens=query_start_loc_d,
                     is_blackwell=self.is_blackwell,
                 )
+
+    def prepare_conv_ring_fusion(self, enabled: bool = True) -> None:
+        """Admit the paired path only after remote checks on this bound layer."""
+        self._conv_ring_ok = False
+        if (not enabled or not self.use_spec_replay or self.num_spec != 5
+                or self.activation not in ("silu", "swish")):
+            return
+        try:
+            state = self.kv_cache[1]
+            if not self._lazy_anchor(state):
+                return
+            conv_state = (self.kv_cache[0] if is_conv_state_dim_first()
+                          else self.kv_cache[0].transpose(-1, -2))
+            from vllm.model_executor.layers.mamba.ops.conv_ring_qualification import prepare
+
+            A = self.A[:, None, None].expand(-1, self.head_dim, self.ssm_state_size).to(torch.float32)
+            bias = self.dt_bias[:, None].expand(-1, self.head_dim)
+            D = self.D[:, None].expand(-1, self.head_dim)
+            row_stride = self.tped_intermediate_size + self.tped_conv_size + self.tped_dt_size
+            self._conv_ring_ok = prepare(
+                state, conv_state, self.conv_weights, self.conv1d.bias, A, D, bias,
+                self.model_config.dtype, self.spec_replay_ring_len, self.is_blackwell,
+                self._lazy_anchor(state), self._spec_replay_pipeline, row_stride,
+            )
+        except Exception as exc:
+            logger.warning("Mamba2 conv-ring admission retained original path: %r", exc)
 
     def prepare_spec_replay_pipeline(self, enabled: bool = True) -> None:
         """Qualify only with real bound layout and loaded immutable parameters."""

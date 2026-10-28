@@ -45,6 +45,7 @@ import sys
 
 import torch
 
+from vllm.model_executor.layers.mamba.ops.conv_ring_guard import conv_ring_window
 from vllm.model_executor.layers.mamba.ops.mamba_ssm import (
     softplus,
     try_get_optimal_ssm_config,
@@ -58,6 +59,17 @@ def spec_replay_enabled() -> bool:
     """The kill switch: on unless VLLM_MAMBA_SPEC_REPLAY is 0/false/off."""
     value = os.environ.get("VLLM_MAMBA_SPEC_REPLAY", "1").strip().lower()
     return value not in ("0", "false", "off", "no")
+
+
+def live_spec_verify_rows(device, N, max_seqlen, batch):
+    """Return the existing shared prefix buffer without importing or rebinding it."""
+    if (N != 1 or max_seqlen not in (5, 6) or batch != max_seqlen
+            or os.environ.get("VLLM_MAMBA_SPEC_PREFIX", "1") == "0"):
+        return None
+    smallk = sys.modules.get("smallk")
+    if smallk is not None and hasattr(smallk, "live_verify_rows"):
+        return smallk.live_verify_rows(device)
+    return None
 
 
 def _const_div_enabled() -> bool:
@@ -236,6 +248,12 @@ def _selective_scan_update_spec_replay_kernel(
     LAZY_P: tl.constexpr = 16,
     SLOT_ELEMS: tl.constexpr = 0,
     PIPELINED: tl.constexpr = False,
+    RING_PRODUCER: tl.constexpr = False,
+    SINK_STATE_STRIDE: tl.constexpr = 0,
+    SINK_INDEX_STRIDE: tl.constexpr = 0,
+    SINK_STATE_SLOTS: tl.constexpr = 0,
+    SINK_MAX_ROWS: tl.constexpr = 0,
+    SINK_NULL_BLOCK: tl.constexpr = 0,
 ):
     # The dt/A of a head are scalars (stride-0 expansion over head_dim); that is
     # the only layout the Mamba2 decode path produces and the only one the
@@ -257,6 +275,18 @@ def _selective_scan_update_spec_replay_kernel(
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
         tl.extra.cuda.gdc_launch_dependents()
+
+    # Private producer/consumer prototype. The caller must enable both ends
+    # together only after remote full-chain qualification.
+    sink_use = False
+    if RING_PRODUCER:
+        sink_use, _, _, _ = conv_ring_window(
+            state_ptr, state_batch_indices_ptr, num_accepted_tokens_ptr,
+            cu_seqlens_ptr, seq_lens_ptr, verify_rows_ptr,
+            SINK_STATE_STRIDE, SINK_INDEX_STRIDE, SLOT_ELEMS,
+            SINK_STATE_SLOTS, SINK_NULL_BLOCK, RING_LEN, SINK_MAX_ROWS,
+            LAZY, LAZY_P, PREFIX_LIMIT,
+        )
 
     bos = tl.load(cu_seqlens_ptr + pid_b).to(tl.int64)
     eos = tl.load(cu_seqlens_ptr + pid_b + 1).to(tl.int64)
@@ -435,7 +465,13 @@ def _selective_scan_update_spec_replay_kernel(
             z_ptrs = z_ptr + offs_m * stride_z_dim
         out_ptrs = out_ptr + offs_m * stride_out_dim
 
-        x_raw = tl.load(x_ptrs, mask=offs_m < dim, other=0.0)
+        if RING_PRODUCER:
+            sink_pos = ((pos0 + i_t) % rl + rl) % rl
+        if RING_PRODUCER and sink_use and (LAZY or i_t > 0):
+            x_raw = tl.load(ring_x_base + sink_pos * ring_stride_x + offs_m,
+                            mask=offs_m < dim, other=0.0)
+        else:
+            x_raw = tl.load(x_ptrs, mask=offs_m < dim, other=0.0)
         x = x_raw.to(tl.float32)
         dt_raw = tl.load(dt_ptr)
         dt = dt_raw.to(tl.float32)
@@ -452,7 +488,11 @@ def _selective_scan_update_spec_replay_kernel(
             A = tl.load(A_ptr).to(tl.float32)
         dA = fast_exp(A * dt)  # scalar, not a matrix
 
-        B_raw = tl.load(B_ptrs, mask=offs_n < dstate, other=0.0)
+        if RING_PRODUCER and sink_use and (LAZY or i_t > 0):
+            B_raw = tl.load(ring_B_base + sink_pos * ring_stride_B + offs_n,
+                            mask=offs_n < dstate, other=0.0)
+        else:
+            B_raw = tl.load(B_ptrs, mask=offs_n < dstate, other=0.0)
         B = B_raw.to(tl.float32)
         C = tl.load(C_ptrs, mask=offs_n < dstate, other=0.0).to(tl.float32)
         if HAS_D:
@@ -491,7 +531,7 @@ def _selective_scan_update_spec_replay_kernel(
             tl.store(
                 ring_x_base + ring_pos * ring_stride_x + offs_m,
                 x_raw,
-                mask=(offs_m < dim) & ring_ok,
+                mask=(offs_m < dim) & ring_ok & (not sink_use),
             )
             tl.store(
                 ring_dt_base + ring_pos * ring_stride_dt,
@@ -501,7 +541,7 @@ def _selective_scan_update_spec_replay_kernel(
             tl.store(
                 ring_B_base + ring_pos * ring_stride_B + offs_n,
                 B_raw,
-                mask=(offs_n < dstate) & ring_ok & is_B_writer,
+                mask=(offs_n < dstate) & ring_ok & is_B_writer & (not sink_use),
             )
 
         out = tl.sum(state * C[None, :], axis=1)
@@ -622,6 +662,7 @@ def selective_state_update_spec_replay(
     _private_verify_rows=None,
     _private_no_prefix=False,
     _private_launch_pdl=None,
+    _private_ring_producer=False,
 ):
     """
     Spec-decode verify update with anchor + input-ring state handling.
@@ -685,22 +726,24 @@ def selective_state_update_spec_replay(
     )
 
     verify_rows = None
-    if (
-        N == 1 and max_seqlen in (5, 6) and batch == max_seqlen
-        and replayed_out is None
-        and _private_verify_rows is None and not _private_no_prefix
-        and os.environ.get("VLLM_MAMBA_SPEC_PREFIX", "1") != "0"
-    ):
-        smallk = sys.modules.get("smallk")
-        if smallk is not None and hasattr(smallk, "live_verify_rows"):
-            # Never import/allocate/rebind the buffer here; its address must
-            # already be the same one captured by every router and sampler.
-            verify_rows = smallk.live_verify_rows(x.device)
+    if replayed_out is None and _private_verify_rows is None and not _private_no_prefix:
+        # Never import/allocate/rebind the buffer here; its address must
+        # already be the same one captured by every router and sampler.
+        verify_rows = live_spec_verify_rows(x.device, N, max_seqlen, batch)
 
     if _private_verify_rows is not None:
         verify_rows = _private_verify_rows
     if _private_no_prefix:
         verify_rows = None
+
+    if _private_ring_producer and not (
+        N == 1 and max_seqlen in (5, 6) and batch == max_seqlen
+        and replayed_out is None and z is None
+        and x.dtype in (torch.float16, torch.bfloat16)
+        and state.dtype == torch.float32
+        and (not lazy or prefill_tag_view(state) is not None)
+    ):
+        raise ValueError("unsupported private convolution ring consumer layout")
 
     with torch.accelerator.device_index(x.device.index):
         _selective_scan_update_spec_replay_kernel[grid](
@@ -776,4 +819,10 @@ def selective_state_update_spec_replay(
             SLOT_ELEMS=nheads * dim * dstate,
             PIPELINED=bool(_pipeline and lazy and N == 1 and batch == 5
                            and max_seqlen == 5 and z is None and dt_softplus),
+            RING_PRODUCER=bool(_private_ring_producer),
+            SINK_STATE_STRIDE=state.stride(0),
+            SINK_INDEX_STRIDE=state_batch_indices.stride(1),
+            SINK_STATE_SLOTS=state.shape[0],
+            SINK_MAX_ROWS=max_seqlen,
+            SINK_NULL_BLOCK=null_block_id,
         )

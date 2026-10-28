@@ -8586,6 +8586,9 @@ class GPUModelRunner(
             prepare_pipeline = getattr(layer, "prepare_spec_replay_pipeline", None)
             if prepare_pipeline is not None:
                 prepare_pipeline(enabled=not is_profiling)
+            prepare_conv_ring = getattr(layer, "prepare_conv_ring_fusion", None)
+            if prepare_conv_ring is not None:
+                prepare_conv_ring(enabled=not is_profiling)
 
         if (
             self.speculative_config

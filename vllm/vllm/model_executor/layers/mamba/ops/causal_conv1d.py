@@ -10,6 +10,7 @@ import functools
 import numpy as np
 import torch
 
+from vllm.model_executor.layers.mamba.ops.conv_ring_guard import conv_ring_window
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
@@ -774,6 +775,10 @@ def _causal_conv1d_update_kernel(
     block_idx_last_scheduled_token,  # (batch,)
     initial_state_idx,  # (batch,)
     o_ptr,  # (batch, dim, seqlen)
+    sink_state_ptr,
+    sink_ring_ptr,
+    sink_seq_ptr,
+    sink_verify_rows_ptr,
     # Matrix dimensions
     batch: int,
     dim: tl.constexpr,
@@ -806,6 +811,19 @@ def _causal_conv1d_update_kernel(
     HAS_NULL_BLOCK: tl.constexpr,
     BLOCK_N: tl.constexpr,
     launch_pdl: tl.constexpr,
+    RING_SINK: tl.constexpr,
+    SINK_STATE_STRIDE: tl.constexpr,
+    SINK_RING_STRIDE: tl.constexpr,
+    SINK_INDEX_STRIDE: tl.constexpr,
+    SINK_SLOT_ELEMS: tl.constexpr,
+    SINK_STATE_SLOTS: tl.constexpr,
+    SINK_RING_LEN: tl.constexpr,
+    SINK_MAX_ROWS: tl.constexpr,
+    SINK_LAZY: tl.constexpr,
+    SINK_LAZY_P: tl.constexpr,
+    SINK_PREFIX: tl.constexpr,
+    SINK_X: tl.constexpr,
+    SINK_B: tl.constexpr,
 ):
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
@@ -819,6 +837,19 @@ def _causal_conv1d_update_kernel(
 
     # [BLOCK_N,] elements along the feature-dimension (channel)
     idx_feats = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    sink_use = False
+    sink_ring = 0
+    sink_pos0 = 0
+    sink_valid = 0
+    if RING_SINK:
+        sink_use, sink_ring, sink_pos0, sink_valid = conv_ring_window(
+            sink_state_ptr, conv_state_indices_ptr, num_accepted_tokens_ptr,
+            query_start_loc_ptr, sink_seq_ptr, sink_verify_rows_ptr,
+            SINK_STATE_STRIDE, SINK_INDEX_STRIDE, SINK_SLOT_ELEMS,
+            SINK_STATE_SLOTS, null_block_id, SINK_RING_LEN, SINK_MAX_ROWS,
+            SINK_LAZY, SINK_LAZY_P, SINK_PREFIX,
+        )
 
     if IS_APC_ENABLED:
         # Get the state from the initial_state_idx
@@ -1092,7 +1123,23 @@ def _causal_conv1d_update_kernel(
             o_ptr + o_offset + idx_token * stride_o_token + (idx_feats * stride_o_dim)
         )
 
-        tl.store(o_ptrs, acc, mask=mask_1d)
+        if RING_SINK:
+            # Only x and B participate. Preserve C and every fallback row in
+            # the original output; the consumer observes the same dtype cast.
+            send = sink_use & (idx_token < sink_valid) & (SINK_LAZY or idx_token > 0)
+            xb = idx_feats < SINK_X + SINK_B
+            rounded = acc.to(o_ptr.dtype.element_ty)
+            ring_pos = (sink_pos0 + idx_token) % SINK_RING_LEN
+            base = sink_ring_ptr + sink_ring * SINK_RING_STRIDE
+            x_address = base + ring_pos * SINK_X + idx_feats
+            b_address = (base + SINK_RING_LEN * SINK_X
+                         + ring_pos * SINK_B + idx_feats - SINK_X)
+            tl.store(x_address, rounded, mask=mask_1d & send & (idx_feats < SINK_X))
+            tl.store(b_address, rounded, mask=mask_1d & send
+                     & (idx_feats >= SINK_X) & xb)
+            tl.store(o_ptrs, acc, mask=mask_1d & ~(send & xb))
+        else:
+            tl.store(o_ptrs, acc, mask=mask_1d)
 
 
 @functools.cache
@@ -1115,6 +1162,7 @@ def causal_conv1d_update(
     initial_state_idx: torch.Tensor | None = None,
     validate_data=False,
     out: torch.Tensor | None = None,
+    _private_ring_sink: dict | None = None,
 ):
     """
     x: Input tensor which can take the following shapes:
@@ -1188,6 +1236,40 @@ def causal_conv1d_update(
         batch = conv_state_indices.size(0)
         dim = x.size(1)
         seqlen = max_query_len
+    if _private_ring_sink is not None:
+        # This is a private qualification interface, not an automatic fast
+        # path. Its caller must arrange the same prefix pointer and guard in
+        # the immediately following replay consumer.
+        sink = _private_ring_sink
+        state, ring = sink["state"], sink["ring"]
+        x_features, b_features = sink["x_features"], sink["b_features"]
+        if not (
+            batch == 1 and seqlen in (5, 6) and x.dim() == 2
+            and x.shape[0] == seqlen and x.dtype == original_x_dtype == out.dtype
+            and ring.dtype == out.dtype and ring.data_ptr() == state.data_ptr()
+            and ring.dtype in (torch.float16, torch.bfloat16)
+            and state.dim() == 4 and state.dtype == torch.float32
+            and ring.stride(0) == 2 * state.stride(0)
+            and state.stride(3) == 1 and state.stride(2) == state.shape[3]
+            and state.stride(1) == state.shape[2] * state.shape[3]
+            and (not sink["lazy"] or state.stride(0) > sink["slot_elems"])
+            and (not sink["lazy"] or (
+                (state.storage_offset() + (state.shape[0] - 1) * state.stride(0)
+                 + sink["slot_elems"] + 1) * state.element_size()
+                <= state.untyped_storage().nbytes()))
+            and state.device == ring.device == x.device
+            and query_start_loc is not None and query_start_loc.numel() == 2
+            and num_accepted_tokens is not None and num_accepted_tokens.numel() == 1
+            and conv_state_indices.dim() == 2 and conv_state_indices.size(1) == seqlen
+            and block_idx_last_scheduled_token is None and initial_state_idx is None
+            and sink["max_rows"] == seqlen
+            and sink["slot_elems"] == state.shape[1] * state.shape[2] * state.shape[3]
+            and x_features == state.shape[1] * state.shape[2]
+            and x_features + 2 * b_features == dim
+            and sink["ring_len"] * (x_features + b_features + state.shape[1]) <= ring.stride(0)
+            and sink["lazy_period"] > 0
+        ):
+            raise ValueError("unsupported private convolution ring sink layout")
     _, width = weight.shape
     # conv_state: (..., dim, state_len), where state_len >= width - 1
     num_cache_lines, _, state_len = conv_state.size()
@@ -1255,6 +1337,10 @@ def causal_conv1d_update(
         block_idx_last_scheduled_token,
         initial_state_idx,
         out,
+        None if _private_ring_sink is None else _private_ring_sink["state"],
+        None if _private_ring_sink is None else _private_ring_sink["ring"],
+        None if _private_ring_sink is None else _private_ring_sink["seq_lens"],
+        None if _private_ring_sink is None else _private_ring_sink["verify_rows"],
         # Matrix dimensions
         batch,
         dim,
@@ -1287,6 +1373,19 @@ def causal_conv1d_update(
         HAS_NULL_BLOCK=null_block_id is not None,
         BLOCK_N=block_n,
         launch_pdl=current_platform.is_arch_support_pdl(),
+        RING_SINK=_private_ring_sink is not None,
+        SINK_STATE_STRIDE=0 if _private_ring_sink is None else _private_ring_sink["state"].stride(0),
+        SINK_RING_STRIDE=0 if _private_ring_sink is None else _private_ring_sink["ring"].stride(0),
+        SINK_INDEX_STRIDE=0 if _private_ring_sink is None else conv_state_indices.stride(1),
+        SINK_SLOT_ELEMS=0 if _private_ring_sink is None else _private_ring_sink["slot_elems"],
+        SINK_STATE_SLOTS=0 if _private_ring_sink is None else _private_ring_sink["state"].shape[0],
+        SINK_RING_LEN=0 if _private_ring_sink is None else _private_ring_sink["ring_len"],
+        SINK_MAX_ROWS=0 if _private_ring_sink is None else _private_ring_sink["max_rows"],
+        SINK_LAZY=False if _private_ring_sink is None else _private_ring_sink["lazy"],
+        SINK_LAZY_P=16 if _private_ring_sink is None else _private_ring_sink["lazy_period"],
+        SINK_PREFIX=_private_ring_sink is not None and _private_ring_sink["verify_rows"] is not None,
+        SINK_X=0 if _private_ring_sink is None else _private_ring_sink["x_features"],
+        SINK_B=0 if _private_ring_sink is None else _private_ring_sink["b_features"],
     )
     if unsqueeze:
         out = out.squeeze(-1)

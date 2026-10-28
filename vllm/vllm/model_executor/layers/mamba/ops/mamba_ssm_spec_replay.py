@@ -236,6 +236,7 @@ def _selective_scan_update_spec_replay_kernel(
     LAZY_P: tl.constexpr = 16,
     SLOT_ELEMS: tl.constexpr = 0,
     PIPELINED: tl.constexpr = False,
+    COEFF_PIPELINED: tl.constexpr = False,
 ):
     # The dt/A of a head are scalars (stride-0 expansion over head_dim); that is
     # the only layout the Mamba2 decode path produces and the only one the
@@ -364,6 +365,17 @@ def _selective_scan_update_spec_replay_kernel(
                              mask=live, other=0.0).to(tl.float32)
         current_B = tl.load(ring_B_base + rpos * ring_stride_B + offs_n,
                             mask=(offs_n < dstate) & live, other=0.0).to(tl.float32)
+        if COEFF_PIPELINED:
+            current_dA = tl.full((), 1.0, tl.float32)
+            current_dB = tl.full((BLOCK_SIZE_DSTATE,), 0.0, tl.float32)
+            if num_replay > 0:
+                coeff_dt = current_dt
+                if HAS_DT_BIAS:
+                    coeff_dt += invariant_bias
+                if DT_SOFTPLUS:
+                    coeff_dt = softplus(coeff_dt)
+                current_dA = fast_exp(invariant_A * coeff_dt)
+                current_dB = current_B * coeff_dt
         for i_r in range(num_replay):
             next_pos = tl.where(rpos + 1 < rl, rpos + 1, 0)
             next_live = ring_ok & (i_r + 1 < num_replay)
@@ -373,16 +385,28 @@ def _selective_scan_update_spec_replay_kernel(
                               mask=next_live, other=0.0).to(tl.float32)
             next_B = tl.load(ring_B_base + next_pos * ring_stride_B + offs_n,
                              mask=(offs_n < dstate) & next_live, other=0.0).to(tl.float32)
-            dt = current_dt
-            if HAS_DT_BIAS:
-                dt += invariant_bias
-            if DT_SOFTPLUS:
-                dt = softplus(dt)
-            dA = fast_exp(invariant_A * dt)
-            dB = current_B * dt
-            # C2FMA: the ordinary loop's exact order, RN(state * dA + RN(dB * x)).
-            # Left implicit, the compiler contracts the other product here.
-            state = tl.fma(state, dA, dB * current_x[:, None])
+            if COEFF_PIPELINED:
+                next_dA, next_dB = current_dA, current_dB
+                if i_r + 1 < num_replay:
+                    coeff_dt = next_dt
+                    if HAS_DT_BIAS:
+                        coeff_dt += invariant_bias
+                    if DT_SOFTPLUS:
+                        coeff_dt = softplus(coeff_dt)
+                    next_dA = fast_exp(invariant_A * coeff_dt)
+                    next_dB = next_B * coeff_dt
+                state = tl.fma(state, current_dA, current_dB * current_x[:, None])
+                current_dA, current_dB = next_dA, next_dB
+            else:
+                dt = current_dt
+                if HAS_DT_BIAS:
+                    dt += invariant_bias
+                if DT_SOFTPLUS:
+                    dt = softplus(dt)
+                dA = fast_exp(invariant_A * dt)
+                dB = current_B * dt
+                # Keep the original C2FMA ordering for the non-coefficient path.
+                state = tl.fma(state, dA, dB * current_x[:, None])
             current_x, current_dt, current_B = next_x, next_dt, next_B
             rpos = next_pos
     else:
@@ -619,6 +643,7 @@ def selective_state_update_spec_replay(
     replayed_out=None,
     lazy=False,
     _pipeline=False,
+    _coefficient_pipeline=False,
     _private_verify_rows=None,
     _private_no_prefix=False,
     _private_launch_pdl=None,
@@ -774,6 +799,10 @@ def selective_state_update_spec_replay(
             LAZY=bool(lazy),
             LAZY_P=LAZY_PERIOD,
             SLOT_ELEMS=nheads * dim * dstate,
-            PIPELINED=bool(_pipeline and lazy and N == 1 and batch == 5
-                           and max_seqlen == 5 and z is None and dt_softplus),
+            PIPELINED=bool(_pipeline and lazy and N == 1
+                           and (batch == 5 or (batch == 6 and _coefficient_pipeline))
+                           and max_seqlen == batch and z is None and dt_softplus),
+            COEFF_PIPELINED=bool(_pipeline and _coefficient_pipeline and lazy
+                                 and N == 1 and batch == 6 and max_seqlen == 6
+                                 and z is None and dt_softplus),
         )

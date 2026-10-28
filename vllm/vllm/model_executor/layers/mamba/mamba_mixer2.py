@@ -572,6 +572,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
         self._spec_replay_ok: bool | None = None
         self._spec_replay_lazy: bool | None = None
         self._spec_replay_pipeline = False
+        self._spec_replay_coeff6 = False
         if self.use_spec_replay:
             logger.info_once(
                 "Mamba2 spec decode: anchor-state replay (ring of %d tokens).",
@@ -1206,7 +1207,8 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     ring_len=self.spec_replay_ring_len,
                     is_blackwell=self.is_blackwell,
                     lazy=self._lazy_anchor(ssm_state),
-                    _pipeline=self._spec_replay_pipeline,
+                    _pipeline=self._spec_replay_pipeline or self._spec_replay_coeff6,
+                    _coefficient_pipeline=self._spec_replay_coeff6,
                 )
             else:
                 selective_state_update(
@@ -1230,20 +1232,27 @@ class MambaMixer2(MambaBase, PluggableLayer):
     def prepare_spec_replay_pipeline(self, enabled: bool = True) -> None:
         """Qualify only with real bound layout and loaded immutable parameters."""
         self._spec_replay_pipeline = False
-        if not enabled or not self.use_spec_replay or self.num_spec != 4:
+        self._spec_replay_coeff6 = False
+        if not enabled or not self.use_spec_replay or self.num_spec not in (4, 5):
             return
         state = self.kv_cache[1]
         if not self._lazy_anchor(state):
             return
-        from vllm.model_executor.layers.mamba.ops.mamba_replay_pipeline import prepare
-
         A = self.A[:, None, None].expand(-1, self.head_dim, self.ssm_state_size)
         bias = self.dt_bias[:, None].expand(-1, self.head_dim)
         D = self.D[:, None].expand(-1, self.head_dim)
-        self._spec_replay_pipeline = prepare(
-            state, self.model_config.dtype, A, bias, D,
-            self.spec_replay_ring_len, self.is_blackwell,
-        )
+        if self.num_spec == 4:
+            from vllm.model_executor.layers.mamba.ops.mamba_replay_pipeline import prepare
+            self._spec_replay_pipeline = prepare(
+                state, self.model_config.dtype, A, bias, D,
+                self.spec_replay_ring_len, self.is_blackwell,
+            )
+        else:
+            from vllm.model_executor.layers.mamba.ops.mamba_replay_coeff6 import prepare
+            self._spec_replay_coeff6 = prepare(
+                state, self.model_config.dtype, A, bias, D,
+                self.spec_replay_ring_len, self.is_blackwell,
+            )
 
     def _lazy_anchor(self, ssm_state: torch.Tensor) -> bool:
         """Whether verifies keep the checkpointed anchor (and prefills write the

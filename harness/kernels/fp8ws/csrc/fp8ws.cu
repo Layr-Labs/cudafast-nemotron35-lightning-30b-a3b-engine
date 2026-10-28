@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
-// fp8ws: the prefill Mamba in_proj FP8 GEMM, C[496,10304] = A[496,2688] x W[10304,2688]^T, BF16 out.
+// fp8ws: the prefill Mamba in_proj and out_proj FP8 GEMMs, C[496,N] = A[496,K] x W[N,K]^T, BF16 out,
+// for (N, K) = (10304, 2688) (in_proj) and (2688, 4096) (out_proj).
 //
 // Arithmetic (identical to the pinned SM120 CUTLASS kernel and to fp8small): every output starts at
 // +0.0f and follows one ascending-K chain of native
 // mma.sync.aligned.kind::f8f6f4.m16n8k32.row.col.f32.e4m3.e4m3.f32 over the original E4M3 bytes
 // (no split-K, no cross-warp reduction), then bf16_rn(fmul(fmul(acc, scale_b), scale_a)).
 //
-// Layout: persistent grid (one CTA per SM), 184 output tiles of 256 rows x 112 columns
-// (2 row bands x 92 column tiles), 8 MMA warps of 64 x 56 per tile. Per K step of 128 bytes the
-// A tile (the producer's row-major activation, rows past 496 zero-filled) arrives by a 2-D TMA
+// Layout: persistent grid (one CTA per SM), output tiles of 256 rows x 112 columns (2 row bands x
+// N / 112 column tiles: 184 tiles for the in_proj, 48 for the out_proj), 8 MMA warps of 64 x 56 per
+// tile. Per K step of 128 bytes the A tile (the producer's row-major activation, rows past 496
+// zero-filled) arrives by a 2-D TMA
 // load with the 128-byte swizzle, and the W tile by one bulk copy from the load-time pack
 // Wp[n_tile][k_tile][112][128], whose 16-byte chunks are pre-swizzled the same way (a byte
 // permutation of the checkpoint weight). Two smem stages, full/empty mbarriers; thread 0 issues
@@ -19,16 +21,21 @@
 #include <stdint.h>
 
 namespace fp8ws {
-constexpr int M = 496, N = 10304, K = 2688;
+constexpr int M = 496;
 constexpr int KT = 128, CPR = KT / 16, ST = 2;
 constexpr int WM = 4, WN = 2, MW = 4, NW = 7;
 constexpr int BM = WM * MW * 16, BN = WN * NW * 8;           // 256 x 112
 constexpr int NWARP = WM * WN, NT = NWARP * 32;
-constexpr int NB = 2, NTN = N / BN, NTILES = NB * NTN;       // 2 x 92 tiles
-constexpr int NKT = K / KT;                                   // 21
+constexpr int NB = 2;                                         // two row bands
 constexpr int ASZ = BM * KT, WSZ = BN * KT, STB = ASZ + WSZ;  // 32768 + 14336 = 46 KiB
 constexpr int SMEM = ST * STB + 1024;                         // + alignment slack
-static_assert(N % BN == 0 && K % KT == 0 && STB % 1024 == 0, "shape");
+static_assert(STB % 1024 == 0, "stage");
+// The supported (N, K): the in_proj (10304, 2688) and the out_proj (2688, 4096).
+template <int N, int K> struct Shape {
+  static constexpr int NTN = N / BN, NTILES = NB * NTN;  // 2 x 92 or 2 x 24 tiles
+  static constexpr int NKT = K / KT;                    // 21 or 32 K steps
+  static_assert(N % BN == 0 && K % KT == 0, "shape");
+};
 
 // 16-byte chunk c of row r lands at chunk c ^ (r & 7) (TMA SWIZZLE_128B on 128-byte rows,
 // 1024-byte aligned stage base).
@@ -92,7 +99,9 @@ __device__ __forceinline__ uint32_t sel4(uint32_t v0, uint32_t v1, uint32_t v2, 
 }
 
 // Wp[nt][kt][r][c'] (16-byte chunks) = W[nt*BN + r][kt*KT + swz(r, c')*16 ...]; W is [N][K].
+template <int N, int K>
 __global__ void pack_kernel(const uint4* __restrict__ W, uint4* __restrict__ Wp) {
+  constexpr int NKT = Shape<N, K>::NKT;
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= (size_t)N * K / 16) return;
   const int cp = i % CPR;
@@ -111,6 +120,7 @@ struct Params {
 // (rows r, r+8 x two blocks); a 4x4 transpose within the quad gives every lane one chunk.
 // wn==0: pairs (0,1)(2,3)(4,5) and block 6 alone; wn==1: block 0 alone and pairs (1,2)(3,4)(5,6),
 // so every pair starts on a 32-byte boundary. The lone block is stored as 8-byte halves.
+template <int N>
 __device__ __forceinline__ void epilogue(const float (&acc)[NW][4], __nv_bfloat16* out, int row0, int col0,
                                          int lane, int wn, float sa, float sb, bool st) {
   const int q = lane & 3, rq = lane >> 2;
@@ -150,7 +160,9 @@ __device__ __forceinline__ void epilogue(const float (&acc)[NW][4], __nv_bfloat1
   if (st) *reinterpret_cast<uint2*>(out + (size_t)row * N + col) = w;
 }
 
+template <int N, int K>
 __global__ void __launch_bounds__(NT, 1) gemm(const __grid_constant__ CUtensorMap tmA, const Params p) {
+  constexpr int NTILES = Shape<N, K>::NTILES, NKT = Shape<N, K>::NKT;
   extern __shared__ uint8_t sm_raw[];
   __shared__ __align__(8) unsigned long long bars[2 * ST];
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -235,7 +247,7 @@ __global__ void __launch_bounds__(NT, 1) gemm(const __grid_constant__ CUtensorMa
       const int col0 = nt * BN + wn * NW * 8;
 #pragma unroll
       for (int i = 0; i < MW; ++i) {
-        epilogue(acc[i], p.out, rb0 + i * 16, col0, lane, wn, sa, sb, rb0 + i * 16 < M);
+        epilogue<N>(acc[i], p.out, rb0 + i * 16, col0, lane, wn, sa, sb, rb0 + i * 16 < M);
 #pragma unroll
         for (int j = 0; j < NW; ++j)
 #pragma unroll
@@ -250,6 +262,32 @@ typedef CUresult (*EncodeFn)(CUtensorMap*, CUtensorMapDataType, cuuint32_t, void
                              CUtensorMapSwizzle, CUtensorMapL2promotion, CUtensorMapFloatOOBfill);
 static EncodeFn encode = nullptr;
 static int num_sms = 0;
+// The two instantiations: in_proj and out_proj.
+template <int N, int K>
+static int pack_shape(const void* w, void* wp, cudaStream_t stream) {
+  const size_t chunks = (size_t)N * K / 16;
+  pack_kernel<N, K><<<(unsigned)((chunks + 255) / 256), 256, 0, stream>>>((const uint4*)w, (uint4*)wp);
+  return (int)cudaGetLastError();
+}
+
+template <int N, int K>
+static int run_shape(const void* a, const void* wp, const void* sa, const void* sb, void* c,
+                     cudaStream_t stream) {
+  CUtensorMap map;
+  cuuint64_t dims[2] = {(cuuint64_t)K, (cuuint64_t)M};
+  cuuint64_t strides[1] = {(cuuint64_t)K};
+  cuuint32_t box[2] = {(cuuint32_t)KT, (cuuint32_t)BM};
+  cuuint32_t es[2] = {1, 1};
+  if (encode(&map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, const_cast<void*>(a), dims, strides, box, es,
+             CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+             CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) != CUDA_SUCCESS)
+    return -3;
+  Params p{(const uint8_t*)wp, (const float*)sa, (const float*)sb, (__nv_bfloat16*)c};
+  constexpr int NTILES = Shape<N, K>::NTILES;
+  const int grid = num_sms < NTILES ? num_sms : NTILES;
+  gemm<N, K><<<grid, NT, SMEM, stream>>>(map, p);
+  return (int)cudaGetLastError();
+}
 }  // namespace fp8ws
 
 extern "C" int fp8ws_init() {
@@ -264,35 +302,25 @@ extern "C" int fp8ws_init() {
   int dev = 0;
   cudaError_t e = cudaGetDevice(&dev);
   if (e == cudaSuccess) e = cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev);
-  if (e == cudaSuccess) e = cudaFuncSetAttribute(gemm, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+  if (e == cudaSuccess) e = cudaFuncSetAttribute(gemm<10304, 2688>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+  if (e == cudaSuccess) e = cudaFuncSetAttribute(gemm<2688, 4096>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
   return (int)e;
 }
 
 // w: [N][K] E4M3 bytes (the column-major [K,N] weight's storage); wp: N*K bytes.
 extern "C" int fp8ws_pack(const void* w, void* wp, int n, int k, void* stream) {
   using namespace fp8ws;
-  if (n != N || k != K) return (int)cudaErrorInvalidValue;
-  const size_t chunks = (size_t)N * K / 16;
-  pack_kernel<<<(unsigned)((chunks + 255) / 256), 256, 0, (cudaStream_t)stream>>>((const uint4*)w, (uint4*)wp);
-  return (int)cudaGetLastError();
+  if (n == 10304 && k == 2688) return pack_shape<10304, 2688>(w, wp, (cudaStream_t)stream);
+  if (n == 2688 && k == 4096) return pack_shape<2688, 4096>(w, wp, (cudaStream_t)stream);
+  return (int)cudaErrorInvalidValue;
 }
 
 extern "C" int fp8ws_run(const void* a, const void* wp, const void* sa, const void* sb, void* c, int m, int n,
                          int k, void* stream) {
   using namespace fp8ws;
-  if (m != M || n != N || k != K || !encode || num_sms <= 0) return (int)cudaErrorInvalidValue;
+  if (m != M || !encode || num_sms <= 0) return (int)cudaErrorInvalidValue;
   if (((uintptr_t)a & 15) || ((uintptr_t)wp & 15) || ((uintptr_t)c & 15)) return (int)cudaErrorInvalidValue;
-  CUtensorMap map;
-  cuuint64_t dims[2] = {(cuuint64_t)K, (cuuint64_t)M};
-  cuuint64_t strides[1] = {(cuuint64_t)K};
-  cuuint32_t box[2] = {(cuuint32_t)KT, (cuuint32_t)BM};
-  cuuint32_t es[2] = {1, 1};
-  if (encode(&map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, const_cast<void*>(a), dims, strides, box, es,
-             CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
-             CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) != CUDA_SUCCESS)
-    return -3;
-  Params p{(const uint8_t*)wp, (const float*)sa, (const float*)sb, (__nv_bfloat16*)c};
-  const int grid = num_sms < NTILES ? num_sms : NTILES;
-  gemm<<<grid, NT, SMEM, (cudaStream_t)stream>>>(map, p);
-  return (int)cudaGetLastError();
+  if (n == 10304 && k == 2688) return run_shape<10304, 2688>(a, wp, sa, sb, c, (cudaStream_t)stream);
+  if (n == 2688 && k == 4096) return run_shape<2688, 4096>(a, wp, sa, sb, c, (cudaStream_t)stream);
+  return (int)cudaErrorInvalidValue;
 }

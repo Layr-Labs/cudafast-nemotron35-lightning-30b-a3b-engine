@@ -682,6 +682,26 @@
     {
       "file": "vllm/vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
       "why": "i34-9: PZSKIP_S6 defaults to off (the prefill routed down keeps pzskip config 369 on the 8-bit plane, as in ercumentyildirim's ef1fe030-2867-402a-bed0-47635a4d1ddf). PZSKIP_S6=1 restores config 379. Measurement 2 of 593041c6-13bc-4e1f-80f1-c8ab630521a3 (code identical)."
+    },
+    {
+      "file": "layers/fused_moe/experts/humming_zskip.py (ZSKIP_S6)",
+      "why": "The lean paired decode's routed down projection builds the 6-bit swap-scale plane (config 663) and admits it only when its load-time bitwise check against config 653 on the layer's own weights passes at M=4/5/8, independent and crowded routing, including the live-row prefix; any failure keeps config 653 with the 8-bit plane. ZSKIP_S6=0 keeps the previous default."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_attn_packed.py (ATTN_PACK12_PDL8)",
+      "why": "The attention pack12 per-shape chooser now also offers the eight-deep-ring programmatic-dependency variant of its CUDA kernel: it is bit-checked against the reference linear layer exactly like the ordinary and four-deep variants, and only the fastest bit-equal candidate is used for each shape. ATTN_PACK12_PDL8=0 keeps the previous menu."
+    },
+    {
+      "file": "vllm/vllm/model_executor/models/nemotron_h_attn_packed.py (WS_ENABLED, _ws, _prepare_ws, the 496-row branch of _linear_impl); harness/kernels/bf16ws; harness/tests/bf16ws_exact.py",
+      "why": "On the current record d6651a3d-df62-4edc-8006-a0fe978f4a9a the 496-row prefill call of each attention qkv_proj (4608x2688) and o_proj (2688x4096) runs a persistent TMA/mbarrier BF16 kernel with an fp32 accumulator and a bf16 output. The weight is repacked at load time by a byte permutation that does not depend on any input; each real weight is admitted only if the inverse restores its bytes and a fixed-seed synthetic activation gives bit-identical output to the existing path. Otherwise the existing path runs. The kernel and the dispatch follow the earlier submissions 640fbe6e-dc20-487b-b993-d5fb0b99f4e7 and 44ca926b-5218-4331-a8f8-9890dd74b500; only their bf16ws part is carried."
+    },
+    {
+      "file": "vllm/vllm/v1/spec_decode/nemotron_step_cond.py (ENABLED default)",
+      "why": "NEMO_MTP_STEP_COND defaults to 0 on the current record d6651a3d-df62-4edc-8006-a0fe978f4a9a, so the drafter loop takes the record's per-pass path (the full-step graph where it is built, otherwise the regular model call and screen) instead of the conditional single-draft graph. The depth, the verify rows and the acceptance rule are the record's. One default changes; no other line of code differs. The change follows the earlier submission 1faceed1-7860-4e8d-b734-96600d6629aa, which set the same default on an earlier record."
+    },
+    {
+      "file": "vllm/VENDOR.json (annotation only)",
+      "why": "Repeat official measurement of our 770c6815-b1bd-4292-8e74-27bc275d5050: the code is byte-identical to that submission; this entry only records the repeat (draw 2)."
     }
   ]
 }

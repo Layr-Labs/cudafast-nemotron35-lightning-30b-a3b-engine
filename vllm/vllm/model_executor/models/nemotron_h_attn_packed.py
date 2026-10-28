@@ -25,6 +25,12 @@ harness/kernels/apk12 runs the same chain (mma.sync m16n8k16 BF16, ascending K f
 one RN rounding) as a CUDA kernel over a fragment-order copy of the planes. It is ranked
 with the Triton configurations under the same speed and equality guards, after its own
 child-process probe and a load-time check of every decoded weight against the BF16 bits.
+
+LOCAL PATCH (cudafast-nemotron35): the 496-row prefill call of each projection runs
+harness/kernels/bf16ws, the same chain as a persistent TMA kernel over a load-time
+byte-permuted copy of the BF16 weight, when that projection's copy inverts to the original
+bytes and its output equals F.linear bit for bit on synthetic activation sets at load
+(_prepare_ws); otherwise F.linear. BF16WS=0 disables it.
 """
 
 import os
@@ -62,11 +68,16 @@ _chosen: dict[tuple[int, int], tuple] = {}
 _word_ok = False
 _triton_ok = False
 _WORD = os.environ.get("ATTN_PACK12_WORDLOAD", "1") != "0"
-# LOCAL PATCH (cudafast-nemotron35): ATTN_PACK12_PDL8 (default off) offers the eight-deep-ring PDL
+# LOCAL PATCH (cudafast-nemotron35): ATTN_PACK12_PDL8 (default on) offers the eight-deep-ring PDL
 # variant to the per-shape timing choice; off, the choice is between the ordinary and the
-# four-deep-ring PDL CUDA kernels and the Triton configurations. ATTN_PACK12_PDL8=1 restores it.
-_PDL8 = os.environ.get("ATTN_PACK12_PDL8", "0") != "0"
+# four-deep-ring PDL CUDA kernels and the Triton configurations. ATTN_PACK12_PDL8=0 keeps that menu.
+_PDL8 = os.environ.get("ATTN_PACK12_PDL8", "1") != "0"
 _registry: dict[int, tuple[torch.Tensor, ...]] = {}
+# bf16ws: weight storage address -> (weight, pack); the weight reference keeps the address valid
+WS_ENABLED = os.environ.get("BF16WS", "1") != "0"
+WS_ROWS = 496
+_ws: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+_ws_stats = {"admitted": 0, "rejected": 0, "dispatched": 0}
 
 _PROBE = """
 import importlib.util, sys, torch
@@ -140,7 +151,32 @@ def _planes(item, cfg: tuple):
     return item[2] if cfg in (CUDA, CUDA_PDL, CUDA_PDL8) else item[1]
 
 
+def _ws_gemm(x: torch.Tensor, w: torch.Tensor, n: int, k: int) -> torch.Tensor | None:
+    """bf16ws output for an admitted weight at 496 rows, else None (the caller runs F.linear)."""
+    entry = _ws.get(w.data_ptr())
+    if entry is None:
+        return None
+    weight, packed = entry
+    if not (
+        w.shape == weight.shape and w.stride() == weight.stride()
+        and x.is_cuda and x.dtype == torch.bfloat16 and x.dim() == 2
+        and x.shape[0] == WS_ROWS and x.shape[1] == k and x.is_contiguous()
+        and x.data_ptr() % 16 == 0 and x.device == packed.device
+    ):
+        return None
+    import bf16ws
+
+    if not _ws_stats["dispatched"]:
+        logger.info("bf16ws: 496-row attention projections dispatched to the packed kernel")
+    _ws_stats["dispatched"] += 1
+    return bf16ws.gemm(x, packed, n)
+
+
 def _linear_impl(x: torch.Tensor, w: torch.Tensor, n: int, k: int, pid: int) -> torch.Tensor:
+    if x.shape[0] == WS_ROWS and _ws:
+        out = _ws_gemm(x, w, n, k)
+        if out is not None:
+            return out
     cfg = _chosen.get((n, k))
     planes = _registry.get(pid)
     if (
@@ -170,7 +206,11 @@ def apply(proj: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
     """proj(x)[0] for an attention projection, packed when prepare() enabled it."""
     nk = getattr(proj, "_apk_nk", None)
     if nk is None:
-        return proj(x)[0]
+        nk = getattr(proj, "_bws_nk", None)
+        if nk is None:
+            return proj(x)[0]
+        # bf16ws only (no planes): 496 rows run the packed kernel, every other count F.linear
+        return torch.ops.vllm.nemo_attn_pk_linear(x, proj.weight, nk[0], nk[1], -1)
     return torch.ops.vllm.nemo_attn_pk_linear(x, proj.weight, nk[0], nk[1], proj._apk_id)
 
 
@@ -395,10 +435,64 @@ def _choose(items, n: int, k: int, flush: torch.Tensor):
 
 
 @torch.no_grad()
+def _ws_activations(device: torch.device, k: int) -> list[torch.Tensor]:
+    g = torch.Generator(device=device)
+    g.manual_seed(20261027)
+    sets = []
+    for scale in (1.0, 0.01, 30.0, 0.001):
+        # explicit dtypes: model loading runs under a BF16 default dtype
+        x = torch.randn((WS_ROWS, k), device=device, generator=g, dtype=torch.float32) * scale
+        sets.append(x.to(torch.bfloat16))
+    # every BF16 bit pattern (infinities and NaNs included), shifted per row
+    bits = (torch.arange(WS_ROWS * k, device=device, dtype=torch.int64) * 7
+            + torch.arange(WS_ROWS, device=device, dtype=torch.int64).repeat_interleave(k) * 131)
+    bits = bits % 65536
+    bits = torch.where(bits >= 32768, bits - 65536, bits).to(torch.int16)
+    sets.append(bits.view(torch.bfloat16).reshape(WS_ROWS, k))
+    return sets
+
+
+def _prepare_ws(projs) -> int:
+    """Pack and admit the 496-row bf16ws copy of each projection: the pack must invert to the
+    weight's bytes and the kernel must equal F.linear bit for bit on every synthetic set."""
+    if not WS_ENABLED:
+        return 0
+    try:
+        import bf16ws
+    except ImportError:
+        return 0
+    for proj in projs:
+        w = proj.weight
+        n, k = w.shape
+        ok = False
+        try:
+            packed = bf16ws.prepare(w)
+            if packed is not None:
+                ok = torch.equal(bf16ws.unpack_reference(packed, n, k), w.view(torch.uint8))
+                for a in _ws_activations(w.device, k):
+                    if not ok:
+                        break
+                    ok = torch.equal(F.linear(a, w).view(torch.int16),
+                                     bf16ws.gemm(a, packed, n).view(torch.int16))
+                torch.cuda.synchronize(w.device)
+        except Exception as exc:  # noqa: BLE001  (any failure keeps F.linear)
+            logger.warning("bf16ws: admission failed (%r); this projection keeps F.linear", exc)
+            ok = False
+        if not ok:
+            _ws_stats["rejected"] += 1
+            continue
+        _ws[w.data_ptr()] = (w, packed)
+        proj._bws_nk = (n, k)
+        _ws_stats["admitted"] += 1
+    logger.info("bf16ws: %d attention projections admitted for the 496-row prefill (%d rejected); "
+                "BF16WS=0 disables", _ws_stats["admitted"], _ws_stats["rejected"])
+    return _ws_stats["admitted"]
+
+
 def prepare(model: torch.nn.Module) -> int:
     """Pack the target's attention projections and enable the shapes that pass the
     guards. Returns the number of projections enabled."""
-    if not ENABLED or not torch.cuda.is_available():
+    if not torch.cuda.is_available():
         return 0
     from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 
@@ -418,6 +512,9 @@ def prepare(model: torch.nn.Module) -> int:
             ):
                 projs.append(proj)
     if not projs:
+        return 0
+    _prepare_ws(projs)
+    if not ENABLED:
         return 0
     global _triton_ok
     _triton_ok = _probe()

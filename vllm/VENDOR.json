@@ -682,6 +682,14 @@
     {
       "file": "vllm/vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
       "why": "i34-9: PZSKIP_S6 defaults to off (the prefill routed down keeps pzskip config 369 on the 8-bit plane, as in ercumentyildirim's ef1fe030-2867-402a-bed0-47635a4d1ddf). PZSKIP_S6=1 restores config 379. Measurement 2 of 593041c6-13bc-4e1f-80f1-c8ab630521a3 (code identical)."
+    },
+    {
+      "file": "layers/fused_moe/experts/humming_zskip.py (ZSKIP_S6)",
+      "why": "The lean paired decode's routed down projection builds the 6-bit swap-scale plane (config 663) and admits it only when its load-time bitwise check against config 653 on the layer's own weights passes at M=4/5/8, independent and crowded routing, including the live-row prefix; any failure keeps config 653 with the 8-bit plane. ZSKIP_S6=0 keeps the previous default."
+    },
+    {
+      "file": "(composition)",
+      "why": "e-man07: re-measurement of kaankolcu ec646c34-10c7-43b1-8993-136f354e076c (the record d6651a3d-df62-4edc-8006-a0fe978f4a9a plus the ZSKIP_S6 admission for the decode's routed down), carried byte for byte. No new arithmetic. Re-measurement #3."
     }
   ]
 }

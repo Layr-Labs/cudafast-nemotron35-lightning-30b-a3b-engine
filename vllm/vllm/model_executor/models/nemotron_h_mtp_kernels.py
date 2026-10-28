@@ -69,7 +69,7 @@ def mtp_pdl() -> bool:
 # Confidence-gated draft depth
 # --------------------------------------------------------------------------- #
 DEPTH_GATE = os.environ.get("MTP_DEPTH_GATE", "1") != "0"
-DEPTH_THETA = float(os.environ.get("MTP_DEPTH_THETA", "0.5"))
+DEPTH_THETA = float(os.environ.get("MTP_DEPTH_THETA", "0.51"))
 # LOCAL PATCH (cudafast-nemotron35, depth 5): the threshold for drafting past the 4th draft
 # (kept count >= 4); at depth 4 the loop ends there and it has no effect. MTP_DEPTH_THETA5 sets it.
 DEPTH_THETA5 = float(os.environ.get("MTP_DEPTH_THETA5", "0.6"))
@@ -89,9 +89,9 @@ ADAPT_TAU = float(os.environ.get("MTP_ADAPT5_TAU", "0.25"))
 ADAPT_MODE = os.environ.get("MTP_ADAPT5_MODE", "lowacc")
 ADAPT_LOWACC_THR = float(os.environ.get("MTP_ADAPT5_LOWACC_THR", "1.8"))
 ADAPT_LOWACC_THR_OFF = float(os.environ.get("MTP_ADAPT5_LOWACC_THR_OFF", "2.0"))
-ADAPT_MIN_CYCLES = int(os.environ.get("MTP_ADAPT5_MIN_CYCLES", "4"))
+ADAPT_MIN_CYCLES = int(os.environ.get("MTP_ADAPT5_MIN_CYCLES", "2"))
 ADAPT_BURN = float(os.environ.get("MTP_ADAPT5_BURN", "4"))
-ADAPT_CAP = int(os.environ.get("MTP_ADAPT5_CAP", "3"))
+ADAPT_CAP = int(os.environ.get("MTP_ADAPT5_CAP", "2"))
 _ADAPT: torch.Tensor | None = None
 
 

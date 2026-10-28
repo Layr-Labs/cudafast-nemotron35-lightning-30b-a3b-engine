@@ -18,9 +18,36 @@ logger = init_logger(__name__)
 _SSD_STATE_NSPLIT = int(os.environ.get("VLLM_SSD_STATE_NSPLIT", "1"))
 _SSD_SCAN_HSPLIT = int(os.environ.get("VLLM_SSD_SCAN_HSPLIT", "2"))
 _final_logged = False
+_shared_cb_attempted = set()
+_shared_cb_admitted = {}
 from vllm.triton_utils import tl, triton
 
 from .triton_helpers import fast_exp
+
+
+def prepare_shared_cb(device, chunk):
+    """Qualify synthetic private chains once during the normal model warmup.
+
+    Admission is fail-closed and cached only by device and chunk size. Runtime
+    dispatch still enforces the narrower metadata and layout checks in ssdcb.
+    No request values or outputs are retained.
+    """
+    if (os.environ.get("VLLM_SSD_SHARED_CB", "1") == "0"
+            or chunk not in (128, 256) or torch.cuda.is_current_stream_capturing()):
+        return
+    key = (device.index, chunk)
+    if key in _shared_cb_attempted:
+        return
+    _shared_cb_attempted.add(key)
+    try:
+        import ssdcb
+        from ssdcb import qualification
+        passed, ratios = qualification.qualify(ssdcb, device, chunk)
+        if passed:
+            _shared_cb_admitted[key] = ssdcb
+        logger.info("SSD shared CB private admission passed=%s ratios=%s", passed, ratios)
+    except Exception as exc:
+        logger.warning("SSD shared CB retains original scan: %r", exc)
 
 
 @triton.jit
@@ -162,6 +189,9 @@ def _cb_scan_kernel(
     BC: tl.constexpr,
     DN: tl.constexpr,
     HSPLIT: tl.constexpr = 1,
+    SHARED_CB: tl.constexpr = False,
+    TOTAL_TOKENS: tl.constexpr = 0,
+    SEQ_COUNT: tl.constexpr = 0,
 ):
     tile = tl.program_id(0)
     chunk = tl.program_id(1)
@@ -169,6 +199,20 @@ def _cb_scan_kernel(
     part = tl.program_id(2) % HSPLIT
     begin = tl.load(CU + chunk)
     limit = tl.load(CU + chunk + 1) - begin
+    if SHARED_CB:
+        # Exact complement of ssdcb::eligible: each original CTA runs only for
+        # metadata that the optional shared-CB CTA declines at device runtime.
+        current = tl.load(SEQ + chunk).to(tl.int64)
+        previous = tl.load(SEQ + chunk - 1, mask=chunk > 0, other=-1).to(tl.int64)
+        start64 = begin.to(tl.int64)
+        end64 = tl.load(CU + chunk + 1).to(tl.int64)
+        valid = ((start64 >= 0) & (end64 >= start64) & (end64 <= TOTAL_TOKENS)
+                 & ((end64 - start64) <= CHUNK) & (current >= 0)
+                 & (current < SEQ_COUNT)
+                 & ((chunk == 0) | ((previous >= 0) & (previous < SEQ_COUNT)))
+                 & ((current != previous) | (chunk > 0)))
+        if valid:
+            return
     rows = tile * BM + tl.arange(0, BM)
     columns = tl.arange(0, CHUNK)
     inner = tl.arange(0, BC)
@@ -329,7 +373,7 @@ def can_fuse_prefill(x, B, C, dt, dA, cu, last, seq, initial, state_dtype):
 
 def fused_prefill(
     x, B, C, dt, dA, cu, last, seq, out, D=None, z=None, initial=None,
-    final_cache=None, final_index=None,
+    final_cache=None, final_index=None, _private_shared_cb=None,
 ):
     """Return all boundaries, or None when the terminal cache was already written.
 
@@ -402,6 +446,18 @@ def fused_prefill(
             num_warps=4,
             num_stages=4,
         )
+        # Research entry point for a future private, full-chain remote gate.
+        # Production callers pass no module, so retain the complete original
+        # scan. A successful optional launch is paired with the exact device
+        # predicate complement below; eligibility can change on graph replay.
+        shared_cb = False
+        module = (_private_shared_cb if _private_shared_cb is not None else
+                  _shared_cb_admitted.get((x.device.index, chunk)))
+        if module is not None and hsplit == 2:
+            shared_cb = module.run(
+                x, B, C, dt, dA, cu, seq, states, initial, D, z, out,
+                last.numel(),
+            )
         _cb_scan_kernel[(triton.cdiv(chunk, 64), chunks, groups * hsplit)](
             x,
             B,
@@ -439,6 +495,9 @@ def fused_prefill(
             BC=32,
             DN=128,
             HSPLIT=hsplit,
+            SHARED_CB=shared_cb,
+            TOTAL_TOKENS=x.shape[0] if shared_cb else 0,
+            SEQ_COUNT=last.numel() if shared_cb else 0,
             num_warps=8,
             num_stages=1,
         )

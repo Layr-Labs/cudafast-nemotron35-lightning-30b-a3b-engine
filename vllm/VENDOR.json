@@ -690,6 +690,14 @@
     {
       "file": "vllm/vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
       "why": "i34-9: ZSKIP_S6 defaults to on (the lean paired decode routed down reads the 6-bit scale plane, config 663, under its load-time bitwise check), as in kaankolcu's 778d1d36-5adf-497f-babb-832df9b0f24b and e-man07's a4b5cd6b-f239-4842-b66d-b1b3c20a58cd. ZSKIP_S6=0 keeps config 653 on the 8-bit plane. Measurement 2 (code identical)."
+    },
+    {
+      "file": "vllm/vllm/v1/spec_decode/nemotron_step_cond.py (ENABLED default)",
+      "why": "NEMO_MTP_STEP_COND defaults to 0 on the current record 5677c186-ecd4-4152-9f0a-081d64d44273, so the drafter loop takes the record's per-pass path (the full-step graph where it is built, otherwise the regular model call and screen) instead of the conditional single-draft graph. The depth, the verify rows and the acceptance rule are the record's. One default changes; no other line of code differs. The change follows the earlier submission 1faceed1-7860-4e8d-b734-96600d6629aa, which set the same default on an earlier record."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_attn_packed.py (ATTN_PACK12_PDL8)",
+      "why": "The attention pack12 per-shape chooser now also offers the eight-deep-ring programmatic-dependency variant of its CUDA kernel: it is bit-checked against the reference linear layer exactly like the ordinary and four-deep variants, and only the fastest bit-equal candidate is used for each shape. ATTN_PACK12_PDL8=0 keeps the previous menu."
     }
   ]
 }

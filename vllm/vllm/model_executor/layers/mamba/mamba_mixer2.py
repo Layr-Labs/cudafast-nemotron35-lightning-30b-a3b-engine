@@ -1344,8 +1344,17 @@ def mamba_mixer2(
     if (_l2pf is not None and projected_states.shape[0] <= 8
             and _l2pf.MAMBA_BYTES > 0):
         gate, reserved = _l2pf.gate_weight(layer_name, _l2pf.MAMBA_BYTES)
+        # Before an attention layer, the head of its packed qkv (apk12's planes) takes
+        # QKV_BYTES of the window; out_proj keeps the rest (l2pf.AHEAD_QKV).
+        qkv = getattr(_l2pf, "AHEAD_QKV", {}).get(layer_name)
+        planes = getattr(qkv, "_apk_planes", None) if qkv is not None else None
+        qb = min(getattr(_l2pf, "QKV_BYTES", 0), _l2pf.MAMBA_BYTES - reserved) if planes is not None else 0
         pf = _l2pf.prefetch_many(((gate, reserved),
-                                 (_out_proj_weight(self), _l2pf.MAMBA_BYTES - reserved)))
+                                 (_out_proj_weight(self), _l2pf.MAMBA_BYTES - reserved - qb)))
+        if qb > 0:
+            # metadata, sign+mantissa and exponent planes (the kernel's loads); the raw-index
+            # plane is read only for escaped blocks
+            pf = _l2pf.prefetch_many(_l2pf.packed_ranges(planes, qb)[1:]) or pf
     self.conv_ssm_forward(projected_states=projected_states, output=output)
     if pf:
         _l2pf.join(projected_states.device)

@@ -681,7 +681,7 @@
     },
     {
       "file": "vllm/vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
-      "why": "i34-9: PZSKIP_S6 defaults to off (the prefill routed down keeps pzskip config 369 on the 8-bit plane, as in ercumentyildirim's ef1fe030-2867-402a-bed0-47635a4d1ddf). PZSKIP_S6=1 restores config 379. Measurement 2 of 593041c6-13bc-4e1f-80f1-c8ab630521a3 (code identical)."
+      "why": "i34-9: PZSKIP_S6 defaults to off (the prefill routed down keeps pzskip config 369 on the 8-bit plane, as in ercumentyildirim's ef1fe030-2867-402a-bed0-47635a4d1ddf). PZSKIP_S6=1 restores config 379. Measurement 5 (code identical)."
     }
   ]
 }

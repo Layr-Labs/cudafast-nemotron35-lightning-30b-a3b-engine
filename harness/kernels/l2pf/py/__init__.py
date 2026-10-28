@@ -57,6 +57,12 @@ AHEAD: dict[str, torch.nn.Module] = {}
 AHEAD_MOE: dict[str, torch.nn.Module] = {}
 # Previous Mamba/attention op -> the actual following target MoE router.
 AHEAD_GATE: dict[str, torch.nn.Module] = {}
+# Mamba mixer prefix -> the following attention layer's qkv_proj. The Mamba window (conv + SSM,
+# MAMBA_BYTES) then gives its first QKV_BYTES to the head of that qkv's apk12 planes and the rest
+# to out_proj: measured on GB10 from a flushed L2, the qkv's first 2.5 MB saves 5.6 us/MB while
+# out_proj's second 2.5 MB saves 3.2 us/MB (L2PF_QKV_MB=0 off).
+AHEAD_QKV: dict[str, torch.nn.Module] = {}
+QKV_BYTES = int(float(os.environ.get("L2PF_QKV_MB", "2.5")) * (1 << 20))
 _GATE_PREFETCH = os.environ.get("L2PF_GATE", "1") != "0"
 
 _lib = None

@@ -159,6 +159,7 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
     ) -> None:
         self._fp8small_weight: torch.Tensor | None = None
         self._fp8c_weight: torch.Tensor | None = None
+        self._fp8c_empty = False
         self.logical_output_size: int | None = None
         super().__init__(c, layer_param_names)
 
@@ -297,7 +298,9 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
             and bias is None
             and out_dtype == torch.bfloat16
         ):
-            output = torch.ops.vllm.fp8c_scaled_mm(A, B, self._fp8c_weight, As, Bs)
+            output = torch.ops.vllm.fp8c_scaled_mm(
+                A, B, self._fp8c_weight, As, Bs, self._fp8c_empty
+            )
         elif (
             self._fp8small_weight is not None
             and bias is None

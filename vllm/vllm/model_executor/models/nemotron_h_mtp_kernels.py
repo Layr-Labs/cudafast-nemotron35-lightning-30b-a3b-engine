@@ -72,7 +72,7 @@ DEPTH_GATE = os.environ.get("MTP_DEPTH_GATE", "1") != "0"
 DEPTH_THETA = float(os.environ.get("MTP_DEPTH_THETA", "0.5"))
 # LOCAL PATCH (cudafast-nemotron35, depth 5): the threshold for drafting past the 4th draft
 # (kept count >= 4); at depth 4 the loop ends there and it has no effect. MTP_DEPTH_THETA5 sets it.
-DEPTH_THETA5 = float(os.environ.get("MTP_DEPTH_THETA5", "0.6"))
+DEPTH_THETA5 = float(os.environ.get("MTP_DEPTH_THETA5", "0.5"))
 DEPTH_CUMULATIVE = os.environ.get("MTP_DEPTH_CUMULATIVE", "1") != "0"
 GATE_PROD_ONE = 0x3F800000
 _GATE: torch.Tensor | None = None

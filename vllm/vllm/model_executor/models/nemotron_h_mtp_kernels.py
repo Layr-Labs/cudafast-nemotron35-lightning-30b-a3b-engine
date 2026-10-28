@@ -69,10 +69,10 @@ def mtp_pdl() -> bool:
 # Confidence-gated draft depth
 # --------------------------------------------------------------------------- #
 DEPTH_GATE = os.environ.get("MTP_DEPTH_GATE", "1") != "0"
-DEPTH_THETA = float(os.environ.get("MTP_DEPTH_THETA", "0.5"))
+DEPTH_THETA = float(os.environ.get("MTP_DEPTH_THETA", "0.6"))
 # LOCAL PATCH (cudafast-nemotron35, depth 5): the threshold for drafting past the 4th draft
 # (kept count >= 4); at depth 4 the loop ends there and it has no effect. MTP_DEPTH_THETA5 sets it.
-DEPTH_THETA5 = float(os.environ.get("MTP_DEPTH_THETA5", "0.6"))
+DEPTH_THETA5 = float(os.environ.get("MTP_DEPTH_THETA5", "0.8"))
 DEPTH_CUMULATIVE = os.environ.get("MTP_DEPTH_CUMULATIVE", "1") != "0"
 GATE_PROD_ONE = 0x3F800000
 _GATE: torch.Tensor | None = None
@@ -81,7 +81,7 @@ _GATE_START: torch.Tensor | None = None
 # num_speculative_tokens drafts (_ADAPT[1]) and those whose deepest draft was accepted (_ADAPT[2]),
 # and keeps drafting past the 4th draft only while (accepted + PRIOR) / (drafted + PRIOR) >= TAU
 # (_ADAPT[0] = 1.0 allowed, 0.0 not). Reset at each request's first proposal. Default on (MTP_ADAPT5_MODE below); MTP_ADAPT5=0 disables.
-ADAPT5 = os.environ.get("MTP_ADAPT5", "1") != "0"
+ADAPT5 = os.environ.get("MTP_ADAPT5", "0") != "0"
 ADAPT_PRIOR = float(os.environ.get("MTP_ADAPT5_PRIOR", "1.0"))
 ADAPT_TAU = float(os.environ.get("MTP_ADAPT5_TAU", "0.25"))
 # LOCAL PATCH (cudafast-nemotron35): MTP_ADAPT5_MODE selects the rule: "lowacc" (default, see
@@ -1025,7 +1025,7 @@ def mtp_moe_row(
 
 # LOCAL PATCH (cudafast-nemotron35): routed experts the MTP draft evaluates per
 # token (the router's top 6 by weight, highest first); MTP_DRAFT_TOPK=0 keeps all.
-_DRAFT_TOPK = int(os.environ.get("MTP_DRAFT_TOPK", "3"))
+_DRAFT_TOPK = int(os.environ.get("MTP_DRAFT_TOPK", "4"))
 # MTP_TOPK_KEEP_KERNEL=0 keeps torch.sort + slice + index_select for the selection.
 _TOPK_KEEP_KERNEL = os.environ.get("MTP_TOPK_KEEP_KERNEL", "1") != "0"
 

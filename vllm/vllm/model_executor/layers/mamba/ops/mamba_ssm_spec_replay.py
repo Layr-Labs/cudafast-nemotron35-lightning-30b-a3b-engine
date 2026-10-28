@@ -120,6 +120,9 @@ def prefill_tag_view(state: torch.Tensor) -> torch.Tensor | None:
     slot_elems = state.shape[1] * state.shape[2] * state.shape[3]
     if state.stride(0) < slot_elems + 1 or state.stride(1) != state.shape[2] * state.shape[3]:
         return None
+    last = state.storage_offset() + slot_elems + (state.shape[0] - 1) * state.stride(0)
+    if (last + 1) * state.element_size() > state.untyped_storage().nbytes():
+        return None
     return torch.as_strided(
         state.view(torch.int32), (state.shape[0],), (state.stride(0),),
         state.storage_offset() + slot_elems,
@@ -683,7 +686,7 @@ def selective_state_update_spec_replay(
 
     verify_rows = None
     if (
-        N == 1 and max_seqlen == 5 and batch == 5
+        N == 1 and max_seqlen in (5, 6) and batch == max_seqlen
         and replayed_out is None
         and _private_verify_rows is None and not _private_no_prefix
         and os.environ.get("VLLM_MAMBA_SPEC_PREFIX", "1") != "0"

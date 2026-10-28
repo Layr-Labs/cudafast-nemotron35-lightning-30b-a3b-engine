@@ -300,6 +300,9 @@ def _keep_verify_rows_for(
 
 # Protect asynchronous H2D sources; switchable for in-process cost screening.
 PINNED_SOURCE_GUARDS = True
+# DecodePrep reads the count into its own separately guarded staging buffer.
+# Set VLLM_FUSED_SOURCE_EVENT=1 to retain the original conservative event.
+_FUSED_SOURCE_EVENT = os.environ.get("VLLM_FUSED_SOURCE_EVENT", "0") != "0"
 # LOCAL PATCH (cudafast-nemotron35): pacing of the drafter's first-weight L2
 # prefetch (_l2pf_prefetch("draft")); 0 issues every piece at once.
 _L2PF_DRAFT_PACE_NS = int(os.environ.get("L2PF_DRAFT_PACE_NS", "400"))
@@ -2337,7 +2340,11 @@ class GPUModelRunner(
         self.num_scheduled_tokens.np[:num_reqs] = num_scheduled_tokens
         if fused:
             self._decode_prep.run(self, num_reqs, total_num_scheduled_tokens, fused_d)
-            if PINNED_SOURCE_GUARDS and self._num_computed_tokens_h2d_event is not None:
+            # DecodePrep copies the count into its own pinned staging buffer
+            # before enqueueing GPU work and guards that buffer separately.
+            # Keep the last direct-source DMA event for deferred corrections.
+            if (_FUSED_SOURCE_EVENT and PINNED_SOURCE_GUARDS
+                    and self._num_computed_tokens_h2d_event is not None):
                 self._num_computed_tokens_h2d_event.record()
         else:
             self.req_indices.copy_to_gpu(total_num_scheduled_tokens)

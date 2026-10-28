@@ -80,8 +80,9 @@ _GATE_START: torch.Tensor | None = None
 # Adaptive deepest draft (depth >= 5): per request, the device counts the cycles that drafted
 # num_speculative_tokens drafts (_ADAPT[1]) and those whose deepest draft was accepted (_ADAPT[2]),
 # and keeps drafting past the 4th draft only while (accepted + PRIOR) / (drafted + PRIOR) >= TAU
-# (_ADAPT[0] = 1.0 allowed, 0.0 not). Reset at each request's first proposal. Default on (MTP_ADAPT5_MODE below); MTP_ADAPT5=0 disables.
-ADAPT5 = os.environ.get("MTP_ADAPT5", "1") != "0"
+# (_ADAPT[0] = 1.0 allowed, 0.0 not). Reset at each request's first proposal. Default off (terrapinelf: the depth gate
+# alone decides the 5th draft); MTP_ADAPT5=1 enables the rule selected by MTP_ADAPT5_MODE below.
+ADAPT5 = os.environ.get("MTP_ADAPT5", "0") != "0"
 ADAPT_PRIOR = float(os.environ.get("MTP_ADAPT5_PRIOR", "1.0"))
 ADAPT_TAU = float(os.environ.get("MTP_ADAPT5_TAU", "0.25"))
 # LOCAL PATCH (cudafast-nemotron35): MTP_ADAPT5_MODE selects the rule: "lowacc" (default, see

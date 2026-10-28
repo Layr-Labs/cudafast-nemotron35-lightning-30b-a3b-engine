@@ -19,7 +19,7 @@ def _same(a, b):
     return torch.equal(a.view(torch.uint8), b.view(torch.uint8))
 
 
-def _layout(state, dtype, ring_len):
+def _layout(state, dtype, ring_len, rows=5):
     if (not state.is_cuda or state.dtype != torch.float32 or state.ndim != 4
             or dtype not in (torch.bfloat16, torch.float16)
             or tuple(state.shape[1:]) != (64, 64, 128) or state.shape[0] < 6
@@ -30,7 +30,7 @@ def _layout(state, dtype, ring_len):
     if end * 4 > state.untyped_storage().nbytes():
         return None
     from . import mamba_ssm_spec_replay as rp
-    if (rp.LAZY_PERIOD not in (16, 20) or ring_len < rp.LAZY_PERIOD + 5
+    if (rp.LAZY_PERIOD not in (16, 20) or ring_len < rp.LAZY_PERIOD + max(5, rows - 1)
             or ring_len * (4096 + 1024 + 64) * 2 > 524288 * 4):
         return None
     return (state.device, dtype, state.stride(0), ring_len, rp.LAZY_PERIOD,
@@ -38,7 +38,7 @@ def _layout(state, dtype, ring_len):
 
 
 def _timing(rp, states, x, dt, A, B, C, D, bias, table, accepted, cu, seq,
-            rows, outputs, ring_len, is_blackwell):
+            rows, outputs, ring_len, is_blackwell, verify=False, count=5):
     """Compare executable structure on generic private lengths, not prompts."""
     dev = x.device
     stream = torch.cuda.Stream(device=dev)
@@ -48,10 +48,12 @@ def _timing(rp, states, x, dt, A, B, C, D, bias, table, accepted, cu, seq,
         def call():
             rp.selective_state_update_spec_replay(
                 states[which], x, dt, A, B, C, D, bias,
-                dt_softplus=True, state_batch_indices=table, out=outputs[which][1:6],
+                dt_softplus=True, state_batch_indices=table, out=outputs[which][1:1 + count],
                 num_accepted_tokens=accepted, cu_seqlens=cu, seq_lens=seq,
                 ring_len=ring_len, is_blackwell=is_blackwell, lazy=True,
-                _pipeline=bool(which), _private_verify_rows=rows,
+                _pipeline=True if verify and count == 5 else bool(which),
+                _verify_pipeline=bool(which) if verify else False,
+                _private_verify_rows=rows,
                 _private_launch_pdl=rp._pdl_enabled(),
             )
         with torch.cuda.stream(stream):
@@ -64,8 +66,8 @@ def _timing(rp, states, x, dt, A, B, C, D, bias, table, accepted, cu, seq,
         graphs.append(graph)
     torch.cuda.synchronize(dev)
     ratios, totals = [], [[], []]
-    for replay, prefix in ((0, 1), (1, 5), (4, 3), (9, 5), (14, 1), (19, 5)):
-        seq.fill_(37 + replay + 5)
+    for replay, prefix in ((0, 1), (1, count), (4, 3), (9, count), (14, 1), (19, count)):
+        seq.fill_(37 + replay + count)
         rows.fill_(prefix)
         samples = [[], []]
         for round_index in range(5):
@@ -95,12 +97,16 @@ def _timing(rp, states, x, dt, A, B, C, D, bias, table, accepted, cu, seq,
 
 
 @torch.no_grad()
-def prepare(state, dtype, A, bias, D, ring_len, is_blackwell):
+def prepare(state, dtype, A, bias, D, ring_len, is_blackwell, verify=False, count=5):
     """Fixed per-layer decision after binding, before compile/capture/requests."""
     if os.environ.get("NEMO_MAMBA_REPLAY_PIPELINE", "1") == "0":
         return False
+    if verify and os.environ.get("NEMO_MAMBA_VERIFY_PIPELINE", "1") == "0":
+        return False
     try:
-        key = _layout(state, dtype, ring_len)
+        if count not in (5, 6) or (count == 6 and not verify):
+            return False
+        key = _layout(state, dtype, ring_len, count)
         if (key is None or torch.cuda.is_current_stream_capturing()
                 or torch.cuda.get_device_capability(state.device) != (12, 1)
                 or A.dtype != torch.float32 or A.shape != (64, 64, 128)
@@ -108,26 +114,29 @@ def prepare(state, dtype, A, bias, D, ring_len, is_blackwell):
                 or bias.stride(1) != 0 or D.shape != (64, 64)
                 or any(t.device != state.device for t in (A, bias, D))):
             return False
+        key = (key, "verify" if verify else "replay", count)
         if _TIMING.get(key) is False:
             return False
         from . import mamba_ssm_spec_replay as rp
         stride, dev = state.stride(0), state.device
         length = 7 * stride + 16
         shape, strides = (7, 64, 64, 128), (stride, 8192, 128, 1)
-        advances = (1, 1, 3, 0, 2, 5, 1, 4, 2, 0, 5, 3)
-        cycles = 24 if key in _SEEN else 48
+        advances = (1, 1, 3, 0, 2, count, 1, 4, 2, 0, count, 3)
+        # Subsequent six-row layers still cover all prefix lengths, a full
+        # accept, zero advances and a checkpoint crossing with their own A/D.
+        cycles = (12 if count == 6 else 24) if key in _SEEN else 48
         for input_dtype in (torch.bfloat16, torch.float16):
             for pdl in ((False, True) if rp._pdl_enabled() else (False,)):
                 for observe in (False, True):
                     backing = [torch.full((length,), 0.03125, device=dev,
                                           dtype=torch.float32) for _ in range(2)]
                     states = [torch.as_strided(t, shape, strides) for t in backing]
-                    table = torch.tensor([[1, 2, 3, 4, 5]], device=dev, dtype=torch.int32)
+                    table = torch.tensor([list(range(1, count + 1))], device=dev, dtype=torch.int32)
                     accepted = torch.ones(1, device=dev, dtype=torch.int32)
-                    cu = torch.tensor([0, 5], device=dev, dtype=torch.int32)
+                    cu = torch.tensor([0, count], device=dev, dtype=torch.int32)
                     seq = torch.empty(1, device=dev, dtype=torch.int32)
                     rows = torch.empty(1, device=dev, dtype=torch.int32)
-                    outputs = [torch.empty((7, 64, 64), device=dev, dtype=input_dtype)
+                    outputs = [torch.empty((count + 2, 64, 64), device=dev, dtype=input_dtype)
                                for _ in range(2)]
                     replayed = [torch.empty((3, 64, 64, 128), device=dev,
                                            dtype=torch.float32) for _ in range(2)]
@@ -135,24 +144,24 @@ def prepare(state, dtype, A, bias, D, ring_len, is_blackwell):
                     for st in states:
                         rp.prefill_tag_view(st)[1] = prompt
                     for cycle in range(cycles):
-                        prefix = 5 if cycle % 6 == 0 else 1 + cycle % 5
-                        projection = (((torch.arange(5 * 6208, device=dev,
+                        prefix = count if cycle % (count + 1) == 0 else 1 + cycle % count
+                        projection = (((torch.arange(count * 6208, device=dev,
                                                      dtype=torch.int32)
                                         + cycle * 19) % 257).float() / 128 - 1)
-                        projection = projection.to(input_dtype).view(5, -1)
-                        x = projection[:, :4096].view(5, 64, 64)
-                        B = projection[:, 4096:5120].view(5, 8, 128)
-                        C = projection[:, 5120:6144].view(5, 8, 128)
+                        projection = projection.to(input_dtype).view(count, -1)
+                        x = projection[:, :4096].view(count, 64, 64)
+                        B = projection[:, 4096:5120].view(count, 8, 128)
+                        C = projection[:, 5120:6144].view(count, 8, 128)
                         raw_dt = projection[:, 6144:]
                         regimes = torch.tensor([-40., -25., -8., -1., -0., 0.,
                                                 .001, 1., 8., 20., 25., 40.],
                                                device=dev, dtype=input_dtype)
-                        index = (torch.arange(320, device=dev).view(5, 64)
+                        index = (torch.arange(count * 64, device=dev).view(count, 64)
                                  + cycle * 3) % regimes.numel()
                         raw_dt.copy_(regimes[index])
                         dt = raw_dt[:, :, None].expand(-1, -1, 64)
                         rows.fill_(prefix)
-                        seq.fill_(pos + 5)
+                        seq.fill_(pos + count)
                         accepted.fill_(previous_advance)
                         for t in outputs:
                             t.fill_(0.0625)
@@ -162,13 +171,15 @@ def prepare(state, dtype, A, bias, D, ring_len, is_blackwell):
                             rp.selective_state_update_spec_replay(
                                 states[which], x, dt, A, B, C, D, bias,
                                 dt_softplus=True, state_batch_indices=table,
-                                out=outputs[which][1:6], num_accepted_tokens=accepted,
+                                out=outputs[which][1:1 + count], num_accepted_tokens=accepted,
                                 cu_seqlens=cu, seq_lens=seq, ring_len=ring_len,
                                 is_blackwell=is_blackwell, lazy=True,
                                 replayed_out=replayed[which][1:2] if observe else None,
-                                _pipeline=bool(which), _private_verify_rows=rows,
+                                _pipeline=True if verify and count == 5 else bool(which),
+                                _verify_pipeline=bool(which) if verify else False,
+                                _private_verify_rows=rows,
                                 _private_launch_pdl=pdl,
-                                _private_no_prefix=(cycle % 6 == 0),
+                                _private_no_prefix=(cycle % (count + 1) == 0),
                             )
                         torch.cuda.synchronize(dev)
                         if not (_same(outputs[0], outputs[1])
@@ -179,7 +190,7 @@ def prepare(state, dtype, A, bias, D, ring_len, is_blackwell):
                         pos += advance
                         previous_advance = advance
                     for empty in (True, False):
-                        cu[1] = 0 if empty else 5
+                        cu[1] = 0 if empty else count
                         table.zero_()
                         accepted.zero_()
                         for which in range(2):
@@ -188,13 +199,15 @@ def prepare(state, dtype, A, bias, D, ring_len, is_blackwell):
                             rp.selective_state_update_spec_replay(
                                 states[which], x, dt, A, B, C, D, bias,
                                 dt_softplus=True, state_batch_indices=table,
-                                out=outputs[which][1:6], num_accepted_tokens=accepted,
+                                out=outputs[which][1:1 + count], num_accepted_tokens=accepted,
                                 cu_seqlens=cu, seq_lens=seq, ring_len=ring_len,
                                 is_blackwell=is_blackwell, lazy=True,
                                 replayed_out=replayed[which][1:2] if observe else None,
-                                _pipeline=bool(which), _private_verify_rows=rows,
+                                _pipeline=True if verify and count == 5 else bool(which),
+                                _verify_pipeline=bool(which) if verify else False,
+                                _private_verify_rows=rows,
                                 _private_launch_pdl=pdl,
-                                _private_no_prefix=(cycle % 6 == 0),
+                                _private_no_prefix=(cycle % (count + 1) == 0),
                             )
                         torch.cuda.synchronize(dev)
                         if not (_same(outputs[0], outputs[1])
@@ -202,12 +215,12 @@ def prepare(state, dtype, A, bias, D, ring_len, is_blackwell):
                                 and _same(backing[0], backing[1])):
                             return False
                     if key not in _TIMING and input_dtype == dtype and not observe:
-                        cu[1] = 5
-                        table.copy_(torch.tensor([[1, 2, 3, 4, 5]], device=dev,
+                        cu[1] = count
+                        table.copy_(torch.tensor([list(range(1, count + 1))], device=dev,
                                                   dtype=torch.int32))
                         _TIMING[key] = _timing(
                             rp, states, x, dt, A, B, C, D, bias, table, accepted,
-                            cu, seq, rows, outputs, ring_len, is_blackwell)
+                            cu, seq, rows, outputs, ring_len, is_blackwell, verify, count)
                         if not _TIMING[key]:
                             return False
         _SEEN.add(key)

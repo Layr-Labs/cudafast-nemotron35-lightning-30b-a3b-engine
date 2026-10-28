@@ -236,6 +236,7 @@ def _selective_scan_update_spec_replay_kernel(
     LAZY_P: tl.constexpr = 16,
     SLOT_ELEMS: tl.constexpr = 0,
     PIPELINED: tl.constexpr = False,
+    VERIFY_PIPELINE: tl.constexpr = False,
 ):
     # The dt/A of a head are scalars (stride-0 expansion over head_dim); that is
     # the only layout the Mamba2 decode path produces and the only one the
@@ -426,6 +427,17 @@ def _selective_scan_update_spec_replay_kernel(
         )
         tl.store(replayed_ptrs, state, mask=mask)
 
+    if VERIFY_PIPELINE:
+        # The caller admits this only for disjoint inputs and output/state.
+        # Keep raw values for the ring; prefetch the following verify row
+        # before computing this row's dependent recurrence and output.
+        current_verify_x = tl.load(x_ptr + offs_m * stride_x_dim,
+                                   mask=offs_m < dim, other=0.0)
+        current_verify_dt = tl.load(dt_ptr)
+        current_verify_B = tl.load(B_ptr + offs_n * stride_B_dstate,
+                                   mask=offs_n < dstate, other=0.0)
+        current_verify_C = tl.load(C_ptr + offs_n * stride_C_dstate,
+                                   mask=offs_n < dstate, other=0.0)
     for i_t in range(compute_len):
         x_ptrs = x_ptr + offs_m * stride_x_dim
         dt_ptrs = dt_ptr + offs_m * stride_dt_dim
@@ -435,9 +447,13 @@ def _selective_scan_update_spec_replay_kernel(
             z_ptrs = z_ptr + offs_m * stride_z_dim
         out_ptrs = out_ptr + offs_m * stride_out_dim
 
-        x_raw = tl.load(x_ptrs, mask=offs_m < dim, other=0.0)
+        if VERIFY_PIPELINE:
+            x_raw = current_verify_x
+            dt_raw = current_verify_dt
+        else:
+            x_raw = tl.load(x_ptrs, mask=offs_m < dim, other=0.0)
+            dt_raw = tl.load(dt_ptr)
         x = x_raw.to(tl.float32)
-        dt_raw = tl.load(dt_ptr)
         dt = dt_raw.to(tl.float32)
         if HAS_DT_BIAS:
             if PIPELINED:
@@ -452,9 +468,22 @@ def _selective_scan_update_spec_replay_kernel(
             A = tl.load(A_ptr).to(tl.float32)
         dA = fast_exp(A * dt)  # scalar, not a matrix
 
-        B_raw = tl.load(B_ptrs, mask=offs_n < dstate, other=0.0)
+        if VERIFY_PIPELINE:
+            B_raw = current_verify_B
+            C = current_verify_C.to(tl.float32)
+            more = i_t + 1 < compute_len
+            next_verify_x = tl.load(x_ptrs + stride_x_batch,
+                                    mask=(offs_m < dim) & more, other=0.0)
+            next_verify_dt = tl.load(dt_ptr + stride_dt_batch,
+                                     mask=more, other=0.0)
+            next_verify_B = tl.load(B_ptrs + stride_B_batch,
+                                    mask=(offs_n < dstate) & more, other=0.0)
+            next_verify_C = tl.load(C_ptrs + stride_C_batch,
+                                    mask=(offs_n < dstate) & more, other=0.0)
+        else:
+            B_raw = tl.load(B_ptrs, mask=offs_n < dstate, other=0.0)
+            C = tl.load(C_ptrs, mask=offs_n < dstate, other=0.0).to(tl.float32)
         B = B_raw.to(tl.float32)
-        C = tl.load(C_ptrs, mask=offs_n < dstate, other=0.0).to(tl.float32)
         if HAS_D:
             if PIPELINED:
                 D = invariant_D
@@ -510,6 +539,10 @@ def _selective_scan_update_spec_replay_kernel(
         if HAS_Z:
             out *= z * tl.sigmoid(z)
         tl.store(out_ptrs, out, mask=offs_m < dim)
+
+        if VERIFY_PIPELINE:
+            current_verify_x, current_verify_dt = next_verify_x, next_verify_dt
+            current_verify_B, current_verify_C = next_verify_B, next_verify_C
 
         x_ptr += stride_x_batch
         dt_ptr += stride_dt_batch
@@ -619,6 +652,7 @@ def selective_state_update_spec_replay(
     replayed_out=None,
     lazy=False,
     _pipeline=False,
+    _verify_pipeline=False,
     _private_verify_rows=None,
     _private_no_prefix=False,
     _private_launch_pdl=None,
@@ -667,6 +701,17 @@ def selective_state_update_spec_replay(
         assert max_seqlen >= 3 and ring_len >= LAZY_PERIOD + max_seqlen - 1
         assert prefill_tag_view(state) is not None
     assert out.shape == x.shape
+    # A future verify input must not be changed by an earlier state/ring or
+    # output store. Conservatively disable the variant for shared storages.
+    if _verify_pipeline:
+        written = {state.untyped_storage().data_ptr(), out.untyped_storage().data_ptr()}
+        _verify_pipeline = all(
+            t.untyped_storage().data_ptr() not in written for t in (x, dt, B, C)
+        )
+        # The six-row qualification compares the combined variants only.
+        # If the verify variant is unsafe, retain the original six-row path.
+        if batch == 6 and not _verify_pipeline:
+            _pipeline = False
     assert num_accepted_tokens.shape == (N,)
     assert seq_lens.shape[0] >= N
     if replayed_out is not None:
@@ -774,6 +819,9 @@ def selective_state_update_spec_replay(
             LAZY=bool(lazy),
             LAZY_P=LAZY_PERIOD,
             SLOT_ELEMS=nheads * dim * dstate,
-            PIPELINED=bool(_pipeline and lazy and N == 1 and batch == 5
-                           and max_seqlen == 5 and z is None and dt_softplus),
+            PIPELINED=bool(_pipeline and lazy and N == 1 and batch in (5, 6)
+                           and max_seqlen == batch and z is None and dt_softplus),
+            VERIFY_PIPELINE=bool(_verify_pipeline and _pipeline and lazy and N == 1
+                                 and batch in (5, 6) and max_seqlen == batch
+                                 and z is None and dt_softplus),
         )

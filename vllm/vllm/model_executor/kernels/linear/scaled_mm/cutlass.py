@@ -7,6 +7,7 @@ from collections.abc import Sequence
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -28,6 +29,8 @@ from .ScaledMMLinearKernel import (
     Int8ScaledMMLinearKernel,
     Int8ScaledMMLinearLayerConfig,
 )
+
+logger = init_logger(__name__)
 
 
 class CutlassInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
@@ -159,6 +162,7 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
     ) -> None:
         self._fp8small_weight: torch.Tensor | None = None
         self._fp8c_weight: torch.Tensor | None = None
+        self._fp8six_selected = False
         self.logical_output_size: int | None = None
         super().__init__(c, layer_param_names)
 
@@ -229,6 +233,21 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
 
                     comp = prepare_fp8c(packed)
                     if comp is not None:
+                        self._fp8six_selected = False
+                        try:
+                            from .fp8six_guard import prepare as prepare_fp8six
+
+                            _, ws_name, is_name, _ = self.layer_param_names
+                            six = prepare_fp8six(
+                                packed, comp,
+                                getattr(layer, is_name, None) if is_name else None,
+                                getattr(layer, ws_name, None) if ws_name else None,
+                            )
+                            if six is not None:
+                                comp = six
+                                self._fp8six_selected = True
+                        except Exception as exc:  # noqa: BLE001 - retain checked fp8c
+                            logger.warning("fp8six: optional admission unavailable (%r)", exc)
                         layer.register_buffer("_fp8c_weight", comp, persistent=False)
                         self._fp8c_weight = comp
                     else:
@@ -297,7 +316,10 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
             and bias is None
             and out_dtype == torch.bfloat16
         ):
-            output = torch.ops.vllm.fp8c_scaled_mm(A, B, self._fp8c_weight, As, Bs)
+            if self._fp8six_selected:
+                output = torch.ops.vllm.fp8six_scaled_mm(A, B, self._fp8c_weight, As, Bs)
+            else:
+                output = torch.ops.vllm.fp8c_scaled_mm(A, B, self._fp8c_weight, As, Bs)
         elif (
             self._fp8small_weight is not None
             and bias is None

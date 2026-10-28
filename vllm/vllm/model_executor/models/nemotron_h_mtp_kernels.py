@@ -89,8 +89,8 @@ ADAPT_TAU = float(os.environ.get("MTP_ADAPT5_TAU", "0.25"))
 ADAPT_MODE = os.environ.get("MTP_ADAPT5_MODE", "lowacc")
 ADAPT_LOWACC_THR = float(os.environ.get("MTP_ADAPT5_LOWACC_THR", "1.8"))
 ADAPT_LOWACC_THR_OFF = float(os.environ.get("MTP_ADAPT5_LOWACC_THR_OFF", "2.0"))
-ADAPT_MIN_CYCLES = int(os.environ.get("MTP_ADAPT5_MIN_CYCLES", "4"))
-ADAPT_BURN = float(os.environ.get("MTP_ADAPT5_BURN", "4"))
+ADAPT_MIN_CYCLES = int(os.environ.get("MTP_ADAPT5_MIN_CYCLES", "2"))
+ADAPT_BURN = float(os.environ.get("MTP_ADAPT5_BURN", "2"))
 ADAPT_CAP = int(os.environ.get("MTP_ADAPT5_CAP", "3"))
 _ADAPT: torch.Tensor | None = None
 

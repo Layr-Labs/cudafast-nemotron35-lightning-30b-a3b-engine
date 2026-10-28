@@ -682,6 +682,14 @@
     {
       "file": "vllm/vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
       "why": "i34-9: PZSKIP_S6 defaults to off (the prefill routed down keeps pzskip config 369 on the 8-bit plane, as in ercumentyildirim's ef1fe030-2867-402a-bed0-47635a4d1ddf). PZSKIP_S6=1 restores config 379. Measurement 2 of 593041c6-13bc-4e1f-80f1-c8ab630521a3 (code identical)."
+    },
+    {
+      "file": "vllm/vllm/model_executor/models/nemotron_h_attn_packed.py (WS_ENABLED, _ws, _prepare_ws, the 496-row branch of _linear_impl); harness/kernels/bf16ws; harness/tests/bf16ws_exact.py",
+      "why": "On the current record d6651a3d-df62-4edc-8006-a0fe978f4a9a the 496-row prefill call of each attention qkv_proj (4608x2688) and o_proj (2688x4096) runs a persistent TMA/mbarrier BF16 kernel with an fp32 accumulator and a bf16 output. The weight is repacked at load time by a byte permutation that does not depend on any input; each real weight is admitted only if the inverse restores its bytes and a fixed-seed synthetic activation gives bit-identical output to the existing path. Otherwise the existing path runs. The kernel and the dispatch follow the earlier submissions 640fbe6e-dc20-487b-b993-d5fb0b99f4e7 and 44ca926b-5218-4331-a8f8-9890dd74b500; only their bf16ws part is carried."
+    },
+    {
+      "file": "vllm/VENDOR.json (annotation only)",
+      "why": "Repeat official measurement of our a3156eaa-e034-4660-8e4c-1f3c84719164: the code is byte-identical to that submission; this entry only records the repeat (draw 2)."
     }
   ]
 }

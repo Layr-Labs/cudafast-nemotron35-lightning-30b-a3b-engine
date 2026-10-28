@@ -170,6 +170,7 @@ struct Smem {
 };
 
 // Block-wide exclusive scan of (a, b) over all THREADS threads in thread order.
+template <bool AGG>
 __device__ __forceinline__ void block_scan2(uint32_t a, uint32_t b, uint32_t& ea, uint32_t& eb,
                                             uint32_t& ta, uint32_t& tb, uint32_t* sh) {
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -199,13 +200,16 @@ __device__ __forceinline__ void block_scan2(uint32_t a, uint32_t b, uint32_t& ea
   eb = pb + ib - b;
   ta = sh[2 * WARPS + WARPS - 1];
   tb = sh[3 * WARPS + WARPS - 1];
-  __syncthreads();
+  // Each topk caller publishes pre/cas/fin with an unconditional CTA fence
+  // before any later scan can overwrite this distinct scratch. AGG uses
+  // that existing lifetime boundary; the original variant retains its fence.
+  if constexpr (!AGG) __syncthreads();
 }
 
 // Output slot (or -1) of each of this thread's E keys (indices t*E .. t*E+E-1, t < N/E) in the
 // top-K list torch.topk(sorted=False) writes. All THREADS threads must call it; sm.hist must be
 // zero on entry and is zero again on return.
-template <int N, int K, int E>
+template <int N, int K, int E, bool AGG>
 __device__ __forceinline__ void topk_slots(const uint32_t (&key)[E], int (&slot)[E], Smem& sm) {
   constexpr int NT = N / E;
   const int t = threadIdx.x;
@@ -214,10 +218,27 @@ __device__ __forceinline__ void topk_slots(const uint32_t (&key)[E], int (&slot)
 #pragma unroll 1
   for (int shift = 24; shift >= 0; shift -= 8) {
     // Histogram of the next digit over the keys that match the selected prefix.
-    if (act) {
+    if constexpr (AGG) {
+      // All512 lanes call the ballot. Only its named prefix-matching lanes
+      // call match_any with that same mask; each equal-bin group contributes
+      // its exact integer population through one leader atomic. No new SMEM.
 #pragma unroll
-      for (int e = 0; e < E; ++e)
-        if ((key[e] & mask) == prefix) atomicAdd(&sm.hist[(key[e] >> shift) & 255u], 1u);
+      for (int e = 0; e < E; ++e) {
+        const bool live = act && ((key[e] & mask) == prefix);
+        const uint32_t members = __ballot_sync(FULL, live);
+        if (live) {
+          const uint32_t digit = (key[e] >> shift) & 255u;
+          const uint32_t peers = __match_any_sync(members, digit);
+          if ((t & 31) == __ffs(peers) - 1)
+            atomicAdd(&sm.hist[digit], static_cast<uint32_t>(__popc(peers)));
+        }
+      }
+    } else {
+      if (act) {
+#pragma unroll
+        for (int e = 0; e < E; ++e)
+          if ((key[e] & mask) == prefix) atomicAdd(&sm.hist[(key[e] >> shift) & 255u], 1u);
+      }
     }
     __syncthreads();
     if (t < 32) {
@@ -261,7 +282,7 @@ __device__ __forceinline__ void topk_slots(const uint32_t (&key)[E], int (&slot)
     for (int e = 0; e < E; ++e) { ngt += key[e] > thr; neq += key[e] == thr; }
   }
   uint32_t egt, eeq, tgt, teq;
-  block_scan2(ngt, neq, egt, eeq, tgt, teq, sm.scan);
+  block_scan2<AGG>(ngt, neq, egt, eeq, tgt, teq, sm.scan);
   const uint32_t need_eq = static_cast<uint32_t>(K) - tgt;
   uint32_t rg = egt, re = eeq;
 #pragma unroll
@@ -279,7 +300,7 @@ __device__ __forceinline__ void topk_slots(const uint32_t (&key)[E], int (&slot)
   }
 }
 
-template <bool PDL, int WIN, bool STAGE1>
+template <bool PDL, int WIN, bool STAGE1, bool AGG = false>
 __global__ void __launch_bounds__(THREADS) scrtail_kernel(Params p) {
   extern __shared__ __align__(16) unsigned char smem_raw[];
   Smem& sm = *reinterpret_cast<Smem*>(smem_raw);
@@ -367,7 +388,7 @@ __global__ void __launch_bounds__(THREADS) scrtail_kernel(Params p) {
       }
       key[e] = topk_key(v);
     }
-    topk_slots<CHUNK, PRE, E>(key, slot, sm);
+    topk_slots<CHUNK, PRE, E, AGG>(key, slot, sm);
 #pragma unroll
     for (int e = 0; e < E; ++e)
       if (slot[e] >= 0) sm.pre[slot[e]] = static_cast<uint16_t>(t * E + e);
@@ -421,7 +442,7 @@ __global__ void __launch_bounds__(THREADS) scrtail_kernel(Params p) {
     int slot[E];
 #pragma unroll
     for (int e = 0; e < E; ++e) key[e] = topk_key(sm.mid[t * E + e]);
-    topk_slots<PRE, CAS, E>(key, slot, sm);
+    topk_slots<PRE, CAS, E, AGG>(key, slot, sm);
 #pragma unroll
     for (int e = 0; e < E; ++e)
       if (slot[e] >= 0) sm.cas[slot[e]] = static_cast<uint16_t>(t * E + e);
@@ -462,7 +483,7 @@ __global__ void __launch_bounds__(THREADS) scrtail_kernel(Params p) {
     uint32_t key[1];
     int slot[1];
     key[0] = t < CAS ? topk_key(sm.ref[t]) : 0u;
-    topk_slots<CAS, PER, 1>(key, slot, sm);
+    topk_slots<CAS, PER, 1, AGG>(key, slot, sm);
     if (slot[0] >= 0) sm.fin[slot[0]] = static_cast<uint16_t>(t);
   }
   __syncthreads();
@@ -509,9 +530,9 @@ __global__ void __launch_bounds__(THREADS) scrtail_kernel(Params p) {
   }
 }
 
-template <bool PDL, int WIN, bool STAGE1>
+template <bool PDL, int WIN, bool STAGE1, bool AGG = false>
 int launch(const Params& prm, int nchunk, cudaStream_t stream, bool pdl) {
-  auto kern = scrtail_kernel<PDL, WIN, STAGE1>;
+  auto kern = scrtail_kernel<PDL, WIN, STAGE1, AGG>;
   const int smem = static_cast<int>(sizeof(Smem));
   static bool attr_done = false;
   if (!attr_done) {
@@ -578,6 +599,46 @@ int scrtail_run(const void* scores, const void* hm, const void* hr, const void* 
                              : scrtail::launch<false, 0, true>(prm, nchunk, s, false);
   return use_pdl ? scrtail::launch<true, 0, false>(prm, nchunk, s, true)
                  : scrtail::launch<false, 0, false>(prm, nchunk, s, false);
+}
+
+// Same ABI and frozen FP/selection contract; separately qualified variant.
+int scrtail_run_agg(const void* scores, const void* hm, const void* hr, const void* h,
+                const void* w_mid, const void* s_mid, const void* w_rest, const void* s_rest,
+                const void* w_full, const void* s_full, void* cand, void* cand_logits,
+                void* pre_cand, void* mid_scores, void* scores_out, void* coarse_cand,
+                void* refine_scores, const void* gate, const void* hp, const void* w_pre,
+                const void* s_pre, float gscale, int nchunk, int win, int pdl, int stage1,
+                void* stream) {
+  scrtail::Params prm;
+  prm.scores = static_cast<const float*>(scores);
+  prm.hp = static_cast<const float*>(hp);
+  prm.w_pre = static_cast<const uint8_t*>(w_pre);
+  prm.s_pre = static_cast<const uint8_t*>(s_pre);
+  prm.hm = static_cast<const float*>(hm);
+  prm.hr = static_cast<const float*>(hr);
+  prm.h = static_cast<const float*>(h);
+  prm.w_mid = static_cast<const uint8_t*>(w_mid);
+  prm.s_mid = static_cast<const uint8_t*>(s_mid);
+  prm.w_rest = static_cast<const uint8_t*>(w_rest);
+  prm.s_rest = static_cast<const uint8_t*>(s_rest);
+  prm.w_full = static_cast<const uint8_t*>(w_full);
+  prm.s_full = static_cast<const uint8_t*>(s_full);
+  prm.cand = static_cast<long long*>(cand);
+  prm.cand_logits = static_cast<float*>(cand_logits);
+  prm.pre_cand = static_cast<long long*>(pre_cand);
+  prm.mid_scores = static_cast<float*>(mid_scores);
+  prm.scores_out = static_cast<float*>(scores_out);
+  prm.coarse_cand = static_cast<long long*>(coarse_cand);
+  prm.refine_scores = static_cast<float*>(refine_scores);
+  prm.gate = static_cast<const int*>(gate);
+  prm.gscale = gscale;
+  cudaStream_t s = static_cast<cudaStream_t>(stream);
+  const bool use_pdl = pdl != 0;
+  if (win != 0) return -1;
+  if (stage1) return use_pdl ? scrtail::launch<true, 0, true, true>(prm, nchunk, s, true)
+                             : scrtail::launch<false, 0, true, true>(prm, nchunk, s, false);
+  return use_pdl ? scrtail::launch<true, 0, false, true>(prm, nchunk, s, true)
+                 : scrtail::launch<false, 0, false, true>(prm, nchunk, s, false);
 }
 
 }  // extern "C"

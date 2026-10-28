@@ -27,6 +27,9 @@ def _load():
         lib.scrtail_run.argtypes = ([ctypes.c_void_p] * 21 + [ctypes.c_float] + [ctypes.c_int] * 4
                                     + [ctypes.c_void_p])
         lib.scrtail_run.restype = ctypes.c_int
+        if hasattr(lib, "scrtail_run_agg"):
+            lib.scrtail_run_agg.argtypes = lib.scrtail_run.argtypes
+            lib.scrtail_run_agg.restype = ctypes.c_int
         _lib = lib
     except OSError:
         _load_failed = True
@@ -37,13 +40,17 @@ def available() -> bool:
     return ENABLED and _load() is not None
 
 
+def aggregate_available() -> bool:
+    return _load() is not None and hasattr(_lib, "scrtail_run_agg")
+
+
 def _ptr(t):
     return None if t is None else t.data_ptr()
 
 
 def run(scores, hm, hr, h, w_mid, s_mid, w_rest, s_rest, w_full, s_full, cand, cand_logits,
         gscale: float, gate=None, win: int = 0, pdl: bool = False, debug=None,
-        first=None) -> bool:
+        first=None, aggregate: bool = False) -> bool:
     """cand [C*32] int64 and cand_logits [C*32] fp32 from the first scores [C*2048], as the
     screen's cascade writes them. first = (hp, w_pre, s_pre) computes the first dot here too
     (scores then only sizes the chunks). debug = (pre_cand, mid_scores, scores_out, coarse_cand,
@@ -80,7 +87,10 @@ def run(scores, hm, hr, h, w_mid, s_mid, w_rest, s_rest, w_full, s_full, cand, c
     dbg = debug if debug is not None else (None,) * 5
     if gate is not None and (gate.dtype != torch.int32 or gate.device != scores.device):
         return False
-    rc = _lib.scrtail_run(
+    fn = getattr(_lib, "scrtail_run_agg", None) if aggregate else _lib.scrtail_run
+    if fn is None:
+        return False
+    rc = fn(
         _ptr(scores), _ptr(hm), _ptr(hr), _ptr(h), _ptr(w_mid), _ptr(s_mid), _ptr(w_rest),
         _ptr(s_rest), _ptr(w_full), _ptr(s_full), _ptr(cand), _ptr(cand_logits),
         *(_ptr(t) for t in dbg), _ptr(gate), _ptr(hp), _ptr(w_pre), _ptr(s_pre), float(gscale),

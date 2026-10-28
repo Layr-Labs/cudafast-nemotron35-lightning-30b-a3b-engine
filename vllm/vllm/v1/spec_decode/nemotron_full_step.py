@@ -11,6 +11,31 @@ from vllm.logger import init_logger
 from vllm.v1.attention.backend import CommonAttentionMetadata
 
 logger = init_logger(__name__)
+# NEMO_MTP_DEEP_LOOP=0 restores the depth-four-only gate: at a declared depth of
+# five neither this graph nor the native plan bank nor the compound draft loop
+# is prepared, and follow-on draft passes take the per-pass path.
+DEEP_LOOP = os.environ.get("NEMO_MTP_DEEP_LOOP", "1") != "0"
+
+
+def deep_depths():
+    """Declared depths the depth-four single-row loop family also serves."""
+    return (4, 5) if DEEP_LOOP else (4,)
+
+
+def deep_rows(p, padded):
+    """Whether this padded row count may run the family at a declared depth of five.
+
+    The whitelist is a shape guard, not a numeric one: the layer code, the plan
+    restore and the three stage kernels all derive their rows from the call
+    shape, so a row count the family never qualified on is the only thing it
+    has to refuse. Depth four serves a single row at capture and five rows for
+    a uniform decode batch; depth five serves a single row at capture and can
+    serve six rows for a uniform decode batch of the full verify width. Both
+    are admitted here and nothing else is, so an unexpected shape still
+    declines to the per-pass path.
+    """
+    n = p.speculative_config.num_speculative_tokens
+    return DEEP_LOOP and n == 5 and padded in (1, n + 1)
 
 
 def _tensor(x):
@@ -66,6 +91,7 @@ def prepare(p):
     p._nemo_full = None
     saved_gate = None
     gate = None
+    padded = 0
     try:
         from vllm.model_executor.models import nemotron_h_mtp_kernels as kernels
         gate = kernels.depth_gate_init(p.device)
@@ -73,7 +99,9 @@ def prepare(p):
             saved_gate = gate.clone()
             gate.zero_()
         _, padded, _ = p._determine_batch_execution_and_padding(1)
-        if padded not in (1, 5) or p.block_size <= 0:
+        if padded not in (1, 5) and not deep_rows(p, padded):
+            return
+        if p.block_size <= 0:
             return
         # Startup has no requests. Capture's padding slots suppress KV writes;
         # initialize the cache used by the private one-token attention warmup.
@@ -167,7 +195,7 @@ def prepare(p):
     finally:
         if saved_gate is not None:
             gate.copy_(saved_gate)
-        p.model.set_moe_row_src(min(p.max_num_tokens, 5), None)
+        p.model.set_moe_row_src(min(p.max_num_tokens, max(padded, 5)), None)
 
 
 def maybe_run(p, kwargs, metadata, padded, batch_size):

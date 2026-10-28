@@ -315,6 +315,13 @@ def _admit_pkslots(key, w, sd, pw, ps, flags, word, pdl):
             del _PKSLOTS_OK[k]
         print(f"MTP_DOWN_PKSLOTS unavailable, _slots kept: {exc!r}", flush=True)
 
+    # Optional qualified metadata broadcast; original admission remains authoritative.
+    try:
+        from .nemotron_h_mtp_down_group import prepare as prepare_group
+        prepare_group(w, sd, pw, ps, flags, word, pdl, _PKSLOTS_OK)
+    except Exception as exc:
+        print(f"MTP_DOWN_PKGROUP preparation unavailable: {exc!r}; original kept", flush=True)
+
 
 def maybe_slots(packed, indices, values, counts, ids, part, pdl):
     if not _ENABLED:
@@ -328,6 +335,13 @@ def maybe_slots(packed, indices, values, counts, ids, part, pdl):
     bn = entry[4].get((ids.numel(), word))
     if bn is None:
         return False
+    try:
+        from .nemotron_h_mtp_down_group import maybe_run as maybe_group
+    except Exception:
+        maybe_group = None
+    if maybe_group is not None and maybe_group(w, sd, entry[2], entry[3], word,
+                                              indices, values, counts, ids, part, pdl):
+        return True
     if (_PKSLOTS_OK.get(((w.data_ptr(), sd.data_ptr()), ids.numel(), word))
             and _pkslots.run(indices, values, counts, entry[2].planes, entry[3].planes, ids, part, pdl)):
         return True

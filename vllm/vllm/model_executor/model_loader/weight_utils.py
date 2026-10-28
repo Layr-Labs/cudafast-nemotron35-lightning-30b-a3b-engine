@@ -843,8 +843,14 @@ def safetensors_weights_iterator(
     *,
     safetensors_prefetch_num_threads: int = DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
     safetensors_prefetch_block_size: int = DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
+    name_filter=None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files.
+
+    LOCAL PATCH (cudafast-nemotron35): with *name_filter*, a tensor whose name the
+    filter rejects is skipped before it is read (the model's own load_weights would
+    discard it unread-equivalently), so a model that loads a small part of a large
+    checkpoint does not read the rest.
 
     When *local_expert_ids* is provided, expert weights not belonging to
     this rank are skipped **before** reading from disk, which drastically
@@ -928,9 +934,17 @@ def safetensors_weights_iterator(
         bar_format=_BAR_FORMAT,
     ):
         if safetensors_load_strategy == "eager":
+            if name_filter is not None:
+                # the header alone names the tensors: a shard with none the model
+                # loads is not read at all
+                with safe_open(st_file, framework="pt") as f:
+                    if not any(name_filter(name) for name in f.keys()):  # noqa: SIM118
+                        continue
             with open(st_file, "rb") as f:
                 state_dict = load(f.read())
             for name, param in state_dict.items():
+                if name_filter is not None and not name_filter(name):
+                    continue
                 if not should_skip_weight(name, local_expert_ids):
                     yield name, param
         elif safetensors_load_strategy == "torchao":
@@ -967,6 +981,8 @@ def safetensors_weights_iterator(
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
                     if should_skip_weight(name, local_expert_ids):
+                        continue
+                    if name_filter is not None and not name_filter(name):
                         continue
                     param = f.get_tensor(name)
                     yield name, param

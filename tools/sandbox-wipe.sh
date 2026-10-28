@@ -230,12 +230,37 @@ enumerate_ipc() {
 # Do not enter a directory that the sandbox user cannot read, own or write.
 # Such a directory cannot hold state that user created. Every other find error
 # remains a wipe failure.
+# A systemd PrivateTmp directory can vanish mid-walk; findutils 4.9 reports
+# ENOENT even with -ignore_readdir_race, so retry only ENOENT-only failures.
 sandbox_find() {
-  local root="$1"
+  local root="$1" attempt out err rc match_rc
   shift
-  as_sandbox find -P "${root}" -xdev \
-    \( -type d ! -readable ! -user "${SANDBOX_USER}" ! -writable -prune \) -o \
-    \( -mindepth 1 "$@" \)
+  for attempt in 1 2 3; do
+    out="$(mktemp)" || return 1
+    err="$(mktemp)" || { rm -f -- "${out}"; return 1; }
+    as_sandbox env LC_ALL=C find -P "${root}" -xdev \
+      \( -type d ! -readable ! -user "${SANDBOX_USER}" ! -writable -prune \) -o \
+      \( -mindepth 1 "$@" \) >"${out}" 2>"${err}"
+    rc=$?
+    if [[ "${rc}" -eq 0 ]]; then
+      cat -- "${out}"
+      rc=$?
+      rm -f -- "${out}" "${err}"
+      return "${rc}"
+    fi
+    if [[ ! -s "${err}" ]]; then
+      rm -f -- "${out}" "${err}"
+      return "${rc}"
+    fi
+    grep -qv '^find: .*: No such file or directory$' "${err}"
+    match_rc=$?
+    if [[ "${match_rc}" -ne 1 ]]; then
+      rm -f -- "${out}" "${err}"
+      return "${rc}"
+    fi
+    rm -f -- "${out}" "${err}"
+  done
+  return "${rc}"
 }
 
 OWNED_PATHS=()

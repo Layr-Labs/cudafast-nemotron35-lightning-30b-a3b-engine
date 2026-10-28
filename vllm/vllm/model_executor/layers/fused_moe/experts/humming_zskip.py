@@ -50,9 +50,9 @@ PZ_ENABLED = os.environ.get("PZSKIP", "1") != "0"
 # layout as 32-row halves, so the 32-row moe_align is not run; PZSKIP_HALF64=0 keeps 356.
 # LOCAL PATCH (cudafast-nemotron35, pz S6): the prefill routed down (pzskip 369) reads the
 # 6-bit swap scale plane (zskip to_s6_swap, config 379) when its load-time check is bitwise
-# equal to humming; PZSKIP_S6=0 keeps 369 and the 8-bit plane. Default off (i34-9); PZSKIP_S6=1
-# restores config 379 on the 6-bit plane.
-PZ_S6_ENABLED = os.environ.get("PZSKIP_S6", "0") != "0"
+# equal to humming; PZSKIP_S6=0 keeps 369 and the 8-bit plane. Default on again (terrapinelf): the
+# 6-bit plane config 379 for the prefill routed down.
+PZ_S6_ENABLED = os.environ.get("PZSKIP_S6", "1") != "0"
 PZ_S6_CONFIG = 379
 PZ_CONFIG = int(os.environ.get(
     "PZSKIP_CONFIG", "369" if os.environ.get("PZSKIP_HALF64", "1") != "0" else "356"))
@@ -81,9 +81,10 @@ LEAN_CONFIG = int(os.environ.get("ZSKIP_LEAN_CONFIG", "653"))
 # LOCAL PATCH (cudafast-nemotron35, zskip S6): the lean config's scale plane as 6-bit offsets
 # (harness/kernels/zskip to_s6, config 663 = 653 with the 6-bit plane decoded to the same bytes
 # in registers). ZSKIP_S6=0 keeps 653 and the 8-bit plane.
-# LOCAL PATCH (i34-9): default off, so the lean paired decode keeps config 653 on the 8-bit plane;
-# ZSKIP_S6=1 builds the 6-bit plane and admits config 663 as before.
-S6_ENABLED = os.environ.get("ZSKIP_S6", "0") != "0"
+# LOCAL PATCH (cudafast-nemotron35, as in kaankolcu ec646c34): default on, so the lean paired decode
+# builds the 6-bit scale plane and admits config 663 under its load-time bitwise check; any failure
+# keeps 653 on the 8-bit plane. ZSKIP_S6=0 keeps 653 directly.
+S6_ENABLED = os.environ.get("ZSKIP_S6", "1") != "0"
 S6_CONFIG = 663
 # Prefill: MoE layers whose relu^2 activations are sparse enough for the skip to beat humming's
 # 64-row blocks on GB10 (measured per layer on prefill-length calls; the others lose). Layer 51,

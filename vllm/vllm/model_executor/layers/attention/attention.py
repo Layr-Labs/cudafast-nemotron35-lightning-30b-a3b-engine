@@ -841,7 +841,7 @@ def _prefetch_ahead(ahead, rows: int, budget: int | None = None,
                                    (native_sm, budget * 2 // 3),
                                    (ahead._mtp_pk_ex, budget - budget * 2 // 3)))
     planes = getattr(ahead, "_apk_planes", None)
-    if planes is None or rows not in (5, 6):
+    if planes is None or rows not in (5, 6, 7):
         return _l2pf.prefetch_many(((gate, gate_bytes), (ahead.weight, budget)))
     return _l2pf.prefetch_many(((gate, gate_bytes),
                                (planes[0], budget * 2 // 3),

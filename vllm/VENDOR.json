@@ -672,16 +672,20 @@
       "why": "terrapinelf, on leech1996's conditional draft step (6f6ff439): at depth >= 5 the speed gate admits the conditional step when the live pass costs at most 30 us more and the stopped pass gains at least twice that (depth 4 keeps 15 us and four times). The exactness checks are unchanged."
     },
     {
+      "file": "mtp-head.manifest.json (num_speculative_tokens 6); harness/kernels/smallk (router M = 7); harness/kernels/zskip (prefix launch shape_m 42); harness/kernels/marlinx/py (live rows at 7); model_executor/layers/fused_moe/experts/humming_zskip.py; model_executor/layers/mamba/ops/gated_norm_fp8.py; model_executor/layers/mamba/ops/mamba_ssm_spec_replay.py; model_executor/models/nemotron_h_attn_packed_kernel.py (ROWS 7); model_executor/layers/attention/attention.py; model_executor/models/nemotron_h_mtp_pkmm.py; v1/worker/gpu_model_runner.py",
+      "why": "terrapinelf: draft depth 6. The six-row verify paths of our depth-5 change extended to seven rows with the same admissions: smallk's router GEMM instantiated for M = 7 (independent per-row fp32 chains), zskip's live-row prefix for shape_m 42 with the paired prefix check at M = 5, 6 and 7, marlinx's live-row lean down and its bitwise admission at 7 rows, apk12 ROWS = 7 (its F.linear admission at 7 rows), the o_proj prefetch, pkmm, the gated norm and replay prefixes for 7 rows, and the fresh prefill graph at depth 6. The 5th and 6th drafts use MTP_DEPTH_THETA5."
+    },
+    {
       "file": "(composition)",
-      "why": "terrapinelf: measurement 3 of: the promoted main bcd22b8 (e-man07's composition 4ae55271-d4bd-44f6-adf0-1f731b273822 on the record a1cf20d1) byte for byte, plus draft depth 5 (the six-row verify paths, the 5th-draft threshold MTP_DEPTH_THETA5 and the optional adaptive deepest draft, off by default), plus fp8ws serving the prefill out_proj and the depth-aware conditional-step speed gate, listed in the entries above."
+      "why": "terrapinelf: measurement 1 of: the promoted main bcd22b8 (e-man07's composition 4ae55271-d4bd-44f6-adf0-1f731b273822 on the record a1cf20d1) byte for byte, plus draft depth 6 (the depth-5 entries above extended to seven-row verifies, the deeper-draft threshold MTP_DEPTH_THETA5 and the optional adaptive deepest draft, off by default), plus fp8ws serving the prefill out_proj and the depth-aware conditional-step speed gate, listed in the entries above."
     },
     {
       "file": "vllm/vllm/model_executor/models/nemotron_h_mtp_kernels.py",
-      "why": "i34-9: on terrapinelf's depth-5 tree (f7425ba8-32af-4067-9de1-fb3183269d2e), the adaptive drafting past the 4th draft is on by default with a new rule MTP_ADAPT5_MODE=lowacc (default; \"deep\" keeps terrapinelf's rule): a per-request running mean of accepted drafts among the first 4, with on/off thresholds MTP_ADAPT5_LOWACC_THR (1.8) and MTP_ADAPT5_LOWACC_THR_OFF (2.0) after MTP_ADAPT5_MIN_CYCLES (4) cycles counted after the first MTP_ADAPT5_BURN (4) cycles, which are not accumulated; each cycle's value is capped at MTP_ADAPT5_CAP (3). MTP_ADAPT5=0 restores the previous default."
+      "why": "i34-9: on terrapinelf's depth-6 tree (b3740ce0-42a7-4cff-ad46-7510a2dc69de), the adaptive drafting past the 4th draft is on by default with the rule MTP_ADAPT5_MODE=lowacc (default; \"deep\" keeps terrapinelf's rule): a per-request running mean of accepted drafts among the first 4, each cycle's value capped at MTP_ADAPT5_CAP (3), with on/off thresholds MTP_ADAPT5_LOWACC_THR (1.8) and MTP_ADAPT5_LOWACC_THR_OFF (2.0) after MTP_ADAPT5_MIN_CYCLES (4) cycles counted after the first MTP_ADAPT5_BURN (4) cycles, which are not accumulated. MTP_ADAPT5=0 restores the previous default."
     },
     {
       "file": "vllm/vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
-      "why": "i34-9: PZSKIP_S6 defaults to off (the prefill routed down keeps pzskip config 369 on the 8-bit plane, as in ercumentyildirim's ef1fe030-2867-402a-bed0-47635a4d1ddf). PZSKIP_S6=1 restores config 379. Measurement 2 of 593041c6-13bc-4e1f-80f1-c8ab630521a3 (code identical)."
+      "why": "i34-9: on terrapinelf's depth-6 tree (b3740ce0-42a7-4cff-ad46-7510a2dc69de), PZSKIP_S6 defaults to off (the prefill routed down keeps pzskip config 369 on the 8-bit plane, as in ercumentyildirim's ef1fe030-2867-402a-bed0-47635a4d1ddf). PZSKIP_S6=1 restores config 379."
     }
   ]
 }

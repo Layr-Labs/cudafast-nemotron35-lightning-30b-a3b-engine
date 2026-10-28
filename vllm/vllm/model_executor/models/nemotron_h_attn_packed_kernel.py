@@ -7,7 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
-ROWS = 6  # verify rows at draft depth 5 (num_speculative_tokens + 1)
+ROWS = 7  # verify rows at draft depth 6 (num_speculative_tokens + 1)
 # (columns per program, warps), tried in this order; BN is a multiple of 16.
 CONFIGS = ((32, 4), (64, 4), (16, 4),
            (32, 4, True, True), (64, 4, True, True), (16, 4, True, True))

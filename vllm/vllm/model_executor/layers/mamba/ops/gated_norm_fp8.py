@@ -81,7 +81,7 @@ def _gated_norm_fp8(
 ) -> torch.Tensor:
     out = torch.empty(x.shape, dtype=torch.float8_e4m3fn, device=x.device)
     verify_rows = None
-    if x.shape[0] in (5, 6) and os.environ.get("VLLM_MAMBA_GATED_NORM_PREFIX", "1") != "0":
+    if x.shape[0] in (5, 6, 7) and os.environ.get("VLLM_MAMBA_GATED_NORM_PREFIX", "1") != "0":
         smallk = sys.modules.get("smallk")
         if smallk is not None and hasattr(smallk, "live_verify_rows"):
             verify_rows = smallk.live_verify_rows(x.device)

@@ -395,6 +395,9 @@ int router_launch(const float* x, long ldx, int M, const void* w, int N, int K, 
     case 6:
       // Depth-5 verify: the same independent per-row chains (bitwise equal to cuBLAS fp32 at M = 6).
       return launch(router_gemm_kernel<R, 6, MODE, W16>, grid, block, pdl, stream, x, ldx, w, K, y, ldy, N, vrows);
+    case 7:
+      // Depth-6 verify: the same independent per-row chains.
+      return launch(router_gemm_kernel<R, 7, MODE, W16>, grid, block, pdl, stream, x, ldx, w, K, y, ldy, N, vrows);
     default:
       return 2;
   }
@@ -436,6 +439,7 @@ int sk_init() {
   rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<4, 5, 0, true>) != cudaSuccess;
   rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<8, 5, 0, true>) != cudaSuccess;
   rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<1, 6, 0, true>) != cudaSuccess;
+  rc |= cudaFuncGetAttributes(&a, router_gemm_kernel<1, 7, 0, true>) != cudaSuccess;
 #endif
   rc |= cudaFuncGetAttributes(&a, topk_sigmoid_kernel<128>) != cudaSuccess;
   rc |= cudaFuncGetAttributes(&a, align_kernel) != cudaSuccess;

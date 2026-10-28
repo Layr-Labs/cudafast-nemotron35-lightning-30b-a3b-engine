@@ -686,7 +686,7 @@ def selective_state_update_spec_replay(
 
     verify_rows = None
     if (
-        N == 1 and max_seqlen in (5, 6) and batch == max_seqlen
+        N == 1 and max_seqlen in (5, 6, 7) and batch == max_seqlen
         and replayed_out is None
         and _private_verify_rows is None and not _private_no_prefix
         and os.environ.get("VLLM_MAMBA_SPEC_PREFIX", "1") != "0"

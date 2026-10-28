@@ -233,9 +233,9 @@ enumerate_ipc() {
 # A systemd PrivateTmp directory can vanish mid-walk; findutils 4.9 reports
 # ENOENT even with -ignore_readdir_race, so retry only ENOENT-only failures.
 sandbox_find() {
-  local root="$1" attempt out err rc match_rc
+  local root="$1" out err rc match_rc
   shift
-  for attempt in 1 2 3; do
+  for _ in 1 2 3; do
     out="$(mktemp)" || return 1
     err="$(mktemp)" || { rm -f -- "${out}"; return 1; }
     as_sandbox env LC_ALL=C find -P "${root}" -xdev \

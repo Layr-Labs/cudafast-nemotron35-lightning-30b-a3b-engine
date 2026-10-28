@@ -13,6 +13,8 @@ import statistics
 import time
 from importlib.metadata import PackageNotFoundError, version
 
+from vllm.v1.spec_decode.nemotron_full_step import deep_depths, deep_rows
+
 logger = logging.getLogger(__name__)
 _SCALARS = ("_q_len_per_req", "_pos_encoding_mode", "_window_left", "_logits_soft_cap",
             "_sm_scale", "_rope_scale", "_rope_theta")
@@ -154,7 +156,7 @@ def _eligible(p):
         package_ok = False
     return (os.environ.get("NEMO_MTP_NATIVE_PLAN_BANK", "1") != "0" and package_ok
             and type(p.model).__name__ == "NemotronHMTP" and p.method == "mtp"
-            and p.speculative_config.num_speculative_tokens == 4
+            and p.speculative_config.num_speculative_tokens in deep_depths()
             and not p.speculative_config.enforce_eager
             and not p.parallel_drafting and not p.constant_draft_positions
             and not p.needs_extra_input_slots and p.pass_hidden_states_to_model
@@ -184,7 +186,7 @@ def prepare(p):
             or screen is None or screen.graph is None):
         return
     mode, padded, _ = p._determine_batch_execution_and_padding(1)
-    if padded not in (1, 5):
+    if padded not in (1, 5) and not deep_rows(p, padded):
         return
     caches = [p.compilation_config.static_forward_context[n].kv_cache
               for n in sorted(p._draft_attn_layer_names)]

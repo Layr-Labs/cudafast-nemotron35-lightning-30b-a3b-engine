@@ -68,6 +68,7 @@ from .nemotron_h_mtp_kernels import adapt_args as _adapt_args
 from .nemotron_h_mtp_kernels import (
     DEPTH_CUMULATIVE, DEPTH_THETA, DEPTH_THETA5, _gate_args, depth_gate_init, mtp_pdl,
 )
+from .nemotron_h_mtp_kernels import ADAPT_BURN, ADAPT_MIN_CYCLES, DEPTH_THETA_OFF, DEPTH_THETA_ON, DEPTH_THETA5_OFF
 
 logger = init_logger(__name__)
 
@@ -556,6 +557,10 @@ def _select_token(
     adapt_ptr=None,
     ADAPT: tl.constexpr = False,
     TAU: tl.constexpr = 0.0,
+    THETA_OFF: tl.constexpr = 0.0,
+    THETA_ON: tl.constexpr = 0.0,
+    THETA5_OFF: tl.constexpr = 2.0,
+    DECIDE_AT: tl.constexpr = 0.0,
     CUM: tl.constexpr = False,
     launch_pdl: tl.constexpr = False,
     ref=None,
@@ -596,10 +601,27 @@ def _select_token(
             if CUM:
                 conf = tl.load(gate_ptr + 3).to(tl.float32, bitcast=True) * conf
                 tl.store(gate_ptr + 3, conf.to(tl.int32, bitcast=True))
-            thr = tl.where(kept >= 4, THETA5, THETA)
+            thr4 = THETA
+            if ADAPT:
+                if (THETA_OFF != THETA) or (THETA_ON != THETA):
+                    # decided (cycles >= BURN + MIN_CYCLES): THETA_ON with the low-acceptance
+                    # flag on, THETA_OFF while it has never been on in this request (adapt[3])
+                    decided = tl.load(adapt_ptr + 1) >= DECIDE_AT
+                    flag_on = tl.load(adapt_ptr) >= TAU
+                    never_on = tl.load(adapt_ptr + 3) < TAU
+                    thr4 = tl.where(decided & flag_on, THETA_ON,
+                                    tl.where(decided & never_on, THETA_OFF, THETA))
+            thr = tl.where(kept >= 4, THETA5, thr4)
             stop = conf < thr
             if ADAPT:
-                stop = stop | ((kept >= 4) & (tl.load(adapt_ptr) < TAU))
+                cut5 = (kept >= 4) & (tl.load(adapt_ptr) < TAU)
+                if THETA5_OFF <= 1.0:
+                    # decided, flag never on in this request (adapt[3]), confident 4th-draft product:
+                    # the 5th draft is still drafted
+                    keep5 = ((tl.load(adapt_ptr + 1) >= DECIDE_AT) & (tl.load(adapt_ptr + 3) < TAU)
+                             & (conf >= THETA5_OFF))
+                    cut5 = cut5 & (keep5 == 0)
+                stop = stop | cut5
             if stop:
                 tl.store(gate_ptr, 1)
 
@@ -1044,7 +1066,7 @@ class DraftHeadScreen:
                     self.cand_logits, self._cand, out, N=self.cand_logits.numel(),
                     BLOCK=triton.next_power_of_2(self.cand_logits.numel()),
                     gate_ptr=gate, GATED=gated and ok, THETA=DEPTH_THETA, THETA5=DEPTH_THETA5,
-                    adapt_ptr=_adapt_args()[0], ADAPT=_adapt_args()[1], TAU=_adapt_args()[2],
+                    adapt_ptr=_adapt_args()[0], ADAPT=_adapt_args()[1], TAU=_adapt_args()[2], THETA_OFF=DEPTH_THETA_OFF, THETA_ON=DEPTH_THETA_ON, THETA5_OFF=DEPTH_THETA5_OFF, DECIDE_AT=float(ADAPT_BURN + ADAPT_MIN_CYCLES),
                     CUM=DEPTH_CUMULATIVE, launch_pdl=mtp_pdl(),
                 )
                 return out
@@ -1166,7 +1188,7 @@ class DraftHeadScreen:
                 self.cand_logits, coarse_idx, out, N=self.cand_logits.numel(),
                 BLOCK=triton.next_power_of_2(self.cand_logits.numel()),
                 gate_ptr=gate, GATED=gated and ok, THETA=DEPTH_THETA, THETA5=DEPTH_THETA5,
-                adapt_ptr=_adapt_args()[0], ADAPT=_adapt_args()[1], TAU=_adapt_args()[2],
+                adapt_ptr=_adapt_args()[0], ADAPT=_adapt_args()[1], TAU=_adapt_args()[2], THETA_OFF=DEPTH_THETA_OFF, THETA_ON=DEPTH_THETA_ON, THETA5_OFF=DEPTH_THETA5_OFF, DECIDE_AT=float(ADAPT_BURN + ADAPT_MIN_CYCLES),
                 CUM=DEPTH_CUMULATIVE, launch_pdl=mtp_pdl(),
                 ref=refined, TWO_LEVEL=True, CHUNK=SCREEN_CHUNK, CPER=CASCADE_PER,
                 SPER=SCREEN_PER,
@@ -1223,7 +1245,7 @@ class DraftHeadScreen:
             self.cand_logits, cand, out, N=self.cand_logits.numel(),
             BLOCK=triton.next_power_of_2(self.cand_logits.numel()),
             gate_ptr=gate, GATED=gated and ok, THETA=DEPTH_THETA, THETA5=DEPTH_THETA5,
-            adapt_ptr=_adapt_args()[0], ADAPT=_adapt_args()[1], TAU=_adapt_args()[2],
+            adapt_ptr=_adapt_args()[0], ADAPT=_adapt_args()[1], TAU=_adapt_args()[2], THETA_OFF=DEPTH_THETA_OFF, THETA_ON=DEPTH_THETA_ON, THETA5_OFF=DEPTH_THETA5_OFF, DECIDE_AT=float(ADAPT_BURN + ADAPT_MIN_CYCLES),
             CUM=DEPTH_CUMULATIVE, launch_pdl=mtp_pdl(),
         )
         if getattr(self, "_finish_next_pf", False):

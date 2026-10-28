@@ -25,6 +25,8 @@ from vllm.model_executor.layers.fused_moe.experts.humming_tuned_moe import (
 )
 from vllm.model_executor.layers.fused_moe.experts.humming_zskip import (
     maybe_down as maybe_zskip_down,
+    maybe_routed_sum_start,
+    routed_sum_finish,
 )
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size,
@@ -858,17 +860,26 @@ class HummingIndexedExperts(HummingExpertsBase):
         # for <= 8 tokens, and for prefill on the sparse layers, without loading
         # the weight rows whose activations are zero (humming_zskip.py);
         # otherwise routed_sparse or humming runs.
-        sparse_done = expert_map is None and maybe_zskip_down(
-            self.layer,
-            inputs,
-            input_scale,
-            down_output,
-            topk_ids.size(0),
-            topk_ids.size(1),
-            getattr(self, "_moe_block_size", None),
-            moe_kwargs2,
-            topk_ids=topk_ids,
-        )
+        routed_sum = None
+        if expert_map is None:
+            routed_sum = maybe_routed_sum_start(
+                self.layer, inputs, input_scale, down_output, output,
+                topk_weights, topk_ids, getattr(self, "_moe_block_size", None),
+                moe_kwargs2,
+            )
+        sparse_done = routed_sum is not None
+        if not sparse_done:
+            sparse_done = expert_map is None and maybe_zskip_down(
+                self.layer,
+                inputs,
+                input_scale,
+                down_output,
+                topk_ids.size(0),
+                topk_ids.size(1),
+                getattr(self, "_moe_block_size", None),
+                moe_kwargs2,
+                topk_ids=topk_ids,
+            )
         sparse_weights = getattr(self.layer, "routed_sparse_down", None)
         if (
             not sparse_done
@@ -892,13 +903,16 @@ class HummingIndexedExperts(HummingExpertsBase):
         if l2pf_pending:
             _l2pf.join(down_output.device)
 
-        moe_fused_mul_sum(
-            inputs=buffers["down_output"].view(*topk_ids.shape, -1),
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            expert_map=expert_map,
-            outputs=output,
-        )
+        if routed_sum is not None:
+            routed_sum_finish(routed_sum, output)
+        else:
+            moe_fused_mul_sum(
+                inputs=buffers["down_output"].view(*topk_ids.shape, -1),
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                expert_map=expert_map,
+                outputs=output,
+            )
 
 
 class HummingGroupedExperts(HummingExpertsBase):

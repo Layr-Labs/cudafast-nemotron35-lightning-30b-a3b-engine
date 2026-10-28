@@ -897,6 +897,7 @@ __global__ void __launch_bounds__(WPC * 32) down4_kernel(const Params p) {
 
 #include "zskip_pair.cuh"
 #include "zskip_lean.cuh"
+#include "zskip_routed_sum_prototype.cuh"
 
 // v6: down4 with the -0 guard moved to the end. With skipped rows read as +0, every step keeps
 // the accumulator equal to stock's or both zero (the two differ at most in the sign of a zero), so
@@ -1707,6 +1708,8 @@ __global__ void epi_kernel(const uint32_t* x, int n, float gs, uint32_t* out_bf1
 }  // namespace zskip
 
 using namespace zskip;
+
+#include "zskip_routed_host_prototype.cuh"
 
 static int g_sms = 0;
 static int g_c3lpt = 1;  // Python C3LPT=0 restores vsc order

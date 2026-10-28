@@ -199,6 +199,26 @@ def finalize(layer: torch.nn.Module) -> None:
         except Exception as exc:  # optional prefix; original checked pair remains
             logger.warning_once("zskip: prefix check unavailable (%r); full pair retained", exc)
 
+    # The proposed fused routed down + weighted reduction is admitted per
+    # layer only after remote startup checks the real weights, workspace side
+    # effects, forced fallback, graph replay and complete-chain timing. Any
+    # failure keeps the original checked down and reduction path.
+    layer.zskip_routed_sum_ok = False
+    if (getattr(layer, "zskip_pair_config", None) == S6_CONFIG
+        and os.environ.get("ZSKIP_ROUTED_SUM", "1") != "0"
+        and not torch.cuda.is_current_stream_capturing()):
+        try:
+            from zskip import routed_gate_prototype
+            from vllm.model_executor.layers.fused_moe.moe_fused_mul_sum import moe_fused_mul_sum
+            layer.zskip_routed_sum_ok = routed_gate_prototype.check_layer(
+                layer, _zskip, _align, moe_fused_mul_sum)
+            logger.info("zskip: routed down+sum admission layer=%s accepted=%s",
+                        getattr(layer, "layer_name", "?"), layer.zskip_routed_sum_ok)
+        except Exception as exc:  # optional path; preserve checked baseline
+            logger.warning("zskip: routed down+sum admission failed for %s: %r",
+                           getattr(layer, "layer_name", "?"), exc)
+            layer.zskip_routed_sum_ok = False
+
 
 def _prepare_pair(layer: torch.nn.Module) -> None:
     """New buffers and kernels are optional; any failure leaves checked 108/100 intact."""
@@ -665,6 +685,32 @@ def maybe_down(
         verify_rows=vrows,
     )
     return True
+
+
+def maybe_routed_sum_start(layer, inputs, input_scale, down_output, output,
+                           topk_weights, topk_ids, block_m, moe_kwargs):
+    """Return the pending fused handle, or None before launching anything."""
+    tokens, top_k = topk_ids.shape
+    if (not getattr(layer, "zskip_routed_sum_ok", False) or input_scale is not None
+        or tokens not in (5, 6) or top_k != TOP_K or block_m != 16
+        or getattr(layer, "zskip_pair_config", None) != S6_CONFIG
+        or torch.compiler.is_compiling()):
+        return None
+    from zskip import routed_host_prototype
+    vrows = None
+    if getattr(layer, "zskip_pair_prefix_ok", False):
+        smallk = sys.modules.get("smallk")
+        if smallk is not None and hasattr(smallk, "live_verify_rows"):
+            vrows = smallk.live_verify_rows(inputs.device)
+    return routed_host_prototype.start(
+        _zskip._load(), inputs, moe_kwargs["sorted_ids"], moe_kwargs["expert_ids"],
+        moe_kwargs["num_tokens_padded"], layer.zskip_pair_w2, S6_CONFIG,
+        down_output, topk_weights, output, vrows)
+
+
+def routed_sum_finish(handle, output):
+    from zskip import routed_host_prototype
+    routed_host_prototype.finish(handle, output)
 
 
 def _pz_down(

@@ -33,4 +33,6 @@ for flags in "" "-DZSKIP_NO_PDL" "-DZSKIP_NO_FUSED" "-DZSKIP_NO_PDL -DZSKIP_NO_F
 done
 test -f "$out/libzskip.so" || { echo "zskip: build failed" >&2; exit 1; }
 cp "$here/py/__init__.py" "$out/__init__.py"
+cp "$here/py/routed_host_prototype.py" "$out/routed_host_prototype.py"
+cp "$here/py/routed_gate_prototype.py" "$out/routed_gate_prototype.py"
 echo "zskip: built $out/libzskip.so for sm_${sm}"

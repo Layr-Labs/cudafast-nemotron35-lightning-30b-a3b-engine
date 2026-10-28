@@ -97,7 +97,10 @@ BACKUP_SCALAR = os.environ.get("MTP_BACKUP_SCALAR", "1") != "0"
 FIRST_PLAN_SIDE = os.environ.get("MTP_FIRST_PLAN_SIDE", "0") != "0"
 # LOCAL PATCH (drafter3): see _mtp_step_prefetch (MB of the packed qkv head per step;
 # the ALT table is built switched off, for in-process A/B of a second size).
-STEP_PF_MB = float(os.environ.get("L2PF_DRAFT_STEP_MB", "0"))
+# Pending public experiment 141cb5da-5110-493c-a8b6-d1918211d663 proposes
+# warming the first 2 MiB of packed draft qkv on the existing side stream.
+# This combination remains unvalidated; the environment can restore zero.
+STEP_PF_MB = float(os.environ.get("L2PF_DRAFT_STEP_MB", "2"))
 STEP_PF_ALT_MB = float(os.environ.get("L2PF_DRAFT_STEP_ALT_MB", "0"))
 
 

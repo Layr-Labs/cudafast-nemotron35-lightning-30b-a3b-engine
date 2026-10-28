@@ -682,6 +682,30 @@
     {
       "file": "vllm/vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
       "why": "i34-9: PZSKIP_S6 defaults to off (the prefill routed down keeps pzskip config 369 on the 8-bit plane, as in ercumentyildirim's ef1fe030-2867-402a-bed0-47635a4d1ddf). PZSKIP_S6=1 restores config 379. Measurement 2 of 593041c6-13bc-4e1f-80f1-c8ab630521a3 (code identical)."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_attn_packed.py (WS_ENABLED, _ws, _ws_activations, _prepare_ws, _ws_gemm, the 496-row branch of _linear_impl, apply for a bf16ws-only projection, prepare calls _prepare_ws); harness/kernels/bf16ws; harness/tests/bf16ws_exact.py",
+      "why": "ercumentyildirim 640fbe6e-dc20-487b-b993-d5fb0b99f4e7, carried byte for byte (as also carried in e-man07's ae2f7fda-935a-4603-92c3-99276da33429): the 496-row prefill call of each attention qkv_proj (4608x2688) and o_proj (2688x4096) runs bf16ws, the fp8ws persistent TMA/mbarrier kernel with the BF16 MMA, instead of F.linear, with the same arithmetic: native bf16 m16n8k16 MMA, one ascending-K chain per output from +0, one RN to BF16. The weight gets a load-time, input-independent byte-permuted copy (the original stays for every other row count). Each projection is admitted at load only if the pack inverts to the original bytes and its output equals F.linear bit for bit on five synthetic activation sets (four Gaussian scales and every BF16 bit pattern); otherwise F.linear. BF16WS=0 disables."
+    },
+    {
+      "file": "v1/spec_decode/nemotron_step_cond.py (ENABLED default)",
+      "why": "NEMO_MTP_STEP_COND defaults to 0, as in jungjipdo's fcbf0e84-79ed-4edb-aeeb-c942fa8f28da on this record (first in e-man07's 1faceed1-7860-4e8d-b734-96600d6629aa on 4ae55271): each single-row draft pass takes the per-pass path (full-step graph, then the screen) instead of leech1996's conditional step graph. NEMO_MTP_STEP_COND=1 restores it. Default only."
+    },
+    {
+      "file": "model_executor/layers/fused_moe/experts/humming_zskip.py (S6_ENABLED default)",
+      "why": "ZSKIP_S6 defaults to 1, as in kaankolcu's ec646c34-10c7-43b1-8993-136f354e076c on this record: the decode verify's lean paired routed down builds the 6-bit scale plane and admits config 663 under its existing load-time bitwise check against humming; any failure keeps 653 on the 8-bit plane. ZSKIP_S6=0 keeps 653. Default only."
+    },
+    {
+      "file": "model_executor/layers/fused_moe/experts/humming_zskip.py (PZ_S6_ENABLED default)",
+      "why": "terrapinelf: PZSKIP_S6 defaults to 1 again, so the prefill routed down reads the 6-bit scale plane (pzskip config 379, admitted by the existing deterministic 496-token check against humming) instead of config 369 on the 8-bit plane. Both are bitwise equal to humming; only the plane the kernel reads changes. PZSKIP_S6=0 keeps 369. Default only."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_kernels.py (ADAPT_LOWACC_THR, ADAPT_LOWACC_THR_OFF defaults)",
+      "why": "terrapinelf: i34-9's low-acceptance rule turns drafting past the 4th draft on below a running mean of 2.1 accepted drafts (was 1.8) and off again at 2.4 (was 2.0); burn-in, minimum cycles and the per-cycle cap are unchanged. Drafts only; the target verifies every committed token."
+    },
+    {
+      "file": "(composition)",
+      "why": "terrapinelf composition on the record d6651a3d-df62-4edc-8006-a0fe978f4a9a (i34-9: terrapinelf's depth-5 tree f7425ba8 with i34-9's low-acceptance rule): the record byte for byte, plus ercumentyildirim's bf16ws prefill attention projections (640fbe6e, byte for byte), the conditional single-row draft step off by default (jungjipdo fcbf0e84 / e-man07 1faceed1), the decode 6-bit scale plane on by default (kaankolcu ec646c34) and the prefill 6-bit scale plane back on by default (terrapinelf)., and the low-acceptance thresholds at 2.1 / 2.4. No new arithmetic. Measurement #1."
     }
   ]
 }

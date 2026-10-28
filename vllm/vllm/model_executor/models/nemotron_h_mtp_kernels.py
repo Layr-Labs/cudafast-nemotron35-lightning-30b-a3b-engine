@@ -69,10 +69,21 @@ def mtp_pdl() -> bool:
 # Confidence-gated draft depth
 # --------------------------------------------------------------------------- #
 DEPTH_GATE = os.environ.get("MTP_DEPTH_GATE", "1") != "0"
-DEPTH_THETA = float(os.environ.get("MTP_DEPTH_THETA", "0.5"))
+DEPTH_THETA = float(os.environ.get("MTP_DEPTH_THETA", "0.51"))
 # LOCAL PATCH (cudafast-nemotron35, depth 5): the threshold for drafting past the 4th draft
 # (kept count >= 4); at depth 4 the loop ends there and it has no effect. MTP_DEPTH_THETA5 sets it.
 DEPTH_THETA5 = float(os.environ.get("MTP_DEPTH_THETA5", "0.6"))
+# LOCAL PATCH (cudafast-nemotron35): once the low-acceptance rule has decided (BURN + MIN_CYCLES
+# cycles counted) and its flag is off, the first four drafts use this threshold instead of
+# MTP_DEPTH_THETA. MTP_DEPTH_THETA_OFF=0.5 (equal to MTP_DEPTH_THETA) restores the record.
+DEPTH_THETA_OFF = float(os.environ.get("MTP_DEPTH_THETA_OFF", str(DEPTH_THETA)))
+# LOCAL PATCH (cudafast-nemotron35): the same, once the rule has decided with its flag on.
+# MTP_DEPTH_THETA_ON=0.5 (equal to MTP_DEPTH_THETA) restores the record.
+DEPTH_THETA_ON = float(os.environ.get("MTP_DEPTH_THETA_ON", str(DEPTH_THETA)))
+# LOCAL PATCH (cudafast-nemotron35): once the rule has decided and its flag has never been on in the
+# request (adapt[3]), a 5th draft is still drafted when the running product after the 4th draft is
+# at least this. Above 1 (the default here) it never is, as in the record.
+DEPTH_THETA5_OFF = float(os.environ.get("MTP_DEPTH_THETA5_OFF", "0.9"))
 DEPTH_CUMULATIVE = os.environ.get("MTP_DEPTH_CUMULATIVE", "1") != "0"
 GATE_PROD_ONE = 0x3F800000
 _GATE: torch.Tensor | None = None
@@ -89,7 +100,7 @@ ADAPT_TAU = float(os.environ.get("MTP_ADAPT5_TAU", "0.25"))
 ADAPT_MODE = os.environ.get("MTP_ADAPT5_MODE", "lowacc")
 ADAPT_LOWACC_THR = float(os.environ.get("MTP_ADAPT5_LOWACC_THR", "1.8"))
 ADAPT_LOWACC_THR_OFF = float(os.environ.get("MTP_ADAPT5_LOWACC_THR_OFF", "2.0"))
-ADAPT_MIN_CYCLES = int(os.environ.get("MTP_ADAPT5_MIN_CYCLES", "4"))
+ADAPT_MIN_CYCLES = int(os.environ.get("MTP_ADAPT5_MIN_CYCLES", "2"))
 ADAPT_BURN = float(os.environ.get("MTP_ADAPT5_BURN", "4"))
 ADAPT_CAP = int(os.environ.get("MTP_ADAPT5_CAP", "3"))
 _ADAPT: torch.Tensor | None = None
@@ -203,10 +214,13 @@ def _gate_begin_lowacc_kernel(gate_ptr, adapt_ptr, rej_ptr, HAS_REJ: tl.constexp
         seen = tl.maximum(cycles - BURN, 0.0)
         ok = (seen >= MIN_CYCLES) & (total < tl.where(was_on, THR_OFF, THR) * seen)
         tl.store(adapt_ptr, ok.to(tl.float32))
+        # adapt[3]: 1.0 once the flag has been on in this request (read by the token select)
+        tl.store(adapt_ptr + 3, tl.maximum(tl.load(adapt_ptr + 3), ok.to(tl.float32)))
     else:
         tl.store(adapt_ptr, 0.0)
         tl.store(adapt_ptr + 1, 0.0)
         tl.store(adapt_ptr + 2, 0.0)
+        tl.store(adapt_ptr + 3, 0.0)
     tl.store(gate_ptr, 0)
     tl.store(gate_ptr + 1, 0)
     tl.store(gate_ptr + 2, 1)

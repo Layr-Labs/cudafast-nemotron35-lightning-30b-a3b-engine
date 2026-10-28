@@ -31,6 +31,22 @@ if ! test -f "$out/libmarlinx.so"; then
     -Xptxas -v -DMARLINX_NO_PDL \
     -o "$out/libmarlinx.so" "$here/csrc/marlinx.cu" 2>&1 || true
 fi
+# If optional six-bit staging cannot build, preserve the original byte-SU
+# implementation before giving up on marlinx altogether.
+if ! test -f "$out/libmarlinx.so"; then
+  echo "marlinx: optional SU6 build failed; rebuilding without SU6" >&2
+  "$nvcc" -O3 -std=c++17 -shared -Xcompiler -fPIC -lineinfo \
+    -gencode "arch=compute_${sm},code=sm_${sm}" \
+    -Xptxas -v -DMARLINX_NO_SU6 \
+    -o "$out/libmarlinx.so" "$here/csrc/marlinx.cu" 2>&1 || true
+fi
+if ! test -f "$out/libmarlinx.so"; then
+  "$nvcc" -O3 -std=c++17 -shared -Xcompiler -fPIC -lineinfo \
+    -gencode "arch=compute_${sm},code=sm_${sm}" \
+    -Xptxas -v -DMARLINX_NO_SU6 -DMARLINX_NO_PDL \
+    -o "$out/libmarlinx.so" "$here/csrc/marlinx.cu" 2>&1 || true
+fi
 test -f "$out/libmarlinx.so" || { echo "marlinx: build failed" >&2; exit 1; }
 cp "$here/py/__init__.py" "$out/__init__.py"
+cp "$here/py/su6_gate.py" "$out/su6_gate.py"
 echo "marlinx: built $out/libmarlinx.so for sm_${sm}"

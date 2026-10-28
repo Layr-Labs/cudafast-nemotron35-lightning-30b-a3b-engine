@@ -49,6 +49,8 @@ struct Params {
   int iters;               // Marlin stripe length (k-tiles per block) in part 2
   const uint2* SU;         // optional unit-major copy of S, [N/64][K/16][8] uint2 (or null)
   const int* vrows;        // lean only: live verify rows (device int; rows >= it read as zero), or null
+  const uint8_t* SUT;      // with SU: SU holds 6-bit codes of S (MARLINX_SU6) and this their
+                           // 64-byte value table, or null (SU holds the bytes themselves)
 };
 
 __device__ __forceinline__ uint4 ld_stream_v4(const uint4* p) {
@@ -343,6 +345,40 @@ __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
   // instead of one 64-byte read per k16 block (row stride N bytes). Scales are weights,
   // immutable at run time, so a PDL grid may stage them before griddepcontrol.wait.
   extern __shared__ __align__(16) uint2 su_smem[];
+#ifndef MARLINX_NO_SU6
+  if (p.SU && p.SUT) {
+    // MARLINX_SU6: the unit's scales as 6-bit codes, 48 bytes per k16 block (32 bytes of low
+    // nibbles, code 2i | code 2i+1 << 4, then 16 bytes of high 2-bit pairs, code 4i+t at bits
+    // 2t), looked up in the tensor's sorted 64-value table: the staged bytes are S's own.
+    __shared__ uint32_t su_table[16];
+    if (threadIdx.x < 16) su_table[threadIdx.x] = __ldg(reinterpret_cast<const uint32_t*>(p.SUT) + threadIdx.x);
+    __syncthreads();
+    const uint8_t* tab = reinterpret_cast<const uint8_t*>(su_table);
+    const uint8_t* src = reinterpret_cast<const uint8_t*>(p.SU) + (long long)unit * (p.K >> 4) * 48;
+    uint4* dst = reinterpret_cast<uint4*>(su_smem);
+    for (int i = threadIdx.x; i < (p.K >> 4) * 4; i += 128) {
+      const uint8_t* row = src + (i >> 2) * 48;
+      const int q = i & 3;
+      const uint2 lo = __ldg(reinterpret_cast<const uint2*>(row + 8 * q));
+      const uint32_t hi = __ldg(reinterpret_cast<const uint32_t*>(row + 32 + 4 * q));
+      uint32_t w[4];
+#pragma unroll
+      for (int b = 0; b < 4; ++b) {
+        uint32_t v = 0;
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+          const int j = 4 * b + t;
+          const uint32_t nib = ((j < 8 ? lo.x : lo.y) >> (4 * (j & 7))) & 15u;
+          const uint32_t code = nib | (((hi >> (2 * j)) & 3u) << 4);
+          v |= (uint32_t)tab[code] << (8 * t);
+        }
+        w[b] = v;
+      }
+      dst[i] = make_uint4(w[0], w[1], w[2], w[3]);
+    }
+    __syncthreads();
+  } else
+#endif
   if (p.SU) {
     const uint4* src = reinterpret_cast<const uint4*>(p.SU + (long long)unit * (p.K >> 4) * 8);
     uint4* dst = reinterpret_cast<uint4*>(su_smem);
@@ -843,7 +879,7 @@ int marlinx_regs(int depth) {
 static int marlinx_gemm_impl(const void* A, long long lda, int M, const void* B, const void* S,
                  const void* GS, void* C, long long ldc, int N, int K, int sms, int depth,
                  void* stream, bool relu2, const void* Z = nullptr, bool pdl = false,
-                 const void* SU = nullptr) {
+                 const void* SU = nullptr, const void* SUT = nullptr) {
   if (M < 1 || M > 8) return -1;
   if (N <= 0 || K <= 0 || N % 128 || K % 128) return -2;
   if (sms <= 0) return -3;
@@ -864,6 +900,8 @@ static int marlinx_gemm_impl(const void* A, long long lda, int M, const void* B,
   p.Z = static_cast<const uint32_t*>(Z);
   p.SU = static_cast<const uint2*>(SU);
   p.vrows = nullptr;
+  p.SUT = static_cast<const uint8_t*>(SUT);
+  if (SUT && (reinterpret_cast<uintptr_t>(SUT) & 15)) return -11;
   if (SU && ((K >> 4) * 64 > 48 * 1024 || (reinterpret_cast<uintptr_t>(SU) & 15))) return -9;
   // Marlin's stripe partition with parallel = 1 and grid = sms.
   int part2 = p.n_tiles;
@@ -967,6 +1005,7 @@ static int marlinx_gemm_lean_impl(const void* A, long long lda, int M, const voi
   p.Z = static_cast<const uint32_t*>(Z2);
   p.SU = nullptr;
   p.vrows = vrows;
+  p.SUT = nullptr;
   int part2 = p.n_tiles;
   if (p.n_tiles > sms) {
     part2 = p.n_tiles % sms;
@@ -1011,6 +1050,21 @@ int marlinx_gemm_su(const void* A, long long lda, int M, const void* B, const vo
   return marlinx_gemm_impl(A, lda, M, B, S, GS, C, ldc, N, K, sms, depth, stream, relu2 != 0, Z,
                            pdl != 0, SU);
 }
+
+#ifndef MARLINX_NO_SU6
+// MARLINX_SU6 variant: SU = py su6_repack(S) codes, SUT = its 64-byte table. Same arithmetic.
+int marlinx_gemm_su6(const void* A, long long lda, int M, const void* B, const void* S,
+                     const void* GS, void* C, long long ldc, int N, int K, int sms, int depth,
+                     void* stream, const void* Z, const void* SU, int relu2, int pdl,
+                     const void* SUT) {
+  if (!SU || !SUT) return -8;
+#ifdef MARLINX_NO_PDL
+  if (pdl) return -10;
+#endif
+  return marlinx_gemm_impl(A, lda, M, B, S, GS, C, ldc, N, K, sms, depth, stream, relu2 != 0, Z,
+                           pdl != 0, SU, SUT);
+}
+#endif
 
 // Streams nbytes from src with blocks x threads, reserving smem bytes of
 // shared memory per CTA. Returns 0 or a cudaError_t value.

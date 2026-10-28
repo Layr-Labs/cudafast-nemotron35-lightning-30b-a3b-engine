@@ -4,6 +4,6 @@
   "max_bytes": 3221225472,
   "spec": {
     "enabled": true,
-    "num_speculative_tokens": 4
+    "num_speculative_tokens": 6
   }
 }

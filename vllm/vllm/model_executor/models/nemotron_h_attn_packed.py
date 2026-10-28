@@ -77,6 +77,7 @@ _registry: dict[int, tuple[torch.Tensor, ...]] = {}
 WS_ENABLED = os.environ.get("BF16WS", "1") != "0"
 WS_ROWS = 496
 _ws: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+_ws_twin: set[int] = set()
 _ws_stats = {"admitted": 0, "rejected": 0, "dispatched": 0}
 
 _PROBE = """
@@ -169,6 +170,8 @@ def _ws_gemm(x: torch.Tensor, w: torch.Tensor, n: int, k: int) -> torch.Tensor |
     if not _ws_stats["dispatched"]:
         logger.info("bf16ws: 496-row attention projections dispatched to the packed kernel")
     _ws_stats["dispatched"] += 1
+    if n == 4608 and k == 2688 and w.data_ptr() in _ws_twin:
+        return bf16ws.gemm_twin(x, packed)
     return bf16ws.gemm(x, packed, n)
 
 
@@ -452,6 +455,96 @@ def _ws_activations(device: torch.device, k: int) -> list[torch.Tensor]:
     return sets
 
 
+def _admit_ws_twin(w: torch.Tensor, packed: torch.Tensor, activations) -> bool:
+    """Qualify the optional path against this exact layer and its replay path.
+
+    Everything here runs on the official device during model preparation. A
+    failed check keeps the existing bf16ws path; timing is a selection, not a
+    claim about whole-model performance.
+    """
+    import bf16ws
+
+    if tuple(w.shape) != (4608, 2688) or torch.cuda.is_current_stream_capturing():
+        return False
+    if not bf16ws.twin_ready(w.device):
+        return False
+    guard_words = 32
+    size = WS_ROWS * 4608
+    guard = torch.full((size + 2 * guard_words,), 0x5a5a, dtype=torch.int16, device=w.device)
+    out = guard[guard_words:-guard_words].view(torch.bfloat16).view(WS_ROWS, 4608)
+    packed_before = packed.clone()
+    weight_before = w.view(torch.int16).clone()
+    # Exercise a contiguous, 16-byte-aligned view whose storage starts earlier
+    # than the actual operand, as well as the standard fresh allocations.
+    offset_storage = torch.empty((WS_ROWS * 2688 + 8,), device=w.device, dtype=torch.bfloat16)
+    offset_a = offset_storage[8:].view(WS_ROWS, 2688)
+    offset_a.copy_(activations[0])
+    for a in (*activations, offset_a):
+        before = a.view(torch.int16).clone()
+        result = bf16ws.gemm_twin(a, packed, out)
+        if not (torch.equal(result.view(torch.int16), bf16ws.gemm(a, packed, 4608).view(torch.int16))
+                and torch.equal(result.view(torch.int16), F.linear(a, w).view(torch.int16))
+                and torch.equal(a.view(torch.int16), before)
+                and torch.all(guard[:guard_words] == 0x5a5a).item()
+                and torch.all(guard[-guard_words:] == 0x5a5a).item()):
+            return False
+    if not torch.equal(packed, packed_before) or not torch.equal(w.view(torch.int16), weight_before):
+        return False
+
+    # Capture both complete custom-op dispatches, change the captured input,
+    # and compare replay results. Each capture owns its output allocation.
+    static_a = activations[0].clone()
+    reference_graph = torch.cuda.CUDAGraph()
+    twin_graph = torch.cuda.CUDAGraph()
+    key = w.data_ptr()
+    _ws_twin.discard(key)
+    try:
+        with torch.cuda.graph(reference_graph):
+            ref_out = torch.ops.vllm.nemo_attn_pk_linear(static_a, w, 4608, 2688, -1)
+        _ws_twin.add(key)
+        with torch.cuda.graph(twin_graph):
+            graph_out = torch.ops.vllm.nemo_attn_pk_linear(static_a, w, 4608, 2688, -1)
+    finally:
+        _ws_twin.discard(key)
+    for a in (activations[0], activations[1]):
+        static_a.copy_(a)
+        reference_graph.replay()
+        twin_graph.replay()
+        if not (torch.equal(ref_out.view(torch.int16), graph_out.view(torch.int16))
+                and torch.equal(graph_out.view(torch.int16), F.linear(a, w).view(torch.int16))
+                and torch.all(guard[:guard_words] == 0x5a5a).item()
+                and torch.all(guard[-guard_words:] == 0x5a5a).item()):
+            return False
+    if not torch.equal(packed, packed_before) or not torch.equal(w.view(torch.int16), weight_before):
+        return False
+
+    # Interleave event measurements to reduce order bias. Require a margin so
+    # noise does not select the experimental path; no local timing is run.
+    pressure = torch.empty((64 * 1024 * 1024,), dtype=torch.uint8, device=w.device)
+    for pressured in (False, True):
+        times = ([], [])
+        for iteration in range(10):
+            for index in ((0, 1) if iteration % 2 == 0 else (1, 0)):
+                if pressured:
+                    # Evict some prior working set before each measured replay;
+                    # pressure traffic itself is not part of the timed interval.
+                    pressure.fill_(iteration + 1)
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                for _ in range(1 if pressured else 8):
+                    (reference_graph if index == 0 else twin_graph).replay()
+                end.record()
+                end.synchronize()
+                if iteration >= 2:
+                    times[index].append(start.elapsed_time(end))
+        times[0].sort()
+        times[1].sort()
+        if times[1][len(times[1]) // 2] >= 0.98 * times[0][len(times[0]) // 2]:
+            return False
+    return True
+
+
 def _prepare_ws(projs) -> int:
     """Pack and admit the 496-row bf16ws copy of each projection: the pack must invert to the
     weight's bytes and the kernel must equal F.linear bit for bit on every synthetic set."""
@@ -469,7 +562,8 @@ def _prepare_ws(projs) -> int:
             packed = bf16ws.prepare(w)
             if packed is not None:
                 ok = torch.equal(bf16ws.unpack_reference(packed, n, k), w.view(torch.uint8))
-                for a in _ws_activations(w.device, k):
+                activations = _ws_activations(w.device, k)
+                for a in activations:
                     if not ok:
                         break
                     ok = torch.equal(F.linear(a, w).view(torch.int16),
@@ -484,6 +578,12 @@ def _prepare_ws(projs) -> int:
         _ws[w.data_ptr()] = (w, packed)
         proj._bws_nk = (n, k)
         _ws_stats["admitted"] += 1
+        try:
+            if _admit_ws_twin(w, packed, activations):
+                _ws_twin.add(w.data_ptr())
+                logger.info("bf16ws: twin-band QKV admitted for this projection")
+        except Exception as exc:  # noqa: BLE001 (optional path remains disabled)
+            logger.warning("bf16ws: twin-band admission failed (%r)", exc)
     logger.info("bf16ws: %d attention projections admitted for the 496-row prefill (%d rejected); "
                 "BF16WS=0 disables", _ws_stats["admitted"], _ws_stats["rejected"])
     return _ws_stats["admitted"]

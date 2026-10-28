@@ -17,6 +17,7 @@ SHAPES = {(4608, 2688): 96, (2688, 4096): 112}
 _lib = None
 _load_failed = False
 _ready_devices = set()
+_twin_ready_devices = set()
 
 
 def _load():
@@ -86,4 +87,36 @@ def gemm(a: torch.Tensor, packed: torch.Tensor, n: int) -> torch.Tensor:
                          torch.cuda.current_stream(a.device).cuda_stream)
     if rc:
         raise RuntimeError(f"bf16ws launch failed: {rc}")
+    return out
+
+
+def twin_ready(device: torch.device) -> bool:
+    """Try the optional QKV kernel without changing the original admission."""
+    if _load() is None or not _ready(device):
+        return False
+    try:
+        init = _lib.bf16ws_twin_init
+        run = _lib.bf16ws_twin_run
+        init.argtypes, init.restype = [], ctypes.c_int
+        run.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_int] * 3 + [ctypes.c_void_p]
+        run.restype = ctypes.c_int
+        with torch.cuda.device(device):
+            index = torch.cuda.current_device()
+            if index not in _twin_ready_devices:
+                if init() != 0:
+                    return False
+                _twin_ready_devices.add(index)
+        return True
+    except AttributeError:
+        return False
+
+
+def gemm_twin(a: torch.Tensor, packed: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+    """QKV only; callers must first qualify this path and guard all operands."""
+    if out is None:
+        out = torch.empty((M, 4608), device=a.device, dtype=torch.bfloat16)
+    rc = _lib.bf16ws_twin_run(a.data_ptr(), packed.data_ptr(), out.data_ptr(), M, 4608, 2688,
+                              torch.cuda.current_stream(a.device).cuda_stream)
+    if rc:
+        raise RuntimeError(f"bf16ws twin launch failed: {rc}")
     return out

@@ -280,6 +280,8 @@ __global__ void __launch_bounds__(NT, 1) gemm(const __grid_constant__ CUtensorMa
   }
 }
 
+#include "bf16ws_twinband_prototype.cuh"
+
 typedef CUresult (*EncodeFn)(CUtensorMap*, CUtensorMapDataType, cuuint32_t, void*, const cuuint64_t*,
                              const cuuint64_t*, const cuuint32_t*, const cuuint32_t*, CUtensorMapInterleave,
                              CUtensorMapSwizzle, CUtensorMapL2promotion, CUtensorMapFloatOOBfill);
@@ -344,4 +346,33 @@ extern "C" int bf16ws_run(const void* a, const void* wp, void* c, int m, int n, 
   if (n == 4608 && k == 2688) return run_shape<QKV>(a, wp, c, (cudaStream_t)stream);
   if (n == 2688 && k == 4096) return run_shape<OPJ>(a, wp, c, (cudaStream_t)stream);
   return (int)cudaErrorInvalidValue;
+}
+
+// Optional path: failure to configure its shared memory does not disable the
+// previously admitted bf16ws kernels. Called separately on each device.
+extern "C" int bf16ws_twin_init() {
+  using namespace bf16ws;
+  if (!encode || num_sms <= 0) return (int)cudaErrorInvalidValue;
+  return (int)cudaFuncSetAttribute(gemm_qkv_twinband_prototype,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize, TWIN_SMEM);
+}
+
+extern "C" int bf16ws_twin_run(const void* a, const void* wp, void* c,
+                                int m, int n, int k, void* stream) {
+  using namespace bf16ws;
+  if (m != M || n != 4608 || k != 2688 || !encode || num_sms <= 0 ||
+      ((uintptr_t)a & 15) || ((uintptr_t)wp & 15) || ((uintptr_t)c & 15))
+    return (int)cudaErrorInvalidValue;
+  CUtensorMap map;
+  cuuint64_t dims[2] = {(cuuint64_t)QKV::KB, (cuuint64_t)M};
+  cuuint64_t strides[1] = {(cuuint64_t)QKV::KB};
+  cuuint32_t box[2] = {(cuuint32_t)KT, (cuuint32_t)BM};
+  cuuint32_t es[2] = {1, 1};
+  if (encode(&map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, const_cast<void*>(a), dims, strides, box, es,
+             CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+             CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) != CUDA_SUCCESS)
+    return -3;
+  Params p{(const uint8_t*)wp, (__nv_bfloat16*)c};
+  gemm_qkv_twinband_prototype<<<QKV::NTN, TWIN_THREADS, TWIN_SMEM, (cudaStream_t)stream>>>(map, p);
+  return (int)cudaGetLastError();
 }

@@ -154,7 +154,10 @@ def _eligible(p):
         package_ok = False
     return (os.environ.get("NEMO_MTP_NATIVE_PLAN_BANK", "1") != "0" and package_ok
             and type(p.model).__name__ == "NemotronHMTP" and p.method == "mtp"
-            and p.speculative_config.num_speculative_tokens == 4
+            and (p.speculative_config.num_speculative_tokens == 4
+                 or (p.speculative_config.num_speculative_tokens == 5
+                     and getattr(getattr(p, "_draft_head_screen", None),
+                                 "_tail_pf_table", None) is not None))
             and not p.speculative_config.enforce_eager
             and not p.parallel_drafting and not p.constant_draft_positions
             and not p.needs_extra_input_slots and p.pass_hidden_states_to_model
@@ -248,8 +251,13 @@ def prepare(p):
 
         # Bound boot work and memory independently of request tokens. Plans for
         # pages outside this generic prefix use the original planner.
-        max_pages = min(blocks, 512)
-        timed_pages = min(blocks, 128)
+        # Depth five uses this bank only to choose private full-loop test
+        # fixtures; production planning is restored after that comparison.
+        # Keep its calibration bounded to a few pages rather than building a
+        # request-time cache that will never be installed.
+        fixture_only = p.speculative_config.num_speculative_tokens == 5
+        max_pages = min(blocks, 4 if fixture_only else 512)
+        timed_pages = min(blocks, 4 if fixture_only else 128)
         calibrated_pages = 0
         raw_float = wrapper._float_workspace_buffer.view(torch.uint8)
         raw_int = wrapper._int_workspace_buffer.view(torch.uint8)

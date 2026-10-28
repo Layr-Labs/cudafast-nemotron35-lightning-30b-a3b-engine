@@ -61,7 +61,7 @@ def maybe_run(p, kwargs, metadata, padded, batch_size):
     return s.hidden, s.screen._out.clone()
 
 
-def prepare(p):
+def prepare(p, compare_to=None):
     if (not ENABLED or getattr(p, "_nemo_step_attempted", False)
             or torch.cuda.is_current_stream_capturing()):
         return
@@ -70,7 +70,7 @@ def prepare(p):
     saved = []
     restore = []
     try:
-        _prepare(p, saved, restore)
+        _prepare(p, saved, restore, compare_to)
     except Exception as exc:
         logger.warning("Native MTP conditional step retained original path: %r", exc)
         p._nemo_step = None
@@ -90,7 +90,7 @@ def prepare(p):
                     s.token, s.timing)
 
 
-def _prepare(p, saved, restore):
+def _prepare(p, saved, restore, compare_to=None):
     full = getattr(p, "_nemo_full", None)
     screen = getattr(p, "_draft_head_screen", None)
     if (full is None or screen is None or getattr(screen, "graph", None) is None
@@ -262,6 +262,27 @@ def _prepare(p, saved, restore):
             b = observe(hid, tok, stopped)
             if len(a) != len(b) or not all(torch.equal(x, y) for x, y in zip(a, b)):
                 raise ValueError(f"conditional step differs (case {case}, stopped={stopped})")
+    if compare_to is not None:
+        # Both arms are actual conditional graphs.  The earlier full-loop
+        # comparison covers the next model reads; this additional guard keeps
+        # the already-qualified conditional path if its recapture regresses.
+        def old_conditional():
+            compare_to.graph.replay()
+            return compare_to.hidden, screen._out.clone()
+
+        for case in range(3):
+            for g, stopped in cases:
+                setup(case, g)
+                a = observe(*old_conditional(), stopped)
+                setup(case, g)
+                b = observe(*new(), stopped)
+                if len(a) != len(b) or not all(torch.equal(x, y) for x, y in zip(a, b)):
+                    raise ValueError("recaptured conditional step differs from baseline")
+        pair_timing = _timed(device, old_conditional, new, setup, start, stop)
+        if (pair_timing[0] <= 0 or pair_timing[2] <= 0
+                or pair_timing[1] > pair_timing[0] * 1.01
+                or pair_timing[3] > pair_timing[2] * 1.03):
+            raise ValueError(f"recaptured conditional step regressed: {pair_timing}")
     timing = None
     if SPEED:
         timing = _timed(device, original, new, setup, start, stop)

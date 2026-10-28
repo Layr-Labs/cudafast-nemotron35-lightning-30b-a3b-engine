@@ -818,6 +818,24 @@ class DraftHeadScreen:
                 and _scrtail is not None and _scrtail.available()):
             self.tail = self._tail_matches(k, device)
             print(f"MTP_SCREEN_TAIL admitted={self.tail}", flush=True)
+        # A separate single table leaves _next_pf empty, so scrtail remains
+        # eligible. The optional path remains disabled until a full-chain
+        # comparison has admitted it; this is only an unvalidated prototype.
+        self._tail_pf_table = None
+        self._tail_pf_enabled = False
+        try:
+            tail_mb = float(os.environ.get("MTP_SCRTAIL_NEXT_MB", "2"))
+            if (self.tail and tail_mb > 0 and _l2pf is not None and _l2pf.ENABLED
+                    and hasattr(_l2pf, "GatedTable")):
+                planes = _l2pf.DRAFT_NEXT.get("qkv")
+                if planes is not None:
+                    table = _l2pf.GatedTable(
+                        _l2pf.packed_ranges(planes, int(tail_mb * (1 << 20))),
+                        device, name="scrtail-next")
+                    if table.nranges:
+                        self._tail_pf_table = table
+        except Exception as exc:  # noqa: BLE001 - retain the original head on setup failure
+            logger.warning("MTP scrtail prefetch prototype unavailable: %r", exc)
         if device.type == "cuda" and screen_graph_enabled():
             # The captured one-row screen is the gated one (depth gate): allocate
             # the gate first so the graph captures its address.
@@ -928,6 +946,36 @@ class DraftHeadScreen:
             num_warps=num_warps, launch_pdl=mtp_pdl(), gate_ptr=tgate, GATED=tgated,
         )
 
+    def _capture_tail_prefetch_graph(self):
+        """Build an uninstalled candidate for a full-loop remote comparison.
+
+        The caller must snapshot and restore the head scratch, depth/adaptive
+        gates and all model state around this capture and the comparison.  A
+        successful capture alone never changes the production graph or admits
+        the candidate.  Warm the side stream outside capture so its creation
+        and kernel initialization cannot occur within a CUDA graph.
+        """
+        _, gate_available = _gate_args(self._out)
+        library = getattr(_l2pf, "_lib", None)
+        if (not self.tail or self.graph is None or self._tail_pf_table is None
+                or not gate_available or library is None
+                or getattr(library, "l2pf_prefetch_table_gated", None) is None
+                or torch.cuda.is_current_stream_capturing()):
+            return None
+        original_enabled = self._tail_pf_enabled
+        try:
+            self._tail_pf_enabled = True
+            for _ in range(2):
+                self._greedy_row(self._h, gated=True, out=self._out)
+            torch.cuda.synchronize(self._h.device)
+            candidate = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(candidate, pool=torch.cuda.graph_pool_handle()):
+                self._greedy_row(self._h, gated=True, out=self._out)
+            torch.cuda.synchronize(self._h.device)
+            return candidate
+        finally:
+            self._tail_pf_enabled = original_enabled
+
     def _tail_matches(self, k: int, device: torch.device) -> bool:
         """Load time, before capture: scrtail against the three-level cascade on random rows
         (several scales, signed zeros, ties) and on the stopped (gated) pass, bitwise on the
@@ -1032,6 +1080,12 @@ class DraftHeadScreen:
             nchunk = self.n // SCREEN_CHUNK
             tgate, tok = _gate_args(self.scores)
             tgated = gated and tok
+            tail_pf_queued = False
+            if (self.tail and tgated and getattr(self, "_tail_pf_enabled", False)
+                    and self._tail_pf_table is not None):
+                # side.wait_stream(main) inside launch orders the gate read
+                # after its prior updates and permits overlap with scrtail.
+                tail_pf_queued = self._tail_pf_table.launch(tgate, self._next_max_kept)
             if self.tail and _scrtail.run(
                 self.scores, self._hm, self._hr, h, self.w_mid, self.s_mid, self.w_rest,
                 self.s_rest, self.w_full, self.s_full, self._cand, self.cand_logits,
@@ -1039,6 +1093,10 @@ class DraftHeadScreen:
                 debug=(self._pre_cand, self.mid_scores, self.scores, self._coarse_cand,
                        self.refine_scores) if self._tail_debug else None,
             ):
+                if tail_pf_queued:
+                    # Selector can update tgate: its write must not race the
+                    # asynchronous prefetch kernel's gated read.
+                    _l2pf.join(h.device)
                 gate, ok = _gate_args(out)
                 _select_token[(1,)](
                     self.cand_logits, self._cand, out, N=self.cand_logits.numel(),
@@ -1048,6 +1106,10 @@ class DraftHeadScreen:
                     CUM=DEPTH_CUMULATIVE, launch_pdl=mtp_pdl(),
                 )
                 return out
+            if tail_pf_queued:
+                # If the tail declined without launching, still retire the
+                # side work before the ordinary cascade mutates its gate.
+                _l2pf.join(h.device)
             # LOCAL PATCH (drafter3): each top-k selection below leaves DRAM idle: a
             # piece of what the next draft pass reads first is queued as each streaming
             # dot ends (skipped on the device for a stopped loop and for the last pass);

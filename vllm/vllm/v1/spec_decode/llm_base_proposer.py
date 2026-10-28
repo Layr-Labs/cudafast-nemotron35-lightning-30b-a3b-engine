@@ -2308,9 +2308,34 @@ class SpecDecodeBaseProposer:
             from vllm.v1.spec_decode.nemotron_step_cond import prepare as prepare_step
             prepare_step(self)
             from vllm.v1.spec_decode.nemotron_decode_plan import prepare as prepare_plan
-            prepare_plan(self)
             from vllm.v1.spec_decode.nemotron_compound_loop import prepare as prepare_loop
-            prepare_loop(self)
+            # For depth five the native plan bank is a private source of real
+            # planner fixtures for the scrtail overlap comparison only.  The
+            # original planner hook is restored before serving any request.
+            depth_five = self.speculative_config.num_speculative_tokens == 5
+            wrapper = None
+            old_hook = None
+            if depth_five and len(self.draft_attn_groups) == 1:
+                builder = self.draft_attn_groups[0].get_metadata_builder()
+                wrapper = getattr(builder, "_decode_wrappers_cudagraph", {}).get(1)
+                if wrapper is not None:
+                    old_hook = getattr(wrapper, "_nemo_native_plan", None)
+            try:
+                prepare_plan(self)
+                prepare_loop(self)
+            finally:
+                if depth_five and wrapper is not None:
+                    wrapper._nemo_native_plan = old_hook
+            screen = getattr(self, "_draft_head_screen", None)
+            if depth_five and getattr(screen, "_tail_pf_enabled", False):
+                # The conditional body embeds _greedy_row at capture time.
+                # Preserve its already-qualified baseline if the separate
+                # candidate fails capture, equivalence, or timing admission.
+                old_step = getattr(self, "_nemo_step", None)
+                self._nemo_step_attempted = False
+                prepare_step(self, compare_to=old_step)
+                if self._nemo_step is None:
+                    self._nemo_step = old_step
 
     def _get_eagle3_use_aux_hidden_state_from_config(self) -> bool:
         """

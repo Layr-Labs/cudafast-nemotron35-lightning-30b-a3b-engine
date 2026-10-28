@@ -289,12 +289,20 @@ def prepare(p):
         return
     values = [p.input_ids[:5], p.positions[:5], p.hidden_states[:5],
               p._slot_mapping_buffer[:5], gate]
+    full_output = p._nemo_full[4][0]
+    if isinstance(full_output, torch.Tensor):
+        values.append(full_output)
     values.extend(t[:4] for t in caches)
     values.extend(t[:5] for t in p.model._moe_row_src_buffers())
-    for name in ("_h", "_out", "scores", "refine_scores", "cand_logits"):
+    screen_buffers = ("_h", "_out", "_hp", "_hm", "_hr", "_pre_cand",
+                      "_coarse_cand", "_cand", "scores", "mid_scores",
+                      "refine_scores", "cand_logits")
+    for name in screen_buffers:
         value = getattr(screen, name, None)
         if isinstance(value, torch.Tensor):
             values.append(value)
+    if isinstance(kernels._ADAPT, torch.Tensor):
+        values.append(kernels._ADAPT)
     for name in ("paged_kv_indptr", "paged_kv_indices", "paged_kv_last_page_len"):
         values.extend((getattr(builder, name).cpu, getattr(builder, name).gpu))
     values.extend((builder.paged_kv_indptr_cpu_buffer,
@@ -345,6 +353,9 @@ def prepare(p):
                 target.copy_(original)
             _restore_bindings(builder, bindings)
             wrapper._plan_info = list(old_plan)
+            bank.last_restore, bank.last_restore_key, bank.last_native_key = old_restore
+            bank.force_native = old_force_native
+            sets._current = old_set_index
             for name, present, value in old_scalars:
                 if present:
                     setattr(wrapper, name, value)
@@ -426,30 +437,34 @@ def prepare(p):
                     _launch_stage(s, p, token, hidden[:1])
             return tuple(tokens)
 
-        # Warm Triton, the existing model/head child graphs and clone outputs
-        # before capturing the three-pass parent. Each token clone has its own
-        # strong owner within this parent graph, including across replays.
-        for _ in range(2):
-            cad, md = setup(s.seed, 0)
-            body(md)
-        cad, capture_md = setup(s.seed, 0)
-        torch.cuda.synchronize(p.device)
-        capture_stream = torch.cuda.Stream(device=p.device)
-        capture_stream.wait_stream(torch.cuda.current_stream())
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=capture_stream,
-                              pool=torch.cuda.graph_pool_handle()):
-            tokens = body(capture_md)
-        torch.cuda.synchronize(p.device)
-        if len({t.data_ptr() for t in tokens}) != 3:
-            raise ValueError("compound draft output slots alias")
-        s.graph, s.tokens = graph, tokens
-        s.owners = (kwargs, capture_md, row_zero, capture_stream)
+        def capture_compound():
+            # Each captured output and child graph must stay alive through
+            # every replay of this particular parent graph.
+            for _ in range(2):
+                cad, md = setup(s.seed, 0)
+                body(md)
+            cad, capture_md = setup(s.seed, 0)
+            torch.cuda.synchronize(p.device)
+            capture_stream = torch.cuda.Stream(device=p.device)
+            capture_stream.wait_stream(torch.cuda.current_stream())
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=capture_stream,
+                                  pool=torch.cuda.graph_pool_handle()):
+                tokens = body(capture_md)
+            torch.cuda.synchronize(p.device)
+            if len({t.data_ptr() for t in tokens}) != 3:
+                raise ValueError("compound draft output slots alias")
+            s.graph, s.tokens = graph, tokens
+            s.owners = (kwargs, capture_md, row_zero, capture_stream, screen.graph)
 
         def original(cad, md):
             tokens = []
             mode, _, across = p._determine_batch_execution_and_padding(1)
             for step in range(3):
+                if p.speculative_config.num_speculative_tokens == 5:
+                    actual_scalars = tuple((n, getattr(wrapper, n)) for n, _ in layout[2])
+                    if tuple(wrapper._plan_info) != layout[1] or actual_scalars != layout[2]:
+                        raise ValueError("native draft plan differs from captured full graph")
                 with set_forward_context(
                     md, p.vllm_config, num_tokens=s.padded,
                     num_tokens_across_dp=across, cudagraph_runtime_mode=mode,
@@ -492,9 +507,12 @@ def prepare(p):
             result.extend((builder.paged_kv_indices.gpu[:pages],
                            builder.paged_kv_indptr.gpu[:2],
                            builder.paged_kv_last_page_len.gpu[:1]))
-            result.extend(getattr(screen, n) for n in (
-                "_h", "_out", "scores", "refine_scores", "cand_logits")
+            result.extend(getattr(screen, n) for n in screen_buffers
                           if isinstance(getattr(screen, n, None), torch.Tensor))
+            if isinstance(kernels._ADAPT, torch.Tensor):
+                result.append(kernels._ADAPT)
+            if isinstance(full_output, torch.Tensor):
+                result.append(full_output)
             return ([t.contiguous().view(torch.uint8).clone() for t in result],
                     cad.max_seq_len)
 
@@ -505,6 +523,75 @@ def prepare(p):
                                        page * p.block_size,
                                        page * p.block_size + 1) if n in s.starts)
         pressure = torch.empty(64 << 20, dtype=torch.uint8, device=p.device)
+
+        # Qualify the independent prefetch child against the same real model,
+        # native metadata path and original head over three draft steps.  In
+        # particular, the timed region contains the *next* model reads, not
+        # just the screen whose work overlaps the prefetch.
+        original_screen_graph = screen.graph
+        candidate_screen_graph = None
+        try:
+            cad, md = setup(s.seed, 0)
+            candidate_screen_graph = screen._capture_tail_prefetch_graph()
+            if candidate_screen_graph is not None:
+                tail_ratios, tail_active = [], []
+                for length in sorted({starts[0], starts[len(starts) // 2], starts[-1]}):
+                    for case in range(4):
+                        for cold in (False, True):
+                            samples = [[], []]
+                            for trial in range(5):
+                                observed = {}
+                                for which in ((0, 1) if trial % 2 == 0 else (1, 0)):
+                                    screen.graph = (original_screen_graph if which == 0
+                                                    else candidate_screen_graph)
+                                    cad, md = setup(length, case)
+                                    if p.speculative_config.num_speculative_tokens == 5:
+                                        # Measure the production native planner,
+                                        # not the temporary fixture bank.
+                                        bank.force_native = True
+                                    if case == 3:
+                                        gate[1].fill_(screen._next_max_kept)
+                                    if cold:
+                                        pressure.fill_(trial + case)
+                                    torch.cuda.synchronize(p.device)
+                                    begin = time.perf_counter()
+                                    out = original(cad, md)
+                                    torch.cuda.synchronize(p.device)
+                                    elapsed = time.perf_counter() - begin
+                                    if not elapsed > 0:
+                                        raise ValueError("invalid scrtail prefetch timing")
+                                    samples[which].append(elapsed)
+                                    observed[which] = observation(cad, out)
+                                a, b = observed[0], observed[1]
+                                if (a[1] != b[1] or len(a[0]) != len(b[0])
+                                        or not all(torch.equal(u, v)
+                                                   for u, v in zip(a[0], b[0]))):
+                                    raise ValueError("scrtail prefetch full-loop state differs")
+                            ratio = statistics.median(samples[1]) / statistics.median(samples[0])
+                            tail_ratios.append(ratio)
+                            if case < 2:
+                                tail_active.append(ratio)
+                if (not tail_active or statistics.median(tail_ratios) >= 0.995
+                        or statistics.median(tail_active) >= 0.995
+                        or max(tail_active) >= 1.01):
+                    raise ValueError("scrtail prefetch did not improve full-loop latency")
+                screen.graph = candidate_screen_graph
+                screen._tail_pf_enabled = True
+                logger.info("MTP scrtail next-pass prefetch admitted by full-loop comparison")
+            else:
+                screen.graph = original_screen_graph
+        except Exception as exc:  # noqa: BLE001 - always retain the original head
+            screen.graph = original_screen_graph
+            screen._tail_pf_enabled = False
+            logger.warning("MTP scrtail next-pass prefetch retained original head: %r", exc)
+
+        if p.speculative_config.num_speculative_tokens == 5:
+            # The existing compound parent is a three-pass depth-4 plan.  In
+            # depth 5 this invocation is qualification only; do not install it.
+            return
+        # Capture after optional child selection, so the compound parent and
+        # the uncaptured original path use the same admitted screen graph.
+        capture_compound()
         ratios, active_ratios = [], []
         # Actual three-pass production path: current plan first, normal side
         # stream staging later, full model child graphs and original head.

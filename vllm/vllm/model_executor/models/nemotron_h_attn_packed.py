@@ -76,7 +76,7 @@ _registry: dict[int, tuple[torch.Tensor, ...]] = {}
 # bf16ws: weight storage address -> (weight, pack); the weight reference keeps the address valid
 WS_ENABLED = os.environ.get("BF16WS", "1") != "0"
 WS_ROWS = 496
-_ws: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+_ws: dict[int, tuple[torch.Tensor, torch.Tensor, bool]] = {}
 _ws_stats = {"admitted": 0, "rejected": 0, "dispatched": 0}
 
 _PROBE = """
@@ -156,7 +156,7 @@ def _ws_gemm(x: torch.Tensor, w: torch.Tensor, n: int, k: int) -> torch.Tensor |
     entry = _ws.get(w.data_ptr())
     if entry is None:
         return None
-    weight, packed = entry
+    weight, packed, pipe = entry
     if not (
         w.shape == weight.shape and w.stride() == weight.stride()
         and x.is_cuda and x.dtype == torch.bfloat16 and x.dim() == 2
@@ -169,7 +169,7 @@ def _ws_gemm(x: torch.Tensor, w: torch.Tensor, n: int, k: int) -> torch.Tensor |
     if not _ws_stats["dispatched"]:
         logger.info("bf16ws: 496-row attention projections dispatched to the packed kernel")
     _ws_stats["dispatched"] += 1
-    return bf16ws.gemm(x, packed, n)
+    return bf16ws.gemm(x, packed, n, pipe=pipe)
 
 
 def _linear_impl(x: torch.Tensor, w: torch.Tensor, n: int, k: int, pid: int) -> torch.Tensor:
@@ -452,6 +452,113 @@ def _ws_activations(device: torch.device, k: int) -> list[torch.Tensor]:
     return sets
 
 
+@torch.no_grad()
+def _ws_pipe_qualify(bf16ws, packed, n, activations) -> bool:
+    """Check the optional pipeline on private owners and time complete captured calls."""
+    if os.environ.get("BF16WS_STAGE_PIPE", "1") == "0":
+        return False
+    device = packed.device
+    try:
+        if torch.cuda.is_current_stream_capturing() or not bf16ws.pipe_ready(device):
+            return False
+        # Compare full output words for the same finite, signed-zero and
+        # non-finite BF16 inputs already used by the reference admission.
+        for a in activations:
+            ref = bf16ws.gemm(a, packed, n)
+            alt = bf16ws.gemm(a, packed, n, pipe=True)
+            if not torch.equal(ref.view(torch.int16), alt.view(torch.int16)):
+                return False
+        torch.cuda.synchronize(device)
+        staged = activations[0].clone()
+        out0 = torch.empty((WS_ROWS, n), device=device, dtype=torch.bfloat16)
+        out1 = torch.empty_like(out0)
+        for _ in range(2):
+            bf16ws.gemm(staged, packed, n, out=out0)
+            bf16ws.gemm(staged, packed, n, pipe=True, out=out1)
+        torch.cuda.synchronize(device)
+        graphs = []
+        for is_pipe, out in ((False, out0), (True, out1)):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=torch.cuda.graph_pool_handle()):
+                for _ in range(3):
+                    bf16ws.gemm(staged, packed, n, pipe=is_pipe, out=out)
+            graphs.append(graph)
+        ratios = []
+        for sample, a in enumerate(activations[:2]):
+            staged.copy_(a)
+            graphs[0].replay()
+            graphs[1].replay()
+            if not torch.equal(out0.view(torch.int16), out1.view(torch.int16)):
+                return False
+            for trial in range(5):
+                measured = [0.0, 0.0]
+                for which in ((0, 1) if (sample + trial) % 2 == 0 else (1, 0)):
+                    start = torch.cuda.Event(enable_timing=True)
+                    end = torch.cuda.Event(enable_timing=True)
+                    start.record()
+                    graphs[which].replay()
+                    end.record()
+                    end.synchronize()
+                    measured[which] = start.elapsed_time(end)
+                if measured[0] <= 0 or measured[1] <= 0:
+                    return False
+                ratios.append(measured[1] / measured[0])
+        ratios.sort()
+        return ratios[len(ratios) // 2] < 0.99 and ratios[-1] < 1.01
+    except Exception as exc:  # noqa: BLE001 - keep the existing admitted kernel
+        logger.warning("bf16ws: stage pipeline admission failed (%r); original kept", exc)
+        return False
+
+
+@torch.no_grad()
+def _ws_faster_than_linear(bf16ws, w, packed, n, activations, pipe: bool) -> bool:
+    """Admit the selected BF16WS path only if it beats the actual base F.linear."""
+    device = packed.device
+    try:
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        staged = activations[0].clone()
+        out = torch.empty((WS_ROWS, n), device=device, dtype=torch.bfloat16)
+        for _ in range(2):
+            F.linear(staged, w)
+            bf16ws.gemm(staged, packed, n, pipe=pipe, out=out)
+        torch.cuda.synchronize(device)
+        linear_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(linear_graph, pool=torch.cuda.graph_pool_handle()):
+            for _ in range(3):
+                linear_out = F.linear(staged, w)
+        packed_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(packed_graph, pool=torch.cuda.graph_pool_handle()):
+            for _ in range(3):
+                bf16ws.gemm(staged, packed, n, pipe=pipe, out=out)
+        graphs = (linear_graph, packed_graph)
+        ratios = []
+        for sample, a in enumerate(activations[:2]):
+            staged.copy_(a)
+            linear_graph.replay()
+            packed_graph.replay()
+            if not torch.equal(linear_out.view(torch.int16), out.view(torch.int16)):
+                return False
+            for trial in range(5):
+                measured = [0.0, 0.0]
+                for which in ((0, 1) if (sample + trial) % 2 == 0 else (1, 0)):
+                    start = torch.cuda.Event(enable_timing=True)
+                    end = torch.cuda.Event(enable_timing=True)
+                    start.record()
+                    graphs[which].replay()
+                    end.record()
+                    end.synchronize()
+                    measured[which] = start.elapsed_time(end)
+                if measured[0] <= 0 or measured[1] <= 0:
+                    return False
+                ratios.append(measured[1] / measured[0])
+        ratios.sort()
+        return ratios[len(ratios) // 2] < 0.99 and ratios[-1] < 1.01
+    except Exception as exc:  # noqa: BLE001 - keep the highest-base F.linear
+        logger.warning("bf16ws: F.linear comparison failed (%r); original kept", exc)
+        return False
+
+
 def _prepare_ws(projs) -> int:
     """Pack and admit the 496-row bf16ws copy of each projection: the pack must invert to the
     weight's bytes and the kernel must equal F.linear bit for bit on every synthetic set."""
@@ -469,7 +576,8 @@ def _prepare_ws(projs) -> int:
             packed = bf16ws.prepare(w)
             if packed is not None:
                 ok = torch.equal(bf16ws.unpack_reference(packed, n, k), w.view(torch.uint8))
-                for a in _ws_activations(w.device, k):
+                activations = _ws_activations(w.device, k)
+                for a in activations:
                     if not ok:
                         break
                     ok = torch.equal(F.linear(a, w).view(torch.int16),
@@ -481,7 +589,11 @@ def _prepare_ws(projs) -> int:
         if not ok:
             _ws_stats["rejected"] += 1
             continue
-        _ws[w.data_ptr()] = (w, packed)
+        pipe = _ws_pipe_qualify(bf16ws, packed, n, activations)
+        if not _ws_faster_than_linear(bf16ws, w, packed, n, activations, pipe):
+            _ws_stats["rejected"] += 1
+            continue
+        _ws[w.data_ptr()] = (w, packed, pipe)
         proj._bws_nk = (n, k)
         _ws_stats["admitted"] += 1
     logger.info("bf16ws: %d attention projections admitted for the 496-row prefill (%d rejected); "

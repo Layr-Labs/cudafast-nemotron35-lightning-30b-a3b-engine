@@ -183,7 +183,7 @@ __device__ __forceinline__ void epilogue(const float (&acc)[NW][4], __nv_bfloat1
   }
 }
 
-template <class S>
+template <class S, bool PIPE = false>
 __global__ void __launch_bounds__(NT, 1) gemm(const __grid_constant__ CUtensorMap tmA, const Params p) {
   constexpr int N = S::N_, NW = S::NW, BN = S::BN, NTILES = S::NTILES, NKT = S::NKT;
   constexpr int WSZ = S::WSZ, STB = S::STB;
@@ -238,6 +238,47 @@ __global__ void __launch_bounds__(NT, 1) gemm(const __grid_constant__ CUtensorMa
     if (tid == 0 && g + 1 < total) produce(g + 1);
     mbar_wait(full0 + 8 * s, n & 1);
     const uint32_t abase = sbase + s * STB, wbase = abase + ASZ;
+    if constexpr (PIPE) {
+      // Two register banks overlap the next ldmatrix group with this group's
+      // MMA chain.  The final shared read completes before this warp releases
+      // the stage; the final MMA consumes registers only after that release.
+      uint32_t aa[2][MW][4], bb[2][NW][2];
+      auto load_fragments = [&](int ks, uint32_t (&a)[MW][4], uint32_t (&b)[NW][2]) {
+#pragma unroll
+        for (int i = 0; i < MW; ++i) {
+          const int r = wm * MW * 16 + i * 16 + ar;
+          if (rb0 + i * 16 < M) ldsm4(abase + r * KT + swz(r, 2 * ks + ach) * 16, a[i]);
+        }
+#pragma unroll
+        for (int j = 0; j < NW / 2; ++j) {
+          const int r = wn * NW * 8 + j * 16 + br;
+          uint32_t qd[4];
+          ldsm4(wbase + r * KT + swz(r, 2 * ks + bch) * 16, qd);
+          b[2 * j][0] = qd[0]; b[2 * j][1] = qd[1];
+          b[2 * j + 1][0] = qd[2]; b[2 * j + 1][1] = qd[3];
+        }
+        if constexpr (NW % 2 == 1) {
+          const int r = wn * NW * 8 + (NW - 1) * 8 + b2r;
+          ldsm2(wbase + r * KT + swz(r, 2 * ks + b2ch) * 16, b[NW - 1][0], b[NW - 1][1]);
+        }
+      };
+      load_fragments(0, aa[0], bb[0]);
+#pragma unroll
+      for (int ks = 0; ks < KT / 32; ++ks) {
+        const int cur = ks & 1;
+        if (ks + 1 < KT / 32) load_fragments(ks + 1, aa[cur ^ 1], bb[cur ^ 1]);
+        if (ks == KT / 32 - 1) {
+          asm volatile("" ::: "memory");
+          __syncwarp();
+          if (lane == 0) mbar_arrive(empty0 + 8 * s);
+        }
+#pragma unroll
+        for (int i = 0; i < MW; ++i)
+          if (rb0 + i * 16 < M)
+#pragma unroll
+            for (int j = 0; j < NW; ++j) mma(aa[cur][i], bb[cur][j][0], bb[cur][j][1], acc[i][j]);
+      }
+    } else {
 #pragma unroll
     for (int ks = 0; ks < KT / 32; ++ks) {  // ascending K within the stage: 16 BF16 values per MMA
       uint32_t a[MW][4], b[NW][2];
@@ -265,6 +306,7 @@ __global__ void __launch_bounds__(NT, 1) gemm(const __grid_constant__ CUtensorMa
     }
     __syncwarp();
     if (lane == 0) mbar_arrive(empty0 + 8 * s);
+    }
     if (++kt == NKT) {
       kt = 0; ++ti;
       const int col0 = nt * BN + wn * NW * 8;
@@ -293,7 +335,7 @@ static int pack_shape(const void* w, void* wp, cudaStream_t stream) {
   return (int)cudaGetLastError();
 }
 
-template <class S>
+template <class S, bool PIPE = false>
 static int run_shape(const void* a, const void* wp, void* c, cudaStream_t stream) {
   CUtensorMap map;
   // the activation's bytes: [M][2K]
@@ -307,7 +349,7 @@ static int run_shape(const void* a, const void* wp, void* c, cudaStream_t stream
     return -3;
   Params p{(const uint8_t*)wp, (__nv_bfloat16*)c};
   const int grid = num_sms < S::NTILES ? num_sms : S::NTILES;
-  gemm<S><<<grid, NT, S::SMEM, stream>>>(map, p);
+  gemm<S, PIPE><<<grid, NT, S::SMEM, stream>>>(map, p);
   return (int)cudaGetLastError();
 }
 }  // namespace bf16ws
@@ -329,6 +371,16 @@ extern "C" int bf16ws_init() {
   return (int)e;
 }
 
+// Optional pipeline has its own initialization, so refusal never disables the
+// unchanged bf16ws implementation.
+extern "C" int bf16ws_pipe_init() {
+  using namespace bf16ws;
+  if (!encode || num_sms <= 0) return (int)cudaErrorInvalidValue;
+  cudaError_t e = cudaFuncSetAttribute(gemm<QKV, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, QKV::SMEM);
+  if (e == cudaSuccess) e = cudaFuncSetAttribute(gemm<OPJ, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, OPJ::SMEM);
+  return (int)e;
+}
+
 // w: [N][K] BF16 (the linear layer's weight); wp: 2*N*K bytes.
 extern "C" int bf16ws_pack(const void* w, void* wp, int n, int k, void* stream) {
   using namespace bf16ws;
@@ -343,5 +395,14 @@ extern "C" int bf16ws_run(const void* a, const void* wp, void* c, int m, int n, 
   if (((uintptr_t)a & 15) || ((uintptr_t)wp & 15) || ((uintptr_t)c & 15)) return (int)cudaErrorInvalidValue;
   if (n == 4608 && k == 2688) return run_shape<QKV>(a, wp, c, (cudaStream_t)stream);
   if (n == 2688 && k == 4096) return run_shape<OPJ>(a, wp, c, (cudaStream_t)stream);
+  return (int)cudaErrorInvalidValue;
+}
+
+extern "C" int bf16ws_run_pipe(const void* a, const void* wp, void* c, int m, int n, int k, void* stream) {
+  using namespace bf16ws;
+  if (m != M || !encode || num_sms <= 0) return (int)cudaErrorInvalidValue;
+  if (((uintptr_t)a & 15) || ((uintptr_t)wp & 15) || ((uintptr_t)c & 15)) return (int)cudaErrorInvalidValue;
+  if (n == 4608 && k == 2688) return run_shape<QKV, true>(a, wp, c, (cudaStream_t)stream);
+  if (n == 2688 && k == 4096) return run_shape<OPJ, true>(a, wp, c, (cudaStream_t)stream);
   return (int)cudaErrorInvalidValue;
 }

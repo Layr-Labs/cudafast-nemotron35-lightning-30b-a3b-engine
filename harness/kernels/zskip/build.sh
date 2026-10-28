@@ -20,7 +20,9 @@ rm -f "$out/libzskip.so"  # the fallbacks below test for this build's output, no
 # --use_fast_math) are written as explicit mul.rn.ftz.f32; nothing else in the kernel is fp32.
 # Build with the PDL launch path; if that does not build, without it (-DZSKIP_NO_PDL: the
 # previous source; the Python side then keeps the ordinary launch).
-for flags in "" "-DZSKIP_NO_PDL" "-DZSKIP_NO_FUSED" "-DZSKIP_NO_PDL -DZSKIP_NO_FUSED" \
+for flags in "" "-DZSKIP_NO_EARLY_ISSUE" "-DZSKIP_NO_PDL" "-DZSKIP_NO_PDL -DZSKIP_NO_EARLY_ISSUE" \
+  "-DZSKIP_NO_FUSED" "-DZSKIP_NO_FUSED -DZSKIP_NO_EARLY_ISSUE" "-DZSKIP_NO_PDL -DZSKIP_NO_FUSED" \
+  "-DZSKIP_NO_PDL -DZSKIP_NO_FUSED -DZSKIP_NO_EARLY_ISSUE" \
   "-DZSKIP_NO_PAIR" "-DZSKIP_NO_PAIR -DZSKIP_NO_PDL" \
   "-DZSKIP_NO_PAIR -DZSKIP_NO_FUSED" "-DZSKIP_NO_PAIR -DZSKIP_NO_PDL -DZSKIP_NO_FUSED"; do
   test -n "$flags" && echo "zskip: previous build failed; rebuilding with $flags" >&2

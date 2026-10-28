@@ -31,6 +31,9 @@ constexpr int F_ZHALF = 1, F_NOSPLIT = 2, F_BPF = 4, F_RPF = 8, F_WPF = 16;
 // then at 64 + 4 * g8 the u32 of their high 2-bit parts (bits 2i..2i+1). s6_decode rebuilds the
 // same 16 bytes the 8-bit plane's 16-byte load gives, before any use.
 constexpr int F_S6 = 32;
+// Experimental schedule: issue the independent future slot before consuming
+// the current slot's data.  The ring size R+1 makes the two slots distinct.
+constexpr int F_EARLY_ISSUE = 1 << 12;
 constexpr uint32_t S6_BASE = 62u;
 // F_WPF: with group j's loads, each lane requests its own pieces of group j + R + D into L2 (the
 // k rows of its mask bits, 8 bytes each, and its 16 scale bytes)
@@ -249,6 +252,9 @@ __device__ __forceinline__ void lean_main(float (&acc)[8][4], const Params& p, c
 #pragma unroll
       for (int i = 0; i < NS; ++i) {
         if (j0 + i < nsteps) {
+          if constexpr ((F & F_EARLY_ISSUE) != 0) {
+            if (j0 + i + R < nsteps) issue((i + R) % NS, j0 + i + R);
+          }
           uint32_t w_[8], s_[4], x_[2];
           const uint32_t m_ = M_[i];
 #pragma unroll
@@ -281,7 +287,9 @@ __device__ __forceinline__ void lean_main(float (&acc)[8][4], const Params& p, c
             }
           }
           // refill before the math: the loads of group j + R start before group j's math
-          if (j0 + i + R < nsteps) issue((i + R) % NS, j0 + i + R);
+          if constexpr ((F & F_EARLY_ISSUE) == 0) {
+            if (j0 + i + R < nsteps) issue((i + R) % NS, j0 + i + R);
+          }
           if (math) {
             lean_group<(F & F_ZHALF) != 0, NR1>(acc, alo, ahi, w_, s_, x_, m_, neg0);
           } else if (p.mode == LOADONLY) {

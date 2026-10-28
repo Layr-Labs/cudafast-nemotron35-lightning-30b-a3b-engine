@@ -198,6 +198,20 @@ def finalize(layer: torch.nn.Module) -> None:
             )
         except Exception as exc:  # optional prefix; original checked pair remains
             logger.warning_once("zskip: prefix check unavailable (%r); full pair retained", exc)
+    # Independent schedule only after the original S6 owner is fully admitted.
+    # The qualification creates private fixtures; no request data is retained.
+    if getattr(layer, "zskip_pair_config", None) == 663:
+        try:
+            from . import humming_zskip_early_issue as early_issue
+
+            packed = layer.zskip_pair_w2
+            if (_pair_check(layer, packed, 664, ms=range(1, 9), ref_config=663)
+                and (not layer.zskip_pair_prefix_ok
+                     or _pair_check(layer, packed, 664, prefix=True, ref_config=663))
+                and early_issue.qualify(layer, _zskip, _align)):
+                layer.zskip_pair_config = 664
+        except Exception as exc:  # optional experiment; retain the checked 663 path
+            logger.warning_once("zskip: early issue unavailable (%r); config 663 retained", exc)
 
 
 def _prepare_pair(layer: torch.nn.Module) -> None:
@@ -652,6 +666,17 @@ def maybe_down(
         smallk = sys.modules.get("smallk")
         if smallk is not None and hasattr(smallk, "live_verify_rows"):
             vrows = smallk.live_verify_rows(inputs.device)
+    pair_config = layer.zskip_pair_config if use_pair else None
+    if pair_config == 664:
+        # The candidate changes read scheduling, so keep the checked original
+        # for any potentially overlapping output owner, including metadata.
+        out_storage = outputs.untyped_storage().data_ptr()
+        sources = (inputs, pair.w, pair.s, pair.gs, moe_kwargs["sorted_ids"],
+                   moe_kwargs["expert_ids"], moe_kwargs["num_tokens_padded"])
+        if vrows is not None:
+            sources += (vrows,)
+        if any(t.untyped_storage().data_ptr() == out_storage for t in sources):
+            pair_config = 663
     _zskip.down(
         inputs,
         moe_kwargs["sorted_ids"],
@@ -660,7 +685,7 @@ def maybe_down(
         pair if use_pair else packed,
         outputs,
         mode=_zskip.SKIP,
-        config=layer.zskip_pair_config if use_pair else getattr(layer, "zskip_config", CONFIG),
+        config=pair_config if use_pair else getattr(layer, "zskip_config", CONFIG),
         max_blocks=rows,
         verify_rows=vrows,
     )

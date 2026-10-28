@@ -1808,9 +1808,14 @@ static int launch_pair(const Params& p, cudaStream_t stream) {
 // lean paired decode (zskip_lean.cuh): config id, warps per CTA, ring depth R, flags (F_ZHALF 1,
 // F_NOSPLIT 2, F_BPF 4, F_RPF 8, F_WPF 16, F_S6 32, prefetch distance code << 8); 653 is the default;
 // 663 is 653 reading the 6-bit scale plane (to_s6)
+#ifndef ZSKIP_NO_EARLY_ISSUE
+#define ZSKIP_EARLY_CONFIG(X) X(664, 1, 3, 4402)
+#else
+#define ZSKIP_EARLY_CONFIG(X)
+#endif
 #define ZSKIP_LEAN_CONFIGS(X) X(604, 1, 2, 260) X(613, 1, 2, 2820) X(616, 1, 2, 2824) X(630, 1, 2, 0) \
   X(640, 1, 3, 272) X(645, 1, 4, 272) X(653, 1, 3, 274) X(656, 1, 4, 274) X(658, 1, 2, 274) \
-  X(663, 1, 3, 306)
+  X(663, 1, 3, 306) ZSKIP_EARLY_CONFIG(X)
 template <int WPC, int R, int F>
 static int launch_lean(const Params& p, cudaStream_t stream) {
 #ifndef ZSKIP_NO_PDL

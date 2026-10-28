@@ -1,0 +1,488 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Optional first-screen gather/dot fusion. All execution official remote only.
+
+The original first-dot body below is copied from whole-highest1faceed1;
+only an unconditional CTA0 gather prefix and additive pointer arguments differ.
+No local import, syntax/AST execution, compile, test or benchmark occurred.
+"""
+import math
+import os
+import statistics
+from types import SimpleNamespace
+
+import torch
+from vllm.triton_utils import tl, triton
+from .nemotron_h_mtp_screen import _e2m1_pair
+
+@triton.jit
+def gather_first_dot(
+    h_ptr,  # [2 * NBYTES] fp32
+    w_ptr,  # [N, NBYTES] uint8, element 2j in the low nibble of byte j
+    s_ptr,  # [N, NBYTES // 8] fp8 e4m3 group scales
+    rows_ptr,  # [R] int64 row ids, or unused when GATHER is False
+    out_ptr,  # [R] fp32
+    R,
+    gscale,
+    NBYTES: tl.constexpr,
+    GATHER: tl.constexpr,
+    BR: tl.constexpr,
+    BB: tl.constexpr,
+    INDEX32: tl.constexpr = False,
+    gate_ptr=None,
+    GATED: tl.constexpr = False,
+    launch_pdl: tl.constexpr = False,
+    hcols_ptr=None,  # [2 * NBYTES] int64 columns of h to read, when HCOLS
+    HCOLS: tl.constexpr = False,
+    ref_ptr=None,  # [R] int64 second-stage top-k indices, when RMODE == 2
+    RMODE: tl.constexpr = 0,
+    CHUNK: tl.constexpr = 1,
+    CPER: tl.constexpr = 1,
+    SPER: tl.constexpr = 1,
+    base_ptr=None,  # [N] fp32 per-row scores already computed over other groups, when BASE
+    BASE: tl.constexpr = False,
+    scatter_ptr=None,  # [N] fp32: the result is also stored at its row, when SCATTER
+    SCATTER: tl.constexpr = False,
+    SCALE_EF: tl.constexpr = False,
+    hp_ptr=None, hm_cols_ptr=None, hm_ptr=None, hr_cols_ptr=None, hr_ptr=None,
+):
+    """RMODE 0: rows from GATHER as before. 1: rows = rows_ptr[r] + (r // CPER) * CHUNK
+    (first-stage top-k indices within their chunk). 2: rows = rows_ptr[c * CPER + ref_ptr[r]]
+    + c * CHUNK with c = r // SPER (the second stage's picks among them). HCOLS reads
+    h[hcols_ptr[j]] where h[j] was read: the same elements a gathered copy holds."""
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    pid = tl.program_id(0)
+    # Publish all original pure-gather workspaces, even for a stopped pass.
+    # Other CTAs only read immutable full h and do not depend on these stores.
+    if pid == 0:
+        a = tl.arange(0, 256)
+        tl.store(hp_ptr + a, tl.load(h_ptr + tl.load(hcols_ptr + a)))
+        b = tl.arange(0, 256)
+        tl.store(hm_ptr + b, tl.load(h_ptr + tl.load(hm_cols_ptr + b)))
+        c = tl.arange(0, 512)
+        tl.store(hr_ptr + c, tl.load(h_ptr + tl.load(hr_cols_ptr + c)))
+    r = pid * BR + tl.arange(0, BR)
+    rmask = r < R
+    if GATED:
+        if tl.load(gate_ptr) != 0:
+            # Stopped draft pass: the +0 sums its masked weight and scale loads
+            # would give, without reading rows, weights or h.
+            tl.store(out_ptr + r, tl.zeros((BR,), dtype=tl.float32) * gscale, mask=rmask)
+            return
+    wr = rmask
+    if RMODE == 1:
+        rows = tl.load(rows_ptr + r, mask=rmask, other=0) + (r // CPER) * CHUNK
+        if INDEX32:
+            rows = rows.to(tl.int32)
+        else:
+            rows = rows.to(tl.int64)
+    elif RMODE == 2:
+        c = r // SPER
+        sel = tl.load(ref_ptr + r, mask=rmask, other=0)
+        rows = tl.load(rows_ptr + c * CPER + sel, mask=rmask, other=0) + c * CHUNK
+        if INDEX32:
+            rows = rows.to(tl.int32)
+        else:
+            rows = rows.to(tl.int64)
+    elif GATHER:
+        if INDEX32:
+            rows = tl.load(rows_ptr + r, mask=rmask, other=0).to(tl.int32)
+        else:
+            rows = tl.load(rows_ptr + r, mask=rmask, other=0).to(tl.int64)
+    else:
+        if INDEX32:
+            rows = r.to(tl.int32)
+        else:
+            rows = r.to(tl.int64)
+    acc = tl.zeros((BR,), dtype=tl.float32)
+    for b0 in range(0, NBYTES, BB):
+        ob = b0 + tl.arange(0, BB)
+        wb = tl.load(
+            w_ptr + rows[:, None] * NBYTES + ob[None, :],
+            mask=wr[:, None],
+            other=0,
+            eviction_policy="evict_first",
+        ).to(tl.int32)
+        og = (b0 // 8) + tl.arange(0, BB // 8)
+        sc = tl.load(
+            s_ptr + rows[:, None] * (NBYTES // 8) + og[None, :],
+            mask=wr[:, None],
+            other=0.0,
+            eviction_policy="evict_first" if SCALE_EF else "",
+        ).to(tl.float32)
+        if HCOLS:
+            hl = tl.load(h_ptr + tl.load(hcols_ptr + 2 * ob))
+            hh = tl.load(h_ptr + tl.load(hcols_ptr + 2 * ob + 1))
+        else:
+            hl = tl.load(h_ptr + 2 * ob)
+            hh = tl.load(h_ptr + 2 * ob + 1)
+        lo, hi = _e2m1_pair(wb)
+        part = lo * hl[None, :] + hi * hh[None, :]
+        part = tl.reshape(part, (BR, BB // 8, 8))
+        acc += tl.sum(tl.sum(part, axis=2) * sc, axis=1)
+    if BASE:
+        # LOCAL PATCH (cudafast-nemotron35): base[row] (the coarse stage's score over
+        # its own groups) plus this kernel's dot over the remaining groups.
+        b = tl.load(base_ptr + rows, mask=wr, other=0.0)
+        tl.store(out_ptr + r, b + acc * gscale, mask=rmask)
+        if SCATTER:
+            tl.store(scatter_ptr + rows, b + acc * gscale, mask=rmask)
+    else:
+        tl.store(out_ptr + r, acc * gscale, mask=rmask)
+
+
+_ENABLED = os.environ.get("MTP_SCREEN_GATHER_FIRST", "1") != "0"
+_ENTRIES = {}
+_MUTABLE = ("_h", "_out", "_hp", "_hm", "_hr", "scores", "_pre_cand",
+            "mid_scores", "_coarse_cand", "refine_scores", "_cand", "cand_logits")
+
+
+def _sig(t):
+    return id(t), t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.dtype, t.device
+
+
+def _span(t):
+    return t.data_ptr(), t.data_ptr() + t.numel() * t.element_size()
+
+
+def _overlap(a, b):
+    al, ah = _span(a)
+    bl, bh = _span(b)
+    return al < bh and bl < ah
+
+
+def _owner(screen):
+    from . import nemotron_h_mtp_screen as s
+    if (not _ENABLED or not screen.tail or not screen.cascade or not screen.fused_topk
+            or not screen.pre or screen._next_pf or s._scrtail is None
+            or not s._scrtail.available() or screen.n != 131072
+            or screen.pre_cols.shape != (256,) or screen.mid_cols.shape != (256,)
+            or screen.rest_cols.shape != (512,) or screen.w_pre.shape != (screen.n, 128)
+            or screen.s_pre.shape != (screen.n, 16)
+            or screen._hp.shape != (256,) or screen._hm.shape != (256,)
+            or screen._hr.shape != (512,) or screen.scores.shape != (screen.n,)):
+        return None
+    tensors = {n: t for n, t in vars(screen).items() if isinstance(t, torch.Tensor)}
+    if (not all(n in tensors for n in _MUTABLE) or screen._h.dtype != torch.float32
+            or screen._h.shape != (2688,) or not screen._h.is_cuda
+            or torch.cuda.get_device_capability(screen._h.device) != (12, 1)
+            or any(not t.is_cuda or t.device != screen._h.device or not t.is_contiguous()
+                   for t in tensors.values())
+            or any(getattr(screen, n).dtype != torch.float32 for n in ("_hp", "_hm", "_hr", "scores"))
+            or any(getattr(screen, n).dtype != torch.int64 for n in ("pre_cols", "mid_cols", "rest_cols"))):
+        return None
+    # New CTA0 stores must never change a different CTA's hidden/weight input.
+    outputs = [tensors[n] for n in _MUTABLE if n != "_h"]
+    immutable = {n: t for n, t in tensors.items() if n not in _MUTABLE}
+    if (any(_overlap(a, b) for i, a in enumerate(outputs) for b in outputs[i + 1:])
+            or any(_overlap(a, b) for a in outputs for b in immutable.values())
+            or any(_overlap(a, screen._h) for a in outputs)):
+        return None
+    scale = float(screen.gscale)
+    if not math.isfinite(scale):
+        return None
+    return SimpleNamespace(screen=screen, tensors=tensors,
+                           signatures={n: _sig(t) for n, t in tensors.items()},
+                           immutable=immutable, scale=scale, n=screen.n,
+                           device=screen._h.device, pdl=s.mtp_pdl(),
+                           scale_ef=s.SCREEN_SCALE_EF, theta=s.DEPTH_THETA,
+                           cumulative=s.DEPTH_CUMULATIVE, tail_module=s._scrtail)
+
+
+def _can(spec, h, gated):
+    from . import nemotron_h_mtp_screen as s
+    screen = spec.screen
+    if (not _ENABLED or not gated or not screen.tail or not screen.cascade or not screen.fused_topk
+            or not screen.pre or screen._next_pf or s._scrtail is not spec.tail_module
+            or float(screen.gscale) != spec.scale or screen.n != spec.n
+            or s.mtp_pdl() != spec.pdl or s.SCREEN_SCALE_EF != spec.scale_ef
+            or s.DEPTH_THETA != spec.theta or s.DEPTH_CUMULATIVE != spec.cumulative
+            or any(_sig(getattr(screen, n)) != q for n, q in spec.signatures.items())
+            or h.dtype != torch.float32 or h.shape != (2688,)
+            or h.device != spec.device or not h.is_contiguous()
+            or any(_overlap(h, getattr(screen, n)) for n in _MUTABLE if n != "_h")):
+        return False
+    gate, ok = s._gate_args(h)
+    if gated and (not ok or gate.dtype != torch.int32 or gate.shape != (4,) or not gate.is_contiguous()
+                  or _overlap(gate, h)
+                  or any(_overlap(gate, getattr(screen, n)) for n in _MUTABLE)):
+        return False
+    return True
+
+
+def _run(spec, h, gated):
+    if not _can(spec, h, gated):
+        return False  # Nothing launched.
+    from . import nemotron_h_mtp_screen as s
+    screen = spec.screen
+    gate, ok = s._gate_args(h)
+    gather_first_dot[(triton.cdiv(spec.n, 64),)](
+        h, screen.w_pre, screen.s_pre, screen.scores, screen.scores, spec.n, spec.scale,
+        NBYTES=128, GATHER=False, BR=64, BB=64, INDEX32=True,
+        gate_ptr=gate, GATED=gated and ok, launch_pdl=spec.pdl,
+        hcols_ptr=screen.pre_cols, HCOLS=True,
+        RMODE=0, CHUNK=s.SCREEN_CHUNK, CPER=1, SPER=1,
+        BASE=False, SCATTER=False, SCALE_EF=spec.scale_ef,
+        hp_ptr=screen._hp, hm_cols_ptr=screen.mid_cols, hm_ptr=screen._hm,
+        hr_cols_ptr=screen.rest_cols, hr_ptr=screen._hr,
+        num_warps=4, num_stages=2)
+    return True  # Any compiler/runtime failure propagates after dispatch.
+
+
+def maybe_first(screen, h, gated):
+    spec = _ENTRIES.get(id(screen))
+    return False if spec is None else _run(spec, h, gated)
+
+
+def _new_full(spec, h, gated, out):
+    from . import nemotron_h_mtp_screen as s
+    screen = spec.screen
+    if not _run(spec, h, gated):
+        raise RuntimeError("private production gather-first contract refused")
+    gate, ok = s._gate_args(out)
+    if not s._scrtail.run(
+        screen.scores, screen._hm, screen._hr, h, screen.w_mid, screen.s_mid,
+        screen.w_rest, screen.s_rest, screen.w_full, screen.s_full,
+        screen._cand, screen.cand_logits, screen.gscale,
+        gate=gate if gated and ok else None, win=0, pdl=spec.pdl,
+        debug=(screen._pre_cand, screen.mid_scores, screen.scores,
+               screen._coarse_cand, screen.refine_scores) if screen._tail_debug else None,
+    ):
+        raise RuntimeError("actual original scrtail unavailable for private full-body timing")
+    s._select_token[(1,)](
+        screen.cand_logits, screen._cand, out, N=screen.cand_logits.numel(),
+        BLOCK=triton.next_power_of_2(screen.cand_logits.numel()),
+        gate_ptr=gate, GATED=gated and ok, THETA=spec.theta,
+        CUM=spec.cumulative, launch_pdl=spec.pdl)
+
+
+def _words(a, b):
+    return torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+
+
+def _guarded(t):
+    owner = torch.empty(t.numel() + 128, dtype=t.dtype, device=t.device)
+    owner.view(torch.uint8).fill_(0xA5)
+    return owner, owner[64:-64].view(t.shape)
+
+
+def _guard(pair):
+    if pair is None or pair[0] is None:
+        return True
+    return bool(torch.all(pair[0][:64].view(torch.uint8) == 0xA5).item()
+                and torch.all(pair[0][-64:].view(torch.uint8) == 0xA5).item())
+
+
+def _snapshot(screen):
+    return {n: getattr(screen, n).clone() for n in _MUTABLE}
+
+
+def _restore(screen, saved):
+    for n, t in saved.items():
+        getattr(screen, n).copy_(t)
+
+
+def _observe(screen, gate, out):
+    return (out.clone(), gate.clone(), *[getattr(screen, n).clone() for n in _MUTABLE])
+
+
+@torch.no_grad()
+def _qualify(spec, guard_pairs, debug, timing):
+    from . import nemotron_h_mtp_screen as s
+    from . import nemotron_h_mtp_kernels as k
+    screen = spec.screen
+    screen._tail_debug = debug
+    gen = torch.Generator(device=spec.device).manual_seed(2026102841 + int(debug))
+    hb = None if timing else _guarded(screen._h)
+    h = screen._h if timing else hb[1]
+    cont = torch.empty_like(h)
+    gate = k._GATE
+    gate_start = torch.empty_like(gate)
+    oldouts = [_guarded(screen._out) for _ in range(8)]
+    newouts = [_guarded(screen._out) for _ in range(8)]
+    if timing:
+        # Also exercise the actual captured screen's output address. Seven
+        # other independently owned outputs remain in each arm.
+        oldouts[0] = (None, screen._out)
+        newouts[0] = (None, screen._out)
+    saved = _snapshot(screen)
+
+    def change(case, stopped):
+        h.copy_(torch.randn(h.shape, device=spec.device, generator=gen)
+                * (.001, .25, 1., 32.)[case % 4])
+        h.view(torch.int32)[:4] = torch.tensor([0, -2147483648, 1, -2147483647],
+                                              dtype=torch.int32, device=spec.device)
+        if case == 4:
+            h.zero_()
+        if case == 5:
+            h.copy_(torch.round(h * 4) / 4)
+        if case == 6:
+            h[:3] = torch.tensor([float("inf"), -float("inf"), float("nan")], device=spec.device)
+        if case == 7:
+            h.mul_(1e-20)
+        cont.copy_(torch.randn(h.shape, device=spec.device, generator=gen) * .5)
+        gate_start.zero_()
+        gate_start[0] = int(stopped)
+        gate_start[2] = 1
+        gate_start[3] = 0x3F800000 if case % 2 == 0 else 0x3F000000
+
+    def reset():
+        for n, t in saved.items():
+            if n != "_h" or h is not screen._h:
+                getattr(screen, n).copy_(t)
+        gate.copy_(gate_start)
+
+    def check_equal(a, b):
+        if not all(_words(x, y) for x, y in zip(a, b)):
+            raise RuntimeError("gather-first complete screen state/output differs")
+        if not _guard(hb) or not all(_guard(p) for p in guard_pairs):
+            raise RuntimeError("gather-first private workspace guard changed")
+
+    # First-dot scores and every aux gather are checked BEFORE tail debug may
+    # overwrite scores. The oracle is exactly the original gather + first dot.
+    for case in range(8):
+        for stopped in (False, True):
+            change(case, stopped)
+            reset()
+            s._gather_three[(1,)](h, screen.pre_cols, screen._hp, screen.mid_cols, screen._hm,
+                                  screen.rest_cols, screen._hr, NA=256, NB=256, NC=512,
+                                  launch_pdl=spec.pdl)
+            s._rows_dot(screen._hp, screen.w_pre, screen.s_pre, None,
+                        screen.gscale, screen.scores, False, True)
+            old = [getattr(screen, n).clone() for n in ("_hp", "_hm", "_hr", "scores")]
+            reset()
+            if not _run(spec, h, True):
+                raise RuntimeError("gather-first actual contract unavailable")
+            check_equal(old, [getattr(screen, n) for n in ("_hp", "_hm", "_hr", "scores")])
+            # Complete screen and an ORIGINAL continuation, from identical state.
+            source = h.clone()
+            reset()
+            screen._greedy_row(h, gated=True, out=oldouts[0][1])
+            old_after = _observe(screen, gate, oldouts[0][1])
+            screen._greedy_row(cont, gated=True, out=oldouts[1][1])
+            old_cont = _observe(screen, gate, oldouts[1][1])
+            reset()
+            _new_full(spec, h, True, newouts[0][1])
+            check_equal(old_after, _observe(screen, gate, newouts[0][1]))
+            screen._greedy_row(cont, gated=True, out=newouts[1][1])
+            check_equal(old_cont, _observe(screen, gate, newouts[1][1]))
+            if not (_words(source, h) and all(_guard(p) for p in oldouts + newouts)):
+                raise RuntimeError("gather-first hidden/output guard or read-only changed")
+    # Eight independently owned full outputs, each graph contains ONE complete
+    # original/new screen body. Gate resets are OUTSIDE the measured graph, so
+    # repeated replays cannot silently time only stopped work or forced policy.
+    change(2, False)
+    graphs = [[], []]
+    for arm, outs in enumerate((oldouts, newouts)):
+        for pair in outs:
+            reset()
+            if arm == 0:
+                screen._greedy_row(h, gated=True, out=pair[1])
+            else:
+                _new_full(spec, h, True, pair[1])
+        torch.cuda.synchronize(spec.device)
+        for pair in outs:
+            graph = torch.cuda.CUDAGraph()
+            reset()
+            with torch.cuda.graph(graph, pool=torch.cuda.graph_pool_handle()):
+                if arm == 0:
+                    screen._greedy_row(h, gated=True, out=pair[1])
+                else:
+                    _new_full(spec, h, True, pair[1])
+            graphs[arm].append(graph)
+        if len({pair[1].data_ptr() for pair in outs}) != 8:
+            raise RuntimeError("gather-first eight outputs alias")
+    for case in range(8):
+        for stopped in (False, True):
+            change(case, stopped)
+            source = h.clone()
+            for i in range(8):
+                for _ in range(2):
+                    reset(); graphs[0][i].replay()
+                    old = _observe(screen, gate, oldouts[i][1])
+                    reset(); graphs[1][i].replay()
+                    check_equal(old, _observe(screen, gate, newouts[i][1]))
+                    if not (_words(source, h) and _guard(oldouts[i]) and _guard(newouts[i])):
+                        raise RuntimeError("gather-first changed-input graph guard/read-only differs")
+    if not timing:
+        return None
+    pressure = torch.empty(64 << 20, dtype=torch.uint8, device=spec.device)
+    begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    ratios = []
+    for case in (0, 1, 2, 3, 4, 5):
+        for stopped in (False, True):
+            change(case, stopped)
+            for cold in (False, True):
+                samples = [[], []]
+                for trial in range(5):
+                    for arm in ((0, 1) if trial % 2 == 0 else (1, 0)):
+                        elapsed = 0.0
+                        for i in range(8):
+                            # Production overwrites all consumed workspaces;
+                            # only the independent private gate input resets.
+                            # No bulk snapshot restore biases the timed cache state.
+                            gate.copy_(gate_start)
+                            if cold:
+                                pressure.fill_(case + trial + i)
+                            begin.record(); graphs[arm][i].replay(); end.record(); end.synchronize()
+                            elapsed += begin.elapsed_time(end)
+                        if not elapsed > 0:
+                            raise RuntimeError("gather-first invalid event interval")
+                        samples[arm].append(elapsed)
+                a, b = (statistics.median(v) for v in samples)
+                ratios.append(b / a)
+    metrics = statistics.median(ratios), max(ratios)
+    if metrics[0] >= .995 or metrics[1] >= 1.01:
+        raise RuntimeError(f"gather-first full-body warm/pressure cost refused {metrics}")
+    return metrics
+
+
+@torch.no_grad()
+def prepare(screen):
+    from . import nemotron_h_mtp_kernels as k
+    if not _ENABLED or torch.cuda.is_current_stream_capturing():
+        return
+    spec = _owner(screen)
+    if spec is None:
+        return
+    original_gate, original_debug = k._GATE, screen._tail_debug
+    original_fields = {n: getattr(screen, n) for n in _MUTABLE}
+    original_values = {n: t.clone() for n, t in original_fields.items()}
+    readonly = {n: t.clone() for n, t in spec.immutable.items()}
+    k._GATE = torch.zeros(4, dtype=torch.int32, device=spec.device)
+    error, metrics = None, None
+    try:
+        guarded = {n: _guarded(t) for n, t in original_fields.items()}
+        for n, pair in guarded.items():
+            pair[1].copy_(original_values[n])
+            setattr(screen, n, pair[1])
+        private_spec = _owner(screen)
+        if private_spec is None:
+            raise RuntimeError("private guarded actual screen contract unavailable")
+        _qualify(private_spec, tuple(guarded.values()), debug=True, timing=False)
+        for n, t in original_fields.items():
+            setattr(screen, n, t)
+        _restore(screen, original_values)
+        metrics = _qualify(spec, (), debug=False, timing=True)
+    except Exception as exc:
+        error = exc
+    finally:
+        try:
+            torch.cuda.synchronize(spec.device)
+            for n, t in original_fields.items():
+                setattr(screen, n, t)
+            _restore(screen, original_values)
+            if not all(_words(getattr(screen, n), t) for n, t in original_values.items()):
+                raise RuntimeError("gather-first mutable owner restoration failed")
+        finally:
+            screen._tail_debug = original_debug
+            k._GATE = original_gate
+    if not all(_words(getattr(screen, n), t) for n, t in readonly.items()):
+        raise RuntimeError("gather-first immutable actual screen weight/scale/column modified")
+    if error is not None:
+        print(f"MTP_SCREEN_GATHER_FIRST refused: {error!r}; original kept", flush=True)
+        return
+    _ENTRIES[id(screen)] = spec
+    print(f"MTP_SCREEN_GATHER_FIRST admitted full-body ratios={metrics}", flush=True)
+

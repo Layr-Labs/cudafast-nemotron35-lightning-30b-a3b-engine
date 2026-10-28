@@ -31,6 +31,8 @@ constexpr int F_ZHALF = 1, F_NOSPLIT = 2, F_BPF = 4, F_RPF = 8, F_WPF = 16;
 // then at 64 + 4 * g8 the u32 of their high 2-bit parts (bits 2i..2i+1). s6_decode rebuilds the
 // same 16 bytes the 8-bit plane's 16-byte load gives, before any use.
 constexpr int F_S6 = 32;
+// One warp builds a shared ordered mask list for the cooperative CTA.
+constexpr int F_SHARED_LIST = 8192;
 constexpr uint32_t S6_BASE = 62u;
 // F_WPF: with group j's loads, each lane requests its own pieces of group j + R + D into L2 (the
 // k rows of its mask bits, 8 bytes each, and its 16 scale bytes)
@@ -316,6 +318,7 @@ __global__ void __launch_bounds__(WPC * 32) down_lean_kernel(const Params p) {
   if (mb * 16 >= *p.num_tokens_padded) return;
   __shared__ int s_rows[8];
   __shared__ int s_nrows, s_e;
+  __shared__ int s_nag;
   __shared__ uint16_t s_mask[128];
   __shared__ uint32_t s_list[WPC][G];
   auto bar = [&]() {
@@ -381,6 +384,23 @@ __global__ void __launch_bounds__(WPC * 32) down_lean_kernel(const Params p) {
   }
   bar();
   int nag = 0;
+  if constexpr ((F & F_SHARED_LIST) != 0) {
+    if (warp == 0) {
+#pragma unroll
+      for (int c = 0; c < 4; ++c) {
+        const int g = 32 * c + lane;
+        const uint32_t m = s_mask[g];
+        const bool a = g < G && m != 0u;
+        const unsigned ball = __ballot_sync(0xFFFFFFFFu, a);
+        if (a) s_list[0][nag + __popc(ball & ((1u << lane) - 1u))] =
+            (m << 16) | static_cast<uint32_t>(g);
+        nag += __popc(ball);
+      }
+      if (lane == 0) s_nag = nag;
+    }
+    bar();
+    nag = s_nag;
+  } else {
 #pragma unroll
   for (int c = 0; c < 4; ++c) {  // each warp: its own ordered list of active groups
     const int g = 32 * c + lane;
@@ -391,10 +411,11 @@ __global__ void __launch_bounds__(WPC * 32) down_lean_kernel(const Params p) {
     nag += __popc(ball);
   }
   __syncwarp();
+  }
   const unsigned long long t1 = p.trace ? gtimer() : 0ull;
   if (p.mode == SETUPONLY) return;
   const int e = s_e;
-  const uint32_t* list = s_list[warp];
+  const uint32_t* list = s_list[(F & F_SHARED_LIST) ? 0 : warp];
   const uint8_t* wb = p.W + e * p.w_expert + P * p.w_tile + g8 * 8;
   const uint8_t* wr[4];
   wr[0] = wb + (2 * t) * p.w_k;

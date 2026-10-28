@@ -627,6 +627,12 @@ class NemotronHMTP(nn.Module, SupportsPP):
         )
         return self.logits_processor(self.lm_head, hidden_states)
 
+    @staticmethod
+    def weight_name_filter(name: str) -> bool:
+        # LOCAL PATCH (cudafast-nemotron35): exactly the names load_weights below uses; the
+        # checkpoint reader skips the rest before reading (default_loader weight_name_filter).
+        return name.startswith("mtp.") or "embeddings" in name
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load MTP weights with proper name remapping."""
         stacked_params_mapping = [

@@ -17,6 +17,7 @@ SHAPES = {(4608, 2688): 96, (2688, 4096): 112}
 _lib = None
 _load_failed = False
 _ready_devices = set()
+_pipe_ready_devices = set()
 
 
 def _load():
@@ -31,6 +32,10 @@ def _load():
         lib.bf16ws_pack.restype = ctypes.c_int
         lib.bf16ws_run.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_int] * 3 + [ctypes.c_void_p]
         lib.bf16ws_run.restype = ctypes.c_int
+        lib.bf16ws_pipe_init.argtypes = []
+        lib.bf16ws_pipe_init.restype = ctypes.c_int
+        lib.bf16ws_run_pipe.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_int] * 3 + [ctypes.c_void_p]
+        lib.bf16ws_run_pipe.restype = ctypes.c_int
         _lib = lib
     except OSError:
         _load_failed = True
@@ -44,6 +49,19 @@ def _ready(device: torch.device) -> bool:
             if _lib.bf16ws_init() != 0:
                 return False
             _ready_devices.add(index)
+    return True
+
+
+def pipe_ready(device: torch.device) -> bool:
+    """Initialize the optional kernel separately; failure keeps the original kernel."""
+    if _load() is None or not _ready(device):
+        return False
+    with torch.cuda.device(device):
+        index = torch.cuda.current_device()
+        if index not in _pipe_ready_devices:
+            if _lib.bf16ws_pipe_init() != 0:
+                return False
+            _pipe_ready_devices.add(index)
     return True
 
 
@@ -79,11 +97,14 @@ def unpack_reference(packed: torch.Tensor, n: int, k: int) -> torch.Tensor:
     return logical.permute(0, 2, 1, 3, 4).reshape(n, kb)
 
 
-def gemm(a: torch.Tensor, packed: torch.Tensor, n: int) -> torch.Tensor:
+def gemm(a: torch.Tensor, packed: torch.Tensor, n: int, *, pipe: bool = False,
+         out: torch.Tensor | None = None) -> torch.Tensor:
     """C[496, n] in BF16 (k = a.shape[1]); called only after the caller's shape/dtype guard."""
-    out = torch.empty((M, n), device=a.device, dtype=torch.bfloat16)
-    rc = _lib.bf16ws_run(a.data_ptr(), packed.data_ptr(), out.data_ptr(), M, n, a.shape[1],
-                         torch.cuda.current_stream(a.device).cuda_stream)
+    if out is None:
+        out = torch.empty((M, n), device=a.device, dtype=torch.bfloat16)
+    run = _lib.bf16ws_run_pipe if pipe else _lib.bf16ws_run
+    rc = run(a.data_ptr(), packed.data_ptr(), out.data_ptr(), M, n, a.shape[1],
+             torch.cuda.current_stream(a.device).cuda_stream)
     if rc:
         raise RuntimeError(f"bf16ws launch failed: {rc}")
     return out

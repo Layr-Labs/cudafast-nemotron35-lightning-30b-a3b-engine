@@ -1063,6 +1063,12 @@ class NemotronHForCausalLM(
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
+    @staticmethod
+    def weight_name_filter(name: str) -> bool:
+        # LOCAL PATCH (cudafast-nemotron35): the loader below skips "mtp" names; the
+        # checkpoint reader skips them before reading (default_loader weight_name_filter).
+        return not name.startswith("mtp")
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self, skip_prefixes=["mtp"])
         loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

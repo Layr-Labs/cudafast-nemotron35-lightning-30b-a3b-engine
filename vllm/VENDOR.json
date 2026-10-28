@@ -5,7 +5,7 @@
   "subtree": "vllm",
   "container_image": "docker.io/vllm/vllm-openai:v0.27.1",
   "container_digest_arm64": "sha256:1c8e60a0841b333c700488cb029d3664807249da0c071e862191b00fe34b228c",
-  "note": "Upstream Python package at the tag. The compiled extensions (csrc) come from the pinned container's install of the same tag; tools/stage-vllm-overlay.sh layers this tree over that install. vllm/vllm/config/fault_tolerance.py is stored LF-normalized (upstream has CRLF). Draw 4. Draw 1.",
+  "note": "Upstream Python package at the tag. The compiled extensions (csrc) come from the pinned container's install of the same tag; tools/stage-vllm-overlay.sh layers this tree over that install. vllm/vllm/config/fault_tolerance.py is stored LF-normalized (upstream has CRLF). Draw 4. Draw 1. Draw 3 (043658).",
   "local_patches": [
     {
       "file": "vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py",
@@ -681,7 +681,15 @@
     },
     {
       "file": "vllm/vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
-      "why": "i34-9: PZSKIP_S6 defaults to off (the prefill routed down keeps pzskip config 369 on the 8-bit plane, as in ercumentyildirim's ef1fe030-2867-402a-bed0-47635a4d1ddf). PZSKIP_S6=1 restores config 379. Measurement 2 of 593041c6-13bc-4e1f-80f1-c8ab630521a3 (code identical)."
+      "why": "i34-9: PZSKIP_S6 defaults to off (the prefill routed down keeps pzskip config 369 on the 8-bit plane, as in ercumentyildirim's ef1fe030-2867-402a-bed0-47635a4d1ddf). PZSKIP_S6=1 restores config 379."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_attn_packed.py (WS_ENABLED, _ws, _ws_activations, _prepare_ws, _ws_gemm, the 496-row branch of _linear_impl, apply for a bf16ws-only projection, prepare calls _prepare_ws); harness/kernels/bf16ws; harness/tests/bf16ws_exact.py",
+      "why": "ercumentyildirim: the 496-row prefill call of each attention qkv_proj (4608x2688) and o_proj (2688x4096) runs bf16ws, the fp8ws persistent TMA/mbarrier kernel with the BF16 MMA, instead of F.linear, with the same arithmetic: native bf16 m16n8k16 MMA, one ascending-K chain per output from +0, one RN to BF16. The activation keeps its layout; the weight gets a load-time, input-independent byte-permuted copy (tiles of BN x 128 bytes, BN 96 or 112, row-swizzled 16-byte chunks; the original stays for every other row count). Each projection is admitted at load only if the pack inverts to the original bytes and its output equals F.linear bit for bit on five synthetic activation sets (four Gaussian scales and every BF16 bit pattern); otherwise F.linear. Dispatch is in the nemo_attn_pk_linear custom op. BF16WS=0 disables."
+    },
+    {
+      "file": "(composition)",
+      "why": "ercumentyildirim: i34-9's 593041c6-13bc-4e1f-80f1-c8ab630521a3 (draft depth 5 with the lowacc adaptive deepest draft at thresholds 1.8/2.0, burn-in 4 cycles and per-cycle cap 3, on i34-9's eb48e2f0-50e6-4c39-a1f3-0ac305d17c5b and 4e50f234-264f-41c3-ac8b-d8903a9f5d32 and terrapinelf's depth-5 tree f7425ba8-32af-4067-9de1-fb3183269d2e over the promoted main bcd22b8) byte for byte, plus bf16ws for the 496-row prefill attention qkv_proj and o_proj (the entry above). No other file changes."
     }
   ]
 }

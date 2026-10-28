@@ -88,8 +88,9 @@ struct Params {
 __device__ __forceinline__ int prefix_row_limit(const Params& p) {
   if (p.verify_rows == nullptr) return p.shape_m;
   const int rows = *p.verify_rows;
-  // Avoid multiplying the ALL_ROWS sentinel. Eligible calls have 5 tokens x6.
-  return rows >= 5 ? p.shape_m : (rows < 1 ? 1 : rows) * 6;
+  // Avoid multiplying the ALL_ROWS sentinel. Eligible calls have 5, 6 or 7 tokens x6.
+  const int ntok = p.shape_m / 6;
+  return rows >= ntok ? p.shape_m : (rows < 1 ? 1 : rows) * 6;
 }
 
 __device__ __forceinline__ unsigned long long gtimer() {
@@ -2034,7 +2035,7 @@ static int zskip_down_impl(const void* A, long long lda, int shape_m, const int*
                void* C, long long ldc, long long w_expert, long long w_tile, long long w_k, long long s_expert,
                long long s_tile, long long s_g, int mode, int* stats, int config, void* ws, int* queue,
                int ctas_per_sm, void* trace, void* stream, const int* verify_rows) {
-  if (verify_rows != nullptr && (shape_m != 30 || mode != SKIP ||
+  if (verify_rows != nullptr && ((shape_m != 30 && shape_m != 36 && shape_m != 42) || mode != SKIP ||
       (config != 113 && config != 114 && config != 118 && config != 119
 #ifndef ZSKIP_NO_PAIR
        && !is_lean_config(config)

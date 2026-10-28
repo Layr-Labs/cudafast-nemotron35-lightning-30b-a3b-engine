@@ -66,7 +66,7 @@ ROUTER_ROWS = int(os.environ.get("SMALLK_ROUTER_ROWS", "1"))
 TOPK_WARPS = int(os.environ.get("SMALLK_TOPK_WARPS", "4"))
 
 # M4 is verified in the carrier; M5 is the new remote-only experiment.
-ROUTER_SHAPES = frozenset({(4, 128, 2688), (5, 128, 2688)})  # M5 unverified extension
+ROUTER_SHAPES = frozenset({(4, 128, 2688), (5, 128, 2688), (6, 128, 2688), (7, 128, 2688)})  # M5-M7: same per-row chains
 NUM_EXPERTS = 128
 MAX_TOPK = 8
 # Stock count_and_sort fills an expert's slots in lane order when all ids sit in one warp; with
@@ -306,7 +306,7 @@ def reset_verify_rows() -> None:
 def maybe_router_gemm(x: torch.Tensor, w: torch.Tensor, row_mask: bool = False) -> torch.Tensor | None:
     """M4 router or follow-on M5 experiment; None for unsupported metadata. row_mask (target-model
     gates only): honour verify_rows."""
-    if not ROUTER_ON or x.dim() != 2 or x.shape[0] not in (4, 5) or w.dim() != 2:
+    if not ROUTER_ON or x.dim() != 2 or x.shape[0] not in (4, 5, 6, 7) or w.dim() != 2:
         return None
     m, k = x.shape
     n = w.shape[0]

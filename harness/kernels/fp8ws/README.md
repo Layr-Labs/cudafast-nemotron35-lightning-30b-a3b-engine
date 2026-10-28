@@ -1,4 +1,9 @@
-# fp8ws: prefill Mamba in_proj FP8 GEMM
+# fp8ws: prefill Mamba in_proj and out_proj FP8 GEMMs
+
+Shapes: in_proj (N,K) = (10304,2688) and out_proj (N,K) = (2688,4096), both at M = 496, same tile
+layout (256 x 112 tiles, 128-byte K steps, two stages); out_proj is 2 x 24 = 48 tiles, one wave on
+GB10's 48 SMs. Cold-weight GB10 timing for out_proj: 68 us vs 82 us for the pinned CUTLASS call.
+Sections below describe the in_proj case; out_proj differs only in N, K and tile counts.
 
 The 496-token prefill runs the Mamba `in_proj` projection, (N,K) = (10304,2688), as
 an FP8 GEMM with M = 496 on every Mamba layer. This package replaces the pinned

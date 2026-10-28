@@ -312,7 +312,7 @@ def _pair_check(layer: torch.nn.Module, packed: Any, config: int, prefix: bool =
         "use_f16_accum": envs.VLLM_HUMMING_USE_F16_ACCUM,
         "gemm_type": GemmType.INDEXED.value,
     })
-    for m in ((5, 6) if prefix else ms):
+    for m in ((5, 6, 7) if prefix else ms):
         for crowded in (False, True):
             ids = [[(29*i + (0 if crowded else 17*t)) % NUM_EXPERTS
                     for i in range(TOP_K)] for t in range(m)]
@@ -646,7 +646,7 @@ def maybe_down(
         return True
     # M=5 / M=6 are the depth-4 / depth-5 verifies. Other shapes keep main's checked decode selection.
     pair = getattr(layer, "zskip_pair_w2", None)
-    use_pair = num_tokens in (5, 6) and pair is not None
+    use_pair = num_tokens in (5, 6, 7) and pair is not None
     vrows = None
     if use_pair and getattr(layer, "zskip_pair_prefix_ok", False):
         smallk = sys.modules.get("smallk")

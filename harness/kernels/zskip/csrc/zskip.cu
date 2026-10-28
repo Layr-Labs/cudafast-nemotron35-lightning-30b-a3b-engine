@@ -2035,7 +2035,7 @@ static int zskip_down_impl(const void* A, long long lda, int shape_m, const int*
                void* C, long long ldc, long long w_expert, long long w_tile, long long w_k, long long s_expert,
                long long s_tile, long long s_g, int mode, int* stats, int config, void* ws, int* queue,
                int ctas_per_sm, void* trace, void* stream, const int* verify_rows) {
-  if (verify_rows != nullptr && ((shape_m != 30 && shape_m != 36) || mode != SKIP ||
+  if (verify_rows != nullptr && ((shape_m != 30 && shape_m != 36 && shape_m != 42) || mode != SKIP ||
       (config != 113 && config != 114 && config != 118 && config != 119
 #ifndef ZSKIP_NO_PAIR
        && !is_lean_config(config)

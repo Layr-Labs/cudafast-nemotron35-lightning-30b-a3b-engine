@@ -26,7 +26,7 @@ _ENABLED = os.environ.get("MTP_PACK12_MM", "1") != "0"
 # four-percent cold-speed margin. MTP_PACK12_MM_FORCE=0 keeps the margin.
 _FORCE = os.environ.get("MTP_PACK12_MM_FORCE", "1") != "0"
 _CONFIGS = {(4608, 2688): (32, 4, 256), (2688, 4096): (16, 2, 256)}
-_ROWS = (2, 3, 4, 5, 6)
+_ROWS = (2, 3, 4, 5, 6, 7)
 # Only immutable weight planes and admission flags persist. No request data.
 _ADMITTED = {}
 

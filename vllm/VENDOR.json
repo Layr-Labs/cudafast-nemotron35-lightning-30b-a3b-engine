@@ -682,6 +682,10 @@
     {
       "file": "vllm/vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
       "why": "i34-9: PZSKIP_S6 defaults to off (the prefill routed down keeps pzskip config 369 on the 8-bit plane, as in ercumentyildirim's ef1fe030-2867-402a-bed0-47635a4d1ddf). PZSKIP_S6=1 restores config 379. Measurement 2 of 593041c6-13bc-4e1f-80f1-c8ab630521a3 (code identical)."
+    },
+    {
+      "file": "vllm/vllm/v1/spec_decode/nemotron_step_cond.py (ENABLED default)",
+      "why": "NEMO_MTP_STEP_COND defaults to 0 on the current record d6651a3d-df62-4edc-8006-a0fe978f4a9a, so the drafter loop takes the record's per-pass path (the full-step graph where it is built, otherwise the regular model call and screen) instead of the conditional single-draft graph. The depth, the verify rows and the acceptance rule are the record's. One default changes; no other line of code differs. The change follows the earlier submission 1faceed1-7860-4e8d-b734-96600d6629aa, which set the same default on an earlier record."
     }
   ]
 }

@@ -251,7 +251,7 @@ def maybe_down(h, packed, ids, weights, y, routed_scale, residual=None):
         # values, with five times the programs streaming the gathered rows.
         part = torch.empty((slots, 2688), dtype=torch.float32, device=h.device)
         from .nemotron_h_mtp_down_packed import maybe_slots
-        if not maybe_slots(packed, indices, values, counts, ids, part, mtp_pdl()):
+        if not maybe_slots(packed, indices, values, counts, ids, part, mtp_pdl(), rows=y.shape[0]):
             _down_slots[(triton.cdiv(2688, _BF16_BN), slots)](
                 indices, values, counts, w2, sd, ids, part,
                 H=2688, I=1856, TOPK=topk, BN=_BF16_BN, BK=64, num_warps=4, num_stages=3,

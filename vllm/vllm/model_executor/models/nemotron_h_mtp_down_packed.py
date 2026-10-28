@@ -142,7 +142,7 @@ def _new(pw, ps, indices, values, counts, ids, part, tile, word, pdl=False):
 
 
 @torch.no_grad()
-def prepare(packed):
+def prepare(packed, routed_scale=None):
     if not _ENABLED or torch.cuda.is_current_stream_capturing():
         return
     w, sd = packed
@@ -250,6 +250,11 @@ def prepare(packed):
         if flags:
             _PACKS[key] = (w, sd, pw, ps, flags)
             _admit_pkslots(key, w, sd, pw, ps, flags, word, pdl)
+            try:
+                from .nemotron_h_mtp_down_code11 import prepare_optional
+                prepare_optional(key, _PACKS[key], word, pdl, routed_scale)
+            except Exception as exc:
+                print(f"MTP_DOWN_CODE11 original packed slots retained: {exc!r}", flush=True)
         print(f"MTP_DOWN_PACK12 admitted={flags} original_weights_retained=True", flush=True)
     except Exception as exc:
         flags.clear()
@@ -316,7 +321,7 @@ def _admit_pkslots(key, w, sd, pw, ps, flags, word, pdl):
         print(f"MTP_DOWN_PKSLOTS unavailable, _slots kept: {exc!r}", flush=True)
 
 
-def maybe_slots(packed, indices, values, counts, ids, part, pdl):
+def maybe_slots(packed, indices, values, counts, ids, part, pdl, rows=None):
     if not _ENABLED:
         return False
     w, sd = packed
@@ -328,6 +333,9 @@ def maybe_slots(packed, indices, values, counts, ids, part, pdl):
     bn = entry[4].get((ids.numel(), word))
     if bn is None:
         return False
+    from .nemotron_h_mtp_down_code11 import maybe_slots as maybe_code11
+    if maybe_code11(packed, indices, values, counts, ids, part, word, bn, pdl, rows):
+        return True
     if (_PKSLOTS_OK.get(((w.data_ptr(), sd.data_ptr()), ids.numel(), word))
             and _pkslots.run(indices, values, counts, entry[2].planes, entry[3].planes, ids, part, pdl)):
         return True

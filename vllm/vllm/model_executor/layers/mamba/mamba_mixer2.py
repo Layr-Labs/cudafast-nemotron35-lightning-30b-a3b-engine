@@ -736,6 +736,10 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     exc_info=True,
                 )
 
+        # Optional shared-CB admission uses only independent synthetic inputs.
+        # It runs once per device/chunk before captured request execution.
+        from vllm.model_executor.layers.mamba.ops.ssd_prefill_fused import prepare_shared_cb
+        prepare_shared_cb(device, chunk_size)
         logger.debug("Mamba2 SSD kernel warmup completed for layer %s", self.prefix)
         torch.accelerator.empty_cache()
 

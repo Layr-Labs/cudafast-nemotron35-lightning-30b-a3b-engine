@@ -87,6 +87,7 @@ BACKUP_ZERO_COPY = os.environ.get("VLLM_MTP_BACKUP_ZERO_COPY", "1") != "0"
 # copies are recorded into one copy batch flushed right after the build
 # (VLLM_DRAFT_FIRST_PLAN_BATCH=0 issues them one by one).
 FIRST_PLAN_BATCH = os.environ.get("VLLM_DRAFT_FIRST_PLAN_BATCH", "1") != "0"
+FIRST_PLAN_BATCH_SIDE = os.environ.get("MTP_FIRST_PLAN_BATCH_SIDE", "1") != "0"
 # LOCAL PATCH (cudafast-nemotron35): the first pass's rejected counts reach
 # their pinned host buffer by a kernel store (VLLM_MTP_REJECTED_ZERO_COPY=0:
 # device-to-host copy).
@@ -606,9 +607,45 @@ class SpecDecodeBaseProposer:
         # main stream waits again after the pass. MTP_FIRST_PLAN_SIDE=0 (default)
         # keeps the plan on the main stream.
         first_ready = None
-        side = (self._draft_plan_side_stream()
-                if FIRST_PLAN_SIDE and first_batch is None and batch_size == 1 else None)
-        if first_batch is not None:
+        # The batched first plan must retain the same ordered copies while
+        # allowing their publication to overlap the main stream's input work.
+        # Restrict this experiment to the one-request, trimmed FlashInfer path;
+        # the original main-stream batch remains the fallback.
+        batch_side = False
+        if (first_batch is not None and FIRST_PLAN_BATCH_SIDE and batch_size == 1
+                and self.method == "mtp" and len(self.draft_attn_groups) == 1
+                and self.draft_attn_groups[0].backend.get_name() == "FLASHINFER"):
+            from vllm.v1.attention.backends.flashinfer import _FI_PAGE_TRIM
+            batch_side = _FI_PAGE_TRIM
+        side_eligible = batch_size == 1 and (
+            (first_batch is None and FIRST_PLAN_SIDE)
+            or batch_side
+        )
+        side = self._draft_plan_side_stream() if side_eligible else None
+        if (first_batch is not None and side is not None
+                and len(self._draft_plan_ready) == self.num_speculative_tokens):
+            main = torch.cuda.current_stream()
+            side.wait_stream(main)
+            try:
+                with torch.cuda.stream(side):
+                    first_batch.begin()
+                    try:
+                        per_group_attn_metadata, per_layer_attn_metadata = (
+                            self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
+                        )
+                    finally:
+                        first_batch.flush()
+                    first_ready = self._draft_plan_ready[-1]
+                    first_ready.record(side)
+            except BaseException:
+                # Failed planning can have issued work on this stream and the
+                # planner's auxiliary stream; drain before their pinned inputs
+                # may be reused while propagating the original failure.
+                torch.cuda.synchronize(self.device)
+                raise
+            for md in {id(m): m for m in per_layer_attn_metadata.values()}.values():
+                md.plan_ready_event = first_ready
+        elif first_batch is not None:
             first_batch.begin()
             try:
                 per_group_attn_metadata, per_layer_attn_metadata = (
@@ -676,6 +713,11 @@ class SpecDecodeBaseProposer:
                 slot_mapping_size, common_attn_metadata.slot_mapping
             ),
         ):
+            # A replay can bypass Python attention's plan_ready_event wait.
+            # Wait before model entry, after main-stream slot/input work was
+            # queued, so both eager and captured consumers see complete plans.
+            if first_ready is not None:
+                torch.cuda.current_stream().wait_event(first_ready)
             ret_hidden_states = self.model(**model_kwargs)
             if not self.model_returns_tuple():
                 last_hidden_states = ret_hidden_states

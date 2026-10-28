@@ -118,7 +118,17 @@ def prepare(p):
             graph = CUDAGraphWrapper(p.model, p.vllm_config, CUDAGraphMode.FULL,
                                     CUDAGraphOptions(weak_ref_output=False))
             graph.graph_pool = torch.cuda.graph_pool_handle()
-            outputs = graph(**kwargs)
+            # Scope the optional finish path only to this explicitly private
+            # capture; generic wrappers may share the global graph pool.
+            try:
+                from vllm.model_executor.models.nemotron_h_mtp_down_finish import private_full_step_capture
+            except Exception:
+                private_full_step_capture = None
+            if private_full_step_capture is None:
+                outputs = graph(**kwargs)
+            else:
+                with private_full_step_capture():
+                    outputs = graph(**kwargs)
         torch.cuda.synchronize(p.device)
         key = BatchDescriptor(num_tokens=padded)
         if key not in graph.concrete_cudagraph_entries:

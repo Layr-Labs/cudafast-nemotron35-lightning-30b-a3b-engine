@@ -242,6 +242,15 @@ def maybe_down(h, packed, ids, weights, y, routed_scale, residual=None):
     indices = torch.empty(h.shape, dtype=torch.int32, device=h.device)
     values = torch.empty_like(h)
     counts = torch.empty(slots, dtype=torch.int32, device=h.device)
+    if _SLOTS:
+        try:
+            from .nemotron_h_mtp_down_finish import maybe_finish
+        except Exception:
+            maybe_finish = None
+        if maybe_finish is not None and maybe_finish(
+                h, packed, ids, weights, y, routed_scale, residual,
+                indices, values, counts, mtp_pdl()):
+            return True
     _compact[(slots,)](
         h, indices, values, counts, I=1856, BLOCK=2048, num_warps=4,
         launch_pdl=mtp_pdl(),

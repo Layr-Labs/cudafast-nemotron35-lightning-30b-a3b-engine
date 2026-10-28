@@ -267,8 +267,13 @@ def _prepare(p, saved, restore):
         timing = _timed(device, original, new, setup, start, stop)
         live_cost = timing[1] - timing[0]
         stop_gain = timing[2] - timing[3]
-        if not (stop_gain > 0 and live_cost <= 15.0
-                and stop_gain >= 4.0 * max(live_cost, 0.0)):
+        # LOCAL PATCH (cudafast-nemotron35, depth 5): with a fifth draft pass whose gate usually stops
+        # it (its own, higher threshold), a stopped pass is the common case; the live pass's IF-node
+        # cost is then admitted up to 30 us while the stopped pass gains at least twice that.
+        deep = int(getattr(p, "num_speculative_tokens", 0)) >= 5
+        max_live, ratio = (30.0, 2.0) if deep else (15.0, 4.0)
+        if not (stop_gain > 0 and live_cost <= max_live
+                and stop_gain >= ratio * max(live_cost, 0.0)):
             raise ValueError(f"conditional step not faster: {timing}")
     p._nemo_step = SimpleNamespace(
         graph=graph, hidden=hidden, screen=screen, padded=padded, signature=signature,

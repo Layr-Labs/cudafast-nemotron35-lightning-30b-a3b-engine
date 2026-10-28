@@ -198,6 +198,21 @@ def finalize(layer: torch.nn.Module) -> None:
             )
         except Exception as exc:  # optional prefix; original checked pair remains
             logger.warning_once("zskip: prefix check unavailable (%r); full pair retained", exc)
+    # Experimental 3-warp CTA shares the same row masks and ordered list.
+    # Keep the already qualified 663 as the fallback on any failure.
+    if getattr(layer, "zskip_pair_config", None) == 663:
+        try:
+            from . import humming_zskip_cooperative as cooperative
+            packed = layer.zskip_pair_w2
+            prefix = getattr(layer, "zskip_pair_prefix_ok", False)
+            if (_pair_check(layer, packed, 667, ms=range(1, 9), ref_config=663)
+                and (not prefix or _pair_check(layer, packed, 667, prefix=True,
+                                               ref_config=663))
+                and cooperative.qualify(layer, _zskip, _align)):
+                layer.zskip_cooperative_pdl = _zskip._pdl_on
+                layer.zskip_pair_config = 667
+        except Exception as exc:
+            logger.warning_once("zskip: cooperative config unavailable (%r); 663 retained", exc)
 
 
 def _prepare_pair(layer: torch.nn.Module) -> None:
@@ -652,6 +667,16 @@ def maybe_down(
         smallk = sys.modules.get("smallk")
         if smallk is not None and hasattr(smallk, "live_verify_rows"):
             vrows = smallk.live_verify_rows(inputs.device)
+    pair_config = getattr(layer, "zskip_pair_config", None) if use_pair else None
+    if pair_config == 667:
+        # Inter-CTA input/output aliasing was not part of the private gate.
+        # Preserve the checked 663 for any shared output storage.
+        owners = (inputs, pair.w, pair.s, pair.gs, moe_kwargs["sorted_ids"],
+                  moe_kwargs["expert_ids"], moe_kwargs["num_tokens_padded"], vrows)
+        if (getattr(layer, "zskip_cooperative_pdl", None) != _zskip._pdl_on
+            or any(t is not None and t.untyped_storage().data_ptr() == outputs.untyped_storage().data_ptr()
+                   for t in owners)):
+            pair_config = 663
     _zskip.down(
         inputs,
         moe_kwargs["sorted_ids"],
@@ -660,7 +685,7 @@ def maybe_down(
         pair if use_pair else packed,
         outputs,
         mode=_zskip.SKIP,
-        config=layer.zskip_pair_config if use_pair else getattr(layer, "zskip_config", CONFIG),
+        config=pair_config if use_pair else getattr(layer, "zskip_config", CONFIG),
         max_blocks=rows,
         verify_rows=vrows,
     )

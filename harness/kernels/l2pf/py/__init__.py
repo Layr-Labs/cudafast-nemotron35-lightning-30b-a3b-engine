@@ -45,7 +45,7 @@ DRAFT_SCREEN: list[torch.Tensor] = []
 # planes (L2PF_DRAFT_SHARED_MB=0 off). GLUE_QKV: the first draft pass's eager input glue
 # prefetches the head of the packed qkv after eh_w_h (L2PF_DRAFT_GLUE_QKV_MB=0 off).
 DRAFT_NEXT_BYTES = int(float(os.environ.get("L2PF_DRAFT_NEXT_MB", "0")) * (1 << 20))
-DRAFT_SHARED_BYTES = int(float(os.environ.get("L2PF_DRAFT_SHARED_MB", "0")) * (1 << 20))
+DRAFT_SHARED_BYTES = int(float(os.environ.get("L2PF_DRAFT_SHARED_MB", "2")) * (1 << 20))
 DRAFT_GLUE_QKV_BYTES = int(float(os.environ.get("L2PF_DRAFT_GLUE_QKV_MB", "5")) * (1 << 20))
 # Packed planes the next draft pass reads first: name -> (sm, ex, base, ri)
 # ("eh": the start projection's hidden half, "qkv": the attention input projection).

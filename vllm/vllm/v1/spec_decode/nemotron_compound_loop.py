@@ -36,6 +36,9 @@ def _stage(token, ids, hsrc, hdst, hstride, positions, seq,
     # Original fused MTP input/position/slot arithmetic, batch one. Runtime
     # guards exclude clamp boundaries, but retain the original clamp itself.
     position = tl.load(positions)
+    previous_length = tl.load(seq)
+    # Compatible pending scalar-read-before-write ordering, no observed old-race claim.
+    tl.debug_barrier()
     new_position = position + 1
     exceeds = new_position >= MAX_LEN
     clamped = tl.where(exceeds, 0, new_position)
@@ -53,7 +56,7 @@ def _stage(token, ids, hsrc, hdst, hstride, positions, seq,
     padded = tl.arange(0, 8)
     tl.store(slots + padded, tl.where(padded == 0, tl.where(exceeds, PAD, slot), PAD),
              mask=padded < PADDED)
-    length = tl.minimum(tl.where(exceeds, 1, tl.load(seq) + 1), MAX_LEN)
+    length = tl.minimum(tl.where(exceeds, 1, previous_length + 1), MAX_LEN)
     tl.store(seq, length)
 
     # Same current-page values as FlashInferMetadataBuilder, and the exact

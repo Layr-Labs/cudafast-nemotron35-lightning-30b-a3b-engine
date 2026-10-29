@@ -71,6 +71,11 @@ def _load():
             lib.marlinx_gemm_su.argtypes = lib.marlinx_gemm.argtypes + [
                 ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]  # Z SU relu2 pdl
             lib.marlinx_gemm_su.restype = ctypes.c_int
+        if hasattr(lib, "marlinx_gemm_su6"):
+            lib.marlinx_gemm_su6.argtypes = lib.marlinx_gemm.argtypes + [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                ctypes.c_void_p]  # Z SU relu2 pdl SUT
+            lib.marlinx_gemm_su6.restype = ctypes.c_int
         if hasattr(lib, "marlinx_gemm_lean"):
             lib.marlinx_init_lean.argtypes = []
             lib.marlinx_init_lean.restype = ctypes.c_int
@@ -178,6 +183,7 @@ def prepare(layer) -> bool:
     layer._marlinx_ok = ok
     layer._marlinx_zs = None
     layer._marlinx_su = None
+    layer._marlinx_sut = None
     layer._marlinx_lean = False
     su_on = SU_SHAPES.get((n, k)) in SU_LAYERS
     if ok and _lean_active and not su_on and LEAN_SHAPES.get((n, k)) in LEAN_LAYERS:
@@ -187,8 +193,13 @@ def prepare(layer) -> bool:
         layer._marlinx_zs = z2_repack(w, n, k) if layer._marlinx_lean else zs_repack(w, n, k)
     if ok and SU_SHAPES.get((n, k)) in SU_LAYERS and hasattr(_lib, "marlinx_gemm_su"):
         layer._marlinx_su = su_repack(s, n, k)
+        if SU6_ENABLED and SU_SHAPES.get((n, k)) in SU6_LAYERS and hasattr(_lib, "marlinx_gemm_su6"):
+            packed = su6_repack(layer._marlinx_su)
+            if packed is not None:
+                layer._marlinx_su, layer._marlinx_sut = packed
         # the shared up runs through an opaque op that receives the tensors, not the layer
-        _su_by_scale[s.data_ptr()] = (s, layer._marlinx_su)
+        if layer._marlinx_sut is None:
+            _su_by_scale[s.data_ptr()] = (s, layer._marlinx_su)
     return ok
 
 
@@ -208,6 +219,45 @@ SU_LAYERS = frozenset(v for v in os.environ.get("MARLINX_SU", "lm").split(",") i
 def su_repack(s: torch.Tensor, n: int, k: int) -> torch.Tensor:
     """[N/64][K/16][64] bytes from Marlin's [K/16][N] scale bytes (byte permutation)."""
     return s.view(torch.uint8).view(k // 16, n // 64, 64).transpose(0, 1).contiguous()
+
+
+# MARLINX_SU6 (comma list of SU layers, default "lm"; "0" or "" = none): an SU copy whose
+# tensor holds at most 64 distinct scale bytes is stored as 6-bit codes into its sorted value
+# table (48 bytes per 64-scale row instead of 64); the kernel's staging loop looks every code up
+# and stages the same bytes in shared memory, so the main loop and every output bit are unchanged.
+_SU6_ENV = os.environ.get("MARLINX_SU6", "lm")
+SU6_ENABLED = _SU6_ENV not in ("", "0")
+SU6_LAYERS = frozenset(v for v in _SU6_ENV.split(",") if v)
+
+
+@torch.no_grad()
+def su6_repack(su: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """(codes [N/64][K/16][48], table [64]) from su_repack's bytes, or None when the tensor
+    holds more than 64 distinct bytes or the decode check fails. Row layout: bytes 0..31 hold
+    code 2i | code 2i+1 << 4 (low nibbles), bytes 32..47 the high 2-bit pairs (code 4i+t at
+    bits 2t of byte 32+i)."""
+    b = su.view(torch.uint8)
+    vals = torch.unique(b)
+    if vals.numel() > 64:
+        return None
+    table = torch.zeros(64, dtype=torch.uint8, device=b.device)
+    table[: vals.numel()] = vals
+    table[vals.numel():] = vals[-1]
+    inv = torch.zeros(256, dtype=torch.int32, device=b.device)
+    inv[vals.long()] = torch.arange(vals.numel(), dtype=torch.int32, device=b.device)
+    c = inv[b.long()]  # [U, KB, 64]
+    lo = (c[..., 0::2] & 15) | ((c[..., 1::2] & 15) << 4)  # [U, KB, 32]
+    h = (c >> 4) & 3
+    hi = h[..., 0::4] | (h[..., 1::4] << 2) | (h[..., 2::4] << 4) | (h[..., 3::4] << 6)  # [U, KB, 16]
+    codes = torch.cat((lo, hi), -1).to(torch.uint8).contiguous()
+    # decode back with the kernel's formula and compare every byte
+    lo_b = codes[..., :32].to(torch.int32)
+    hi_b = codes[..., 32:].to(torch.int32)
+    nib = torch.stack((lo_b & 15, lo_b >> 4), -1).reshape(c.shape)
+    two = torch.stack([(hi_b >> (2 * t)) & 3 for t in range(4)], -1).reshape(c.shape)
+    if not torch.equal(table[(nib | (two << 4)).long()], b):
+        return None
+    return codes, table
 
 
 # Zero-row skip for the shared expert down projection (its input is ReLU^2,
@@ -270,7 +320,7 @@ def gemm(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
          global_scale: torch.Tensor, n: int, k: int, depth: int = DEPTH,
          relu2: bool = False, zs: torch.Tensor | None = None,
          su: torch.Tensor | None = None, lean: bool = False,
-         vrows: torch.Tensor | None = None) -> torch.Tensor:
+         vrows: torch.Tensor | None = None, sut: torch.Tensor | None = None) -> torch.Tensor:
     """out[M, n] for a 2-D bf16 x[M, k] (1 <= M <= 8); no guard beyond the C side's.
     vrows (lean zero-row-skip down only): live verify rows, rows at or past it read as zero."""
     global _pdl_active
@@ -307,6 +357,15 @@ def gemm(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
             rc = lib.marlinx_gemm_lean(*lean_args, 0)
         if rc != 0:
             raise RuntimeError(f"marlinx_gemm_lean failed: {rc} (M={m} N={n} K={k})")
+        return out
+    if su is not None and sut is not None:
+        su_args = args + (zs.data_ptr() if zs is not None else None, su.data_ptr(), int(relu2))
+        rc = lib.marlinx_gemm_su6(*su_args, int(use_pdl), sut.data_ptr())
+        if rc and use_pdl and not torch.cuda.is_current_stream_capturing():
+            _pdl_active = False
+            rc = lib.marlinx_gemm_su6(*su_args, 0, sut.data_ptr())
+        if rc != 0:
+            raise RuntimeError(f"marlinx_gemm_su6 failed: {rc} (M={m} N={n} K={k} depth={depth})")
         return out
     if su is not None:
         su_args = args + (zs.data_ptr() if zs is not None else None, su.data_ptr(), int(relu2))
@@ -420,7 +479,8 @@ def maybe_apply(layer, x: torch.Tensor) -> torch.Tensor | None:
     vrows = _live_rows(layer, x2) if m in (5, 6) else None
     out = gemm(x2, layer.weight, layer.weight_scale, layer.weight_global_scale, n, k,
                zs=getattr(layer, "_marlinx_zs", None), su=getattr(layer, "_marlinx_su", None),
-               lean=getattr(layer, "_marlinx_lean", False), vrows=vrows)
+               lean=getattr(layer, "_marlinx_lean", False), vrows=vrows,
+               sut=getattr(layer, "_marlinx_sut", None))
     return out.reshape(*x.shape[:-1], n)
 
 

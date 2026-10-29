@@ -6,6 +6,7 @@
 
 
 import functools
+import os
 
 import numpy as np
 import torch
@@ -806,6 +807,7 @@ def _causal_conv1d_update_kernel(
     HAS_NULL_BLOCK: tl.constexpr,
     BLOCK_N: tl.constexpr,
     launch_pdl: tl.constexpr,
+    REUSE_INPUT_PACKET: tl.constexpr = False,
 ):
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
@@ -1027,7 +1029,21 @@ def _causal_conv1d_update_kernel(
                 elif j == 3:
                     matrix_w = w_col3
                     x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                    if REUSE_INPUT_PACKET:
+                        # The spec packet above already holds this exact BF16
+                        # input at [VAL + idx_token, feature]. Keep the serial
+                        # arithmetic below; this is selection, not a reduction.
+                        if (seqlen >= 1) & (seqlen <= 6) & (VAL == 2):
+                            packet_row = tl.full(
+                                (1, BLOCK_N), VAL + idx_token, tl.int32
+                            )
+                            matrix_x = tl.gather(
+                                loaded_x, packet_row, axis=0
+                            ).reshape((BLOCK_N,))
+                        else:
+                            matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                    else:
+                        matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
             elif KERNEL_WIDTH == 5:
                 if j == 1:
                     matrix_w = w_col1
@@ -1098,6 +1114,121 @@ def _causal_conv1d_update_kernel(
 @functools.cache
 def _is_sm121() -> bool:
     return current_platform.is_device_capability(121)
+
+
+_REUSE_INPUT_PACKET = os.environ.get("VLLM_CONV_REUSE_PACKET", "1").lower() not in (
+    "0", "false", "off", "no"
+)
+
+
+def _conv_packet_span(tensor: torch.Tensor) -> tuple[int, int]:
+    """A conservative byte interval for a positive-stride tensor view."""
+    if tensor.layout != torch.strided or any(
+        n <= 0 or stride <= 0
+        for n, stride in zip(tensor.shape, tensor.stride())
+    ):
+        raise ValueError("unsupported convolution packet view")
+    start = tensor.data_ptr()
+    elements = 1 + sum(
+        (n - 1) * stride for n, stride in zip(tensor.shape, tensor.stride())
+    )
+    return start, start + elements * tensor.element_size()
+
+
+def _can_reuse_conv_input_packet(
+    x: torch.Tensor,
+    out: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    conv_state_indices: torch.Tensor | None,
+    num_accepted_tokens: torch.Tensor | None,
+    query_start_loc: torch.Tensor | None,
+    max_query_len: int,
+    block_idx_last_scheduled_token: torch.Tensor | None,
+    initial_state_idx: torch.Tensor | None,
+) -> bool:
+    """Metadata-only qualification; never reads a GPU value or launches work.
+
+    The actual query length is also checked by the selected kernel. Refusal
+    changes no tensor. This helper does not catch launch or capture failures.
+    """
+    if not _REUSE_INPUT_PACKET:
+        return False
+    try:
+        if (
+            x.device.type != "cuda"
+            or not _is_sm121()
+            or x.dtype != torch.bfloat16
+            or x.ndim != 2
+            or not 1 <= x.shape[0] <= 6
+            or x.shape[1] != 6144
+            or x.stride() != (10304, 1)
+            or out is not x
+            or max_query_len != 6
+            or block_idx_last_scheduled_token is not None
+            or initial_state_idx is not None
+            or conv_state.dtype != torch.bfloat16
+            or conv_state.ndim != 3
+            or conv_state.shape[0] < 1
+            or conv_state.shape[1] != 6144
+            or conv_state.shape[2] < 8
+            or weight.dtype != torch.bfloat16
+            or tuple(weight.shape) != (6144, 4)
+            or not weight.is_contiguous()
+        ):
+            return False
+        if bias is not None and (
+            bias.dtype != torch.bfloat16
+            or tuple(bias.shape) != (6144,)
+            or not bias.is_contiguous()
+        ):
+            return False
+        for tensor, shape in (
+            (conv_state_indices, (1, 6)),
+            (num_accepted_tokens, (1,)),
+            (query_start_loc, (2,)),
+        ):
+            if (
+                tensor is None
+                or tensor.dtype != torch.int32
+                or tuple(tensor.shape) != shape
+                or not tensor.is_contiguous()
+            ):
+                return False
+
+        # Support the original DS and SD layouts, including slot padding,
+        # while excluding overlapping channels, tokens or cache slots.
+        _, dim, tokens = conv_state.shape
+        ss, sd, st = conv_state.stride()
+        if not (
+            (st == 1 and sd >= tokens) or (sd == 1 and st >= dim)
+        ):
+            return False
+        if ss < 1 + (dim - 1) * sd + (tokens - 1) * st:
+            return False
+
+        readonly = [
+            weight, conv_state_indices, num_accepted_tokens, query_start_loc
+        ]
+        if bias is not None:
+            readonly.append(bias)
+        tensors = [x, conv_state, *readonly]
+        if any(tensor.device != x.device for tensor in tensors):
+            return False
+        intervals = [_conv_packet_span(tensor) for tensor in tensors]
+        # Read-only sources may alias each other. Neither writable view may
+        # overlap any other source: STEP 2 writes state before STEP 5 reads x.
+        for i in range(2):
+            for j in range(i + 1, len(intervals)):
+                a, b = intervals[i], intervals[j]
+                if a[0] < b[1] and b[0] < a[1]:
+                    return False
+        return True
+    except Exception:
+        # Only host metadata inspection lives in this try block. A refusal is
+        # safe before dispatch; a failed GPU launch is never retried here.
+        return False
 
 
 def causal_conv1d_update(
@@ -1237,6 +1368,20 @@ def causal_conv1d_update(
     if batch == 1 and dim % 128 == 0 and _is_sm121():
         block_n = 128
 
+    reuse_input_packet = _can_reuse_conv_input_packet(
+        x,
+        out,
+        conv_state,
+        weight,
+        bias,
+        conv_state_indices,
+        num_accepted_tokens,
+        query_start_loc,
+        max_query_len,
+        block_idx_last_scheduled_token,
+        initial_state_idx,
+    )
+
     def grid(META):
         return (
             batch,
@@ -1287,6 +1432,7 @@ def causal_conv1d_update(
         HAS_NULL_BLOCK=null_block_id is not None,
         BLOCK_N=block_n,
         launch_pdl=current_platform.is_arch_support_pdl(),
+        REUSE_INPUT_PACKET=reuse_input_packet,
     )
     if unsqueeze:
         out = out.squeeze(-1)

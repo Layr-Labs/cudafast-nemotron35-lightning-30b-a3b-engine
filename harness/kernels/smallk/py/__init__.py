@@ -38,6 +38,11 @@ import os
 
 import torch
 
+try:
+    import routerw12 as _routerw12
+except ImportError:
+    _routerw12 = None
+
 __all__ = ["LIB_PATH", "available", "load_error", "init", "router_gemm", "topk_sigmoid", "align", "route",
            "ROUTER_ON", "ROUTER_W16_ON", "TOPK_ON", "ALIGN_ON", "FUSE_ON", "EARLY_ROUTER_ON", "maybe_router_gemm",
            "maybe_topk_sigmoid", "maybe_align", "VROWS_ALL", "enable_verify_rows", "verify_rows", "reset_verify_rows",
@@ -164,7 +169,7 @@ def _pdl(pdl: int | None) -> int:
 
 def router_gemm(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor | None = None, rows: int | None = None,
                 mode: int = 0, pdl: int | None = None, vrows: torch.Tensor | None = None,
-                w16: torch.Tensor | None = None) -> torch.Tensor:
+                w16: torch.Tensor | None = None, _packet=None) -> torch.Tensor:
     """y[M, N] = x[M, K] . w[N, K]^T in fp32 (x rows unit-stride, w contiguous). mode 1 (mul+add
     chains) exists only to show the fma chain is the one cuBLAS uses. vrows (int32 device scalar):
     rows m >= vrows get row max(vrows, 1) - 1's logits. w16: bf16 copy of w that holds the same
@@ -176,6 +181,9 @@ def router_gemm(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor | None = Non
     if out is None:
         out = torch.empty((m, n), dtype=torch.float32, device=x.device)
     rows = ROUTER_ROWS if rows is None else rows
+    if (_packet is not None and _routerw12 is not None
+            and _routerw12.run(_packet, x, w, w16, out, rows, mode, _pdl(pdl), vrows)):
+        return out
     if vrows is not None:
         assert _has_vrows_entry and vrows.dtype == torch.int32 and vrows.device == x.device
     if w16 is not None:
@@ -333,7 +341,11 @@ def maybe_router_gemm(x: torch.Tensor, w: torch.Tensor, row_mask: bool = False) 
         vrows = verify_rows(x.device)
         if vrows is None and capturing:
             _vrows_missed = True
-    return router_gemm(x, w, vrows=vrows, w16=gate_w16(w))
+    shadow = gate_w16(w)
+    packet = None
+    if _routerw12 is not None and row_mask:
+        packet = _routerw12.lookup(w, shadow, m, row_mask=True)
+    return router_gemm(x, w, vrows=vrows, w16=shadow, _packet=packet)
 
 
 def gate_w16(w: torch.Tensor) -> torch.Tensor | None:

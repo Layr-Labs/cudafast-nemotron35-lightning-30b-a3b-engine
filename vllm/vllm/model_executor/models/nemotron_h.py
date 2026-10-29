@@ -1063,6 +1063,56 @@ class NemotronHForCausalLM(
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
+    def process_weights_after_loading(self) -> None:
+        """Prepare optional exact router packets after final quant processing.
+
+        Only immutable single-worker target routers are considered. The original
+        forward, outer FP32 conversion and stream DAG are not changed here.
+        """
+        optional = getattr(_smallk, "_routerw12", None) if _smallk is not None else None
+        if optional is None or _l2pf is None:
+            return
+        cfg, pc = self.vllm_config, self.vllm_config.parallel_config
+        if (pc.tensor_parallel_size != 1 or pc.pipeline_parallel_size != 1
+                or pc.data_parallel_size != 1 or pc.prefill_context_parallel_size != 1
+                or pc.decode_context_parallel_size != 1 or pc.enable_eplb or pc.use_ubatching
+                or pc.distributed_executor_backend != "uni"
+                or cfg.scheduler_config.max_num_seqs != 1 or cfg.lora_config is not None
+                or cfg.weight_transfer_config is not None or cfg.kv_transfer_config is not None
+                or cfg.offload_config.uva.cpu_offload_gb != 0
+                or cfg.offload_config.prefetch.offload_group_size != 0):
+            return
+        from vllm.model_executor.layers.mamba.mamba_mixer2 import _out_proj_weight
+
+        layers = self.model.layers
+        for i in range(self.model.start_layer, self.model.end_layer - 1):
+            previous, following = layers[i], layers[i + 1]
+            if not isinstance(following, NemotronHMoEDecoderLayer):
+                continue
+            moe = following.mixer
+            if not moe._smallk_early_router or not moe.gate.__dict__.get("_smallk_row_mask", False):
+                continue
+            by_rows = {}
+            if isinstance(previous, NemotronHMambaDecoderLayer):
+                name = str(previous.mixer.prefix)
+                if _l2pf.AHEAD_GATE.get(name) is not moe.gate:
+                    continue
+                budget = _l2pf.MAMBA_BYTES - 688128
+                weight = _out_proj_weight(previous.mixer)
+                by_rows = {m: ((weight, budget),) for m in (5, 6)}
+            elif isinstance(previous, NemotronHAttentionDecoderLayer):
+                name = str(previous.mixer.attn.layer_name)
+                ahead = _l2pf.AHEAD.get(name)
+                if _l2pf.AHEAD_GATE.get(name) is not moe.gate or ahead is not previous.mixer.o_proj:
+                    continue
+                budget = _l2pf.ATTN_BYTES - 688128
+                planes = getattr(ahead, "_apk_planes", None)
+                ranges = ((ahead.weight, budget),) if planes is None else (
+                    (planes[0], budget * 2 // 3), (planes[1], budget - budget * 2 // 3))
+                by_rows = {m: ranges for m in (5, 6)}
+            if by_rows:
+                optional.prepare(moe.gate, by_rows)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self, skip_prefixes=["mtp"])
         loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

@@ -690,6 +690,22 @@
     {
       "file": "vllm/vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
       "why": "i34-9: ZSKIP_S6 defaults to on (the lean paired decode routed down reads the 6-bit scale plane, config 663, under its load-time bitwise check), as in kaankolcu's 778d1d36-5adf-497f-babb-832df9b0f24b and e-man07's a4b5cd6b-f239-4842-b66d-b1b3c20a58cd. ZSKIP_S6=0 keeps config 653 on the 8-bit plane. Measurement 2 (code identical)."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_kernels.py (ADAPT_MIN_CYCLES default)",
+      "why": "terrapinelf: i34-9's low-acceptance rule decides after 2 counted cycles (was 4) past its 4-cycle burn-in; thresholds 1.8 / 2.0 and the per-cycle cap are unchanged. Drafts only; the target verifies every committed token. MTP_ADAPT5_MIN_CYCLES=4 restores the record's rule."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_kernels.py (DEPTH_THETA default)",
+      "why": "terrapinelf: the depth gate's cumulative-confidence threshold for the first four drafts defaults to 0.51 (was 0.5); MTP_DEPTH_THETA=0.5 restores it."
+    },
+    {
+      "file": "(composition)",
+      "why": "terrapinelf on the record 5677c186-ecd4-4152-9f0a-081d64d44273 (i34-9: d6651a3d with ercumentyildirim's bf16ws and the decode 6-bit scale plane): the record byte for byte, plus the low-acceptance rule's minimum cycle count at 2 and the depth gate's threshold at 0.51. No new arithmetic. Measurement #8."
+    },
+    {
+      "file": "harness/kernels/routerw12; harness/kernels/smallk/py/__init__.py; harness/kernels/l2pf/py/__init__.py; models/nemotron_h.py; layers/mamba/mamba_mixer2.py; layers/attention/attention.py",
+      "why": "Independent optional router W16/W12 packet on complete c41fc629-8c06-4bf2-8cb8-cad0edea9875 only. Original FP32 input conversion, R1 explicit FMA/tile/lane chain, vrows substitution, PDL and stream DAG retained. One owning immutable packet holds raw W16 rows or exact exponent-window rows; actual gate/shadow bit proof, native full decode, full output/count/changed two-stream graph and warm/pressure actual-prefetch-range timing must pass remotely before entry publication. Same admitted packet is used by prefetch and GEMV; old W16 reservation remains, so projection prefetch does not refill saved gate bytes. No fit/activation/bit/performance claim. Material original router100549d4-51c4-4f56-b3ca-2604731ab8a4, W160852152c-9025-499d-83bd-684cf825232e, codec3d51cab6-7079-4fb2-98e4-f2a238077897, grouped loads c0ce642d-0f7b-4c1f-a168-f8edb153aa4e and59b3dbb4-6919-44ca-85f1-fcbbc0f1d975, prefetch297e3412-dc4a-45ae-a0f1-b6c3afd76c1b, M5f38ce1ad-87fa-4cfb-8a0c-ac46587810f7, M6eb48e2f0-50e6-4c39-a1f3-0ac305d17c5b and count protocolca5c19dd-da37-4328-880a-152f8c7b3651. Only private admission/owner/drain/fallback designs reused from110cff4b-d86d-4fe9-ae30-f6ce550d005f and77f74985-a845-4963-bf29-b860e8daa7ef, both retired lower wholes; no A16 or suffix arithmetic imported. Implementation GPT6.1Sol/ultra/Codex actual turn_context. All candidate execution official remote only. Optional build failure preserves baseline smallk; native runtime errors are visible and not retried."
     }
   ]
 }

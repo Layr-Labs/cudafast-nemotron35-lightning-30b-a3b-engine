@@ -873,7 +873,7 @@ def unified_attention_with_output(
     ahead = _l2pf.AHEAD.get(layer_name) if _l2pf is not None else None
     pf = False
     if (ahead is not None and query.shape[0] <= 8 and _l2pf.ATTN_BYTES > 0):
-        gate, reserved = _l2pf.gate_weight(layer_name, _l2pf.ATTN_BYTES)
+        gate, reserved = _l2pf.gate_weight(layer_name, _l2pf.ATTN_BYTES, query.shape[0])
         pf = _prefetch_ahead(ahead, query.shape[0],
                              _l2pf.ATTN_BYTES - reserved, gate, reserved)
     self.impl.forward(

@@ -222,7 +222,7 @@ def join(device: torch.device) -> None:
     torch.cuda.current_stream(device).wait_stream(_side_stream(device))
 
 
-def gate_weight(layer_name: str, budget: int) -> tuple[torch.Tensor | None, int]:
+def gate_weight(layer_name: str, budget: int, rows: int | None = None) -> tuple[torch.Tensor | None, int]:
     """Reserve at most a quarter of the existing window for next-router bytes.
 
     Prefetches the exact immutable BF16 shadow the existing router selects,
@@ -245,6 +245,13 @@ def gate_weight(layer_name: str, budget: int) -> tuple[torch.Tensor | None, int]
     reserved = min(weight.untyped_storage().nbytes(), budget // 4)
     if reserved <= 0:
         return None, 0
+    # Both decisions select the same admitted immutable packet. Keep the old
+    # W16 reservation: projection bytes do not refill the saved gate requests.
+    optional = getattr(smallk, "_routerw12", None) if shadow is not None else None
+    if optional is not None:
+        packet = optional.prefetch_packet(gate, gate.weight, shadow, rows, reserved)
+        if packet is not None:
+            return packet, reserved
     return weight, reserved
 
 

@@ -49,6 +49,7 @@ struct Params {
   int iters;               // Marlin stripe length (k-tiles per block) in part 2
   const uint2* SU;         // optional unit-major copy of S, [N/64][K/16][8] uint2 (or null)
   const int* vrows;        // lean only: live verify rows (device int; rows >= it read as zero), or null
+  uint64_t* partials = nullptr;  // optional [M, N/64], float bits | token id << 32
 };
 
 __device__ __forceinline__ uint4 ld_stream_v4(const uint4* p) {
@@ -276,12 +277,25 @@ __device__ __forceinline__ __nv_bfloat162 round_output2_relu2(float a, float b) 
   return cvt.h;
 }
 
+// The same total order as vsample::wins: NaN first, then value, then lowest id.
+__device__ __forceinline__ void head_take(float& a, int& ai, float b, int bi) {
+  const bool na = a != a, nb = b != b;
+  if (nb ? (!na || bi < ai) : (!na && (b > a || (b == a && bi < ai)))) {
+    a = b;
+    ai = bi;
+  }
+}
+
 // Marlin write_result: bf16_rn(R * global_scale), rows < M only (warp 0).
-template <bool Relu2>
+// Partials retains every original C store; only the rounded values feed max.
+template <bool Relu2, bool Partials = false>
 __device__ __forceinline__ void write_out(const Params& p, int col, int h, int lane,
                                           const float (&R)[4][4]) {
+  static_assert(!Partials || !Relu2);
   const float g = __ldg(p.GS);
   const int t0 = 2 * (lane & 3);
+  float best0 = -__int_as_float(0x7f800000), best1 = best0;
+  int id0 = 0x7fffffff, id1 = 0x7fffffff;
 #pragma unroll
   for (int j = 0; j < 4; ++j) {
     const long long f = 128LL * col + 64 * h + 16 * j + (lane >> 2);
@@ -307,6 +321,35 @@ __device__ __forceinline__ void write_out(const Params& p, int col, int h, int l
       p.C[(t0 + 1) * p.ldc + f] = v1;
       p.C[(t0 + 1) * p.ldc + f + 8] = v3;
     }
+    if constexpr (Partials) {
+      head_take(best0, id0, __bfloat162float(v0), (int)f);
+      head_take(best0, id0, __bfloat162float(v2), (int)f + 8);
+      head_take(best1, id1, __bfloat162float(v1), (int)f);
+      head_take(best1, id1, __bfloat162float(v3), (int)f + 8);
+    }
+  }
+  if constexpr (Partials) {
+    // lane&3 identifies a pair of token rows. XOR 4/8/16 visits only the
+    // eight lanes owning different columns for that SAME pair of rows.
+#pragma unroll
+    for (int d = 4; d <= 16; d *= 2) {
+      const float b0 = __shfl_xor_sync(0xffffffffu, best0, d);
+      const int i0 = __shfl_xor_sync(0xffffffffu, id0, d);
+      const float b1 = __shfl_xor_sync(0xffffffffu, best1, d);
+      const int i1 = __shfl_xor_sync(0xffffffffu, id1, d);
+      head_take(best0, id0, b0, i0);
+      head_take(best1, id1, b1, i1);
+    }
+    if ((lane >> 2) == 0) {
+      const int unit = 2 * col + h;
+      const int units = p.N / 64;
+      if (t0 < p.M)
+        p.partials[(long long)t0 * units + unit] =
+            uint64_t(__float_as_uint(best0)) | (uint64_t(uint32_t(id0)) << 32);
+      if (t0 + 1 < p.M)
+        p.partials[(long long)(t0 + 1) * units + unit] =
+            uint64_t(__float_as_uint(best1)) | (uint64_t(uint32_t(id1)) << 32);
+    }
   }
 }
 
@@ -319,7 +362,7 @@ __device__ __forceinline__ int column_first_cut(const Params& p, int col) {
 
 // One 64-feature half column (`unit`) per CTA of 4 warps; warp w runs Marlin's
 // warp-row chain w through a register ring of P k16 blocks.
-template <int P, bool Relu2 = false, bool ZS = false, bool PDL = false>
+template <int P, bool Relu2 = false, bool ZS = false, bool PDL = false, bool Partials = false>
 __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
   __shared__ float red[2][3][16][32];
   __shared__ uint16_t zmask[ZS ? 512 : 1];
@@ -470,7 +513,7 @@ __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
   // epilogue remains; a dependent must wait before reading any of C.
   if constexpr (PDL) pdl_launch_dependents();
 #endif
-  if (!w) write_out<Relu2>(p, col, h, lane, R);
+  if (!w) write_out<Relu2, Partials>(p, col, h, lane, R);
 }
 
 // ---------------------------------------------------------------------------
@@ -726,7 +769,7 @@ __global__ void hog_kernel(const uint4* __restrict__ src, long long n16, unsigne
   if (x == 0x9e3779b9u) sink[0] = x + (unsigned)(uintptr_t)hog_smem;
 }
 
-template <int P, bool Relu2 = false, bool ZS = false>
+template <int P, bool Relu2 = false, bool ZS = false, bool Partials = false>
 static int launch(const Params& p, cudaStream_t stream, bool pdl) {
 #ifndef MARLINX_NO_PDL
   if (pdl) {
@@ -740,12 +783,12 @@ static int launch(const Params& p, cudaStream_t stream, bool pdl) {
     attr[0].val.programmaticStreamSerializationAllowed = 1;
     cfg.attrs = attr;
     cfg.numAttrs = 1;
-    cudaError_t rc = cudaLaunchKernelEx(&cfg, gemm_kernel<P, Relu2, ZS, true>, p);
+    cudaError_t rc = cudaLaunchKernelEx(&cfg, gemm_kernel<P, Relu2, ZS, true, Partials>, p);
     if (rc != cudaSuccess) { cudaGetLastError(); return (int)rc; }
     return (int)cudaGetLastError();
   }
 #endif
-  gemm_kernel<P, Relu2, ZS><<<2 * p.n_tiles, 128, p.SU ? (size_t)(p.K >> 4) * 64 : 0, stream>>>(p);
+  gemm_kernel<P, Relu2, ZS, false, Partials><<<2 * p.n_tiles, 128, p.SU ? (size_t)(p.K >> 4) * 64 : 0, stream>>>(p);
   return (int)cudaGetLastError();
 }
 
@@ -843,7 +886,7 @@ int marlinx_regs(int depth) {
 static int marlinx_gemm_impl(const void* A, long long lda, int M, const void* B, const void* S,
                  const void* GS, void* C, long long ldc, int N, int K, int sms, int depth,
                  void* stream, bool relu2, const void* Z = nullptr, bool pdl = false,
-                 const void* SU = nullptr) {
+                 const void* SU = nullptr, void* partials = nullptr) {
   if (M < 1 || M > 8) return -1;
   if (N <= 0 || K <= 0 || N % 128 || K % 128) return -2;
   if (sms <= 0) return -3;
@@ -864,6 +907,7 @@ static int marlinx_gemm_impl(const void* A, long long lda, int M, const void* B,
   p.Z = static_cast<const uint32_t*>(Z);
   p.SU = static_cast<const uint2*>(SU);
   p.vrows = nullptr;
+  p.partials = static_cast<uint64_t*>(partials);
   if (SU && ((K >> 4) * 64 > 48 * 1024 || (reinterpret_cast<uintptr_t>(SU) & 15))) return -9;
   // Marlin's stripe partition with parallel = 1 and grid = sms.
   int part2 = p.n_tiles;
@@ -874,6 +918,15 @@ static int marlinx_gemm_impl(const void* A, long long lda, int M, const void* B,
   p.part1_cols = p.n_tiles - part2;
   p.iters = (p.k_tiles * part2 + sms - 1) / sms;
   cudaStream_t st = static_cast<cudaStream_t>(stream);
+  if (partials) {
+    if (N != 131072 || K != 2688 || M < 2 || M > 6 || relu2 || Z ||
+        ldc != N || (reinterpret_cast<uintptr_t>(partials) & 7)) return -11;
+    switch (depth) {
+      case 4: return marlinx::launch<4, false, false, true>(p, st, pdl);
+      case 8: return marlinx::launch<8, false, false, true>(p, st, pdl);
+      default: return -5;
+    }
+  }
   if (relu2) {
     if (N != 3712 || K != 2688) return -6;
     switch (depth) {
@@ -902,6 +955,18 @@ int marlinx_gemm(const void* A, long long lda, int M, const void* B, const void*
                  const void* GS, void* C, long long ldc, int N, int K, int sms, int depth,
                  void* stream) {
   return marlinx_gemm_impl(A, lda, M, B, S, GS, C, ldc, N, K, sms, depth, stream, false);
+}
+
+// Optional ABI. The original GEMM and all its original exports remain intact.
+int marlinx_gemm_head_partials(const void* A, long long lda, int M, const void* B, const void* S,
+                 const void* GS, void* C, long long ldc, int N, int K, int sms, int depth,
+                 void* stream, const void* SU, void* partials, int pdl) {
+  if (!partials) return -11;
+#ifdef MARLINX_NO_PDL
+  if (pdl) return -10;
+#endif
+  return marlinx_gemm_impl(A, lda, M, B, S, GS, C, ldc, N, K, sms, depth,
+                          stream, false, nullptr, pdl != 0, SU, partials);
 }
 
 int marlinx_gemm_relu2(const void* A, long long lda, int M, const void* B, const void* S,

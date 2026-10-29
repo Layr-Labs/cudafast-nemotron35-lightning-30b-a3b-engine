@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import ctypes
 import os
+import threading
+from contextlib import contextmanager
 
 import torch
 
@@ -41,6 +43,81 @@ _init_pdl = None
 _ops = {}
 _ops_pdl = {}
 _lean_active = False  # MARLINX_LEAN kernels loaded (see LEAN_LAYERS)
+_HEAD_PARTIALS = os.environ.get("MARLINX_HEAD_PARTIALS", "1") != "0"
+_head_local = threading.local()
+
+
+def _head_layout(t):
+    return (t.device, t.dtype, t.data_ptr(), tuple(t.shape), tuple(t.stride()),
+            t.storage_offset())
+
+
+class HeadPartialTicket:
+    """Single-use, owning outputs of ONE eager target-head call, never a cache."""
+
+    def __init__(self, logits, partials, stream):
+        self.logits = logits
+        self.partials = partials
+        self.layout = _head_layout(logits)
+        self.stream = stream
+        self.used = False
+
+    def prepare_for_sample(self, logits, grammar):
+        if self.used or logits is not self.logits or _head_layout(logits) != self.layout:
+            self.used = True
+            return None
+        current = torch.cuda.current_stream(logits.device)
+        if current.cuda_stream != self.stream.cuda_stream:
+            # C is an ordinary owning allocation, not borrowed graph output.
+            # Publish readiness on its producer stream before grammar/sampling.
+            ready = torch.cuda.Event(enable_timing=False)
+            ready.record(self.stream)
+            current.wait_event(ready)
+            logits.record_stream(current)
+            self.used = True
+            return None
+        if grammar or torch.cuda.is_current_stream_capturing():
+            self.used = True
+            return None
+        return self
+
+    def take(self, logits):
+        if self.used:
+            return None
+        self.used = True
+        if (logits is not self.logits or _head_layout(logits) != self.layout
+                or torch.cuda.current_stream(logits.device).cuda_stream != self.stream.cuda_stream
+                or torch.cuda.is_current_stream_capturing()):
+            return None
+        return self.partials
+
+
+class _HeadCollector:
+    def __init__(self, layer):
+        self.layer = layer
+        self.output = None
+        self.partials = None
+        self.stream = None
+        self.calls = 0
+
+    def finish(self, logits):
+        if (self.calls != 1 or self.output is None or logits is None
+                or _head_layout(logits) != _head_layout(self.output)):
+            return None
+        return HeadPartialTicket(logits, self.partials, self.stream)
+
+
+@contextmanager
+def collect_head_partials(layer):
+    """Scope only the original target compute_logits; no callback replacement."""
+    previous = getattr(_head_local, "collector", None)
+    collector = _HeadCollector(layer)
+    # A nested scope refuses collection rather than redirecting another head.
+    _head_local.collector = collector if previous is None and _HEAD_PARTIALS else None
+    try:
+        yield collector
+    finally:
+        _head_local.collector = previous
 
 
 def _load():
@@ -61,6 +138,10 @@ def _load():
             ctypes.c_void_p,  # stream
         ]
         lib.marlinx_gemm.restype = ctypes.c_int
+        if hasattr(lib, "marlinx_gemm_head_partials"):
+            lib.marlinx_gemm_head_partials.argtypes = lib.marlinx_gemm.argtypes + [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]  # SU partials pdl
+            lib.marlinx_gemm_head_partials.restype = ctypes.c_int
         if hasattr(lib, "marlinx_gemm_zs"):
             lib.marlinx_gemm_zs.argtypes = lib.marlinx_gemm.argtypes + [ctypes.c_void_p]
             lib.marlinx_gemm_zs.restype = ctypes.c_int
@@ -417,6 +498,31 @@ def maybe_apply(layer, x: torch.Tensor) -> torch.Tensor | None:
     if not _ready and not _init():
         return None
     n = layer.output_size_per_partition
+    collector = getattr(_head_local, "collector", None)
+    if (collector is not None and collector.layer is layer
+            and (n, k) == (131072, 2688) and 2 <= m <= 6
+            and not torch.cuda.is_current_stream_capturing()
+            and hasattr(_lib, "marlinx_gemm_head_partials")):
+        collector.calls += 1
+        if collector.calls == 1:
+            out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
+            partials = torch.empty((m, n // 64), dtype=torch.int64, device=x.device)
+            stream = torch.cuda.current_stream(x.device)
+            su = getattr(layer, "_marlinx_su", None)
+            rc = _lib.marlinx_gemm_head_partials(
+                x2.data_ptr(), x2.stride(0), m,
+                layer.weight.data_ptr(), layer.weight_scale.data_ptr(),
+                layer.weight_global_scale.data_ptr(), out.data_ptr(), n,
+                n, k, _sm_count(x.device), DEPTH, stream.cuda_stream,
+                None if su is None else su.data_ptr(), partials.data_ptr(), int(_pdl_active))
+            if rc != 0:
+                # A failed launch is visible; never retry after potentially
+                # enqueued work or publish an incomplete partial ticket.
+                raise RuntimeError(f"marlinx_gemm_head_partials failed: {rc}")
+            collector.output = out
+            collector.partials = partials
+            collector.stream = stream
+            return out.reshape(*x.shape[:-1], n)
     vrows = _live_rows(layer, x2) if m in (5, 6) else None
     out = gemm(x2, layer.weight, layer.weight_scale, layer.weight_global_scale, n, k,
                zs=getattr(layer, "_marlinx_zs", None), su=getattr(layer, "_marlinx_su", None),

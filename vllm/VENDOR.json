@@ -690,6 +690,22 @@
     {
       "file": "vllm/vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
       "why": "i34-9: ZSKIP_S6 defaults to on (the lean paired decode routed down reads the 6-bit scale plane, config 663, under its load-time bitwise check), as in kaankolcu's 778d1d36-5adf-497f-babb-832df9b0f24b and e-man07's a4b5cd6b-f239-4842-b66d-b1b3c20a58cd. ZSKIP_S6=0 keeps config 653 on the 8-bit plane. Measurement 2 (code identical)."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_kernels.py (ADAPT_MIN_CYCLES default)",
+      "why": "terrapinelf: i34-9's low-acceptance rule decides after 2 counted cycles (was 4) past its 4-cycle burn-in; thresholds 1.8 / 2.0 and the per-cycle cap are unchanged. Drafts only; the target verifies every committed token. MTP_ADAPT5_MIN_CYCLES=4 restores the record's rule."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_kernels.py (DEPTH_THETA default)",
+      "why": "terrapinelf: the depth gate's cumulative-confidence threshold for the first four drafts defaults to 0.51 (was 0.5); MTP_DEPTH_THETA=0.5 restores it."
+    },
+    {
+      "file": "(composition)",
+      "why": "terrapinelf on the record 5677c186-ecd4-4152-9f0a-081d64d44273 (i34-9: d6651a3d with ercumentyildirim's bf16ws and the decode 6-bit scale plane): the record byte for byte, plus the low-acceptance rule's minimum cycle count at 2 and the depth gate's threshold at 0.51. No new arithmetic. Measurement #8."
+    },
+    {
+      "file": "harness/kernels/marlinx/{csrc/marlinx.cu,py/__init__.py,HEAD_PARTIALS.md}; harness/kernels/vsample/{csrc/vsample.cu,py/__init__.py}; vllm/vllm/v1/worker/gpu_model_runner.py",
+      "why": "Unvalidated head-partial experiment on complete verified c41fc629-8c06-4bf2-8cb8-cad0edea9875 (tree3f3a3fa2636eb7c71bf871462134b3b18fbc5259). Original MarlinX GEMM/reduction/BF16 logits stores retained; optional eager M2..6 N131072 K2688 epilogue also writes one (rounded-value,id) record per64-column unit. Only a single-use owning frame ticket with exact logits layout, original no-op LogitsProcessor, native MTP/one-request/single-worker guards and current original greedy-argmax qualification may feed the partial-input vsample specialization. Grammar/unsupported/capture/stream changes keep the complete original logits and original sampler; cross-stream fallback orders and records logits before grammar. Source methods: adab284a-bf1d-4ce2-8e90-6720fa0f5435 MarlinX; b86d9048-2e9d-4a70-9373-abe8d09b77d4 vsample total-order/rejection/count/reset. MARLINX_HEAD_PARTIALS=0 disables collection. No target format or draft-policy change, no new persistent request/graph result cache. Net logical M6 traffic saving bound1.3125MiB, not a measured HBM/speed claim. All compilation, numerical/capture/stream checks and complete score validation official remote only; none executed locally."
     }
   ]
 }

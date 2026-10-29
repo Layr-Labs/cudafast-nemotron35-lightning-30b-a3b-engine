@@ -77,6 +77,7 @@ __device__ __forceinline__ float bf16_bits_to_float(unsigned short h) {
   return __uint_as_float(static_cast<unsigned int>(h) << 16);
 }
 
+template <bool Partials = false>
 __global__ void __launch_bounds__(kThreads)
     greedy_verify_kernel(const unsigned short* __restrict__ logits, long ld, int V, int C,
                          const int* __restrict__ target_idx, const int* __restrict__ bonus_idx,
@@ -94,8 +95,19 @@ __global__ void __launch_bounds__(kThreads)
   pdl_wait();
   // ---- phase 1: this CTA's chunk of row r
   Best b{-__int_as_float(0x7f800000), 0x7fffffff};  // (-inf, +big): loses to every element
-  const unsigned short* row = logits + static_cast<long>(r) * ld;
-  const int base = c * kChunk;
+  if constexpr (Partials) {
+    // One uint64 per MarlinX 64-column unit: original rounded value bits
+    // in low32, global vocabulary id in high32. One input per thread.
+    const int i = c * kThreads + t;
+    if (i < V) {
+      const auto* row = reinterpret_cast<const unsigned long long*>(logits)
+          + static_cast<long>(r) * ld;
+      const unsigned long long q = __ldcg(row + i);
+      take(b, __uint_as_float(static_cast<unsigned int>(q)), static_cast<int>(q >> 32));
+    }
+  } else {
+    const unsigned short* row = logits + static_cast<long>(r) * ld;
+    const int base = c * kChunk;
 #pragma unroll
   for (int l = 0; l < kLoads; ++l) {
     const int e0 = base + (l * kThreads + t) * kVec;
@@ -110,6 +122,7 @@ __global__ void __launch_bounds__(kThreads)
     } else {
       for (int e = e0; e < V && e < e0 + kVec; ++e) take(b, bf16_bits_to_float(row[e]), e);
     }
+  }
   }
   b = warp_best(b);
   if ((t & 31) == 0) wbest[t >> 5] = b;
@@ -205,10 +218,36 @@ int vs_greedy_verify(const void* logits, long ld, int R, int V, const int* targe
   attr[0].val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = attr;
   cfg.numAttrs = pdl ? 1 : 0;
-  const cudaError_t e = cudaLaunchKernelEx(&cfg, greedy_verify_kernel,
+  const cudaError_t e = cudaLaunchKernelEx(&cfg, greedy_verify_kernel<false>,
                                            static_cast<const unsigned short*>(logits), ld, V, C, target_idx,
                                            bonus_idx, cu_num_draft, draft, vrows, out, out_len, num_accepted, R,
                                            pval, pidx, counter);
+  return e == cudaSuccess ? 0 : 100 + static_cast<int>(e);
+}
+
+// Optional input ABI, same exact rejection/count/reset body as greedy_verify.
+// V counts uint64 partial records, not vocabulary entries. The producer fixes
+// N=131072 and emits every one of its 2048 units for every row.
+int vs_greedy_verify_partials(const void* partials, long ld, int R, int V, const int* target_idx,
+                     const int* bonus_idx, const int* cu_num_draft, const int* draft, int* vrows,
+                     int* out, int out_len, int* num_accepted, float* pval, int* pidx,
+                     unsigned int* counter, int pdl, cudaStream_t stream) {
+  if (R < 2 || R > 6 || V != 2048 || ld != V || out_len != R ||
+      (reinterpret_cast<uintptr_t>(partials) & 7u) != 0) return 1;
+  const int C = (V + kThreads - 1) / kThreads;
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3(C, R, 1);
+  cfg.blockDim = dim3(kThreads, 1, 1);
+  cfg.stream = stream;
+  cudaLaunchAttribute attr[1];
+  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr[0].val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = attr;
+  cfg.numAttrs = pdl ? 1 : 0;
+  const cudaError_t e = cudaLaunchKernelEx(&cfg, greedy_verify_kernel<true>,
+      static_cast<const unsigned short*>(partials), ld, V, C, target_idx,
+      bonus_idx, cu_num_draft, draft, vrows, out, out_len, num_accepted, R,
+      pval, pidx, counter);
   return e == cudaSuccess ? 0 : 100 + static_cast<int>(e);
 }
 

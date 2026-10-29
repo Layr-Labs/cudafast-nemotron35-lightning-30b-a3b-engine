@@ -42,6 +42,9 @@ def _load():
         lib.vs_max_vocab.restype = ci
         lib.vs_greedy_verify.argtypes = [vp, cl, ci, ci, vp, vp, vp, vp, vp, vp, ci, vp, vp, vp, vp, ci, vp]
         lib.vs_greedy_verify.restype = ci
+        if hasattr(lib, "vs_greedy_verify_partials"):
+            lib.vs_greedy_verify_partials.argtypes = lib.vs_greedy_verify.argtypes
+            lib.vs_greedy_verify_partials.restype = ci
         _max_rows = lib.vs_max_rows()
         _max_vocab = lib.vs_max_vocab()
         _lib = lib
@@ -52,6 +55,11 @@ def _load():
 
 def available() -> bool:
     return ENABLED and _load() is not None
+
+
+def partials_available() -> bool:
+    lib = _load()
+    return ENABLED and lib is not None and hasattr(lib, "vs_greedy_verify_partials")
 
 
 def _bufs(device: torch.device):
@@ -70,7 +78,8 @@ def _bufs(device: torch.device):
 
 def greedy_verify(logits: torch.Tensor, target_logits_indices: torch.Tensor, bonus_logits_indices: torch.Tensor,
                   cu_num_draft_tokens: torch.Tensor, draft_token_ids: torch.Tensor, max_spec_len: int,
-                  vrows: torch.Tensor | None, num_accepted: torch.Tensor | None) -> torch.Tensor:
+                  vrows: torch.Tensor | None, num_accepted: torch.Tensor | None,
+                  partials: torch.Tensor | None = None) -> torch.Tensor:
     """output_token_ids [1, max_spec_len + 1] int32 of the stock greedy chain; writes num_accepted[0]
     (int32) and resets vrows[0] to VROWS_ALL when given."""
     lib = _load()
@@ -78,8 +87,10 @@ def greedy_verify(logits: torch.Tensor, target_logits_indices: torch.Tensor, bon
     rows, vocab = logits.shape
     out = torch.empty((1, max_spec_len + 1), dtype=torch.int32, device=logits.device)
     pval, pidx, counter = _bufs(logits.device)
-    rc = lib.vs_greedy_verify(
-        logits.data_ptr(), logits.stride(0), rows, vocab, target_logits_indices.data_ptr(),
+    op = lib.vs_greedy_verify if partials is None else lib.vs_greedy_verify_partials
+    source = logits if partials is None else partials
+    rc = op(
+        source.data_ptr(), source.stride(0), rows, source.shape[1], target_logits_indices.data_ptr(),
         bonus_logits_indices.data_ptr(), cu_num_draft_tokens.data_ptr(), draft_token_ids.data_ptr(),
         None if vrows is None else vrows.data_ptr(), out.data_ptr(), out.shape[1],
         None if num_accepted is None else num_accepted.data_ptr(), pval.data_ptr(), pidx.data_ptr(),
@@ -95,7 +106,8 @@ def _i32(t: torch.Tensor | None, n: int, device) -> bool:
 
 
 def maybe_greedy_verify(logits: torch.Tensor | None, metadata, vrows: torch.Tensor | None,
-                        num_accepted: torch.Tensor | None) -> torch.Tensor | None:
+                        num_accepted: torch.Tensor | None,
+                        partials: torch.Tensor | None = None) -> torch.Tensor | None:
     """The fused chain for a one-request greedy verify, or None (the caller runs the stock ops).
     The caller has already established that the rejection sampler would take its greedy-argmax path."""
     if not ENABLED or logits is None or metadata is None:
@@ -127,8 +139,17 @@ def maybe_greedy_verify(logits: torch.Tensor | None, metadata, vrows: torch.Tens
         or torch.cuda.is_current_stream_capturing()
     ):
         return None
+    if partials is not None and (
+        not hasattr(_lib, "vs_greedy_verify_partials") or logits.shape[1] != 131072
+        or not 2 <= logits.shape[0] <= 6 or partials.device != dev
+        or partials.dtype != torch.int64 or not partials.is_contiguous()
+        or tuple(partials.shape) != (logits.shape[0], 2048)
+        or partials.data_ptr() % 8
+    ):
+        partials = None  # Complete original logits were retained by the producer.
     return greedy_verify(logits, metadata.target_logits_indices, metadata.bonus_logits_indices,
-                         metadata.cu_num_draft_tokens, metadata.draft_token_ids, max_spec_len, vrows, num_accepted)
+                         metadata.cu_num_draft_tokens, metadata.draft_token_ids, max_spec_len,
+                         vrows, num_accepted, partials)
 
 
 _load() if ENABLED else None

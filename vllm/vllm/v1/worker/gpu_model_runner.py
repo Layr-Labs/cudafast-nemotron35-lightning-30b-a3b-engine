@@ -532,6 +532,7 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+    head_partial_ticket: Any | None = None
 
 
 class GPUModelRunner(
@@ -4003,6 +4004,7 @@ class GPUModelRunner(
         self,
         logits: torch.Tensor | None,
         spec_decode_metadata: SpecDecodeMetadata | None,
+        head_partial_ticket=None,
     ) -> SamplerOutput:
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
@@ -4036,7 +4038,7 @@ class GPUModelRunner(
         # integer results (argmax under torch's NaN/tie order); the stock path runs
         # whenever its guard refuses. VSAMPLE=0 disables it.
         fused = self._vsample_greedy(
-            logits, spec_decode_metadata, sampling_metadata, vrows
+            logits, spec_decode_metadata, sampling_metadata, vrows, head_partial_ticket
         )
         if fused is not None:
             return fused
@@ -4064,6 +4066,7 @@ class GPUModelRunner(
         spec_decode_metadata: SpecDecodeMetadata,
         sampling_metadata,
         vrows: torch.Tensor | None,
+        head_partial_ticket=None,
     ) -> SamplerOutput | None:
         self._vsample_counted = None
         vsample = sys.modules.get("vsample")
@@ -4087,7 +4090,12 @@ class GPUModelRunner(
             if self.speculative_config and self.model_config.is_hybrid
             else None
         )
-        out = vsample.maybe_greedy_verify(logits, spec_decode_metadata, vrows, count)
+        partials = None if head_partial_ticket is None else head_partial_ticket.take(logits)
+        if partials is None:
+            out = vsample.maybe_greedy_verify(logits, spec_decode_metadata, vrows, count)
+        else:
+            out = vsample.maybe_greedy_verify(
+                logits, spec_decode_metadata, vrows, count, partials=partials)
         if out is None:
             return None
         if count is not None:
@@ -4909,11 +4917,16 @@ class GPUModelRunner(
                     )
 
                 sample_hidden_states = hidden_states[logits_indices]
-                logits = (fresh_logits if fresh_logits is not None else
-                          self.model.compute_logits(sample_hidden_states))
+                if fresh_logits is not None:
+                    logits = fresh_logits
+                    head_partial_ticket = None
+                else:
+                    logits, head_partial_ticket = self._compute_logits_with_head_partials(
+                        sample_hidden_states, spec_decode_metadata)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
+                head_partial_ticket = None
 
                 sample_hidden_states = hidden_states[logits_indices]
                 if not get_pp_group().is_last_rank:
@@ -4952,6 +4965,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            head_partial_ticket,
         )
         self.kv_connector_output = kv_connector_output
 
@@ -4961,6 +4975,60 @@ class GPUModelRunner(
             deferred_state_corrections_fn()
 
         return None
+
+    def _compute_logits_with_head_partials(self, hidden, metadata):
+        """Retain original callback/full logits; collect an optional eager epilogue."""
+        def ordinary():
+            return self.model.compute_logits(hidden), None
+
+        mx = sys.modules.get("marlinx")
+        if (mx is None or not hasattr(mx, "collect_head_partials")
+                or metadata is None or self.speculative_config is None
+                or self.speculative_config.method != "mtp"
+                or self.input_batch.num_reqs != 1 or self.lora_config is not None
+                or self.parallel_config.tensor_parallel_size != 1
+                or self.parallel_config.pipeline_parallel_size != 1
+                or self.parallel_config.data_parallel_size != 1
+                or self.parallel_config.use_ubatching
+                or not hidden.is_cuda or hidden.dtype != torch.bfloat16 or hidden.ndim != 2
+                or hidden.shape[1] != 2688 or not 2 <= hidden.shape[0] <= 6
+                or torch.cuda.is_current_stream_capturing()
+                or type(self.rejection_sampler) is not RejectionSampler
+                or not self.rejection_sampler._can_use_greedy_argmax(
+                    self.input_batch.sampling_metadata)):
+            return ordinary()
+        from vllm.model_executor.layers.logits_processor import LogitsProcessor
+        from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+        from vllm.model_executor.kernels.linear.nvfp4.marlin import MarlinNvFp4LinearKernel
+        from vllm.model_executor.layers.quantization.modelopt import (
+            ModelOptNvFp4LinearMethod, ModelOptNvFp4W4A16LinearMethod,
+        )
+        from vllm.model_executor.models.nemotron_h import NemotronHForCausalLM
+
+        model = self.get_model()
+        processor = getattr(model, "logits_processor", None)
+        head = getattr(model, "lm_head", None)
+        method = getattr(head, "quant_method", None)
+        if (type(model) is not NemotronHForCausalLM or type(processor) is not LogitsProcessor
+                or type(head) is not ParallelLMHead
+                or type(method) not in (ModelOptNvFp4LinearMethod, ModelOptNvFp4W4A16LinearMethod)
+                or type(getattr(method, "kernel", None)) is not MarlinNvFp4LinearKernel
+                or getattr(self.model.compute_logits, "__func__", None)
+                is not NemotronHForCausalLM.compute_logits
+                or processor.logits_as_input or processor.soft_cap is not None
+                or processor.scale != 1.0 or processor.org_vocab_size != 131072
+                or processor.head_dtype not in (None, torch.bfloat16)
+                or head.tp_size != 1 or not getattr(head, "_marlinx_ok", False)):
+            return ordinary()
+        try:
+            import vsample
+        except ImportError:
+            return ordinary()
+        if not hasattr(vsample, "partials_available") or not vsample.partials_available():
+            return ordinary()
+        with mx.collect_head_partials(head) as collector:
+            logits = self.model.compute_logits(hidden)
+        return logits, collector.finish(logits)
 
     def _input_fits_in_drafter(
         self, common_attn_metadata: CommonAttentionMetadata | None
@@ -5277,9 +5345,14 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            head_partial_ticket,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
+
+        if head_partial_ticket is not None:
+            head_partial_ticket = head_partial_ticket.prepare_for_sample(
+                logits, grammar_output is not None)
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -5288,7 +5361,7 @@ class GPUModelRunner(
             )
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+            sampler_output = self._sample(logits, spec_decode_metadata, head_partial_ticket)
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output

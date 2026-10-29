@@ -279,6 +279,11 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
             hidden_states, residual = self.norm(hidden_states, residual)
         if self._fast_moe:
             if self.has_end_norm and self._mtp_fold_residual_ok and residual is not None:
+                if hidden_states.shape[0] in getattr(self, "_mtp_combine_norm_rows", ()):
+                    normalized = torch.ops.vllm.mtp_moe_single_row_add_norm(
+                        hidden_states, self.moe_row_src[: hidden_states.shape[0]],
+                        residual, self._fast_moe_name)
+                    return normalized, None
                 hidden_states = torch.ops.vllm.mtp_moe_single_row_add_residual(
                     hidden_states, self.moe_row_src[: hidden_states.shape[0]],
                     residual, self._fast_moe_name)

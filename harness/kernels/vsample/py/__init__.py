@@ -16,11 +16,13 @@ import os
 
 import torch
 
-__all__ = ["LIB_PATH", "ENABLED", "available", "greedy_verify", "maybe_greedy_verify", "VROWS_ALL"]
+__all__ = ["LIB_PATH", "ENABLED", "available", "greedy_verify", "maybe_greedy_verify", "VROWS_ALL",
+           "PACKET_ENABLED", "maybe_greedy_verify_packet"]
 
 LIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "libvsample.so")
 ENABLED = os.environ.get("VSAMPLE", "1") != "0"
 PDL = int(os.environ.get("VSAMPLE_PDL", "1"))
+PACKET_ENABLED = os.environ.get("VSAMPLE_PACKET", "1") != "0"
 VROWS_ALL = 1 << 30
 
 _lib = None
@@ -42,6 +44,10 @@ def _load():
         lib.vs_max_vocab.restype = ci
         lib.vs_greedy_verify.argtypes = [vp, cl, ci, ci, vp, vp, vp, vp, vp, vp, ci, vp, vp, vp, vp, ci, vp]
         lib.vs_greedy_verify.restype = ci
+        packet = getattr(lib, "vs_greedy_verify_packet", None)
+        if packet is not None:
+            packet.argtypes = lib.vs_greedy_verify.argtypes + [vp, ci]
+            packet.restype = ci
         _max_rows = lib.vs_max_rows()
         _max_vocab = lib.vs_max_vocab()
         _lib = lib
@@ -70,7 +76,8 @@ def _bufs(device: torch.device):
 
 def greedy_verify(logits: torch.Tensor, target_logits_indices: torch.Tensor, bonus_logits_indices: torch.Tensor,
                   cu_num_draft_tokens: torch.Tensor, draft_token_ids: torch.Tensor, max_spec_len: int,
-                  vrows: torch.Tensor | None, num_accepted: torch.Tensor | None) -> torch.Tensor:
+                  vrows: torch.Tensor | None, num_accepted: torch.Tensor | None, *,
+                  continuation: torch.Tensor | None = None, query_last: int = 0) -> torch.Tensor:
     """output_token_ids [1, max_spec_len + 1] int32 of the stock greedy chain; writes num_accepted[0]
     (int32) and resets vrows[0] to VROWS_ALL when given."""
     lib = _load()
@@ -78,12 +85,16 @@ def greedy_verify(logits: torch.Tensor, target_logits_indices: torch.Tensor, bon
     rows, vocab = logits.shape
     out = torch.empty((1, max_spec_len + 1), dtype=torch.int32, device=logits.device)
     pval, pidx, counter = _bufs(logits.device)
-    rc = lib.vs_greedy_verify(
+    args = (
         logits.data_ptr(), logits.stride(0), rows, vocab, target_logits_indices.data_ptr(),
         bonus_logits_indices.data_ptr(), cu_num_draft_tokens.data_ptr(), draft_token_ids.data_ptr(),
         None if vrows is None else vrows.data_ptr(), out.data_ptr(), out.shape[1],
         None if num_accepted is None else num_accepted.data_ptr(), pval.data_ptr(), pidx.data_ptr(),
         counter.data_ptr(), PDL, torch.cuda.current_stream(logits.device).cuda_stream)
+    if continuation is None:
+        rc = lib.vs_greedy_verify(*args)
+    else:
+        rc = lib.vs_greedy_verify_packet(*args, continuation.data_ptr(), query_last)
     if rc != 0:
         raise RuntimeError(f"vs_greedy_verify failed: {rc} (rows={rows} vocab={vocab})")
     return out
@@ -95,7 +106,9 @@ def _i32(t: torch.Tensor | None, n: int, device) -> bool:
 
 
 def maybe_greedy_verify(logits: torch.Tensor | None, metadata, vrows: torch.Tensor | None,
-                        num_accepted: torch.Tensor | None) -> torch.Tensor | None:
+                        num_accepted: torch.Tensor | None, *,
+                        continuation: torch.Tensor | None = None,
+                        query_last: int = 0) -> torch.Tensor | None:
     """The fused chain for a one-request greedy verify, or None (the caller runs the stock ops).
     The caller has already established that the rejection sampler would take its greedy-argmax path."""
     if not ENABLED or logits is None or metadata is None:
@@ -107,6 +120,14 @@ def maybe_greedy_verify(logits: torch.Tensor | None, metadata, vrows: torch.Tens
     if _load() is None or d < 1 or max_spec_len != d:
         return None
     dev = logits.device
+    if continuation is not None and (
+        not PACKET_ENABLED
+        or getattr(_lib, "vs_greedy_verify_packet", None) is None
+        or query_last != d
+        or not _i32(continuation, 4, dev)
+        or continuation.numel() != 4
+    ):
+        return None
     if (
         not logits.is_cuda
         or logits.dtype != torch.bfloat16
@@ -128,7 +149,27 @@ def maybe_greedy_verify(logits: torch.Tensor | None, metadata, vrows: torch.Tens
     ):
         return None
     return greedy_verify(logits, metadata.target_logits_indices, metadata.bonus_logits_indices,
-                         metadata.cu_num_draft_tokens, metadata.draft_token_ids, max_spec_len, vrows, num_accepted)
+                         metadata.cu_num_draft_tokens, metadata.draft_token_ids, max_spec_len, vrows, num_accepted,
+                         continuation=continuation, query_last=query_last)
+
+
+def maybe_greedy_verify_packet(logits, metadata, vrows, num_accepted, query_last):
+    """Fresh GPU continuation fields; caller proves non-discard/vocabulary/query guards.
+
+    The ordinary entry point and its complete original fallback remain available.
+    This does not publish a CPU count, borrow persistent accepted-count storage,
+    or retain any request output after this call's owners release it.
+    """
+    if (not PACKET_ENABLED or _load() is None
+            or getattr(_lib, "vs_greedy_verify_packet", None) is None
+            or logits is None):
+        return None
+    status = torch.empty(4, dtype=torch.int32, device=logits.device)
+    out = maybe_greedy_verify(
+        logits, metadata, vrows, num_accepted,
+        continuation=status, query_last=query_last,
+    )
+    return None if out is None else (out, status)
 
 
 _load() if ENABLED else None

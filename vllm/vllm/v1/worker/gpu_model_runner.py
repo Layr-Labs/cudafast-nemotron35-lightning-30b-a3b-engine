@@ -534,6 +534,20 @@ class ExecuteModelState(NamedTuple):
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
 
 
+@dataclass
+class _MTPVerifyPacket:
+    """One-call GPU integer handoff, never a cached request/model result."""
+
+    sampled_token_ids: torch.Tensor
+    status: torch.Tensor  # fresh int32 [next, valid, rejected, sample_index]
+    spec_metadata: SpecDecodeMetadata
+    common_metadata: CommonAttentionMetadata
+    req_id: str
+    stream: int
+    vocab_size: int
+    consumed: bool = False
+
+
 class GPUModelRunner(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
@@ -4003,6 +4017,9 @@ class GPUModelRunner(
         self,
         logits: torch.Tensor | None,
         spec_decode_metadata: SpecDecodeMetadata | None,
+        *,
+        mtp_packet_sink: list[_MTPVerifyPacket] | None = None,
+        common_attn_metadata: CommonAttentionMetadata | None = None,
     ) -> SamplerOutput:
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
@@ -4036,7 +4053,9 @@ class GPUModelRunner(
         # integer results (argmax under torch's NaN/tie order); the stock path runs
         # whenever its guard refuses. VSAMPLE=0 disables it.
         fused = self._vsample_greedy(
-            logits, spec_decode_metadata, sampling_metadata, vrows
+            logits, spec_decode_metadata, sampling_metadata, vrows,
+            mtp_packet_sink=mtp_packet_sink,
+            common_attn_metadata=common_attn_metadata,
         )
         if fused is not None:
             return fused
@@ -4058,12 +4077,93 @@ class GPUModelRunner(
     # accepted count the fused kernel already wrote to num_accepted_tokens.gpu[0].
     _vsample_counted: torch.Tensor | None = None
 
+    def _mtp_verify_packet_context(
+        self,
+        metadata: SpecDecodeMetadata | None,
+        common: CommonAttentionMetadata | None,
+    ) -> bool:
+        """Host metadata only; no GPU status read or new completion wait."""
+        spec = self.speculative_config
+        p = self.parallel_config
+        ib = self.input_batch
+        if (
+            spec is None or spec.method != "mtp"
+            or not self.use_async_spec_decode
+            or spec.disable_padded_drafter_batch
+            or type(self.drafter) is not EagleProposer
+            or self.drafter.method != "mtp"
+            or self.drafter.parallel_drafting or self.drafter.needs_extra_input_slots
+            or self.drafter.use_heterogeneous_vocab
+            or self.drafter.constant_draft_positions
+            or self.drafter.uses_mrope or self.drafter.uses_xdrope_dim > 0
+            or self.use_aux_hidden_state_outputs or self.supports_mm_inputs
+            or self.drafter.supports_mm_inputs or self.lora_config
+            or getattr(self.model_config.hf_config, "model_type", None) != "nemotron_h"
+            or p.tensor_parallel_size != 1 or p.pipeline_parallel_size != 1
+            or p.data_parallel_size != 1 or p.decode_context_parallel_size != 1
+            or p.prefill_context_parallel_size != 1 or p.use_ubatching or p.enable_eplb
+            or ib.num_reqs != 1 or metadata is None or common is None
+            or not 1 <= self.num_spec_tokens <= 6
+            or metadata.num_draft_tokens != [self.num_spec_tokens]
+            or metadata.max_spec_len != self.num_spec_tokens
+            or common.num_reqs != 1
+            or common.num_actual_tokens != self.num_spec_tokens + 1
+            or common.max_query_len != self.num_spec_tokens + 1
+            or common.max_seq_len + self.num_spec_tokens >= min(
+                self.max_model_len, self.effective_drafter_max_model_len
+            )
+            or bool(self.discard_request_mask.np[0])
+            or ib.num_computed_tokens_cpu[0] < ib.num_prompt_tokens[0]
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return False
+        req_id = ib.req_ids[0]
+        prev_req_id_to_index = ib.prev_req_id_to_index
+        if not prev_req_id_to_index or prev_req_id_to_index.get(req_id) != 0:
+            return False
+        qsl = common.query_start_loc_cpu
+        return (
+            qsl.device.type == "cpu" and qsl.dtype == torch.int32
+            and qsl.shape == (2,) and qsl.is_contiguous()
+            and int(qsl[0]) == 0 and int(qsl[1]) == self.num_spec_tokens + 1
+        )
+
+    def _take_mtp_verify_packet(
+        self,
+        packet: _MTPVerifyPacket | None,
+        sampled_token_ids,
+        metadata: SpecDecodeMetadata | None,
+        common: CommonAttentionMetadata,
+    ) -> torch.Tensor | None:
+        # An ordinary local variable carries the ticket through sample_tokens;
+        # there is no runner-global pending ticket to survive abort or reset.
+        if packet is None or packet.consumed:
+            return None
+        packet.consumed = True
+        if (
+            packet.sampled_token_ids is not sampled_token_ids
+            or packet.spec_metadata is not metadata
+            or packet.common_metadata is not common
+            or packet.vocab_size != self.input_batch.vocab_size
+            or not self._mtp_verify_packet_context(metadata, common)
+            or packet.req_id != self.input_batch.req_ids[0]
+            or packet.stream != torch.cuda.current_stream(self.device).cuda_stream
+            or packet.status.device != sampled_token_ids.device
+            or packet.status.dtype != torch.int32 or packet.status.shape != (4,)
+            or not packet.status.is_contiguous()
+        ):
+            return None
+        return packet.status
+
     def _vsample_greedy(
         self,
         logits: torch.Tensor | None,
         spec_decode_metadata: SpecDecodeMetadata,
         sampling_metadata,
         vrows: torch.Tensor | None,
+        *,
+        mtp_packet_sink: list[_MTPVerifyPacket] | None = None,
+        common_attn_metadata: CommonAttentionMetadata | None = None,
     ) -> SamplerOutput | None:
         self._vsample_counted = None
         vsample = sys.modules.get("vsample")
@@ -4087,7 +4187,34 @@ class GPUModelRunner(
             if self.speculative_config and self.model_config.is_hybrid
             else None
         )
-        out = vsample.maybe_greedy_verify(logits, spec_decode_metadata, vrows, count)
+        packet_result = None
+        packet_entry = getattr(vsample, "maybe_greedy_verify_packet", None)
+        if (
+            mtp_packet_sink is not None and not mtp_packet_sink
+            and getattr(vsample, "PACKET_ENABLED", False)
+            and callable(packet_entry)
+            and logits.is_cuda and logits.dim() == 2
+            and logits.shape[1] == self.input_batch.vocab_size
+            and logits.device == self.device
+            and self._mtp_verify_packet_context(
+                spec_decode_metadata, common_attn_metadata
+            )
+        ):
+            packet_result = packet_entry(
+                logits, spec_decode_metadata, vrows, count, self.num_spec_tokens
+            )
+        if packet_result is None:
+            out = vsample.maybe_greedy_verify(logits, spec_decode_metadata, vrows, count)
+        else:
+            out, status = packet_result
+            mtp_packet_sink.append(_MTPVerifyPacket(
+                sampled_token_ids=out, status=status,
+                spec_metadata=spec_decode_metadata,
+                common_metadata=common_attn_metadata,
+                req_id=self.input_batch.req_ids[0],
+                stream=torch.cuda.current_stream(self.device).cuda_stream,
+                vocab_size=self.input_batch.vocab_size,
+            ))
         if out is None:
             return None
         if count is not None:
@@ -5288,7 +5415,15 @@ class GPUModelRunner(
             )
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+            mtp_packet_sink: list[_MTPVerifyPacket] = []
+            sampler_output = self._sample(
+                logits, spec_decode_metadata,
+                mtp_packet_sink=mtp_packet_sink,
+                common_attn_metadata=(
+                    spec_decode_common_attn_metadata if grammar_output is None else None
+                ),
+            )
+            mtp_packet = mtp_packet_sink[0] if mtp_packet_sink else None
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
@@ -5348,6 +5483,7 @@ class GPUModelRunner(
                     spec_decode_metadata,
                     spec_decode_common_attn_metadata,
                     slot_mappings,
+                    continuation_packet=mtp_packet,
                 )
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 
@@ -5864,6 +6000,8 @@ class GPUModelRunner(
         spec_decode_metadata: SpecDecodeMetadata | None,
         common_attn_metadata: CommonAttentionMetadata,
         slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
+        *,
+        continuation_packet: _MTPVerifyPacket | None = None,
     ) -> list[list[int]] | torch.Tensor:
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         spec_config = self.speculative_config
@@ -6009,6 +6147,11 @@ class GPUModelRunner(
                 EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer,
             )
 
+            packet_status = self._take_mtp_verify_packet(
+                continuation_packet, sampled_token_ids,
+                spec_decode_metadata, common_attn_metadata,
+            )
+
             if spec_config.disable_padded_drafter_batch:
                 # When padded-batch is disabled, the sampled_token_ids should be
                 # the cpu-side list[list[int]] of valid sampled tokens for each
@@ -6032,14 +6175,18 @@ class GPUModelRunner(
                     "sampled_token_ids should be a torch.Tensor when"
                     "padded-batch is enabled."
                 )
-                next_token_ids, valid_sampled_tokens_count = (
-                    self.drafter.prepare_next_token_ids_padded(
-                        sampled_token_ids,
-                        self.requests,
-                        self.input_batch,
-                        self.discard_request_mask.gpu,
+                if packet_status is not None:
+                    next_token_ids = packet_status[0:1]
+                    valid_sampled_tokens_count = packet_status[1:2]
+                else:
+                    next_token_ids, valid_sampled_tokens_count = (
+                        self.drafter.prepare_next_token_ids_padded(
+                            sampled_token_ids,
+                            self.requests,
+                            self.input_batch,
+                            self.discard_request_mask.gpu,
+                        )
                     )
-                )
                 self._copy_valid_sampled_token_count(
                     next_token_ids, valid_sampled_tokens_count
                 )
@@ -6093,6 +6240,10 @@ class GPUModelRunner(
                         common_attn_metadata,
                         spec_decode_metadata,
                         valid_sampled_tokens_count,
+                        prepared=(
+                            (packet_status[3:4], packet_status[2:3])
+                            if packet_status is not None else None
+                        ),
                     )
                     # LOCAL PATCH (cudafast-nemotron35): hostfast S2.
                     self._hostfast_num_draft_tokens = (

@@ -77,13 +77,15 @@ __device__ __forceinline__ float bf16_bits_to_float(unsigned short h) {
   return __uint_as_float(static_cast<unsigned int>(h) << 16);
 }
 
+template <bool WritePacket>
 __global__ void __launch_bounds__(kThreads)
     greedy_verify_kernel(const unsigned short* __restrict__ logits, long ld, int V, int C,
                          const int* __restrict__ target_idx, const int* __restrict__ bonus_idx,
                          const int* __restrict__ cu_num_draft, const int* __restrict__ draft,
                          int* __restrict__ vrows, int* __restrict__ out, int out_len,
                          int* __restrict__ num_accepted, int R, float* __restrict__ pval,
-                         int* __restrict__ pidx, unsigned int* __restrict__ counter) {
+                         int* __restrict__ pidx, unsigned int* __restrict__ counter,
+                         int* __restrict__ packet, int query_last) {
   const int c = blockIdx.x;
   const int r = blockIdx.y;
   const int t = threadIdx.x;
@@ -165,6 +167,18 @@ __global__ void __launch_bounds__(kThreads)
     }
     if (vrows != nullptr) *vrows = kVrowsAll;
     if (num_accepted != nullptr) *num_accepted = written;
+    if constexpr (WritePacket) {
+      // The caller admits only one non-discarded request, V == the real
+      // vocabulary, and a full D+1-row query. Every argmax ID is therefore a
+      // valid token and written >= 1. These are exactly the two subsequent
+      // eagle_prepare_* kernels' integer results. Storage is fresh per call;
+      // no CPU status publication or synchronization is changed.
+      const int rejected_count = nd > 0 ? nd + 1 - written : 0;
+      packet[0] = out[written - 1];
+      packet[1] = written;
+      packet[2] = rejected_count;
+      packet[3] = query_last - rejected_count;
+    }
     __threadfence();
   }
   // every output is written before this CTA lets a dependent grid launch (a dependent
@@ -205,10 +219,39 @@ int vs_greedy_verify(const void* logits, long ld, int R, int V, const int* targe
   attr[0].val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = attr;
   cfg.numAttrs = pdl ? 1 : 0;
-  const cudaError_t e = cudaLaunchKernelEx(&cfg, greedy_verify_kernel,
+  const cudaError_t e = cudaLaunchKernelEx(&cfg, greedy_verify_kernel<false>,
                                            static_cast<const unsigned short*>(logits), ld, V, C, target_idx,
                                            bonus_idx, cu_num_draft, draft, vrows, out, out_len, num_accepted, R,
-                                           pval, pidx, counter);
+                                           pval, pidx, counter, static_cast<int*>(nullptr), 0);
+  return e == cudaSuccess ? 0 : 100 + static_cast<int>(e);
+}
+
+// Optional, additive ABI. An older library without this symbol keeps the
+// complete original sampler/preparation route through the Python guard.
+int vs_greedy_verify_packet(const void* logits, long ld, int R, int V, const int* target_idx,
+                            const int* bonus_idx, const int* cu_num_draft, const int* draft, int* vrows,
+                            int* out, int out_len, int* num_accepted, float* pval, int* pidx,
+                            unsigned int* counter, int pdl, cudaStream_t stream,
+                            int* packet, int query_last) {
+  if (R < 2 || R > kMaxRows || V < 1 || V > kMaxChunks * kChunk || (V % kVec) != 0 || (ld % kVec) != 0 ||
+      out_len != R || query_last != R - 1 || packet == nullptr ||
+      (reinterpret_cast<uintptr_t>(logits) & 15u) != 0)
+    return 1;
+  const int C = (V + kChunk - 1) / kChunk;
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3(C, R, 1);
+  cfg.blockDim = dim3(kThreads, 1, 1);
+  cfg.dynamicSmemBytes = 0;
+  cfg.stream = stream;
+  cudaLaunchAttribute attr[1];
+  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr[0].val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = attr;
+  cfg.numAttrs = pdl ? 1 : 0;
+  const cudaError_t e = cudaLaunchKernelEx(&cfg, greedy_verify_kernel<true>,
+                                           static_cast<const unsigned short*>(logits), ld, V, C, target_idx,
+                                           bonus_idx, cu_num_draft, draft, vrows, out, out_len, num_accepted, R,
+                                           pval, pidx, counter, packet, query_last);
   return e == cudaSuccess ? 0 : 100 + static_cast<int>(e);
 }
 

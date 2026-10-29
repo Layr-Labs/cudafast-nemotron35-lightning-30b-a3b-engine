@@ -1715,6 +1715,8 @@ class SpecDecodeBaseProposer:
         common_attn_metadata: CommonAttentionMetadata,
         spec_decode_metadata: SpecDecodeMetadata,
         valid_sampled_tokens_count: torch.Tensor,
+        *,
+        prepared: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[CommonAttentionMetadata, torch.Tensor, torch.Tensor]:
         """
         This function is used to prepare the inputs for speculative decoding
@@ -1727,22 +1729,32 @@ class SpecDecodeBaseProposer:
         num_reqs = common_attn_metadata.num_reqs
         device = valid_sampled_tokens_count.device
 
-        token_indices_to_sample = torch.empty(
-            (num_reqs,), dtype=torch.int32, device=device
-        )
-        num_rejected_tokens_gpu = torch.empty(
-            (num_reqs,), dtype=torch.int32, device=device
-        )
+        if prepared is not None and len(prepared) == 2 and num_reqs == 1 and all(
+            t.device == device and t.dtype == torch.int32
+            and t.shape == (num_reqs,) and t.is_contiguous()
+            for t in prepared
+        ):
+            # Only the runner's one-call, same-output/metadata/stream ticket
+            # supplies this pair. The CPU metadata construction below stays
+            # exactly where it was; no CPU count or plan fence is removed.
+            token_indices_to_sample, num_rejected_tokens_gpu = prepared
+        else:
+            token_indices_to_sample = torch.empty(
+                (num_reqs,), dtype=torch.int32, device=device
+            )
+            num_rejected_tokens_gpu = torch.empty(
+                (num_reqs,), dtype=torch.int32, device=device
+            )
 
-        grid = (num_reqs,)
-        eagle_prepare_inputs_padded_kernel[grid](
-            spec_decode_metadata.cu_num_draft_tokens,
-            valid_sampled_tokens_count,
-            common_attn_metadata.query_start_loc,
-            token_indices_to_sample,
-            num_rejected_tokens_gpu,
-            num_reqs,
-        )
+            grid = (num_reqs,)
+            eagle_prepare_inputs_padded_kernel[grid](
+                spec_decode_metadata.cu_num_draft_tokens,
+                valid_sampled_tokens_count,
+                common_attn_metadata.query_start_loc,
+                token_indices_to_sample,
+                num_rejected_tokens_gpu,
+                num_reqs,
+            )
 
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         new_query_len_per_req = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]

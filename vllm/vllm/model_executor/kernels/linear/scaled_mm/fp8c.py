@@ -43,6 +43,40 @@ def prepare_weight(packed: torch.Tensor) -> torch.Tensor | None:
     return comp
 
 
+def qualify_model(model) -> None:
+    """Qualify final weight owners after optional CMP2 rebinding, before capture."""
+    if model is None:
+        return
+    try:
+        import fp8c
+    except ImportError:
+        return
+    for _, layer in model.named_modules():
+        kernel = getattr(getattr(layer, "quant_method", None), "fp8_linear", None)
+        if kernel is None or not hasattr(kernel, "_fp8c_empty"):
+            continue
+        kernel._fp8c_empty = False
+        comp = getattr(layer, "_fp8c_weight", None)
+        if comp is None or comp is not getattr(kernel, "_fp8c_weight", None):
+            continue
+        try:
+            if not fp8c.empty_available(comp.device):
+                continue
+            weight, sb, sa, upper = kernel._get_layer_params(layer)
+            if upper is not None or weight.ndim != 2:
+                continue
+            k, n = weight.shape
+            if (n, k) not in SHAPES:
+                continue
+            with torch.cuda.device(comp.device):
+                # fp8c.prepare already compared its reference decode to the
+                # original pack; CMP2 byte-checks before any pointer rebind.
+                packed = fp8c.decode(comp, n, k)
+                kernel._fp8c_empty = fp8c.qualify_empty(packed, comp, sa, sb)
+        except Exception as exc:  # noqa: BLE001 -- original path remains selected
+            logger.warning("fp8c empty-window qualification skipped: %r", exc)
+
+
 def _log_once(fp8c) -> None:
     global _logged
     if _logged:
@@ -64,6 +98,7 @@ def _scaled_mm(
     comp: torch.Tensor,
     sa: torch.Tensor,
     sb: torch.Tensor,
+    use_empty: bool = False,
 ) -> torch.Tensor:
     # Runs on real tensor metadata inside the custom op, so a symbolic compiled
     # range can contain both prefill and small decode M.
@@ -85,7 +120,7 @@ def _scaled_mm(
         import fp8c
 
         _log_once(fp8c)
-        return fp8c.gemm(a, comp, sa, sb, n, k)
+        return fp8c.gemm(a, comp, sa, sb, n, k, use_empty=use_empty)
     # LOCAL PATCH (cudafast-nemotron35): the M=496 prefill of an admitted in_proj (fp8ws.py).
     out = fp8ws_maybe_gemm(a, b, sa, sb)
     if out is not None:
@@ -99,6 +134,7 @@ def _scaled_mm_fake(
     comp: torch.Tensor,
     sa: torch.Tensor,
     sb: torch.Tensor,
+    use_empty: bool = False,
 ) -> torch.Tensor:
     return torch.empty((a.shape[0], b.shape[1]), device=a.device, dtype=torch.bfloat16)
 

@@ -30,6 +30,9 @@ if RING not in (0, 3, 4, 6):
 _RING_DEFAULT = {(10304, 2688): 3, (2688, 4096): 4}
 _PDL_ENABLED = os.environ.get("FP8C_PDL", "1") != "0"
 _lib = None
+_empty_lib = None
+_empty_ready_devices = set()
+_empty_failed_devices = set()
 _load_failed = False
 _ready_devices = set()
 _pdl = False
@@ -187,6 +190,62 @@ def decode(buf: torch.Tensor, n: int, k: int) -> torch.Tensor:
     return out
 
 
+def empty_available(device) -> bool:
+    """Check the optional library once per device before decoding any owner."""
+    global _empty_lib
+    if os.environ.get("FP8C_EMPTY", "1") == "0" or _lib is None:
+        return False
+    from .empty_guard import load_optional
+
+    with torch.cuda.device(device):
+        index = torch.cuda.current_device()
+        if index in _empty_failed_devices:
+            return False
+        if index in _empty_ready_devices:
+            return True
+        alt = _empty_lib or load_optional()
+        if alt is None or alt.fp8c_init() != 0:
+            _empty_failed_devices.add(index)
+            return False
+        _empty_lib = alt
+        _empty_ready_devices.add(index)
+        return True
+
+
+@torch.no_grad()
+def qualify_empty(packed, buf, sa, sb) -> bool:
+    """Admit the optional decoder for this immutable weight owner only."""
+    if not empty_available(buf.device):
+        return False
+    if (sa is None or sb is None or sa.device != buf.device or sb.device != buf.device
+            or sa.dtype != torch.float32 or sb.dtype != torch.float32
+            or sa.numel() != 1 or sb.numel() != 1
+            or not sa.is_contiguous() or not sb.is_contiguous()
+            or torch.cuda.is_current_stream_capturing()):
+        return False
+    try:
+        from .empty_guard import qualify
+
+        with torch.cuda.device(buf.device):
+            alt = _empty_lib
+            n, k = packed.shape
+            # Empty warp/chunks are the only ones that can use the fast path.
+            # This is an admission filter, not a claim about runtime traffic.
+            offsets = buf[:, :(4 * (k // 128) + 1) * 2].view(torch.int16)
+            empty_fraction = (offsets[:, 1:] == offsets[:, :-1]).float().mean().item()
+            if empty_fraction < 0.20:
+                return False
+            ring = RING or _RING_DEFAULT[(n, k)]
+            # The base path can turn PDL off after a rejected eager launch.
+            # Validate both variants before allowing a later fallback.
+            for mode in ((False, True) if _pdl else (False,)):
+                if not qualify(_lib, alt, packed, buf, sa, sb, mode, ring, header_bytes(k)):
+                    return False
+            return True
+    except Exception:  # noqa: BLE001 -- keep the already verified base path
+        return False
+
+
 @torch.no_grad()
 def prepare(packed: torch.Tensor, return_info: bool = False):
     """Encode and verify an fp8small pack [N, K]; None keeps fp8small."""
@@ -222,7 +281,7 @@ def prepare(packed: torch.Tensor, return_info: bool = False):
 
 def gemm(
     a: torch.Tensor, buf: torch.Tensor, sa: torch.Tensor, sb: torch.Tensor,
-    n: int, k: int, ring: int = 0, pdl: bool | None = None,
+    n: int, k: int, ring: int = 0, pdl: bool | None = None, use_empty: bool = False,
 ) -> torch.Tensor:
     """Called only after the runtime guard and load-time preparation."""
     global _pdl
@@ -235,13 +294,14 @@ def gemm(
         m, n, k, buf.shape[1], int(use_pdl), ring,
         torch.cuda.current_stream(a.device).cuda_stream,
     ]
-    rc = _lib.fp8c_run(*args)
+    lib = _empty_lib if use_empty and _empty_lib is not None else _lib
+    rc = lib.fp8c_run(*args)
     if rc and use_pdl and not torch.cuda.is_current_stream_capturing():
         # The PDL launch was rejected (eager, before any capture): ordinary
         # launches from now on, and redo this call.
         _pdl = False
         args[9] = 0
-        rc = _lib.fp8c_run(*args)
+        rc = lib.fp8c_run(*args)
     if rc:
         raise RuntimeError(f"fp8c launch failed: {rc}, M={m}, N={n}, K={k}")
     return out

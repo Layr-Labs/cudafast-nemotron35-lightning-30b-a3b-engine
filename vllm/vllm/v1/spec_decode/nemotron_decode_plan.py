@@ -87,9 +87,10 @@ def _signature(wrapper, kw):
 
 
 class NativePlanBank:
-    def __init__(self, wrapper):
+    def __init__(self, wrapper, graph_layout=None):
         from flashinfer.decode import fast_decode_plan
         self.wrapper = wrapper
+        self.graph_layout = graph_layout
         self.native = fast_decode_plan
         self.entries = {}
         self.enabled = False
@@ -114,6 +115,14 @@ class NativePlanBank:
             pass
         key = signed
         entry = self.entries.get(key) if key is not None else None
+        if entry is not None and self.graph_layout is not None:
+            from vllm.v1.spec_decode.nemotron_full_step import _native_wrapper_layout
+            plan, _, scalars = entry
+            layout = (wrapper, tuple(plan), tuple(scalars))
+            current = _native_wrapper_layout(wrapper)
+            if (current is None or current[3] != self.graph_layout[3]
+                    or layout != self.graph_layout[:3]):
+                entry = None
         if self.enabled and not self.force_native and entry is not None:
             plan, prefix, scalars = entry
             # Only executable native integer metadata is restored. Current
@@ -154,7 +163,7 @@ def _eligible(p):
         package_ok = False
     return (os.environ.get("NEMO_MTP_NATIVE_PLAN_BANK", "1") != "0" and package_ok
             and type(p.model).__name__ == "NemotronHMTP" and p.method == "mtp"
-            and p.speculative_config.num_speculative_tokens == 4
+            and p.speculative_config.num_speculative_tokens in (4, 5)
             and not p.speculative_config.enforce_eager
             and not p.parallel_drafting and not p.constant_draft_positions
             and not p.needs_extra_input_slots and p.pass_hidden_states_to_model
@@ -202,6 +211,8 @@ def prepare(p):
     p._nemo_plan_attempted = True
     values = [p.input_ids[:padded], p.positions[:padded], p.hidden_states[:padded],
               p._slot_mapping_buffer[:padded], gate]
+    if p.num_speculative_tokens == 5 and getattr(p, "_nemo_step", None) is not None:
+        values.extend((p._nemo_step.hidden, p._nemo_step.live))
     values.extend(t[:4] for t in caches)
     values.extend(b[:max(5, padded)] for b in p.model._moe_row_src_buffers())
     for name in ("_h", "_out", "scores", "refine_scores", "cand_logits"):
@@ -228,7 +239,14 @@ def prepare(p):
             if key not in seen:
                 saved.append((t, t.clone()))
                 seen.add(key)
-        bank = NativePlanBank(wrapper)
+        layout = None
+        if p.num_speculative_tokens == 5:
+            layout = getattr(p, "_nemo_full_capture_native_layout", None)
+            step = getattr(p, "_nemo_step", None)
+            if (layout is None or layout[0] is not wrapper
+                    or (step is not None and getattr(step, "native_layout", None) != layout)):
+                raise ValueError("native plan graph layouts are not known and equal")
+        bank = NativePlanBank(wrapper, layout)
         wrapper._nemo_native_plan = bank
         blocks = (p.max_model_len + p.block_size - 1) // p.block_size
         table = (torch.arange(blocks, dtype=torch.int32, device=p.device) % 2).view(1, -1)
@@ -298,9 +316,11 @@ def prepare(p):
         sample_pages = sorted({1, min(2, timed_pages), max(1, timed_pages // 2),
                                timed_pages, max(1, calibrated_pages // 2), calibrated_pages})
         residues = sorted({1, max(1, p.block_size // 2), p.block_size})
-        ratios = []
+        ratios, hit_ratios = [], []
         # Warm the original stream/event control before either timed arm.
         p._draft_plan_side_stream()
+        if p.num_speculative_tokens == 5:
+            p._mtp_step_prefetch(gate)
 
         def run_case(length, case, native):
             # Both arms get identical private model inputs/KV and integer
@@ -331,6 +351,8 @@ def prepare(p):
             wrapper._nemo_native_plan = None if native else bank
             torch.cuda.synchronize(p.device)
             start = time.perf_counter()
+            if p.num_speculative_tokens == 5:
+                p._mtp_step_prefetch(gate)
             side = p._draft_plan_side_stream()
             if side is not None:
                 main = torch.cuda.current_stream()
@@ -343,15 +365,31 @@ def prepare(p):
                     md.plan_ready_event = ready
             else:
                 _, metadata = p.build_per_group_and_layer_attn_metadata(common, draft_index=1)
-            if not native and not bank.last_restore:
+            # The original comparison arm removes the bank, so the guarded
+            # graph helper cannot see it. Order its side-stream writes before
+            # replay as well; otherwise the reference can race its own plan.
+            if p.num_speculative_tokens == 5 and native and side is not None:
+                torch.cuda.current_stream().wait_event(ready)
+            # A layout mismatch is a deliberate native-planner fallback.
+            # Compare and time it too, so the admission reflects real coverage.
+            restored = bool(not native and bank.last_restore)
+            if p.num_speculative_tokens == 4 and not native and not restored:
                 raise ValueError("private plan restore declined")
             with set_forward_context(metadata, p.vllm_config, num_tokens=padded,
                                      cudagraph_runtime_mode=mode,
                                      slot_mapping=p._get_slot_mapping(padded)):
-                hidden = model_graph(p, kwargs, metadata, padded, 1)
-                if hidden is None:
-                    hidden = p.model(**kwargs)
-            token = screen.greedy(hidden[:1])
+                step = None
+                if p.num_speculative_tokens == 5 and getattr(p, "_nemo_step", None) is not None:
+                    from vllm.v1.spec_decode.nemotron_step_cond import maybe_run as step_run
+                    step = step_run(p, kwargs, metadata, padded, 1)
+                if step is None:
+                    hidden = model_graph(p, kwargs, metadata, padded, 1)
+                    if hidden is None:
+                        hidden = p.model(**kwargs)
+                else:
+                    hidden, token = step
+            if step is None:
+                token = screen.greedy(hidden[:1])
             torch.cuda.synchronize(p.device)
             elapsed = time.perf_counter() - start
             extent = _extent(tuple(int(v) for v in wrapper._plan_info),
@@ -381,9 +419,10 @@ def prepare(p):
                 "page_indices": _bytes(builder.paged_kv_indices.gpu[
                     :(length + p.block_size - 1) // p.block_size]),
             }
-            return observation, elapsed
+            return observation, elapsed, restored
 
         trial = 0
+        hit_lengths, timed_hit_lengths = set(), set()
         for pages in sample_pages:
             for residue in residues:
                 length = (pages - 1) * p.block_size + residue
@@ -392,8 +431,10 @@ def prepare(p):
                 for case in range(4):
                     order = (True, False) if trial % 2 == 0 else (False, True)
                     results = {native: run_case(length, case, native) for native in order}
-                    original, original_time = results[True]
-                    actual, cached_time = results[False]
+                    original, original_time, _ = results[True]
+                    actual, cached_time, restored = results[False]
+                    if restored:
+                        hit_lengths.add(length)
                     torch.cuda.synchronize(p.device)
                     if (set(actual) != set(original)
                             or not all(torch.equal(actual[k], original[k]) for k in actual)):
@@ -405,12 +446,24 @@ def prepare(p):
                     # entitlement or a weaker comparison threshold.
                     if pages <= timed_pages:
                         ratios.append((case, cached_time / original_time))
+                        if restored:
+                            timed_hit_lengths.add(length)
+                            hit_ratios.append((case, cached_time / original_time))
                     trial += 1
+        if p.num_speculative_tokens == 5:
+            if (len(hit_lengths) < 2 or len(timed_hit_lengths) < 2
+                    or {case for case, _ in hit_ratios} != {0, 1, 2, 3}):
+                raise ValueError("native plan bank lacks diverse qualifying hits")
+            if (statistics.median([r for _, r in hit_ratios]) >= 0.98
+                    or statistics.median([r for case, r in hit_ratios if case != 2]) >= 0.99
+                    or statistics.median([r for case, r in hit_ratios if case == 2]) >= 0.99):
+                raise ValueError("native plan hits did not reduce guarded latency")
         if (not ratios or statistics.median([r for _, r in ratios]) >= 0.98
                 or statistics.median([r for case, r in ratios if case != 2]) >= 0.99
                 or statistics.median([r for case, r in ratios if case == 2]) >= 0.99):
             raise ValueError("native plan restore did not reduce guarded model-step latency")
         bank.private_speed_ratios = tuple(ratios)
+        bank.private_hit_ratios = tuple(hit_ratios)
         admitted = True
     except Exception as exc:
         logger.warning("Native MTP plan bank unavailable: %r", exc)
@@ -427,6 +480,9 @@ def prepare(p):
         if bank is not None:
             bank.force_native = False
             bank.enabled = admitted
+            if p.num_speculative_tokens == 5:
+                bank.last_restore = False
+                bank.last_restore_key = None
         wrapper._nemo_native_plan = bank if admitted else old_hook
         torch.cuda.synchronize(p.device)
     if admitted:

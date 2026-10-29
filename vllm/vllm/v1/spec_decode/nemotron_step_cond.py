@@ -16,7 +16,9 @@ from vllm.config import CUDAGraphMode
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
-from vllm.v1.spec_decode.nemotron_full_step import _inputs, _metadata
+from vllm.v1.spec_decode.nemotron_full_step import (
+    _inputs, _metadata, _native_wrapper_layout, _wait_native_plan_ready,
+)
 
 logger = init_logger(__name__)
 ENABLED = os.environ.get("NEMO_MTP_STEP_COND", "1") != "0"
@@ -56,6 +58,8 @@ def maybe_run(p, kwargs, metadata, padded, batch_size):
     if s is None or batch_size != 1 or padded != s.padded:
         return None
     if _inputs(kwargs) != s.inputs or _metadata(p, metadata) != s.signature:
+        return None
+    if not _wait_native_plan_ready(metadata):
         return None
     s.graph.replay()
     return s.hidden, s.screen._out.clone()
@@ -172,6 +176,9 @@ def _prepare(p, saved, restore):
     del plain
     if not _probe(device):
         raise ValueError("conditional graph probe failed")
+    wrappers = {id(m.decode.wrapper): m.decode.wrapper for m in metadata.values()}
+    wrapper = next(iter(wrappers.values())) if len(wrappers) == 1 else None
+    native_layout = _native_wrapper_layout(wrapper)
     gate.copy_(start)
     graph = torch.cuda.CUDAGraph()
     stream = torch.cuda.Stream(device=device)
@@ -201,6 +208,8 @@ def _prepare(p, saved, restore):
         _end_capture(stream)
         raise
     torch.cuda.synchronize(device)
+    if native_layout != _native_wrapper_layout(wrapper):
+        native_layout = None
 
     def original():
         hid = nemotron_full_step.maybe_run(p, kwargs, metadata, padded, 1)
@@ -278,7 +287,7 @@ def _prepare(p, saved, restore):
     p._nemo_step = SimpleNamespace(
         graph=graph, hidden=hidden, screen=screen, padded=padded, signature=signature,
         inputs=inputs, live=live, owners=(kwargs, metadata, zero_row, stream, slots),
-        token=token, timing=timing)
+        token=token, timing=timing, native_layout=native_layout)
 
 
 _PROBE = r"""

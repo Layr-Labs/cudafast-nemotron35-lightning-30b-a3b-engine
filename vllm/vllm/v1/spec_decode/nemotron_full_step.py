@@ -42,6 +42,41 @@ def _metadata(p, metadata):
     return tuple(result), buffers
 
 
+def _wait_native_plan_ready(metadata):
+    """Order graph replay after the current side-stream native plan writes."""
+    seen = set()
+    for m in metadata.values():
+        wrapper = getattr(getattr(m, 'decode', None), 'wrapper', None)
+        bank = getattr(wrapper, '_nemo_native_plan', None)
+        event = getattr(m, 'plan_ready_event', None)
+        if (bank is None or not bank.enabled
+                or getattr(bank, 'graph_layout', None) is None
+                or event is None or id(event) in seen):
+            continue
+        # A captured wait would bind an event generation rather than the
+        # per-replay event. Keep the original path while capturing.
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        torch.cuda.current_stream().wait_event(event)
+        seen.add(id(event))
+    return True
+
+
+def _native_wrapper_layout(wrapper):
+    """Best-effort capture identity; an unknown layout disables the new bank."""
+    try:
+        from vllm.v1.spec_decode.nemotron_decode_plan import _SCALARS
+        names = ('_float_workspace_buffer', '_int_workspace_buffer',
+                 '_qo_indptr_buf', '_paged_kv_indptr_buf',
+                 '_paged_kv_indices_buf', '_paged_kv_last_page_len_buf')
+        tensors = tuple((n, id(getattr(wrapper, n)), _tensor(getattr(wrapper, n)))
+                        for n in names)
+        return (wrapper, tuple(wrapper._plan_info), tuple(
+            (n, getattr(wrapper, n)) for n in _SCALARS if hasattr(wrapper, n)), tensors)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
 def prepare(p):
     """Build the graph outside requests, preserving the existing padded model shape."""
     if getattr(p, '_nemo_full_attempted', False):
@@ -118,8 +153,14 @@ def prepare(p):
             graph = CUDAGraphWrapper(p.model, p.vllm_config, CUDAGraphMode.FULL,
                                     CUDAGraphOptions(weak_ref_output=False))
             graph.graph_pool = torch.cuda.graph_pool_handle()
+            wrapper = builder._decode_wrappers_cudagraph.get(1)
+            capture_layout = _native_wrapper_layout(wrapper)
             outputs = graph(**kwargs)
         torch.cuda.synchronize(p.device)
+        after_capture_layout = _native_wrapper_layout(wrapper)
+        p._nemo_full_capture_native_layout = (
+            capture_layout if capture_layout is not None
+            and capture_layout == after_capture_layout else None)
         key = BatchDescriptor(num_tokens=padded)
         if key not in graph.concrete_cudagraph_entries:
             return
@@ -177,6 +218,8 @@ def maybe_run(p, kwargs, metadata, padded, batch_size):
     graph, _, signature, inputs, _outputs = state
     if (BatchDescriptor(num_tokens=padded) not in graph.concrete_cudagraph_entries
             or _inputs(kwargs) != inputs or _metadata(p, metadata) != signature):
+        return None
+    if not _wait_native_plan_ready(metadata):
         return None
     with set_forward_context(metadata, p.vllm_config, num_tokens=padded,
                              cudagraph_runtime_mode=CUDAGraphMode.FULL,

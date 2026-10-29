@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 import glob
+import json
 import os
 import time
-from collections.abc import Generator, Iterable
+from collections.abc import Callable, Generator, Iterable
 from typing import cast
 
 import torch
@@ -242,7 +243,7 @@ class DefaultModelLoader(BaseModelLoader):
         return hf_folder, hf_weights_files, use_safetensors
 
     def _get_weights_iterator(
-        self, source: "Source"
+        self, source: "Source", name_filter: Callable[[str], bool] | None = None
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         extra_config = self.load_config.model_loader_extra_config
@@ -253,6 +254,8 @@ class DefaultModelLoader(BaseModelLoader):
             source.fall_back_to_pt,
             source.allow_patterns_overrides,
         )
+        if name_filter is not None and use_safetensors:
+            hf_weights_files = _shards_with_names(hf_weights_files, name_filter)
         if self.load_config.load_format == "npcache":
             # Currently np_cache only support *.bin checkpoints
             assert use_safetensors is False
@@ -330,7 +333,9 @@ class DefaultModelLoader(BaseModelLoader):
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
         )
-        yield from self._get_weights_iterator(primary_weights)
+        yield from self._get_weights_iterator(
+            primary_weights, getattr(model, "load_weight_name_filter", None)
+        )
 
         secondary_weights = cast(
             Iterable[DefaultModelLoader.Source],
@@ -468,3 +473,19 @@ class DefaultModelLoader(BaseModelLoader):
                     "Following weights were not initialized from "
                     f"checkpoint: {weights_not_loaded}"
                 )
+
+
+# LOCAL PATCH (cudafast-nemotron35): a model that reads only some checkpoint names (its
+# load_weight_name_filter) is given only the shards whose safetensors header lists at least
+# one of them, so a shard it would skip whole is never read. The kept shards, their order and
+# every tensor they yield are unchanged; with no match at all every shard is kept.
+def _shards_with_names(
+    hf_weights_files: list[str], name_filter: Callable[[str], bool]
+) -> list[str]:
+    kept = []
+    for path in hf_weights_files:
+        with open(path, "rb") as f:
+            header = json.loads(f.read(int.from_bytes(f.read(8), "little")))
+        if any(name_filter(k) for k in header if k != "__metadata__"):
+            kept.append(path)
+    return kept or hf_weights_files

@@ -99,6 +99,9 @@ FIRST_PLAN_SIDE = os.environ.get("MTP_FIRST_PLAN_SIDE", "0") != "0"
 # the ALT table is built switched off, for in-process A/B of a second size).
 STEP_PF_MB = float(os.environ.get("L2PF_DRAFT_STEP_MB", "0"))
 STEP_PF_ALT_MB = float(os.environ.get("L2PF_DRAFT_STEP_ALT_MB", "0"))
+# LOCAL PATCH (cudafast-nemotron35): the step-start prefetch also covers the start
+# projection's BF16 hidden half eh_w_h (L2PF_DRAFT_STEP_EH=0 disables).
+STEP_PF_EH = os.environ.get("L2PF_DRAFT_STEP_EH", "1") != "0"
 
 
 class SpecDecodeBaseProposer:
@@ -1046,7 +1049,10 @@ class SpecDecodeBaseProposer:
         glue, the start projection (eh_w_h, L2-resident) and a norm, all leaving DRAM
         idle; queue an L2 prefetch of the head of the packed qkv the step reads next,
         on l2pf's side stream (eager, no join: it moves no value). Skipped on the device
-        once the depth gate stopped the loop. L2PF_DRAFT_STEP_MB=0 disables."""
+        once the depth gate stopped the loop. L2PF_DRAFT_STEP_MB=0 disables.
+        LOCAL PATCH (cudafast-nemotron35): the same gated launch first prefetches the
+        start projection's BF16 hidden half eh_w_h (registered as l2pf DRAFT_NEXT
+        "eh_bf16"), which the step reads first. L2PF_DRAFT_STEP_EH=0 disables."""
         tables = self._step_pf_tables
         if tables is None:
             tables = []
@@ -1054,6 +1060,13 @@ class SpecDecodeBaseProposer:
                 import l2pf
             except ImportError:
                 l2pf = None
+            eh = getattr(l2pf, "DRAFT_NEXT", {}).get("eh_bf16") if l2pf is not None else None
+            if (STEP_PF_EH and eh is not None and hasattr(l2pf, "GatedTable")
+                    and not torch.cuda.is_current_stream_capturing()):
+                t = l2pf.GatedTable([(eh[0], eh[0].numel() * eh[0].element_size())],
+                                    gate.device, name="stepeh", mode=2)
+                if t.nranges:
+                    tables.append(t)
             planes = getattr(l2pf, "DRAFT_NEXT", {}).get("qkv") if l2pf is not None else None
             if (planes is not None and hasattr(l2pf, "GatedTable")
                     and not torch.cuda.is_current_stream_capturing()):

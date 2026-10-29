@@ -6230,6 +6230,18 @@ class GPUModelRunner(
                         (self.model, getattr(getattr(self, "drafter", None), "model", None))
                     )
 
+                # Optional real-owner qualification before compilation and capture.
+                # No admission is published unless all selected checks succeed.
+                try:
+                    from vllm.model_executor.layers.mamba.ops.native_input_norm_fp8_draft import (
+                        prepare_model_native_draft,
+                    )
+                    prepare_model_native_draft(self.model)
+                except Exception as exc:
+                    # Rethrow a poisoned CUDA context; otherwise retain the original path.
+                    torch.cuda.synchronize(self.device)
+                    logger.warning("Native Mamba input fusion disabled: %r", exc)
+
                 self._setup_eagle3_aux_hidden_state_outputs()
 
                 # Resolve the MoE model, unwrapping VLM wrappers if needed.

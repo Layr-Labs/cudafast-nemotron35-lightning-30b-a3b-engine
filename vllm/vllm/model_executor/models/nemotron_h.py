@@ -489,6 +489,17 @@ class NemotronHMambaDecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         **kwargs,
     ):
+        if getattr(self, "_native_input_fp8_rows", ()):
+            from vllm.model_executor.layers.mamba.ops.native_input_norm_fp8_draft import (
+                maybe_native_input_draft,
+            )
+
+            prepared = maybe_native_input_draft(self, hidden_states, residual)
+            if prepared is not None:
+                quantized, next_residual = prepared
+                projected_states, _ = self.mixer.in_proj(quantized)
+                output = self.mixer(hidden_states, projected_states=projected_states)
+                return output, next_residual
         if residual is None:
             residual = hidden_states
             hidden_states = self.norm(hidden_states)

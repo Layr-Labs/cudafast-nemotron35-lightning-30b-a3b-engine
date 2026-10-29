@@ -600,9 +600,11 @@ class MambaMixer2(MambaBase, PluggableLayer):
         self,
         hidden_states: torch.Tensor,
         mup_vector: torch.Tensor | None = None,
+        projected_states: torch.Tensor | None = None,
     ):
         # 1. Gated MLP's linear projection
-        projected_states, _ = self.in_proj(hidden_states)
+        if projected_states is None:
+            projected_states, _ = self.in_proj(hidden_states)
         if mup_vector is not None:
             projected_states = projected_states * mup_vector
 

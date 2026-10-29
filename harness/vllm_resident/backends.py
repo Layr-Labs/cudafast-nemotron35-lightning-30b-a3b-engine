@@ -208,11 +208,25 @@ class VllmBackend:
 
     def _warm_up(self) -> None:
         prompt = [(i * 7919) % 30000 + 1000 for i in range(self.WARMUP_PROMPT_TOKENS)]
-        for _ in range(self.WARMUP_ROUNDS):
-            self.start(prompt)
-            for _ in range(self.WARMUP_DECODE_STEPS):
-                self.step()
-            self.abort()
+        try:
+            import vsample as vsample_warm
+        except ImportError:
+            vsample_warm = None
+        try:
+            for warm_round in range(self.WARMUP_ROUNDS):
+                # Only this synthetic boot round may admit new sampler shapes;
+                # unseen runtime shapes always keep the original sampler.
+                free_run = (warm_round == self.WARMUP_ROUNDS - 1
+                            and os.environ.get("VSAMPLE_REDUX", "1") != "0")
+                if vsample_warm is not None and hasattr(vsample_warm, "set_redux_qualification"):
+                    vsample_warm.set_redux_qualification(free_run)
+                self.start(prompt, logprobs=not free_run)
+                for _ in range(self.WARMUP_DECODE_STEPS):
+                    self.step()
+                self.abort()
+        finally:
+            if vsample_warm is not None and hasattr(vsample_warm, "set_redux_qualification"):
+                vsample_warm.set_redux_qualification(False)
 
     def _params(self, prompt_len: int, max_tokens: int | None = None, logprobs: bool = True):
         room = max(1, self.ctx_size - prompt_len - self.depth - 1)

@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import ctypes
 import os
+import sys
+import threading
 
 import torch
 
@@ -28,6 +30,18 @@ _load_error: str | None = None
 _max_rows = 0
 _max_vocab = 0
 _scratch: dict = {}  # (device index, stream) -> (pval, pidx, counter)
+_REDUX_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "libvsample_redux.so")
+_REDUX_ENABLED = os.environ.get("VSAMPLE_REDUX", "1") != "0"
+_redux_choice: dict = {}  # (device, rows, vocab, row stride, pdl) -> library or None
+_redux_lock = threading.Lock()
+_redux_qualifying = False
+
+
+def set_redux_qualification(enabled: bool) -> None:
+    # Called by resident only in its startup warm-up window. Unseen runtime
+    # shapes retain the original library instead of benchmarking in a request.
+    global _redux_qualifying
+    _redux_qualifying = bool(enabled)
 
 
 def _load():
@@ -68,6 +82,39 @@ def _bufs(device: torch.device):
     return b
 
 
+def _select_redux(logits, target, bonus, cu, draft, vrows, out_len):
+    # Qualify once per exact call shape using private outputs and counters. This
+    # runs only outside capture; original remains available on any failed gate.
+    if (not _REDUX_ENABLED or not logits.is_cuda or logits.dtype != torch.bfloat16
+            or logits.ndim != 2 or logits.stride(1) != 1
+            or torch.cuda.is_current_stream_capturing()):
+        return None
+    device_index = logits.device.index if logits.device.index is not None else torch.cuda.current_device()
+    key = (device_index, logits.shape[0], logits.shape[1], logits.stride(0),
+           out_len, vrows is not None, PDL)
+    if key in _redux_choice:
+        return _redux_choice[key]
+    if not _redux_qualifying:
+        return None
+    with _redux_lock:
+        if key in _redux_choice:
+            return _redux_choice[key]
+        if not _redux_qualifying:
+            return None
+        chosen = None
+        try:
+            from .redux_qualify_draft import _bind, qualify
+            metrics = qualify(LIB_PATH, _REDUX_PATH, logits, target, bonus, cu, draft, vrows, out_len, PDL)
+            if metrics is not None:
+                chosen = _bind(ctypes.CDLL(_REDUX_PATH))
+                print(f"vsample redux: admitted shape={key} qualification={metrics}",
+                      file=sys.stderr, flush=True)
+        except (ImportError, OSError, AttributeError):
+            chosen = None
+        _redux_choice[key] = chosen
+        return chosen
+
+
 def greedy_verify(logits: torch.Tensor, target_logits_indices: torch.Tensor, bonus_logits_indices: torch.Tensor,
                   cu_num_draft_tokens: torch.Tensor, draft_token_ids: torch.Tensor, max_spec_len: int,
                   vrows: torch.Tensor | None, num_accepted: torch.Tensor | None) -> torch.Tensor:
@@ -75,6 +122,10 @@ def greedy_verify(logits: torch.Tensor, target_logits_indices: torch.Tensor, bon
     (int32) and resets vrows[0] to VROWS_ALL when given."""
     lib = _load()
     assert lib is not None, _load_error
+    alternate = _select_redux(logits, target_logits_indices, bonus_logits_indices,
+                              cu_num_draft_tokens, draft_token_ids, vrows, max_spec_len + 1)
+    if alternate is not None:
+        lib = alternate
     rows, vocab = logits.shape
     out = torch.empty((1, max_spec_len + 1), dtype=torch.int32, device=logits.device)
     pval, pidx, counter = _bufs(logits.device)

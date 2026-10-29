@@ -63,7 +63,7 @@ __device__ __forceinline__ void take(Best& b, float v, int i) {
   if (wins(v, i, b.v, b.i)) { b.v = v; b.i = i; }
 }
 
-__device__ __forceinline__ Best warp_best(Best b) {
+__device__ __forceinline__ Best warp_best_reference(Best b) {
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) {
     const float v = __shfl_xor_sync(0xffffffffu, b.v, o);
@@ -73,9 +73,52 @@ __device__ __forceinline__ Best warp_best(Best b) {
   return b;
 }
 
+__device__ __forceinline__ Best warp_best(Best b) {
+#if defined(VSAMPLE_REDUX_SKETCH) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  // Map BF16-representable floats to an order key. All NaNs outrank numbers;
+  // +/-0 are equal, as in torch's comparator. Every lane participates.
+  const unsigned int bits = __float_as_uint(b.v);
+  const unsigned int mag = bits & 0x7fffffffu;
+  unsigned int h = bits >> 16;
+  if (mag == 0u) h = 0u;
+  const unsigned int key = (mag > 0x7f800000u) ? 0xffffu
+      : ((h & 0x8000u) ? ((~h) & 0xffffu) : (h ^ 0x8000u));
+  const unsigned int top = __reduce_max_sync(0xffffffffu, key);
+  const unsigned int eligible = key == top ? static_cast<unsigned int>(b.i) : 0xffffffffu;
+  const unsigned int best_i = __reduce_min_sync(0xffffffffu, eligible);
+  const unsigned int winners = __ballot_sync(0xffffffffu, key == top &&
+                                              static_cast<unsigned int>(b.i) == best_i);
+  const int winner_lane = __ffs(winners) - 1;
+  b.v = __shfl_sync(0xffffffffu, b.v, winner_lane);
+  b.i = static_cast<int>(best_i);
+#else
+  b = warp_best_reference(b);
+#endif
+  return b;
+}
+
 __device__ __forceinline__ float bf16_bits_to_float(unsigned short h) {
   return __uint_as_float(static_cast<unsigned int>(h) << 16);
 }
+
+#if defined(VSAMPLE_REDUX_SKETCH)
+// Remote qualification helper only. Each warp compares its actual two reduction
+// implementations across every BF16 word and eight fixed adversarial pivots.
+// The caller must allocate 65536 * 16 int32 results; this is not an admission gate.
+__global__ void redux_pair_probe(int* mismatch) {
+  const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const int lane = threadIdx.x & 31;
+  const unsigned word = static_cast<unsigned>(warp >> 4);
+  const unsigned pivots[8] = {0x0000u, 0x8000u, 0x0001u, 0x8001u,
+                              0x7f80u, 0xff80u, 0x7fc1u, 0xff81u};
+  const unsigned h = (lane & 1) ? word : pivots[(warp >> 1) & 7];
+  const int index = ((warp & 1) ? 31 - lane : lane);
+  Best input{bf16_bits_to_float(static_cast<unsigned short>(h)), index};
+  Best old_best = warp_best_reference(input);
+  Best new_best = warp_best(input);
+  if (lane == 0) mismatch[warp] = old_best.i != new_best.i;
+}
+#endif
 
 __global__ void __launch_bounds__(kThreads)
     greedy_verify_kernel(const unsigned short* __restrict__ logits, long ld, int V, int C,
@@ -184,6 +227,16 @@ int vs_max_rows() { return kMaxRows; }
 int vs_max_vocab() { return kMaxChunks * kChunk; }
 
 int vs_chunk() { return kChunk; }
+
+#if defined(VSAMPLE_REDUX_SKETCH)
+int vs_redux_pair_probe(int* mismatch, cudaStream_t stream) {
+  constexpr int cases = 65536 * 16;
+  constexpr int warps_per_cta = kThreads / 32;
+  redux_pair_probe<<<cases / warps_per_cta, kThreads, 0, stream>>>(mismatch);
+  const cudaError_t e = cudaGetLastError();
+  return e == cudaSuccess ? 0 : 100 + static_cast<int>(e);
+}
+#endif
 
 // logits: bf16 [R, V] with row stride ld elements (16-byte aligned rows: ld % 8 == 0, V % 8 == 0).
 // scratch: >= kMaxRows * kMaxChunks floats + ints; counter: one zeroed unsigned int.

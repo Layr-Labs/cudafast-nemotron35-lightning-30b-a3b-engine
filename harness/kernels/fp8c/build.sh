@@ -32,5 +32,13 @@ if ! test -f "$out/libfp8c.so"; then
     -o "$out/libfp8c.so" "$here/csrc/fp8c.cu" 2>&1 || true
 fi
 test -f "$out/libfp8c.so" || { echo "fp8c: build failed" >&2; exit 1; }
+# Optional independent implementation.  A failed optional build must never
+# replace the admitted original library; Python retains it as the fallback.
+rm -f "$out/libfp8c_empty.so"
+"$nvcc" -O3 -std=c++17 -shared -Xcompiler -fPIC -lineinfo \
+  -gencode "arch=compute_${sm},code=sm_${sm}" \
+  -Xptxas -v -DFP8C_SKIP_EMPTY_ESCAPE \
+  -o "$out/libfp8c_empty.so" "$here/csrc/fp8c.cu" 2>&1 || rm -f "$out/libfp8c_empty.so"
 cp "$here/py/__init__.py" "$out/__init__.py"
+cp "$here/py/empty_guard.py" "$out/empty_guard.py"
 echo "fp8c: built $out/libfp8c.so for sm_${sm}"

@@ -6230,6 +6230,13 @@ class GPUModelRunner(
                         (self.model, getattr(getattr(self, "drafter", None), "model", None))
                     )
 
+                # The optional decoder must be timed against the final
+                # post-CMP2 weight owner, before any model graph captures it.
+                from vllm.model_executor.kernels.linear.scaled_mm.fp8c import (
+                    qualify_model as _qualify_fp8c_empty,
+                )
+                _qualify_fp8c_empty(self.model)
+
                 self._setup_eagle3_aux_hidden_state_outputs()
 
                 # Resolve the MoE model, unwrapping VLM wrappers if needed.

@@ -19,7 +19,9 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.spec_decode.nemotron_full_step import _inputs, _metadata
 
 logger = init_logger(__name__)
-ENABLED = os.environ.get("NEMO_MTP_STEP_COND", "1") != "0"
+# LOCAL PATCH (cudafast-nemotron35): default off (as in jungjipdo fcbf0e84 / e-man07 1faceed1): each
+# single-row draft pass takes the per-pass path; NEMO_MTP_STEP_COND=1 restores the conditional step graph.
+ENABLED = os.environ.get("NEMO_MTP_STEP_COND", "0") != "0"
 SPEED = os.environ.get("NEMO_MTP_STEP_COND_SPEED", "1") != "0"
 
 

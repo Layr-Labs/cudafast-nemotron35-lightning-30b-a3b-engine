@@ -400,11 +400,69 @@ int router_launch(const float* x, long ldx, int M, const void* w, int N, int K, 
   }
 }
 
+#ifndef SMALLK_NO_A16
+#include "router_a16.cuh"
+#endif
+
 }  // namespace
 
 extern "C" {
 
 int sk_version() { return SK_VERSION; }
+
+#ifndef SMALLK_NO_A16
+int sk_router_a16_version() { return 1; }
+
+// Optional kernel loading is independent of sk_init; refusal keeps old ABI.
+int sk_router_a16_init() {
+  cudaFuncAttributes a;
+  int rc = 0;
+#define CHECK_A16(R, M, W) rc |= cudaFuncGetAttributes(&a, router_gemm_a16_kernel<R,M,0,W>) != cudaSuccess
+  CHECK_A16(1,5,false); CHECK_A16(2,5,false); CHECK_A16(4,5,false); CHECK_A16(8,5,false);
+  CHECK_A16(1,6,false); CHECK_A16(2,6,false); CHECK_A16(4,6,false); CHECK_A16(8,6,false);
+#ifndef SMALLK_NO_W16
+  CHECK_A16(1,5,true); CHECK_A16(2,5,true); CHECK_A16(4,5,true); CHECK_A16(8,5,true);
+  CHECK_A16(1,6,true); CHECK_A16(2,6,true); CHECK_A16(4,6,true); CHECK_A16(8,6,true);
+#endif
+#undef CHECK_A16
+  rc |= cudaFuncGetAttributes(&a, router_a16_convert_kernel) != cudaSuccess;
+  return rc;
+}
+
+int sk_router_a16_convert(const void* x, void* y, int n, void* stream) {
+  if (n != 65536 || !x || !y) return 1;
+  router_a16_convert_kernel<<<256,256,0,static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint16_t*>(x), static_cast<float*>(y), n);
+  return static_cast<int>(cudaGetLastError());
+}
+
+int sk_router_gemm_a16(const void* x, long ldx, int m, const void* w,
+                        float* y, long ldy, int rows, int w16, int pdl,
+                        const int* vrows, void* stream) {
+  if (!x || !w || !y || ldx < 2688 || ldy < 128 || (m != 5 && m != 6)) return 1;
+  const uint16_t* a = static_cast<const uint16_t*>(x);
+  cudaStream_t s = static_cast<cudaStream_t>(stream);
+  if (w16 == 0) {
+    switch (rows) {
+      case 1: return router_a16_launch<1,false>(a,ldx,m,w,y,ldy,pdl,vrows,s);
+      case 2: return router_a16_launch<2,false>(a,ldx,m,w,y,ldy,pdl,vrows,s);
+      case 4: return router_a16_launch<4,false>(a,ldx,m,w,y,ldy,pdl,vrows,s);
+      case 8: return router_a16_launch<8,false>(a,ldx,m,w,y,ldy,pdl,vrows,s);
+    }
+  }
+#ifndef SMALLK_NO_W16
+  if (w16 == 1) {
+    switch (rows) {
+      case 1: return router_a16_launch<1,true>(a,ldx,m,w,y,ldy,pdl,vrows,s);
+      case 2: return router_a16_launch<2,true>(a,ldx,m,w,y,ldy,pdl,vrows,s);
+      case 4: return router_a16_launch<4,true>(a,ldx,m,w,y,ldy,pdl,vrows,s);
+      case 8: return router_a16_launch<8,true>(a,ldx,m,w,y,ldy,pdl,vrows,s);
+    }
+  }
+#endif
+  return 3;
+}
+#endif
 
 // Loads every kernel into the context (call outside CUDA graph capture).
 int sk_init() {

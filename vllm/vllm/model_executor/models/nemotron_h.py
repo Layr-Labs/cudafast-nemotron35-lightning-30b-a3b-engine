@@ -319,6 +319,23 @@ class NemotronHMoE(nn.Module):
             # target-model gates honour smallk.verify_rows (masked trailing verify rows reuse the
             # last valid row's experts); the MTP layer's gate ("mtp.layers.N") never does
             self.gate._smallk_row_mask = "mtp" not in prefix.split(".")
+        # The shared-output entry is pure and already receives the same BF16
+        # tensor as hidden_states/shared_experts_input. Offer that same input
+        # to the qualified A16 router, preserving the original fork/join.
+        self._smallk_a16_router = (
+            self._smallk_early_router
+            and getattr(_smallk, "ROUTER_A16_ON", False)
+            and "mtp" not in prefix.split(".")
+            and self.tp_size == self.ep_size == 1
+            and config.hidden_size == 2688 and self.n_routed_experts == 128
+            and getattr(self.experts, "_forward_entry", None) == torch.ops.vllm.moe_forward_shared
+            and getattr(self.experts, "gate", None) is None
+            and getattr(self.experts, "routed_input_transform", None) is None
+            and getattr(self.experts, "routed_output_transform", None) is None
+        )
+        # Empty until the model-level hook runs after all weight postprocessing.
+        # Refused shapes retain the original outer FP32 cast/compiler boundary.
+        self._smallk_a16_shapes = ()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
@@ -328,10 +345,18 @@ class NemotronHMoE(nn.Module):
             hidden_states = sequence_parallel_chunk(hidden_states)
 
         if self._smallk_early_router:
-            # the runner applies self.gate to this fp32 copy after the side-stream fork
+            # The runner applies the gate after the original side-stream fork.
+            # Select before casting: eager refusals and non-admitted compile
+            # shapes keep the original outside-the-opaque-op conversion.
+            if (num_tokens in self._smallk_a16_shapes
+                    and hidden_states.dtype == torch.bfloat16
+                    and hidden_states.shape[1] == 2688):
+                router_input = hidden_states
+            else:
+                router_input = hidden_states.to(self.gate.weight.dtype)
             final_hidden_states = self.experts(
                 hidden_states=hidden_states,
-                router_logits=hidden_states.to(self.gate.weight.dtype),
+                router_logits=router_input,
             )
             return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -1062,6 +1087,40 @@ class NemotronHForCausalLM(
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
+
+    def process_weights_after_loading(self) -> None:
+        """Optional A16 admission after quant/attention/HPC weight finalization.
+
+        This is a fixed, resident, single-worker experiment. No request data,
+        output, or sampling decision is used; only private synthetic inputs
+        and the actual immutable gate weights participate in admission.
+        """
+        blocks = [m for m in self.modules() if isinstance(m, NemotronHMoE)]
+        for block in blocks:
+            block._smallk_a16_shapes = ()
+        if _smallk is None or not getattr(_smallk, "ROUTER_A16_ON", False):
+            return
+        cfg = self.vllm_config
+        pc = cfg.parallel_config
+        if (pc.tensor_parallel_size != 1 or pc.pipeline_parallel_size != 1
+                or pc.data_parallel_size != 1
+                or pc.prefill_context_parallel_size != 1
+                or pc.decode_context_parallel_size != 1
+                or pc.enable_eplb or pc.use_ubatching
+                or pc.distributed_executor_backend != "uni"
+                or cfg.scheduler_config.max_num_seqs != 1
+                or cfg.lora_config is not None
+                or cfg.weight_transfer_config is not None
+                or cfg.kv_transfer_config is not None
+                or cfg.offload_config.uva.cpu_offload_gb != 0
+                or cfg.offload_config.prefetch.offload_group_size != 0):
+            return
+        for block in blocks:
+            if block._smallk_a16_router:
+                block._smallk_a16_shapes = tuple(
+                    m for m in (5, 6)
+                    if _smallk.prepare_router_a16(block.gate.weight, m)
+                )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self, skip_prefixes=["mtp"])

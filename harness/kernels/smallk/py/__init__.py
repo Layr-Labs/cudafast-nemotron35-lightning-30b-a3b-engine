@@ -54,6 +54,7 @@ ENABLED = _flag("SMALLK")
 ROUTER_ON = ENABLED and _flag("SMALLK_ROUTER")
 ROUTER_M5_ON = _flag("SMALLK_ROUTER_M5")
 ROUTER_W16_ON = ROUTER_ON and _flag("SMALLK_ROUTER_W16")
+ROUTER_A16_ON = ROUTER_ON and _flag("SMALLK_ROUTER_A16")
 # Opt-in: exact, but no end-to-end gain at depth 3 (the routing chain overlaps the shared-expert
 # GEMMs on the side stream; a shorter chain only moves that overlap into the routed-expert GEMM).
 TOPK_ON = ENABLED and _flag("SMALLK_TOPK", "0")
@@ -89,10 +90,11 @@ _vrows_missed = False
 _has_vrows_entry = False
 _w16: dict = {}  # gate weight data_ptr -> (weight, bf16 shadow or None when not bf16-exact)
 _has_w16_entry = False
+_has_a16_entry = False
 
 
 def _load():
-    global _lib, _load_error, _has_vrows_entry, _has_w16_entry
+    global _lib, _load_error, _has_vrows_entry, _has_w16_entry, _has_a16_entry
     if _lib is not None or _load_error is not None:
         return _lib
     try:
@@ -118,6 +120,16 @@ def _load():
             _has_w16_entry = current
         except AttributeError:
             _has_w16_entry = False
+        try:
+            lib.sk_router_a16_version.restype = ci
+            lib.sk_router_a16_init.restype = ci
+            lib.sk_router_a16_convert.argtypes = [vp, vp, ci, vp]
+            lib.sk_router_a16_convert.restype = ci
+            lib.sk_router_gemm_a16.argtypes = [vp, cl, ci, vp, vp, cl, ci, ci, ci, vp, vp]
+            lib.sk_router_gemm_a16.restype = ci
+            _has_a16_entry = lib.sk_router_a16_version() == 1
+        except AttributeError:
+            _has_a16_entry = False
         lib.sk_topk_sigmoid.argtypes = [vp, vp, ci, ci, ci, ci, cf, vp, vp, ci, ci, vp]
         lib.sk_topk_sigmoid.restype = ci
         lib.sk_align.argtypes = [vp, ci, ci, ci, vp, ci, vp, ci, vp, ci, vp]
@@ -334,6 +346,22 @@ def maybe_router_gemm(x: torch.Tensor, w: torch.Tensor, row_mask: bool = False) 
         if vrows is None and capturing:
             _vrows_missed = True
     return router_gemm(x, w, vrows=vrows, w16=gate_w16(w))
+
+
+def prepare_router_a16(w: torch.Tensor, m: int) -> bool:
+    """Optional actual-weight admission, only at the model post-load hook."""
+    if not ROUTER_A16_ON:
+        return False
+    from . import a16
+    return a16.prepare(w, m)
+
+
+def maybe_router_gemm_a16(x: torch.Tensor, w: torch.Tensor, row_mask: bool = False):
+    """Optional qualified BF16 input; None is a pre-launch refusal."""
+    if not ROUTER_A16_ON:
+        return None
+    from . import a16
+    return a16.maybe_router_gemm(x, w, row_mask=row_mask)
 
 
 def gate_w16(w: torch.Tensor) -> torch.Tensor | None:

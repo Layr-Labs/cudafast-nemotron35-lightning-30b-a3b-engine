@@ -298,6 +298,14 @@ def smallk_router_gemm_impl(
 ) -> torch.Tensor:
     """Router logits x . weight^T in fp32: smallk for its verified shape, else torch.mm.
     row_mask (early-router target gates): smallk honours its verify_rows buffer."""
+    if x.dtype == torch.bfloat16:
+        # Only the target early-router producer offers this dtype. Refusal
+        # restores the original FP32 input before every legacy consumer.
+        attempt = getattr(_smallk, "maybe_router_gemm_a16", None)
+        out = attempt(x, weight, row_mask=row_mask) if attempt is not None else None
+        if out is not None:
+            return out
+        x = x.float()
     if _smallk is not None:
         out = _smallk.maybe_router_gemm(x, weight, row_mask=row_mask)
         if out is not None:

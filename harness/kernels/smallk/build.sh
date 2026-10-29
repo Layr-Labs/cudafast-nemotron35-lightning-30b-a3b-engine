@@ -19,15 +19,20 @@ rm -f "$out/libsmallk.so"  # the fallback below tests for this build's output, n
 # No --use_fast_math: the reductions must stay plain IEEE fp32 adds and multiplies.
 # If the bf16 gate-read variant does not build, build without it (-DSMALLK_NO_W16: no
 # sk_router_gemm_w16 symbol, and the Python side keeps the fp32 read).
-for flags in "" "-DSMALLK_NO_W16"; do
+for flags in "" "-DSMALLK_NO_A16" "-DSMALLK_NO_W16" "-DSMALLK_NO_A16 -DSMALLK_NO_W16"; do
   test -n "$flags" && echo "smallk: previous build failed; rebuilding with $flags" >&2
   # shellcheck disable=SC2086
-  "$nvcc" -O3 -std=c++17 -shared -Xcompiler -fPIC -lineinfo \
+  rm -f "$out/libsmallk.so"
+  if "$nvcc" -O3 -std=c++17 -shared -Xcompiler -fPIC -lineinfo \
     -gencode "arch=compute_${sm},code=sm_${sm}" \
     -Xptxas -v $flags \
-    -o "$out/libsmallk.so" "$here/csrc/smallk.cu" 2>&1 | grep -v '^$' || true
-  test -f "$out/libsmallk.so" && break
+    -o "$out/libsmallk.so" "$here/csrc/smallk.cu" 2>&1 | grep -v '^$'; then
+    test -s "$out/libsmallk.so" && break
+  else
+    rm -f "$out/libsmallk.so"
+  fi
 done
-test -f "$out/libsmallk.so" || { echo "smallk: build failed" >&2; exit 1; }
+test -s "$out/libsmallk.so" || { echo "smallk: build failed" >&2; exit 1; }
 cp "$here/py/__init__.py" "$out/__init__.py"
+cp "$here/py/a16.py" "$out/a16.py"
 echo "smallk: built $out/libsmallk.so for sm_${sm}"

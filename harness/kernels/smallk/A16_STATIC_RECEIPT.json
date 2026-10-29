@@ -1,0 +1,63 @@
+{
+  "status": "STATIC_DRAFT_UNVALIDATED",
+  "recordedAtUTC": "2026-10-29 09:26:26 UTC",
+  "actualTurnModel": "gpt-6.1-sol",
+  "actualTurnEffort": "ultra",
+  "harness": "Codex",
+  "baselineSubmissionId": "c41fc629-8c06-4bf2-8cb8-cad0edea9875",
+  "officialSource": "cdea0e5bb85ae36999f23c1f9de15de5901b8e45",
+  "baselineLocal": "4726d88aef2bfa8e04c110015568a9c68a840b30",
+  "baselineTree": "3f3a3fa2636eb7c71bf871462134b3b18fbc5259",
+  "baselineScore": 2.77776232031352,
+  "sourceOnly": true,
+  "noLocalCandidateExecution": true,
+  "noLocalParsingImportCompileTestBenchmarkSetupPreflight": true,
+  "noUpload": true,
+  "noSharedStateEdits": true,
+  "earlierFamilyFailures": [
+    {
+      "submissionId": "4ef72848-19b4-492e-a948-e9d44a94bef0",
+      "result": "Official whole golden token mismatch, no score; multiple changes, cause not isolated"
+    },
+    {
+      "submissionId": "528c6b75-628b-427b-9dab-07f2e7a9a3c1",
+      "result": "Official whole golden token mismatch, no score; X16/Gluon/readiness not isolated"
+    }
+  ],
+  "staticKernelTextComparison": {
+    "equal": true,
+    "oldChars": 3469,
+    "newChars": 3469
+  },
+  "retainedOriginalFP32Kernel": true,
+  "retainedOriginalWeightLoadsAfterPDLWait": true,
+  "addedPrewaitWeightFetch": false,
+  "originalFallbackCastPreservedForRejectedPostloadShapes": true,
+  "admittedShapesRequireRemotePostloadQualification": true,
+  "productionAdmissionOrGraphCreation": false,
+  "privateOwnersDrainedInSameFrameFinally": true,
+  "newPersistentStrongWeightOrGraphOwner": false,
+  "optionalBuildCanDisableA16": true,
+  "allChangesWithinEditablePaths": [
+    "vllm",
+    "harness"
+  ],
+  "expectedRuntimeBlobHashes": {
+    "harness/kernels/smallk/build.sh": "b5ae9830d480eca3ad2b24d8282d6cb23a727d42",
+    "harness/kernels/smallk/csrc/smallk.cu": "8cd9cd48bede6bd6c066d3823dc42c6a31d70d98",
+    "harness/kernels/smallk/csrc/router_a16.cuh": "837234ad374aeabf090771ad66a07318696fad7e",
+    "harness/kernels/smallk/py/__init__.py": "db6f4ad6a4c4193a2bbd60abdba8a90aaba8866a",
+    "harness/kernels/smallk/py/a16.py": "4b6c2c75bd8f6d3b2f1c3228b9e1cf51526a47ef",
+    "vllm/vllm/model_executor/models/nemotron_h.py": "e347b9a74ff04b4795e0969ae2e05c8477cba39d",
+    "vllm/vllm/model_executor/layers/fused_moe/router/gate_linear.py": "0f02800634e8381983bcb7838788279c854ec88d"
+  },
+  "limits": [
+    "Not a new family and not a demonstrated repair of historical mismatch",
+    "Conversion NaN raw-bit check may reject every layer; actual engagement unknown",
+    "Admitted shapes change outer compiler boundary; private kernel equality is not whole-model proof",
+    "Private pure-kernel timing omits cast cost and full shared/routed overlap",
+    "Fixed immutable resident scope, no supported general hot-reload or concurrent serving",
+    "Native errors remain visible; no production retry after launch/capture failure",
+    "Compilation, graph capture, numerical behavior and full score require official remote validation"
+  ]
+}

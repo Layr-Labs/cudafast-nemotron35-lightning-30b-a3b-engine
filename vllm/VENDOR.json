@@ -690,6 +690,22 @@
     {
       "file": "vllm/vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
       "why": "i34-9: ZSKIP_S6 defaults to on (the lean paired decode routed down reads the 6-bit scale plane, config 663, under its load-time bitwise check), as in kaankolcu's 778d1d36-5adf-497f-babb-832df9b0f24b and e-man07's a4b5cd6b-f239-4842-b66d-b1b3c20a58cd. ZSKIP_S6=0 keeps config 653 on the 8-bit plane. Measurement 2 (code identical)."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_kernels.py (ADAPT_MIN_CYCLES default)",
+      "why": "terrapinelf: i34-9's low-acceptance rule decides after 2 counted cycles (was 4) past its 4-cycle burn-in; thresholds 1.8 / 2.0 and the per-cycle cap are unchanged. Drafts only; the target verifies every committed token. MTP_ADAPT5_MIN_CYCLES=4 restores the record's rule."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_kernels.py (DEPTH_THETA default)",
+      "why": "terrapinelf: the depth gate's cumulative-confidence threshold for the first four drafts defaults to 0.51 (was 0.5); MTP_DEPTH_THETA=0.5 restores it."
+    },
+    {
+      "file": "v1/worker/gpu_model_runner.py (_pin_inductor_reductions)",
+      "why": "terrapinelf: Inductor reduction kernels keep, without timing their candidates, the candidate config with the largest R0_BLOCK, then the most warps, then the smallest XBLOCK (CachingAutotuner.benchmark_all_configs returns that order for REDUCTION and PERSISTENT_REDUCTION kernels); pointwise and other kernels are still benchmarked. INDUCTOR_RED_PIN=0 restores the timed choice."
+    },
+    {
+      "file": "(composition)",
+      "why": "terrapinelf on the record 5677c186-ecd4-4152-9f0a-081d64d44273 (i34-9: d6651a3d with ercumentyildirim's bf16ws and the decode 6-bit scale plane): the record byte for byte, plus the low-acceptance rule's minimum cycle count at 2, the depth gate's threshold at 0.51 and fixed Inductor reduction configs (largest R0_BLOCK, most warps, smallest XBLOCK, chosen without timing). No new arithmetic. Measurement #39."
     }
   ]
 }

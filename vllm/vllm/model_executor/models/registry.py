@@ -1001,9 +1001,18 @@ class _LazyRegisteredModel(_BaseRegisteredModel):
                 )
 
         # Performed in another process to avoid initializing CUDA
-        mi = _run_in_subprocess(
-            lambda: _ModelInfo.from_model_cls(self.load_model_cls())
-        )
+        # LOCAL PATCH (cudafast-nemotron35): the resident drives its engine in this process
+        # (multiprocess_mode=False, uniprocess executor), so the CUDA context the model module's
+        # import creates here is the one the engine uses anyway, and the module import is the one
+        # model construction does later. The subprocess imported vLLM and the model module once
+        # more for each class on every boot (the model-info cache dir is fresh per boot).
+        # VLLM_INSPECT_MODEL_SUBPROCESS=1 restores the subprocess.
+        if os.environ.get("VLLM_INSPECT_MODEL_SUBPROCESS", "0") == "1":
+            mi = _run_in_subprocess(
+                lambda: _ModelInfo.from_model_cls(self.load_model_cls())
+            )
+        else:
+            mi = _ModelInfo.from_model_cls(self.load_model_cls())
         logger.debug(
             "Loaded model info for class %s.%s", self.module_name, self.class_name
         )

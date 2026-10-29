@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Native Nemotron MTP decode-step graph, prepared only during remote startup."""
 import os
+import statistics
 
 import torch
 
@@ -11,6 +12,108 @@ from vllm.logger import init_logger
 from vllm.v1.attention.backend import CommonAttentionMetadata
 
 logger = init_logger(__name__)
+
+
+def _qualify_selected_full(p, graph, kwargs, metadata, padded, slots, used_rows, gate):
+    """Remote private full-step output and arm/clear timing qualification."""
+    setter = getattr(p.model, "set_moe_selected_mode", None)
+    if padded != 5 or not callable(setter):
+        return False
+    caches, saved_caches = [], []
+    saved_gate = None
+    try:
+        if not setter(False):
+            return False
+        if gate is not None:
+            saved_gate = gate.clone()
+        for name in p._draft_attn_layer_names:
+            cache = p.compilation_config.static_forward_context[name].kv_cache
+            if not isinstance(cache, torch.Tensor) or not cache.is_cuda or cache.shape[0] < 4:
+                return False
+            caches.append(cache)
+            saved_caches.append(cache[:4].clone())
+        # One real private KV slot and padded invalid slots, restored in finally.
+        p._slot_mapping_buffer[:padded].fill_(-1)
+        p._slot_mapping_buffer[:1].zero_()
+        with set_forward_context(metadata, p.vllm_config, num_tokens=padded,
+                                 cudagraph_runtime_mode=CUDAGraphMode.FULL,
+                                 slot_mapping=slots):
+            for case in range(6):
+                if gate is not None:
+                    gate.zero_()
+                    if case >= 4:
+                        gate[0].fill_(1)
+                p.input_ids[:padded].fill_(case % 2)
+                p.hidden_states[:padded].fill_((case - 2) * 0.125)
+                p.input_ids[1:padded].fill_((case + 1) % 2)
+                p.hidden_states[1:padded].fill_((case + 1) * 0.0625)
+                for cache, saved in zip(caches, saved_caches):
+                    cache[:4].copy_(saved)
+                output = graph(**kwargs)
+                if not isinstance(output, torch.Tensor) or output.shape[0] != padded:
+                    return False
+                expected = used_rows(output)
+                expected_caches = [cache[:4].clone() for cache in caches]
+                # A selected replay must leave the graph output's padded rows
+                # untouched, proving that this captured graph uses the mode.
+                output[1:].view(torch.uint8).fill_(0xA5)
+                for cache, saved in zip(caches, saved_caches):
+                    cache[:4].copy_(saved)
+                try:
+                    setter(True)
+                    selected_output = graph(**kwargs)
+                    actual = used_rows(selected_output)
+                finally:
+                    setter(False)
+                if len(actual) != len(expected) or not all(
+                        torch.equal(a, b) for a, b in zip(actual, expected)) or not all(
+                        torch.equal(cache[:4], old) for cache, old in zip(caches, expected_caches)) or not bool(
+                        torch.all(selected_output[1:].view(torch.uint8) == 0xA5).item()):
+                    return False
+            # Performance admission must exercise the live graph, not the
+            # stopped-gate path that the correctness loop also covers.
+            if gate is not None:
+                gate.zero_()
+            pressure = torch.empty(64 * (1 << 20), dtype=torch.uint8, device=p.device)
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            ratios, total = [], [0.0, 0.0]
+            for cold in (False, True):
+                samples = [[], []]
+                for trial in range(5):
+                    for arm in ((0, 1) if trial % 2 == 0 else (1, 0)):
+                        if cold:
+                            pressure.fill_(trial)
+                        start.record()
+                        for _ in range(8):
+                            if arm:
+                                try:
+                                    setter(True)
+                                    graph(**kwargs)
+                                finally:
+                                    setter(False)
+                            else:
+                                graph(**kwargs)
+                        end.record()
+                        end.synchronize()
+                        samples[arm].append(start.elapsed_time(end) / 8)
+                a, b = (statistics.median(x) for x in samples)
+                if min(a, b) <= 0:
+                    return False
+                ratios.append(b / a)
+                total[0] += a
+                total[1] += b
+            return (statistics.median(ratios) < 0.99 and total[1] / total[0] < 0.99
+                    and max(ratios) < 1.02)
+    except Exception as exc:
+        logger.warning("MTP selected full-step qualification refused: %r", exc)
+        return False
+    finally:
+        setter(False)
+        for cache, saved in zip(caches, saved_caches):
+            cache[:4].copy_(saved)
+        if saved_gate is not None:
+            gate.copy_(saved_gate)
+        p._slot_mapping_buffer[:padded].fill_(-1)
 
 
 def _tensor(x):
@@ -64,6 +167,7 @@ def prepare(p):
         return
     p._nemo_full_attempted = True
     p._nemo_full = None
+    p._nemo_full_selected_ok = False
     saved_gate = None
     gate = None
     try:
@@ -150,6 +254,10 @@ def prepare(p):
                     torch.equal(a, b) for a, b in zip(actual, reference)):
                 logger.warning('Native MTP full-step private rows differ; original path retained')
                 return
+        # Only this private, padded one-row full-step graph can opt into the
+        # selected final row. Original model/graph paths keep mode disabled.
+        p._nemo_full_selected_ok = _qualify_selected_full(
+            p, graph, kwargs, metadata, padded, slots, used_rows, gate)
         # Own strong output references and a private pool throughout replay.
         p._nemo_full = (graph, padded, signature, _inputs(kwargs),
                         (outputs, private, metadata, zero_row))
@@ -181,4 +289,11 @@ def maybe_run(p, kwargs, metadata, padded, batch_size):
     with set_forward_context(metadata, p.vllm_config, num_tokens=padded,
                              cudagraph_runtime_mode=CUDAGraphMode.FULL,
                              slot_mapping=p._get_slot_mapping(padded)):
+        if (getattr(p, "_nemo_full_selected_ok", False)
+                and not torch.cuda.is_current_stream_capturing()):
+            try:
+                p.model.set_moe_selected_mode(True)
+                return graph(**kwargs)
+            finally:
+                p.model.set_moe_selected_mode(False)
         return graph(**kwargs)

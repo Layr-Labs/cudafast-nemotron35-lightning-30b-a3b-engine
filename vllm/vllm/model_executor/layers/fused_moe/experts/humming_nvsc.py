@@ -503,6 +503,15 @@ def launch_prefill(layer, inputs, outputs, compute_config, tuning_config, sorted
     variant = _variant_key(dyn)
     if variant in _PF_FAILED:
         return False
+    # Experimental adjacent-N reuse is a strict prefill subset. A refusal
+    # launches nothing and keeps this complete original NVSC implementation.
+    from vllm.model_executor.layers.fused_moe.experts import humming_apair
+
+    if humming_apair.launch_prefill(
+        layer, inputs, outputs, compute_config, tuning_config, sorted_ids,
+        expert_ids, num_tokens_padded, top_k, valid_shape_m, dyn,
+    ):
+        return True
     from humming import ops
 
     meta = layer.humming_metas["w13"]

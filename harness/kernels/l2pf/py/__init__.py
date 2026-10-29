@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import sys
 
 import torch
 
@@ -125,11 +126,20 @@ def _side_stream(device: torch.device) -> torch.cuda.Stream:
     return s
 
 
+def _selected_weight(t):
+    # Same immutable-packet selector as fp8c_scaled_mm. Existing callers may
+    # retain the original Tensor (including the runner's cached first target).
+    # No import, qualification, GPU allocation or fallback work occurs here.
+    mixed = sys.modules.get("fp8mix")
+    return t if mixed is None else mixed.select(t)
+
+
 def prefetch(t: torch.Tensor | None, max_bytes: int = 0) -> bool:
     """Queue an L2 prefetch of the first max_bytes (0: all) of t's storage on the
     side stream. Returns whether one was queued."""
     if not ENABLED or _lib is None or t is None or not t.is_cuda:
         return False
+    t = _selected_weight(t)
     st = t.untyped_storage()
     nbytes = st.nbytes()
     if max_bytes:
@@ -151,6 +161,7 @@ def prefetch_paced(t: torch.Tensor | None, max_bytes: int = 0, interval_ns: int 
         return prefetch(t, max_bytes)
     if not ENABLED or t is None or not t.is_cuda:
         return False
+    t = _selected_weight(t)
     st = t.untyped_storage()
     nbytes = st.nbytes()
     if max_bytes:
@@ -252,7 +263,7 @@ def prefetch_many(ranges) -> bool:
     """Up to three immutable ranges in one CUDA launch and side-stream fork."""
     if not ENABLED or _lib is None:
         return False
-    selected = [(t, int(limit)) for t, limit in ranges
+    selected = [(_selected_weight(t), int(limit)) for t, limit in ranges
                 if t is not None and t.is_cuda and limit > 0]
     if not selected:
         return False

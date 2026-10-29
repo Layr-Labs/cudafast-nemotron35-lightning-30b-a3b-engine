@@ -1,0 +1,42 @@
+[
+  {
+    "submissionId": "c41fc629-8c06-4bf2-8cb8-cad0edea9875",
+    "rationale": "Complete verified baseline, including all existing FP8C, prefill, prefetch and immutable-backing features; no retired whole is a baseline.",
+    "evidence": "Official source cdea0e5bb85ae36999f23c1f9de15de5901b8e45, complete tree 3f3a3fa2636eb7c71bf871462134b3b18fbc5259, verified score 2.77776232031352. Parent local equivalent 4726d88aef2bfa8e04c110015568a9c68a840b30."
+  },
+  {
+    "submissionId": "fc04335b-c894-41f9-b73b-aa9b5aac1fb5",
+    "rationale": "Original exact seven-bit FP8C codec, exception/header layout, original four-warp MMA consumer and bounded escape admission.",
+    "evidence": "seven_helpers.cuh executable prefix is an exact source copy of c41 fp8c.cu lines1-182. Original registered seven-bit weights and complete fallback are retained."
+  },
+  {
+    "submissionId": "0fde1e7f-cced-4bea-bfe7-cc2eece540be",
+    "rationale": "Exact six-bit decoder and encoder math, and negative whole-layer selection evidence. New selection is per-original-N32 tile and requires both C6 and C7, rather than replacing the complete layer with six bits.",
+    "evidence": "six_helpers.cuh executable prefix copies its fp8six.cu lines1-185; codec.py adapts the four-exponent window and exact escape math. Source1f82db36fac86947761636ca7f77645ff9e23aeb; whole2.74656547661021 was approximately0.948622% below de497 base, so the whole is not adopted. Actual activation and isolated cause are unknown."
+  },
+  {
+    "submissionId": "4929b3f5-29ce-4a7c-93b5-f2f441fd4d29",
+    "rationale": "Original out-proj consumer decode/refill scheduling retained exactly within each selected codec branch.",
+    "evidence": "fp8mix.cu retains K4096 activation refill after the next weight decode, while K2688 retains its earlier activation refill; original ascending MMA, scaleB->scaleA and BF16 RN output remain."
+  },
+  {
+    "submissionId": "297e3412-dc4a-45ae-a0f1-b6c3afd76c1b",
+    "rationale": "Existing l2pf window, fixed byte budget, side-stream fork/join and next-layer ownership mechanism. Shared packet selection now redirects both prefetch and the original guarded consumer.",
+    "evidence": "l2pf prefetch/prefetch_paced/prefetch_many retain their range counts, limits and stream DAG. The original runner cached tensor is not replaced; select maps it to the same admitted packet consumed by GEMV."
+  },
+  {
+    "submissionId": "110cff4b-d86d-4fe9-ae30-f6ce550d005f",
+    "rationale": "Material actual-owner, immutable startup admission and exception-safe private-stream qualification ideas only; no A16 arithmetic or runtime bundle.",
+    "evidence": "Weak metadata owner keys, post-load admission before capture, private-output byte checking and same-frame drain precede publication. Whole2.74300427046762 was approximately1.2513% below c41 and retired; component activation and cause are not isolated."
+  },
+  {
+    "submissionId": "77f74985-a845-4963-bf29-b860e8daa7ef",
+    "rationale": "Material changed-input graph, dynamic private validation and owner-retirement ideas; no router suffix feature.",
+    "evidence": "Private current-input/scales replay tests and nested finally stream drains are adapted as safety patterns. Whole2.75184607067041 was approximately0.933% below c41 and retired; it is not a baseline."
+  },
+  {
+    "submissionId": "8e0a3de6-17c7-4667-8804-ee17507eb41a",
+    "rationale": "Material single immutable encoded-packet producer/consumer selection and full-fallback lifecycle ideas; no W12 router codec or runtime feature.",
+    "evidence": "One common metadata selector controls existing prefetch and GEMV, with actual-byte reconstruction and private whole-chain timing before publication. Whole2.76663609402143 was approximately0.40055% below c41 and retired; activation and component cause are unknown."
+  }
+]

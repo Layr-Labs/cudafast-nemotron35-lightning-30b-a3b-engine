@@ -6230,6 +6230,15 @@ class GPUModelRunner(
                         (self.model, getattr(getattr(self, "drafter", None), "model", None))
                     )
 
+                # Optional exact mixed FP8C packet admission at final immutable
+                # owner addresses, after CMP2 and before compile/graph capture.
+                try:
+                    import fp8mix as _fp8mix
+                except ImportError:
+                    pass
+                else:
+                    _fp8mix.prepare_model(self.model, self.vllm_config)
+
                 self._setup_eagle3_aux_hidden_state_outputs()
 
                 # Resolve the MoE model, unwrapping VLM wrappers if needed.

@@ -85,6 +85,15 @@ def _scaled_mm(
         import fp8c
 
         _log_once(fp8c)
+        # Same packet as l2pf's central selector; this remains inside every
+        # original dtype/shape/alignment/device/scale guard. Missing or refused
+        # post-load admission leaves the original seven-bit path below.
+        import sys
+        mixed = sys.modules.get("fp8mix")
+        if mixed is not None:
+            out = mixed.maybe_gemm(a, comp, sa, sb, n, k)
+            if out is not None:
+                return out
         return fp8c.gemm(a, comp, sa, sb, n, k)
     # LOCAL PATCH (cudafast-nemotron35): the M=496 prefill of an admitted in_proj (fp8ws.py).
     out = fp8ws_maybe_gemm(a, b, sa, sb)

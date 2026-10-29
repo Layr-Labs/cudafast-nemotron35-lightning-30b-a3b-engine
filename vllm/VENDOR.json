@@ -690,6 +690,22 @@
     {
       "file": "vllm/vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
       "why": "i34-9: ZSKIP_S6 defaults to on (the lean paired decode routed down reads the 6-bit scale plane, config 663, under its load-time bitwise check), as in kaankolcu's 778d1d36-5adf-497f-babb-832df9b0f24b and e-man07's a4b5cd6b-f239-4842-b66d-b1b3c20a58cd. ZSKIP_S6=0 keeps config 653 on the 8-bit plane. Measurement 2 (code identical)."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_kernels.py (ADAPT_MIN_CYCLES default)",
+      "why": "terrapinelf: i34-9's low-acceptance rule decides after 2 counted cycles (was 4) past its 4-cycle burn-in; thresholds 1.8 / 2.0 and the per-cycle cap are unchanged. Drafts only; the target verifies every committed token. MTP_ADAPT5_MIN_CYCLES=4 restores the record's rule."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_kernels.py (DEPTH_THETA default)",
+      "why": "terrapinelf: the depth gate's cumulative-confidence threshold for the first four drafts defaults to 0.51 (was 0.5); MTP_DEPTH_THETA=0.5 restores it."
+    },
+    {
+      "file": "(composition)",
+      "why": "terrapinelf on the record 5677c186-ecd4-4152-9f0a-081d64d44273 (i34-9: d6651a3d with ercumentyildirim's bf16ws and the decode 6-bit scale plane): the record byte for byte, plus the low-acceptance rule's minimum cycle count at 2 and the depth gate's threshold at 0.51. No new arithmetic. Measurement #8."
+    },
+    {
+      "file": "harness/kernels/fp8mix; harness/kernels/l2pf/py/__init__.py; model_executor/kernels/linear/scaled_mm/fp8c.py; v1/worker/gpu_model_runner.py",
+      "why": "Codex experimental isolated c41 extension, actual gpt-6.1-sol / ultra. Complete baseline c41fc629-8c06-4bf2-8cb8-cad0edea9875 is retained. Original FP8C codec from fc04335b-c894-41f9-b73b-aa9b5aac1fb5 and retired whole-layer six-bit family 0fde1e7f-cced-4bea-bfe7-cc2eece540be supply exact decoder math; new selection is per original N32 tile with both six- and seven-bit tiles required. Original out-proj activation refill order follows 4929b3f5-29ce-4a7c-93b5-f2f441fd4d29; unchanged prefetch window mechanism follows 297e3412-dc4a-45ae-a0f1-b6c3afd76c1b. A shared metadata-only selector redirects prefetch and the existing guarded consumer to one actual-weight-qualified immutable packet, after CMP2 and before compile/capture. It preserves original K/MMA/scaling/BF16 order and the old complete seven-bit fallback. Private remote-only admission adapts conservative actual-owner/graph/stream retirement patterns used in 110cff4b-d86d-4fe9-ae30-f6ce550d005f, 77f74985-a845-4963-bf29-b860e8daa7ef and 8e0a3de6-17c7-4667-8804-ee17507eb41a, without importing their runtime feature bundles. All those retired whole scores are disclosed in EXPERIMENT.md, do not establish component causality, and are not baselines. No local candidate execution, compilation or test; no compression distribution, path hit, numerical admission, resource or performance result is claimed."
     }
   ]
 }

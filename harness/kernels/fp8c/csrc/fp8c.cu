@@ -29,7 +29,11 @@ template<int K> struct Shape {
  static constexpr int EXC = HDR + C * MAIN;
 };
 struct P {const uint8_t *a,*w;const float *sa,*sb;__nv_bfloat16 *c;int m;int tile_bytes;};
-struct Slot {uint32_t c[7];uint32_t x;uint32_t q0;};
+struct Slot {uint32_t c[7];uint32_t x;uint32_t q0;
+#ifdef FP8C_SKIP_EMPTY_ESCAPE
+ uint32_t has_escape;
+#endif
+};
 
 __device__ __forceinline__ uint4 ld4(const uint8_t* p) {
  uint4 v;
@@ -66,6 +70,11 @@ __device__ __forceinline__ void load_main(const uint8_t* tb,int warp,int lane,in
 template<int K>
 __device__ __forceinline__ void load_x(const uint8_t* tb,int lane,int c,uint32_t ts,uint32_t te,Slot& s) {
  uint32_t off=__shfl_sync(FULL,ts,c),end=__shfl_sync(FULL,te,c);
+#ifdef FP8C_SKIP_EMPTY_ESCAPE
+ // Header offsets describe one entire warp/chunk, so this predicate is
+ // identical in all lanes. Only an empty window can bypass escape handling.
+ s.has_escape=(off!=end);
+#endif
  uint32_t q0=off&3u;
  s.q0=q0;
  s.x=(4u*lane<q0+end-off)?ld1(tb+Shape<K>::EXC+(off-q0)+4*lane):0u;
@@ -82,6 +91,19 @@ __device__ __forceinline__ uint32_t lanemask_lt() {
 // Fast path: two shuffled window words hold this lane's bytes q..q+7-(q&3),
 // enough unless (q&3)+cnt > 8 in some lane (rare: then a shuffle per escape).
 __device__ __forceinline__ void decode(const Slot& s,uint32_t e0x,uint32_t esc4,int lane,uint32_t (&w)[8]) {
+#ifdef FP8C_SKIP_EMPTY_ESCAPE
+ if (!s.has_escape) {
+  uint32_t hi=0;
+  #pragma unroll
+  for(int i=0;i<7;++i){
+   uint32_t v=s.c[i];
+   hi|=(v>>(7-i))&(0x01010101u<<i);
+   w[i]=((v&0x3f3f3f3fu)+e0x)|((v<<1)&0x80808080u);
+  }
+  w[7]=((hi&0x3f3f3f3fu)+e0x)|((hi<<1)&0x80808080u);
+  return;
+ }
+#endif
  uint32_t cw[8],em[8],pc[8],hi=0,cnt=0;
  #pragma unroll
  for(int i=0;i<7;++i){cw[i]=s.c[i];hi|=(s.c[i]>>(7-i))&(0x01010101u<<i);}

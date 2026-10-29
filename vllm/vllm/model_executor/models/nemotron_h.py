@@ -1063,6 +1063,36 @@ class NemotronHForCausalLM(
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
+    def process_weights_after_loading(self) -> None:
+        """Optional dead router-row admission after actual weight finalization.
+
+        No forward interface, dtype or outer conversion changes. Private
+        checks use only synthetic inputs and the loaded immutable gate.
+        """
+        if _smallk is None or not getattr(_smallk, "ROUTER_SUFFIX_ON", False):
+            return
+        cfg = self.vllm_config
+        pc = cfg.parallel_config
+        if (pc.tensor_parallel_size != 1 or pc.pipeline_parallel_size != 1
+                or pc.data_parallel_size != 1
+                or pc.prefill_context_parallel_size != 1
+                or pc.decode_context_parallel_size != 1
+                or pc.enable_eplb or pc.use_ubatching
+                or pc.distributed_executor_backend != "uni"
+                or cfg.scheduler_config.max_num_seqs != 1
+                or cfg.lora_config is not None
+                or cfg.weight_transfer_config is not None
+                or cfg.kv_transfer_config is not None
+                or cfg.offload_config.uva.cpu_offload_gb != 0
+                or cfg.offload_config.prefetch.offload_group_size != 0):
+            return
+        for block in self.modules():
+            if (isinstance(block, NemotronHMoE)
+                    and block._smallk_early_router
+                    and block.gate.__dict__.get("_smallk_row_mask", False)):
+                for m in (5, 6):
+                    _smallk.prepare_router_suffix(block.gate.weight, m)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self, skip_prefixes=["mtp"])
         loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

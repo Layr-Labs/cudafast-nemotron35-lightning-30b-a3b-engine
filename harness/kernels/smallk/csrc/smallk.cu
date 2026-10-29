@@ -400,11 +400,59 @@ int router_launch(const float* x, long ldx, int M, const void* w, int N, int K, 
   }
 }
 
+#ifndef SMALLK_NO_SUFFIX
+#include "router_suffix.cuh"
+#endif
+
 }  // namespace
 
 extern "C" {
 
 int sk_version() { return SK_VERSION; }
+
+#ifndef SMALLK_NO_SUFFIX
+int sk_router_suffix_version() { return 1; }
+
+int sk_router_suffix_init() {
+  cudaFuncAttributes a;
+  int rc = 0;
+#define CHECK_SUFFIX(R, M, W) rc |= cudaFuncGetAttributes(&a, router_gemm_suffix_kernel<R,M,0,W>) != cudaSuccess
+  CHECK_SUFFIX(1,5,false); CHECK_SUFFIX(2,5,false); CHECK_SUFFIX(4,5,false); CHECK_SUFFIX(8,5,false);
+  CHECK_SUFFIX(1,6,false); CHECK_SUFFIX(2,6,false); CHECK_SUFFIX(4,6,false); CHECK_SUFFIX(8,6,false);
+#ifndef SMALLK_NO_W16
+  CHECK_SUFFIX(1,5,true); CHECK_SUFFIX(2,5,true); CHECK_SUFFIX(4,5,true); CHECK_SUFFIX(8,5,true);
+  CHECK_SUFFIX(1,6,true); CHECK_SUFFIX(2,6,true); CHECK_SUFFIX(4,6,true); CHECK_SUFFIX(8,6,true);
+#endif
+#undef CHECK_SUFFIX
+  return rc;
+}
+
+int sk_router_gemm_suffix(const float* x, long ldx, int m, const void* w,
+                          float* y, long ldy, int rows, int w16, int pdl,
+                          const int* vrows, void* stream) {
+  if (!x || !w || !y || !vrows || ldx < 2688 || ldy < 128 || (m != 5 && m != 6)) return 1;
+  cudaStream_t s = static_cast<cudaStream_t>(stream);
+  if (w16 == 0) {
+    switch (rows) {
+      case 1: return router_suffix_launch<1,false>(x,ldx,m,w,y,ldy,pdl,vrows,s);
+      case 2: return router_suffix_launch<2,false>(x,ldx,m,w,y,ldy,pdl,vrows,s);
+      case 4: return router_suffix_launch<4,false>(x,ldx,m,w,y,ldy,pdl,vrows,s);
+      case 8: return router_suffix_launch<8,false>(x,ldx,m,w,y,ldy,pdl,vrows,s);
+    }
+  }
+#ifndef SMALLK_NO_W16
+  if (w16 == 1) {
+    switch (rows) {
+      case 1: return router_suffix_launch<1,true>(x,ldx,m,w,y,ldy,pdl,vrows,s);
+      case 2: return router_suffix_launch<2,true>(x,ldx,m,w,y,ldy,pdl,vrows,s);
+      case 4: return router_suffix_launch<4,true>(x,ldx,m,w,y,ldy,pdl,vrows,s);
+      case 8: return router_suffix_launch<8,true>(x,ldx,m,w,y,ldy,pdl,vrows,s);
+    }
+  }
+#endif
+  return 3;
+}
+#endif
 
 // Loads every kernel into the context (call outside CUDA graph capture).
 int sk_init() {

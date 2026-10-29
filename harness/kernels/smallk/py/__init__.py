@@ -54,6 +54,7 @@ ENABLED = _flag("SMALLK")
 ROUTER_ON = ENABLED and _flag("SMALLK_ROUTER")
 ROUTER_M5_ON = _flag("SMALLK_ROUTER_M5")
 ROUTER_W16_ON = ROUTER_ON and _flag("SMALLK_ROUTER_W16")
+ROUTER_SUFFIX_ON = ROUTER_ON and _flag("SMALLK_ROUTER_SUFFIX")
 # Opt-in: exact, but no end-to-end gain at depth 3 (the routing chain overlaps the shared-expert
 # GEMMs on the side stream; a shorter chain only moves that overlap into the routed-expert GEMM).
 TOPK_ON = ENABLED and _flag("SMALLK_TOPK", "0")
@@ -89,10 +90,11 @@ _vrows_missed = False
 _has_vrows_entry = False
 _w16: dict = {}  # gate weight data_ptr -> (weight, bf16 shadow or None when not bf16-exact)
 _has_w16_entry = False
+_has_suffix_entry = False
 
 
 def _load():
-    global _lib, _load_error, _has_vrows_entry, _has_w16_entry
+    global _lib, _load_error, _has_vrows_entry, _has_w16_entry, _has_suffix_entry
     if _lib is not None or _load_error is not None:
         return _lib
     try:
@@ -118,6 +120,14 @@ def _load():
             _has_w16_entry = current
         except AttributeError:
             _has_w16_entry = False
+        try:
+            lib.sk_router_suffix_version.restype = ci
+            lib.sk_router_suffix_init.restype = ci
+            lib.sk_router_gemm_suffix.argtypes = [vp, cl, ci, vp, vp, cl, ci, ci, ci, vp, vp]
+            lib.sk_router_gemm_suffix.restype = ci
+            _has_suffix_entry = lib.sk_router_suffix_version() == 1
+        except AttributeError:
+            _has_suffix_entry = False
         lib.sk_topk_sigmoid.argtypes = [vp, vp, ci, ci, ci, ci, cf, vp, vp, ci, ci, vp]
         lib.sk_topk_sigmoid.restype = ci
         lib.sk_align.argtypes = [vp, ci, ci, ci, vp, ci, vp, ci, vp, ci, vp]
@@ -333,7 +343,21 @@ def maybe_router_gemm(x: torch.Tensor, w: torch.Tensor, row_mask: bool = False) 
         vrows = verify_rows(x.device)
         if vrows is None and capturing:
             _vrows_missed = True
-    return router_gemm(x, w, vrows=vrows, w16=gate_w16(w))
+    w16 = gate_w16(w)
+    if ROUTER_SUFFIX_ON and row_mask and vrows is not None:
+        from . import suffix
+        out = suffix.maybe_router_gemm(x, w, w16, vrows)
+        if out is not None:
+            return out
+    return router_gemm(x, w, vrows=vrows, w16=w16)
+
+
+def prepare_router_suffix(w: torch.Tensor, m: int) -> bool:
+    """Actual-weight private admission, only at model post-load, never a frame."""
+    if not ROUTER_SUFFIX_ON:
+        return False
+    from . import suffix
+    return suffix.prepare(w, m)
 
 
 def gate_w16(w: torch.Tensor) -> torch.Tensor | None:

@@ -690,6 +690,22 @@
     {
       "file": "vllm/vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
       "why": "i34-9: ZSKIP_S6 defaults to on (the lean paired decode routed down reads the 6-bit scale plane, config 663, under its load-time bitwise check), as in kaankolcu's 778d1d36-5adf-497f-babb-832df9b0f24b and e-man07's a4b5cd6b-f239-4842-b66d-b1b3c20a58cd. ZSKIP_S6=0 keeps config 653 on the 8-bit plane. Measurement 2 (code identical)."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_kernels.py (ADAPT_MIN_CYCLES default)",
+      "why": "terrapinelf: i34-9's low-acceptance rule decides after 2 counted cycles (was 4) past its 4-cycle burn-in; thresholds 1.8 / 2.0 and the per-cycle cap are unchanged. Drafts only; the target verifies every committed token. MTP_ADAPT5_MIN_CYCLES=4 restores the record's rule."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_kernels.py (DEPTH_THETA default)",
+      "why": "terrapinelf: the depth gate's cumulative-confidence threshold for the first four drafts defaults to 0.51 (was 0.5); MTP_DEPTH_THETA=0.5 restores it."
+    },
+    {
+      "file": "(composition)",
+      "why": "terrapinelf on the record 5677c186-ecd4-4152-9f0a-081d64d44273 (i34-9: d6651a3d with ercumentyildirim's bf16ws and the decode 6-bit scale plane): the record byte for byte, plus the low-acceptance rule's minimum cycle count at 2 and the depth gate's threshold at 0.51. No new arithmetic. Measurement #8."
+    },
+    {
+      "file": "harness/kernels/smallk/{csrc/router_suffix.cuh,csrc/smallk.cu,py/suffix.py,py/__init__.py,build.sh}; model_executor/models/nemotron_h.py (post-load hook only)",
+      "why": "GPT 6.1 Sol / ultra / Codex: on complete c41fc629-8c06-4bf2-8cb8-cad0edea9875 add optional target M5/M6 router dead-suffix input/FMA-chain pruning. Original FP32 outer cast, original kernel/ABIs, weight loads, valid-row FP32 chain, folds/barriers, last-live suffix substitution and stream DAG retained. Original router100549d4-51c4-4f56-b3ca-2604731ab8a4; confidence-prefix ca5c19dd-da37-4328-880a-152f8c7b3651; exact W16 0852152c-9025-499d-83bd-684cf825232e; M5 f38ce1ad-87fa-4cfb-8a0c-ac46587810f7; depth-five/M6 eb48e2f0-50e6-4c39-a1f3-0ac305d17c5b. Private post-load admission/lifetime/buildfallback design reused from110cff4b-d86d-4fe9-ae30-f6ce550d005f, whose entire2.74300427046762 result regressed1.2513% and is not baseline; no A16 input/kernel/cast changes carried. Official-remote-only actual-weight full-output/guard/raw-bit checks across negative/zero/all-prefix/sentinel/int32 boundaries and changed-input/count graphs, plus warm/pressure pure-kernel timing. Production only prior-admission lookup. No local candidate execution/parse/build/test; actual compilation, activation, count distribution, equality and whole benefit unknown. No weight or HBM saving claim. Details: harness/kernels/smallk/SUFFIX_EXPERIMENT.md."
     }
   ]
 }

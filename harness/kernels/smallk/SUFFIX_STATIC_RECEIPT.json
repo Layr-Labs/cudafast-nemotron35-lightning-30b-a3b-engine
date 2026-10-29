@@ -1,0 +1,95 @@
+{
+  "status": "STATIC_REVIEWED_UNVALIDATED_DRAFT",
+  "atUTC": "2026-10-29 10:26:11 UTC",
+  "actualTurnModel": "gpt-6.1-sol",
+  "actualTurnEffort": "ultra",
+  "harness": "Codex",
+  "baselineSubmissionId": "c41fc629-8c06-4bf2-8cb8-cad0edea9875",
+  "baselineOfficialSource": "cdea0e5bb85ae36999f23c1f9de15de5901b8e45",
+  "baselineLocal": "4726d88aef2bfa8e04c110015568a9c68a840b30",
+  "baselineTree": "3f3a3fa2636eb7c71bf871462134b3b18fbc5259",
+  "baselineScore": 2.77776232031352,
+  "originalKernelUnedited": true,
+  "inferenceWeightsRefusedBeforeVersionAccess": true,
+  "originalFP32OuterCastUnedited": true,
+  "modelConstructorAndForwardUnedited": true,
+  "originalGateLinearAndMoERunnerUnedited": true,
+  "normalizedKernelTextProof": {
+    "sourceNormalizationExact": true,
+    "originalChars": 3469,
+    "normalizedChars": 3469,
+    "normalizationOnly": [
+      "kernel_name",
+      "live_clamp_definition",
+      "two_x_load_conditions",
+      "two_FMA_conditions"
+    ]
+  },
+  "productionExtraKernelLaunches": 0,
+  "productionExtraStreams": 0,
+  "productionExtraScratchBuffers": 0,
+  "productionCPUDeviceScalarRead": false,
+  "productionPrivateAdmission": false,
+  "candidateScope": {
+    "M": [
+      5,
+      6
+    ],
+    "N": 128,
+    "K": 2688,
+    "SM": "12.1",
+    "input": "FP32 contiguous",
+    "count": "existing target row_mask int32[1]",
+    "weight": "original FP32 or existing exact W16"
+  },
+  "sourceSavingsExample": {
+    "M": 6,
+    "live": 2,
+    "R": 1,
+    "targetLayers": 23,
+    "deletedFMAs": 31653888,
+    "deletedFP32ActivationLoadRequestBytes": 126615552,
+    "deletedWeightBytes": 0,
+    "measured": false
+  },
+  "qualificationAuthoredOnly": [
+    "Actual loaded gate weight and unchanged selected weight policy",
+    "Negative/zero/all-prefix/over-M/VROWS_ALL/INT32 bounds",
+    "Finite scales/signed zero/subnormal/Inf/NaN raw-word inputs",
+    "All M*128 output raw bits plus distinct left/right poisons",
+    "Independent count expected values and unchanged input/weight/shadow bits",
+    "Changed input+count private graphs; current copies before each kernel",
+    "Warm/64MiB-pressure, all live counts and sentinel, alternating old/new timing",
+    "Private owner same-frame finally drain and caller rejoin; native errors visible"
+  ],
+  "reusedPrivateAdmissionSource": {
+    "id": "110cff4b-d86d-4fe9-ae30-f6ce550d005f",
+    "officialWholeScore": 2.74300427046762,
+    "wholeRetired": true,
+    "baseline": false,
+    "selected": "Private post-load/cache/lifetime/build-fallback design only",
+    "excluded": "All A16 input/kernel/outercast change",
+    "isolatedCauseOrActivationKnown": false
+  },
+  "runtimeBlobHashes": {
+    "harness/kernels/smallk/csrc/router_suffix.cuh": "8d331be64d384474790c038411e25df10edb30fc",
+    "harness/kernels/smallk/csrc/smallk.cu": "43df2e25f79a476db541d9c34966bf89f26e5b8f",
+    "harness/kernels/smallk/py/suffix.py": "d41fac6e1ebbe4ba35c3d06d0030c307b1f4638b",
+    "harness/kernels/smallk/py/__init__.py": "10d7cea54ca375af6df26fd8cb62e175139f2788",
+    "harness/kernels/smallk/build.sh": "c4cab75adaa643b13a88f62800a68b86cb9ec447",
+    "vllm/vllm/model_executor/models/nemotron_h.py": "2eee011c115311c6b4ccbb98f015ca6404dd44e0"
+  },
+  "localCandidateExecution": false,
+  "localParseImportCompileTestSetupBenchmarkPreflight": false,
+  "uploaded": false,
+  "inFlightOrOtherCheckoutEdited": false,
+  "sharedStateEdited": false,
+  "unresolved": [
+    "Compilation/resource feasibility",
+    "Generated predicate/load behavior",
+    "Remote admission and real count distribution",
+    "Production engagement",
+    "Full golden and score",
+    "Shared/routed concurrency benefit"
+  ]
+}

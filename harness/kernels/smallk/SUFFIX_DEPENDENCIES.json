@@ -1,0 +1,30 @@
+[
+  {
+    "submissionId": "c41fc629-8c06-4bf2-8cb8-cad0edea9875",
+    "rationale": "Complete verified baseline cdea0e5/tree3f3a3fa, official2.77776232031352; original FP32 outer cast and complete runtime retained."
+  },
+  {
+    "submissionId": "100549d4-51c4-4f56-b3ca-2604731ab8a4",
+    "rationale": "Original smallk FP32 router chain, weight-load source order and early-router schedule; new optional row-skip kernel derives from its current inherited body."
+  },
+  {
+    "submissionId": "ca5c19dd-da37-4328-880a-152f8c7b3651",
+    "rationale": "Original confidence/verify-row/forced-rejection device protocol; new path only consumes its existing current count and preserves suffix substitution."
+  },
+  {
+    "submissionId": "0852152c-9025-499d-83bd-684cf825232e",
+    "rationale": "Original exact W16 shadow/weight-read policy preserved for both reference and new kernel."
+  },
+  {
+    "submissionId": "f38ce1ad-87fa-4cfb-8a0c-ac46587810f7",
+    "rationale": "Inherited original M5 row chains retained as the reference."
+  },
+  {
+    "submissionId": "eb48e2f0-50e6-4c39-a1f3-0ac305d17c5b",
+    "rationale": "Inherited complete depth-five/M6 implementation carried through c41, retained as reference."
+  },
+  {
+    "submissionId": "110cff4b-d86d-4fe9-ae30-f6ce550d005f",
+    "rationale": "Only private post-load admission/lifetime/weak owner and optional build-fallback design reused. Entire score2.74300427046762 regressed1.2513% vs c41, not a baseline; no A16 input/kernel/outercast change. Actual component admission/engagement/cause unknown."
+  }
+]

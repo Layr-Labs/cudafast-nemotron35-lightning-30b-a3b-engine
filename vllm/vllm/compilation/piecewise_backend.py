@@ -22,6 +22,73 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
+# LOCAL PATCH (cudafast-nemotron35): lite prefill tail. Set (to the forward's row
+# count) only while the whole-forward prefill graph's lite forward runs, whose caller
+# reads the last row alone (vllm/v1/worker/prefill_graph.py, NemotronHForCausalLM
+# .set_last_moe_row_src): the forward's last compiled piece then runs on that row
+# alone (_lite_tail_call). 0 (the default) changes nothing.
+LITE_TAIL_ROWS = 0
+_lite_tail_logged = False
+
+
+def _lite_tail_call(backend: "PiecewiseBackend", args: tuple[Any, ...]) -> Any:
+    """Run the last compiled piece of an n-row forward on its last row alone, or
+    return None (the caller then runs the piece as usual).
+
+    The piece (Nemotron-H: layer 50's gated RMSNorm, FP8 quant and out_proj, layer
+    51's add+RMSNorm and MoE op, norm_f) is per row up to the MoE op, which pads its
+    one-row input back to n rows (MoERunner._lite_tail_impl). It runs the very
+    runnable that serves n rows, compiled for a symbolic row count, so every Inductor
+    kernel is the same object with the same tuned launcher and per-row code, launched
+    for one row. Only row n - 1 of the returned tensors is written.
+    """
+    global _lite_tail_logged
+    n = LITE_TAIL_ROWS
+    idx = backend.sym_shape_indices
+    if not idx or any(args[i] != n for i in idx):
+        return None
+    entry = backend._find_range_for_shape(n)
+    if (
+        entry is None
+        or not entry.compiled
+        or entry.compile_range.is_single_size()
+        or 1 not in entry.compile_range
+    ):
+        return None
+    rows = [
+        i
+        for i, a in enumerate(args)
+        if isinstance(a, torch.Tensor) and a.dim() >= 1 and a.shape[0] == n
+    ]
+    if not rows:
+        return None
+    new = list(args)
+    for i in idx:
+        new[i] = 1
+    for i in rows:
+        new[i] = args[i][n - 1 : n]
+    out = entry.runnable(*new)
+
+    def pad(t: Any) -> Any:
+        if isinstance(t, torch.Tensor) and t.dim() >= 1 and t.shape[0] == 1:
+            full = t.new_empty((n, *t.shape[1:]))
+            full[n - 1 : n].copy_(t)
+            return full
+        return t
+
+    out = type(out)(pad(t) for t in out) if isinstance(out, (tuple, list)) else pad(out)
+    if not _lite_tail_logged:
+        _lite_tail_logged = True
+        logger.info(
+            "lite prefill tail: the last compiled piece runs row %d of %d alone "
+            "(row inputs %s, range %s); PREFILL_LITE_MAMBA_TAIL=0 disables",
+            n - 1,
+            n,
+            [tuple(args[i].shape) for i in rows],
+            entry.compile_range,
+        )
+    return out
+
 
 def get_fake_args_from_graph(graph: fx.GraphModule) -> list[Any]:
     """Get fake args directly from graph placeholder nodes."""
@@ -356,6 +423,11 @@ class PiecewiseBackend:
         return None
 
     def __call__(self, *args: Any) -> Any:
+        # LOCAL PATCH (cudafast-nemotron35): lite prefill tail (_lite_tail_call).
+        if LITE_TAIL_ROWS and self.is_last_graph:
+            out = _lite_tail_call(self, args)
+            if out is not None:
+                return out
         if self.sym_shape_indices:
             runtime_shape = args[self.sym_shape_indices[0]]
             range_entry = self._find_range_for_shape(runtime_shape)

@@ -300,6 +300,12 @@ class MoERunner(MoERunnerInterface):
         # only that row (see _apply_quant_method); set for a prefill whose request
         # samples one token and drafts nothing (prefill_graph.py).
         self.keep_m_lite = False
+        # LOCAL PATCH (cudafast-nemotron35): lite prefill tail. With keep_m_lite set,
+        # the row count of the forward whose last compiled piece runs its last row
+        # alone (compilation/piecewise_backend.py _lite_tail_call); a one-row call is
+        # then padded back to that many rows (_lite_tail_impl). 0 = off.
+        self.keep_m_pad = 0
+        self._lite_pad: dict[str, torch.Tensor] = {}
 
         self._forward_entry = self._select_forward()
 
@@ -903,12 +909,81 @@ class MoERunner(MoERunnerInterface):
         if lite:
             _shco.TAIL_ONLY = True
         try:
+            if lite and self.keep_m_pad > 1 and hidden_states.size(0) == 1:
+                return self._lite_tail_impl(
+                    self.keep_m_pad,
+                    hidden_states,
+                    router_logits,
+                    shared_experts_input,
+                    input_ids,
+                )
             return self._forward_impl_body(
                 hidden_states, router_logits, shared_experts_input, input_ids
             )
         finally:
             if lite:
                 _shco.TAIL_ONLY = False
+
+    def arm_lite_tail(self, rows: int) -> bool:
+        """LOCAL PATCH (cudafast-nemotron35): with keep_m_lite set, let a one-row
+        call stand for row rows - 1 of a rows-row call (_lite_tail_impl); 0 disarms.
+        Returns whether it is armed (the lite path needs shco)."""
+        armed = (
+            rows > 1
+            and self.keep_m_row_src is not None
+            and self.keep_m_lite
+            and _shco is not None
+        )
+        self.keep_m_pad = rows if armed else 0
+        return armed
+
+    def _lite_tail_impl(
+        self,
+        n: int,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+        input_ids: torch.Tensor | None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # LOCAL PATCH (cudafast-nemotron35): lite prefill tail. The one-row inputs are
+        # row n - 1 (keep_m_row_src) of the n-row call the lite path serves
+        # (piecewise_backend._lite_tail_call). They are copied into that row of
+        # persistent zero buffers and the lite path runs at M = n as before: the
+        # router GEMM (routerbig's per-row chains at prefill M), the shared expert's
+        # tail launch (shx at M = 496) and the routed experts on that row alone, so
+        # the row's outputs are the ones the n-row call gives; every other row is a
+        # zero row, never written, and reaches only its own outputs. Returns that row.
+        def padded(t: torch.Tensor, slot: str) -> torch.Tensor:
+            shape = (n, *t.shape[1:])
+            buf = self._lite_pad.get(slot)
+            if (
+                buf is None
+                or tuple(buf.shape) != shape
+                or buf.dtype != t.dtype
+                or buf.device != t.device
+            ):
+                buf = torch.zeros(shape, dtype=t.dtype, device=t.device)
+                self._lite_pad[slot] = buf
+            buf[n - 1 : n].copy_(t)
+            return buf
+
+        h = padded(hidden_states, "hidden")
+        r = padded(router_logits, "router")
+        if shared_experts_input is None:
+            s = None
+        elif shared_experts_input is hidden_states or (
+            shared_experts_input.data_ptr() == hidden_states.data_ptr()
+            and shared_experts_input.shape == hidden_states.shape
+            and shared_experts_input.stride() == hidden_states.stride()
+            and shared_experts_input.dtype == hidden_states.dtype
+        ):
+            s = h
+        else:
+            s = padded(shared_experts_input, "shared")
+        out = self._forward_impl_body(h, r, s, input_ids)
+        if isinstance(out, tuple):
+            return tuple(None if t is None else t[n - 1 : n] for t in out)
+        return out[n - 1 : n]
 
     def _forward_impl_body(
         self,

@@ -8,6 +8,9 @@ import torch
 
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import set_forward_context
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 def _static(value, memo):
@@ -119,19 +122,34 @@ class FreshPrefillGraph:
         # Row 495's logits are the ones the graph above gives. Its own pool, so the
         # outputs above are never overwritten by it. PREFILL_LITE=0 disables.
         self.graph_lite = None
+        # LOCAL PATCH (cudafast-nemotron35): lite prefill tail. In the lite graph the
+        # forward's last compiled piece (after layer 50's conv/SSM op, which still
+        # writes every row's state) runs row 495 alone: layer 50's gated RMSNorm,
+        # FP8 quant and out_proj, layer 51's add+RMSNorm and norm_f no longer run
+        # for the 495 rows nobody reads (NemotronHForCausalLM.set_last_moe_row_src,
+        # piecewise_backend._lite_tail_call). If that capture fails, the lite graph
+        # is captured without it. PREFILL_LITE_MAMBA_TAIL=0 disables.
+        self.lite_tail = os.environ.get("PREFILL_LITE_MAMBA_TAIL", "1") != "0"
         if os.environ.get("PREFILL_LITE", "1") != "0":
-            try:
-                self.pool_lite = torch.cuda.graph_pool_handle()
-                for _ in range(2):
-                    self._forward(lite=True)
-                torch.cuda.synchronize()
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph, pool=self.pool_lite):
-                    self.hidden_lite, self.logits_lite = self._forward(lite=True)
-                torch.cuda.synchronize()
-                self.graph_lite = graph
-            except Exception:  # noqa: BLE001
-                self.graph_lite = None
+            for _attempt in range(2 if self.lite_tail else 1):
+                try:
+                    self.pool_lite = torch.cuda.graph_pool_handle()
+                    for _ in range(2):
+                        self._forward(lite=True)
+                    torch.cuda.synchronize()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph, pool=self.pool_lite):
+                        self.hidden_lite, self.logits_lite = self._forward(lite=True)
+                    torch.cuda.synchronize()
+                    self.graph_lite = graph
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    self.graph_lite = None
+                    if not self.lite_tail:
+                        break
+                    logger.warning("lite prefill tail failed (%r); lite graph "
+                                   "captured without it", exc)
+                    self.lite_tail = False
         # LOCAL PATCH (cudafast-nemotron35): early launch (gpu_model_runner
         # _fresh_prefill_early). The request tensors above are written only by
         # replay(); early_sig names what the last replay wrote them for: the
@@ -156,7 +174,10 @@ class FreshPrefillGraph:
         # never re-decides it, and the clear keeps every later forward (the
         # decode graphs are captured earlier, :7036 against :7024) untouched.
         model = self.runner.get_model()
-        model.set_last_moe_row_src(self.logits_indices, lite=lite)
+        # tail_rows: row 495 is the last of the 496 (lite prefill tail, __init__).
+        model.set_last_moe_row_src(
+            self.logits_indices, lite=lite,
+            tail_rows=496 if lite and getattr(self, "lite_tail", False) else 0)
         try:
             with set_forward_context(
                 self.metadata, self.runner.vllm_config, num_tokens=496,

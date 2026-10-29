@@ -1012,7 +1012,9 @@ class NemotronHForCausalLM(
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
-    def set_last_moe_row_src(self, row_src: torch.Tensor | None, lite: bool = False) -> bool:
+    def set_last_moe_row_src(
+        self, row_src: torch.Tensor | None, lite: bool = False, tail_rows: int = 0
+    ) -> bool:
         """Route every row of the last layer's MoE through row `row_src` (a
         1-element GPU index tensor), or restore per-row routing with None.
 
@@ -1020,26 +1022,46 @@ class NemotronHForCausalLM(
         The last MoE layer is the model's last layer, so its output reaches
         only norm_f, a per-row RMSNorm. Returns False when the last layer is
         not an MoE on this rank.
+
+        tail_rows (lite only, LOCAL PATCH cudafast-nemotron35): the forward's row
+        count when row_src holds its last row, tail_rows - 1; the forward's last
+        compiled piece then runs that row alone (compilation/piecewise_backend.py
+        _lite_tail_call). That piece starts after the last Mamba layer's conv/SSM
+        op, which keeps every row's state, and holds the per-row rest of that layer
+        (gated RMSNorm, static FP8 quant, out_proj), the last layer's add+RMSNorm
+        and MoE op, and norm_f. Armed only when the layer before the last is a Mamba
+        layer.
         """
         # A tuple, so nn.Module does not register the runner a second time.
         cached = getattr(self, "_last_moe_runner", None)
         if cached is None:
             runner = None
+            tail_ok = False
             model = self.model
             layers = model.layers
             if model.end_layer == len(layers):
                 last = layers[len(layers) - 1]
                 if isinstance(last, NemotronHMoEDecoderLayer):
                     runner = last.mixer.experts
-            cached = (runner,)
+                    prev = len(layers) - 2
+                    tail_ok = prev >= model.start_layer and isinstance(
+                        layers[prev], NemotronHMambaDecoderLayer
+                    )
+            cached = (runner, tail_ok)
             self._last_moe_runner = cached
-        runner = cached[0]
+        runner, tail_ok = cached
         if runner is None:
             return False
         runner.keep_m_row_src = row_src
         # lite (a forward that samples one token and drafts nothing): that row is the
         # only one computed (moe_runner._apply_quant_method).
         runner.keep_m_lite = bool(lite) and row_src is not None
+        # LOCAL PATCH (cudafast-nemotron35): lite prefill tail (docstring above).
+        from vllm.compilation import piecewise_backend
+
+        rows = int(tail_rows) if tail_ok else 0
+        armed = runner.arm_lite_tail(rows)
+        piecewise_backend.LITE_TAIL_ROWS = rows if armed else 0
         return True
 
     def forward(

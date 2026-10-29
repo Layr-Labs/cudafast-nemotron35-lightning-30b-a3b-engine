@@ -180,7 +180,7 @@ def prepare_residual_add(device, routed_scale):
     try:
         gen = torch.Generator(device=device)
         gen.manual_seed(20261025)
-        for m in (1, 5, 8):
+        for m in (1, 5, 6, 8):
             for topk in (3, 6):
                 for case, scale in enumerate((0.0, 1e-3, 1.0, 32.0)):
                     part = torch.randn(topk + 2, 2688, device=device, generator=gen, dtype=torch.float32) * scale
@@ -210,7 +210,7 @@ def prepare_residual_add(device, routed_scale):
 def can_add_residual(residual, y, routed_scale, topk):
     return (residual is not None and _ADD_OK.get((y.device.index, float(routed_scale)), False)
             and _SLOTS and topk in (3, 6)
-            and y.ndim == 2 and y.shape[0] in (1, 5, 8) and y.shape[1] == 2688
+            and y.ndim == 2 and y.shape[0] in (1, 5, 6, 8) and y.shape[1] == 2688
             and residual.dtype == y.dtype == torch.bfloat16
             and residual.device == y.device and residual.shape == y.shape
             and residual.is_contiguous() and y.is_contiguous())

@@ -240,7 +240,7 @@ def zs_repack(w: torch.Tensor, n: int, k: int) -> torch.Tensor:
 # projections at M <= 8, same arithmetic and output bits. Comma list: "up", "down"
 # ("1" = both, "0" or "" = off; default "down": the lean shared down). The lean down with the zero-row skip reads the Z2
 # copy (z2_repack) in place of the zs_repack copy (same size).
-_LEAN_ENV = os.environ.get("MARLINX_LEAN", "down")
+_LEAN_ENV = os.environ.get("MARLINX_LEAN", "1")
 LEAN_SHAPES = {(3712, 2688): "up", (2688, 3712): "down"}
 LEAN_LAYERS = frozenset(("up", "down") if _LEAN_ENV == "1" else
                         (v for v in _LEAN_ENV.split(",") if v in ("up", "down")))

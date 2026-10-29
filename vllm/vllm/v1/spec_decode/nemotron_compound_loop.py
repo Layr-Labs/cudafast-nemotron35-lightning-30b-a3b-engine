@@ -113,8 +113,13 @@ def _state(p, builder, wrapper, bank, layout):
     if not families:
         return None
     family, entries = max(families.items(), key=lambda item: len(item[1]))
-    starts = sorted(n for n in entries if n + 1 in entries and n + 2 in entries
-                    and n + 2 < p.max_model_len)
+    # Every later pass of a full-depth round (depth - 1 of them) needs an entry.
+    passes = int(p.num_speculative_tokens) - 1
+    if passes < 2:
+        return None
+    starts = sorted(n for n in entries
+                    if all(n + i in entries for i in range(1, passes))
+                    and n + passes - 1 < p.max_model_len)
     if not starts:
         return None
     # Strong prefix owners make the device pointer lookup immutable. These
@@ -138,12 +143,13 @@ def _state(p, builder, wrapper, bank, layout):
             dtype=torch.int32, device=p.device),
         plan=wanted_plan, scalars=wanted_scalars,
         signature=p._nemo_full[2], inputs=p._nemo_full[3], graph=None,
+        passes=passes,
     )
 
 
-def _advance_cpu(cad):
+def _advance_cpu(cad, steps):
     # Preserve the original field order, including any CPU aliasing.
-    for _ in range(2):
+    for _ in range(steps):
         cad.max_seq_len += 1
         for name in ("_seq_lens_cpu", "_num_computed_tokens_cpu",
                      "seq_lens_cpu_upper_bound"):
@@ -164,7 +170,7 @@ def _ready(metadata):
 
 
 def _check(s, p, kwargs, metadata, cad, padded, batch_size):
-    if (batch_size != 1 or padded != s.padded or p.num_speculative_tokens != 4
+    if (batch_size != 1 or padded != s.padded or p.num_speculative_tokens != s.passes + 1
             or p._nemo_full is None or s.wrapper._nemo_native_plan is not s.bank
             or not s.bank.enabled or s.bank.force_native
             or _inputs(kwargs) != s.inputs or _metadata(p, metadata) != s.signature
@@ -177,7 +183,7 @@ def _check(s, p, kwargs, metadata, cad, padded, batch_size):
             or cpu.numel() != 1 or cad.seq_lens.dtype != torch.int32
             or not cad.seq_lens.is_cuda or cad.seq_lens.numel() != 1
             or not cad.seq_lens.is_contiguous()
-            or cad.max_seq_len + 2 >= p.max_model_len):
+            or cad.max_seq_len + s.passes - 1 >= p.max_model_len):
         return None
     length = int(cpu[0])
     shadows = [getattr(cad, name) for name in (
@@ -190,10 +196,10 @@ def _check(s, p, kwargs, metadata, cad, padded, batch_size):
     if (length not in s.starts
             or s.bank.last_restore_key != s.entries[length][0]
             or any(s.bank.entries.get(s.entries[n][0], (None, None))[1]
-                   is not s.entries[n][1] for n in (length, length + 1, length + 2))):
+                   is not s.entries[n][1] for n in range(length, length + s.passes))):
         return None
     table = cad.block_table_tensor
-    pages = (length + 2 + p.block_size - 1) // p.block_size
+    pages = (length + s.passes - 1 + p.block_size - 1) // p.block_size
     if (not table.is_cuda or table.dtype != torch.int32 or table.ndim != 2
             or table.shape[0] != 1 or table.shape[1] < pages
             or table.stride(1) != 1 or table.device != s.table.device
@@ -216,7 +222,7 @@ def _replay(s, p, kwargs, metadata, cad, padded, batch_size):
     # The caller's original seq buffer is preserved as an observable output,
     # although the captured metadata stages use a private stable sequence ptr.
     cad.seq_lens.copy_(s.seq)
-    _advance_cpu(cad)
+    _advance_cpu(cad, s.passes - 1)
     s.bank.last_restore_key = s.entries[int(cad._seq_lens_cpu[0])][0]
     return s.tokens
 
@@ -248,6 +254,26 @@ def _restore_bindings(builder, values):
 
 
 def prepare(p):
+    """Compound-loop qualification; a plan bank admitted only for this loop
+    (guard_failed, depth >= 5) is removed again when the loop is not admitted,
+    so the original native planner runs exactly as without the bank."""
+    try:
+        _prepare(p)
+    finally:
+        if getattr(p, "_nemo_compound_loop", None) is None:
+            try:
+                builder = p.draft_attn_groups[0].get_metadata_builder()
+                wrapper = builder._decode_wrappers_cudagraph.get(1)
+            except (AttributeError, IndexError):
+                wrapper = None
+            bank = getattr(wrapper, "_nemo_native_plan", None)
+            if bank is not None and getattr(bank, "guard_failed", False):
+                bank.enabled = False
+                wrapper._nemo_native_plan = None
+                logger.info("Native MTP plan bank removed: compound loop not admitted")
+
+
+def _prepare(p):
     """Complete original-loop versus compound-loop qualification, remote boot."""
     if (not ENABLED or getattr(p, "_nemo_compound_attempted", False)
             or torch.cuda.is_current_stream_capturing()
@@ -401,29 +427,53 @@ def prepare(p):
             expected_indices = s.table[0, :pages]
             expected_slot = ((length - 1) // p.block_size % 2) * p.block_size + (length - 1) % p.block_size
             torch.cuda.synchronize(p.device)
-            if (not torch.equal(raw[:prefix.numel()], prefix)
-                    or not bool(torch.all(tail == 0xD5))
-                    or not torch.equal(builder.paged_kv_indices.gpu[:pages], expected_indices)
-                    or int(p.positions[0]) != length - 1 or int(s.seq[0]) != length
-                    or int(p.input_ids[0]) != 17
-                    or int(p._slot_mapping_buffer[0]) != expected_slot
-                    or not bool(torch.all(p._slot_mapping_buffer[1:s.padded] == PADDING_SLOT_ID))
-                    or builder.paged_kv_indptr.gpu[:2].tolist() != [0, pages]
-                    or int(builder.paged_kv_last_page_len.gpu[0]) != ((length - 1) % p.block_size + 1)
-                    or not torch.equal(p.hidden_states[:1].view(torch.int16),
-                                       private_hidden.view(torch.int16))):
-                raise ValueError("compound native metadata stage differs")
+            checks = {
+                "prefix": torch.equal(raw[:prefix.numel()], prefix),
+                "tail": bool(torch.all(tail == 0xD5)),
+                "indices": torch.equal(builder.paged_kv_indices.gpu[:pages], expected_indices),
+                "position": int(p.positions[0]) == length - 1,
+                "seq": int(s.seq[0]) == length,
+                "input": int(p.input_ids[0]) == 17,
+                "slot": int(p._slot_mapping_buffer[0]) == expected_slot,
+                "pad_slots": bool(torch.all(p._slot_mapping_buffer[1:s.padded] == PADDING_SLOT_ID)),
+                "indptr": builder.paged_kv_indptr.gpu[:2].tolist() == [0, pages],
+                "last_page": int(builder.paged_kv_last_page_len.gpu[0]) == ((length - 1) % p.block_size + 1),
+                "hidden": torch.equal(p.hidden_states[:1].view(torch.int16),
+                                      private_hidden.view(torch.int16)),
+            }
+            if not all(checks.values()):
+                bad = [k for k, v in checks.items() if not v]
+                extra = ""
+                if "prefix" in bad:
+                    neq = (raw[:prefix.numel()] != prefix).nonzero().flatten()
+                    extra = f" prefix_bytes={prefix.numel()} first_bad={neq[:8].tolist()} n_bad={neq.numel()}"
+                raise ValueError(f"compound native metadata stage differs: length={length} "
+                                 f"failed={bad}{extra}")
+
+        from vllm.v1.spec_decode import nemotron_step_cond as step_cond
+        cond = getattr(p, "_nemo_step", None)
+
+        last_hidden = [None, None]
+        final_hidden_of = {}
 
         def body(md):
             tokens = []
-            for step in range(3):
-                hidden = model_graph(p, kwargs, md, s.padded, 1)
+            for step in range(s.passes):
+                if cond is not None and torch.cuda.is_current_stream_capturing():
+                    # The production pass is the admitted conditional step:
+                    # emit its exact construct (arm, IF{forward+screen}, clear).
+                    hidden, token = step_cond.capture_pass(p, gate)
+                elif cond is not None:
+                    hidden, token = step_cond.maybe_run(p, kwargs, md, s.padded, 1) or (None, None)
+                else:
+                    hidden = model_graph(p, kwargs, md, s.padded, 1)
+                    token = screen.greedy(hidden[:1]) if isinstance(hidden, torch.Tensor) else None
                 if hidden is None or not isinstance(hidden, torch.Tensor):
                     raise ValueError("full model graph declined compound capture")
-                token = screen.greedy(hidden[:1])
                 tokens.append(token)
-                if step < 2:
+                if step < s.passes - 1:
                     _launch_stage(s, p, token, hidden[:1])
+            last_hidden[1] = hidden
             return tuple(tokens)
 
         # Warm Triton, the existing model/head child graphs and clone outputs
@@ -441,26 +491,41 @@ def prepare(p):
                               pool=torch.cuda.graph_pool_handle()):
             tokens = body(capture_md)
         torch.cuda.synchronize(p.device)
-        if len({t.data_ptr() for t in tokens}) != 3:
+        if len({t.data_ptr() for t in tokens}) != s.passes:
             raise ValueError("compound draft output slots alias")
         s.graph, s.tokens = graph, tokens
+        # The captured loop's last pass output (its continuation hidden row).
+        final_hidden_of[1] = last_hidden[1]
         s.owners = (kwargs, capture_md, row_zero, capture_stream)
+
+        fallbacks = [0]
 
         def original(cad, md):
             tokens = []
             mode, _, across = p._determine_batch_execution_and_padding(1)
-            for step in range(3):
+            for step in range(s.passes):
+                token = None
                 with set_forward_context(
                     md, p.vllm_config, num_tokens=s.padded,
                     num_tokens_across_dp=across, cudagraph_runtime_mode=mode,
                     slot_mapping=p._get_slot_mapping(s.padded),
                 ):
-                    hidden = model_graph(p, kwargs, md, s.padded, 1)
+                    # Same per-pass dispatch as the production loop.
+                    res = None if cond is None else step_cond.maybe_run(
+                        p, kwargs, md, s.padded, 1)
+                    if res is not None:
+                        hidden, token = res
+                    elif cond is not None:
+                        fallbacks[0] += 1
+                    else:
+                        hidden = model_graph(p, kwargs, md, s.padded, 1)
                 if hidden is None:
                     raise ValueError("original full graph declined private comparison")
-                token = screen.greedy(hidden[:1])
+                if token is None:
+                    token = screen.greedy(hidden[:1])
                 tokens.append(token)
-                if step < 2:
+                last_hidden[0] = hidden
+                if step < s.passes - 1:
                     p._update_positions_dependent_metadata(
                         p.positions[:1], cad, 1, s.padded, p.block_size,
                         fused=(token, hidden[:1]),
@@ -537,7 +602,9 @@ def prepare(p):
                             # different pinned staging set. This is outside the
                             # timed three-pass comparison.
                             if length + 3 < p.max_model_len:
-                                final_hidden = p._nemo_full[4][0]
+                                # Each arm continues from its own last pass's hidden row.
+                                final_hidden = (last_hidden[0] if which == 0
+                                                else final_hidden_of[1])
                                 if not isinstance(final_hidden, torch.Tensor):
                                     raise ValueError("compound continuation hidden is not a tensor")
                                 p._update_positions_dependent_metadata(
@@ -564,7 +631,18 @@ def prepare(p):
                                 x[1] != y[1] or len(x[0]) != len(y[0])
                                 or not all(torch.equal(u, v) for u, v in zip(x[0], y[0]))
                                 for x, y in zip(a, b))):
-                            raise ValueError("compound full private state differs from original loop")
+                            where = []
+                            for oi, (x, y) in enumerate(zip(a, b)):
+                                if x[1] != y[1]:
+                                    where.append((oi, "max_seq_len", x[1], y[1]))
+                                for ti, (u, v) in enumerate(zip(x[0], y[0])):
+                                    if u.shape != v.shape or not torch.equal(u, v):
+                                        nd = int((u != v).sum()) if u.shape == v.shape else -1
+                                        where.append((oi, ti, tuple(u.shape), nd))
+                            raise ValueError(
+                                f"compound full private state differs from original loop: "
+                                f"length={length} case={case} cold={cold} diffs={where[:12]} "
+                                f"orig_cond_fallbacks={fallbacks[0]}")
                     ratio = statistics.median(samples[1]) / statistics.median(samples[0])
                     ratios.append(ratio)
                     if case != 2:

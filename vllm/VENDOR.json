@@ -690,6 +690,26 @@
     {
       "file": "vllm/vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
       "why": "i34-9: ZSKIP_S6 defaults to on (the lean paired decode routed down reads the 6-bit scale plane, config 663, under its load-time bitwise check), as in kaankolcu's 778d1d36-5adf-497f-babb-832df9b0f24b and e-man07's a4b5cd6b-f239-4842-b66d-b1b3c20a58cd. ZSKIP_S6=0 keeps config 653 on the 8-bit plane. Measurement 2 (code identical)."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_kernels.py (ADAPT_MIN_CYCLES default)",
+      "why": "terrapinelf: i34-9's low-acceptance rule decides after 2 counted cycles (was 4) past its 4-cycle burn-in; thresholds 1.8 / 2.0 and the per-cycle cap are unchanged. Drafts only; the target verifies every committed token. MTP_ADAPT5_MIN_CYCLES=4 restores the record's rule."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_kernels.py (DEPTH_THETA default)",
+      "why": "terrapinelf: the depth gate's cumulative-confidence threshold for the first four drafts defaults to 0.51 (was 0.5); MTP_DEPTH_THETA=0.5 restores it."
+    },
+    {
+      "file": "(composition)",
+      "why": "terrapinelf on the record 5677c186-ecd4-4152-9f0a-081d64d44273 (i34-9: d6651a3d with ercumentyildirim's bf16ws and the decode 6-bit scale plane): the record byte for byte, plus the low-acceptance rule's minimum cycle count at 2 and the depth gate's threshold at 0.51. No new arithmetic. Measurement #8."
+    },
+    {
+      "file": "model_executor/layers/fused_moe/experts/humming_apair.py; humming_nvsc.py",
+      "why": "Own unvalidated prefill w13 adjacent-N A-stage reuse on complete c41fc629-8c06-4bf2-8cb8-cad0edea9875. Only actual sm121/48SM M496/top6 NVSC+PFUP: two original N64 tiles share indexed A in a natural N128/8-warp CTA; each warp retains its K32 ascending MMA chain and original rounded BF16 ReLU2 epilogue. ProblemN1856 and packed weights/scales stay unchanged, two independent NVSC96B records are decoded, last N64 tail has legal dummy zero-size B/BS copies and masked output stores. PFUP four-N-warp padding mapping and pair scheduler own current route metadata/counters. Installed Humming0.1.10 release4351 source hash checks, no-cold-capture preparation and compiled resource refusal keep original NVSC before launch; launch errors propagate without production retry. Numerical equality, graph engagement and whole gain require official remote validation. Sources: fc04335b-c894-41f9-b73b-aa9b5aac1fb5 originalNVSC;1e1c2581-e506-4ca4-9341-5f08ffceec86 NVSCprefill;f5904a37-e3aa-4c29-9a8a-4cecee7b6184 PFUP. Prior a6b707d9-73d4-472a-b1ad-7134add40400 attention-A-staging regression is negative design context only; no runtime from its whole is adopted. No local candidate execution."
+    },
+    {
+      "file": "harness/kernels/shco/csrc/shx.cu; harness/kernels/shco/csrc/shx_pair.cuh; harness/kernels/shco/py/__init__.py; harness/kernels/shco/build.sh",
+      "why": "Unverified SHX prefill pair experiment on ENTIRE c41fc629-8c06-4bf2-8cb8-cad0edea9875. Only sm121/48SM/M496/v2/non-tail with checked original full-segment unit tables: pair row bands (0,64) and (128,192) at the same 128-feature tile. Two independent original four-warp MMA/rounding/scratch chains share one immutable NVFP4 weight/FP8-scale stage, with eight-warp barriers. Keep old kernel/tables/counters and stock stream DAG; shape/stream/resource refusal uses original full SHX. Build-only SHX_NO_PAIR fallback preserves original library if the new TU fails; no production launch retry. Source material: adab284a-bf1d-4ce2-8e90-6720fa0f5435 original SHCO, 1e1c2581-e506-4ca4-9341-5f08ffceec86 retained BF16x2 epilogue. 02e9c4c3-32f2-4091-87a3-ed19a12a5d04 twin-band weight sharing is credited as negative design context, not adopted whole. Resource checks are not numerical/performance admission. All compilation/execution/validation remote only; no gain or activation claimed. See harness/kernels/shco/PAIR_DESIGN.md."
     }
   ]
 }

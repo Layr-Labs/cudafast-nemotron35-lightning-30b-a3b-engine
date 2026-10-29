@@ -300,6 +300,43 @@ def _keep_verify_rows_for(
 
 # Protect asynchronous H2D sources; switchable for in-process cost screening.
 PINNED_SOURCE_GUARDS = True
+
+# LOCAL PATCH (cudafast-nemotron35): fixed Inductor reduction configs. A reduction kernel
+# keeps, without timing its candidates, the candidate with the largest R0_BLOCK, then the
+# most warps, then the smallest XBLOCK; pointwise and other kernels are still benchmarked.
+# INDUCTOR_RED_PIN=0 restores the timed choice.
+_INDUCTOR_RED_PIN = os.environ.get("INDUCTOR_RED_PIN", "1") != "0"
+
+
+def _pin_inductor_reductions() -> None:
+    try:
+        from torch._inductor.runtime import triton_heuristics as _th
+        from torch._inductor.runtime.hints import HeuristicType as _HT
+    except Exception:  # noqa: BLE001 -- no Inductor runtime: nothing to pin
+        return
+    timed = _th.CachingAutotuner.benchmark_all_configs
+    if getattr(timed, "_cudafast_pinned", False):
+        return
+
+    def benchmark_all_configs(self, *args, **kwargs):
+        if (self.heuristic_type not in (_HT.REDUCTION, _HT.PERSISTENT_REDUCTION)
+                or len(self.launchers) < 2):
+            return timed(self, *args, **kwargs)
+
+        def rank(launcher):
+            c = launcher.config
+            return (c.kwargs.get("R0_BLOCK", 0), c.num_warps, -c.kwargs.get("XBLOCK", 1))
+
+        ordered = sorted(self.launchers, key=rank, reverse=True)
+        return {launcher: float(i) for i, launcher in enumerate(ordered)}
+
+    benchmark_all_configs._cudafast_pinned = True
+    _th.CachingAutotuner.benchmark_all_configs = benchmark_all_configs
+
+
+if _INDUCTOR_RED_PIN:
+    _pin_inductor_reductions()
+
 # LOCAL PATCH (cudafast-nemotron35): pacing of the drafter's first-weight L2
 # prefetch (_l2pf_prefetch("draft")); 0 issues every piece at once.
 _L2PF_DRAFT_PACE_NS = int(os.environ.get("L2PF_DRAFT_PACE_NS", "400"))
@@ -6229,6 +6266,13 @@ class GPUModelRunner(
                     _cmp2.prepare(
                         (self.model, getattr(getattr(self, "drafter", None), "model", None))
                     )
+
+                # The optional decoder must be timed against the final
+                # post-CMP2 weight owner, before any model graph captures it.
+                from vllm.model_executor.kernels.linear.scaled_mm.fp8c import (
+                    qualify_model as _qualify_fp8c_empty,
+                )
+                _qualify_fp8c_empty(self.model)
 
                 self._setup_eagle3_aux_hidden_state_outputs()
 

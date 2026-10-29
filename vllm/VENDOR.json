@@ -690,6 +690,22 @@
     {
       "file": "vllm/vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
       "why": "i34-9: ZSKIP_S6 defaults to on (the lean paired decode routed down reads the 6-bit scale plane, config 663, under its load-time bitwise check), as in kaankolcu's 778d1d36-5adf-497f-babb-832df9b0f24b and e-man07's a4b5cd6b-f239-4842-b66d-b1b3c20a58cd. ZSKIP_S6=0 keeps config 653 on the 8-bit plane. Measurement 2 (code identical)."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_kernels.py (ADAPT_MIN_CYCLES default)",
+      "why": "terrapinelf: i34-9's low-acceptance rule decides after 2 counted cycles (was 4) past its 4-cycle burn-in; thresholds 1.8 / 2.0 and the per-cycle cap are unchanged. Drafts only; the target verifies every committed token. MTP_ADAPT5_MIN_CYCLES=4 restores the record's rule."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_kernels.py (DEPTH_THETA default)",
+      "why": "terrapinelf: the depth gate's cumulative-confidence threshold for the first four drafts defaults to 0.51 (was 0.5); MTP_DEPTH_THETA=0.5 restores it."
+    },
+    {
+      "file": "harness/kernels/marlinx (MARLINX_SU6)",
+      "why": "ercumentyildirim (33873b50-ea84-4cd6-99cd-9dc6bc386ef5, b77c2d33-0d10-4ce5-9dfd-8c725d5bd3a5; filed alone on the record by e-man07 as 893d2197-29fa-4c8d-95e0-8d4ba6648ede): the lm_head's unit-major scale copy (MARLINX_SU) is stored as 6-bit codes into the tensor's sorted 64-value table; the staging loop rebuilds the same scale bytes in shared memory, so the main loop and every output bit are unchanged. Both marlinx files carried byte for byte. MARLINX_SU6=0 keeps the byte copy."
+    },
+    {
+      "file": "(composition)",
+      "why": "kshitij-hash (O1 stack, variant A) on the record 5677c186-ecd4-4152-9f0a-081d64d44273: terrapinelf's c41fc629-8c06-4bf2-8cb8-cad0edea9875 tree (MTP_ADAPT5_MIN_CYCLES 2, MTP_DEPTH_THETA 0.51) plus ercumentyildirim's marlinx lm_head 6-bit scale staging, each carried byte for byte; code identical to ercumentyildirim's b77c2d33 outside this file. No new arithmetic. Measurement 3 (code identical to e301b6cb-6230-4ae2-b04a-c325f0c63657)."
     }
   ]
 }

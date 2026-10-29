@@ -95,6 +95,53 @@ from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
 
+# LOCAL PATCH (cudafast-nemotron35, hb1): deferred sampling for the in-process,
+# single-sequence async engine. The batch queue still holds every executed batch
+# in the same order; only the HOST call of a batch's sample_tokens moves, from
+# right after its execute_model to right before the next execute_model (or the
+# first point that needs its result). The scheduler therefore plans the next
+# batch, and the caller consumes the previous batch's output, while the sampler
+# and drafter wait for the GPU, instead of after that wait. Every GPU launch is
+# issued in the same stream order as before (sample N, then execute N+1), so
+# every value is unchanged. VLLM_DEFER_SAMPLE=0 restores the immediate call.
+DEFER_SAMPLE = os.environ.get("VLLM_DEFER_SAMPLE", "1").strip() not in ("0", "", "false", "no")
+
+
+class _DeferredSample(Future):
+    """A sample_tokens call that has not been issued yet. start() issues it
+    (once) with the drafter's emit target of the moment it was deferred."""
+
+    def __init__(self, core: "EngineCore", grammar_output):
+        super().__init__()
+        self._core = core
+        self._grammar_output = grammar_output
+        self._inner = None
+        drafter = core._defer_drafter()
+        self._emit_target = getattr(drafter, "emit_target", None)
+
+    def start(self):
+        if self._inner is None:
+            drafter = self._core._defer_drafter()
+            current = getattr(drafter, "emit_target", None)
+            if drafter is not None:
+                drafter.emit_target = self._emit_target
+            try:
+                self._inner = self._core.model_executor.sample_tokens(
+                    self._grammar_output, non_block=True
+                )
+            finally:
+                if drafter is not None:
+                    drafter.emit_target = current
+            self._grammar_output = None
+        return self._inner
+
+    def done(self):
+        return self._inner is not None and self._inner.done()
+
+    def result(self, timeout=None):
+        return self.start().result(timeout)
+
+
 
 HANDSHAKE_TIMEOUT_MINS = 5
 
@@ -443,6 +490,8 @@ class EngineCore:
         `request_wave`: indicate which wave of requests this is expected to
         belong to in DP case
         """
+        # hb1: the runner holds no unsampled batch when a request arrives.
+        self._start_deferred_samples()
         # Validate the request_id type.
         if not isinstance(request.request_id, str):
             raise TypeError(
@@ -485,6 +534,8 @@ class EngineCore:
 
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
+        # hb1: a deferred sample runs before the scheduler frees its blocks.
+        self._start_deferred_samples()
 
         # TODO: The scheduler doesn't really need to know the
         # specific finish reason, TBD whether we propagate that
@@ -623,6 +674,39 @@ class EngineCore:
             if draft_token_ids is not None:
                 self.scheduler.update_draft_token_ids(draft_token_ids)
 
+    # LOCAL PATCH (hb1): deferred sampling helpers (see _DeferredSample).
+    _defer_sample_ok: bool = False
+    _defer_drafter_obj: Any = None
+
+    def _defer_drafter(self):
+        d = self._defer_drafter_obj
+        if d is None:
+            try:
+                d = self.model_executor.driver_worker.worker.model_runner.drafter
+            except AttributeError:
+                d = False
+            self._defer_drafter_obj = d
+        return d or None
+
+    def _defer_sample_enabled(self) -> bool:
+        return (
+            DEFER_SAMPLE
+            and self._defer_sample_ok
+            and self.batch_queue_size == 2
+            and self.async_scheduling
+            and not self.is_pooling_model
+            and self.vllm_config.scheduler_config.max_num_seqs == 1
+            and self.vllm_config.parallel_config.pipeline_parallel_size == 1
+            and self.vllm_config.kv_transfer_config is None
+        )
+
+    def _start_deferred_samples(self) -> None:
+        """Issue every queued deferred sample, oldest first."""
+        if self.batch_queue:
+            for entry in reversed(self.batch_queue):
+                if isinstance(entry[0], _DeferredSample):
+                    entry[0].start()
+
     def step_with_batch_queue(
         self,
     ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
@@ -674,6 +758,8 @@ class EngineCore:
                 self._c57_drained = True
         if self.scheduler.has_requests() and not drain_tail:
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            # hb1: the previous batch's sampling precedes this execution.
+            self._start_deferred_samples()
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -691,9 +777,12 @@ class EngineCore:
                     grammar_output = self.scheduler.get_grammar_bitmask(
                         scheduler_output
                     )
-                    future = self.model_executor.sample_tokens(
-                        grammar_output, non_block=True
-                    )
+                    if self._defer_sample_enabled() and grammar_output is None:
+                        future = _DeferredSample(self, grammar_output)
+                    else:
+                        future = self.model_executor.sample_tokens(
+                            grammar_output, non_block=True
+                        )
                 else:
                     # We need to defer sampling until we have processed the model output
                     # from the prior step.
@@ -756,6 +845,7 @@ class EngineCore:
             grammar_output = self.scheduler.get_grammar_bitmask(
                 deferred_scheduler_output
             )
+            self._start_deferred_samples()
             future = self.model_executor.sample_tokens(grammar_output, non_block=True)
             batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
 

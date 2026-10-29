@@ -464,6 +464,13 @@ class NemotronHMultiTokenPredictor(nn.Module):
 class NemotronHMTP(nn.Module, SupportsPP):
     """NemotronH MTP model."""
 
+    # LOCAL PATCH (cudafast-nemotron35): the checkpoint names load_weights reads (it skips
+    # every other name). The default loader reads only the shards whose header lists one of
+    # them: the head's 270 tensors and the embedding sit in 2 of the 52 shards.
+    @staticmethod
+    def load_weight_name_filter(name: str) -> bool:
+        return name.startswith("mtp.") or "embeddings" in name
+
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -655,7 +662,7 @@ class NemotronHMTP(nn.Module, SupportsPP):
 
         for name, loaded_weight in weights:
             # Only process MTP weights - skip all non-MTP weights
-            if not name.startswith("mtp.") and "embeddings" not in name:
+            if not self.load_weight_name_filter(name):
                 continue
             # Skip rotary embeddings (computed, not loaded)
             if "rotary_emb.inv_freq" in name:

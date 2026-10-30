@@ -1,0 +1,42 @@
+[
+  {
+    "submissionId": "c41fc629-8c06-4bf2-8cb8-cad0edea9875",
+    "rationale": "Complete verified baseline, score 2.77776232031352, official source cdea0e5bb85ae36999f23c1f9de15de5901b8e45. Preserve the complete tree, its providers, draft policy, numerical formats, all model kernels and sampling. No lower whole result is used as baseline.",
+    "evidence": "Candidate parent 4726d88aef2bfa8e04c110015568a9c68a840b30 has exact whole tree 3f3a3fa2636eb7c71bf871462134b3b18fbc5259. Only the optional MarlinX head-pair package/integration and documentation/VENDOR differ; HEAD_PAIR_EXPERIMENT.md records the boundaries."
+  },
+  {
+    "submissionId": "100549d4-51c4-4f56-b3ca-2604731ab8a4",
+    "rationale": "Original MarlinX register-ring kernel, exact original Marlin stripe/Cursor, four independent warp chains, segment reduction/fold and BF16 epilogue. New kernel derives two separate original half-column chains and shares only their identical activation ring.",
+    "evidence": "Original harness/kernels/marlinx/csrc/marlinx.cu gemm_kernel, Cursor, block_mma, close_segment and write_out are retained. New csrc/head_pair.cuh invokes these same helpers separately for h0/h1, while preserving column_first_cut and original host stripe calculations."
+  },
+  {
+    "submissionId": "c3e16bbb-c76b-42e2-84d6-3a7260e3d478",
+    "rationale": "Existing unit-major lm_head scale permutation and immutable SU staging are material. This experiment consumes the two adjacent existing SU records, without a new weight/scale representation or second persistent pack.",
+    "evidence": "Source marlinx py su_repack and gemm_kernel SU path retain [N/64][K/16][64] byte layout. New head_pair.cuh copies the two original unit-major records into separate shared halves and loads each original scale byte; py/head_pair.py checks the actual existing SU byte relationship before admission."
+  },
+  {
+    "submissionId": "3d51cab6-7079-4fb2-98e4-f2a238077897",
+    "rationale": "Material carrier of MarlinX PDL weight/scale-only preload, coherent activation loads after griddepcontrol.wait and launch_dependents before the BF16 epilogue. No MTP codec or other whole-bundle feature is ported as a new change.",
+    "evidence": "Source MarlinX PDL gemm_kernel and its optional native launch ABI are already carried in c41. New head_pair.cuh preserves immutable B/SU preloads before the wait, places all shared A-ring reads after the wait, and signals once after both independent chains complete."
+  },
+  {
+    "submissionId": "e7f42e20-4e1b-4a8e-80b5-8c2c49369615",
+    "rationale": "Material same-M adjacent-N activation-sharing idea and negative resource evidence from the earlier Humming w13 N128 experiment. Its complete score 2.75254912647548 is 0.90768% below c41 and the whole is excluded; activation and isolated cause are unknown. No Humming/NVSC/PFUP code is imported.",
+    "evidence": "Prior apair design shares A across adjacent N64 outputs in a prefill eight-warp Humming CTA. This experiment instead pairs the two same-col halves of the original four-warp MarlinX target head, preserving independent original chains and full output. HEAD_PAIR_EXPERIMENT.md explicitly distinguishes these mechanisms and resource risks."
+  },
+  {
+    "submissionId": "110cff4b-d86d-4fe9-ae30-f6ce550d005f",
+    "rationale": "Only final-postload private-admission, weak/versioned owner lookup and same-frame cleanup design is reused. Complete A16 whole 2.74300427046762 regressed 1.2513% versus c41 and is excluded; no router input, outer-cast or A16 kernel change is adopted.",
+    "evidence": "Prior smallk/py/a16.py owner/admission design and Nemotron final model postprocess hook supplied lifecycle constraints. New marlinx/py/head_pair.py and NemotronHForCausalLM.process_weights_after_loading apply those constraints only to the actual Marlin head."
+  },
+  {
+    "submissionId": "77f74985-a845-4963-bf29-b860e8daa7ef",
+    "rationale": "Only full-output raw-bit, poisoned-boundary, changed-input-graph and private refusal/cleanup validation principles are reused. Its complete router-suffix whole 2.75184607067041 regressed 0.933% and is excluded; no suffix or router arithmetic is imported.",
+    "evidence": "Prior smallk/py/suffix.py private qualification motivates explicit raw-bit output and boundary checks. New head_pair.py adapts them to every full head output element of M5/6 and independent private CUDA graphs."
+  },
+  {
+    "submissionId": "8e0a3de6-17c7-4667-8804-ee17507eb41a",
+    "rationale": "Only the private two-stream ownership/drain and postload-only fixed-real-weight qualification design is material. W12 whole 2.76663609402143 regressed 0.40055% and is retired; no weight codec, prefetch packet, router or whole source is carried into this candidate.",
+    "evidence": "Prior routerw12 private real-weight two-stream qualification supplied lifecycle lessons. New head_pair.py uses same-frame graph/tensor owners and nested finally to attempt draining both streams, rejects if safe qualification fails, and never performs production qualification or retries a production launch."
+  }
+]

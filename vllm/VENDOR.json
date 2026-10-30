@@ -5,7 +5,7 @@
   "subtree": "vllm",
   "container_image": "docker.io/vllm/vllm-openai:v0.27.1",
   "container_digest_arm64": "sha256:1c8e60a0841b333c700488cb029d3664807249da0c071e862191b00fe34b228c",
-  "note": "Upstream Python package at the tag. The compiled extensions (csrc) come from the pinned container's install of the same tag; tools/stage-vllm-overlay.sh layers this tree over that install. vllm/vllm/config/fault_tolerance.py is stored LF-normalized (upstream has CRLF). Draw 4. Draw 1.",
+  "note": "Upstream Python package at the tag. The compiled extensions (csrc) come from the pinned container's install of the same tag; tools/stage-vllm-overlay.sh layers this tree over that install. vllm/vllm/config/fault_tolerance.py is stored LF-normalized (upstream has CRLF). Draw 4. Draw 1. Draw 022424.",
   "local_patches": [
     {
       "file": "vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py",
@@ -690,6 +690,34 @@
     {
       "file": "vllm/vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
       "why": "i34-9: ZSKIP_S6 defaults to on (the lean paired decode routed down reads the 6-bit scale plane, config 663, under its load-time bitwise check), as in kaankolcu's 778d1d36-5adf-497f-babb-832df9b0f24b and e-man07's a4b5cd6b-f239-4842-b66d-b1b3c20a58cd. ZSKIP_S6=0 keeps config 653 on the 8-bit plane. Measurement 2 (code identical)."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_kernels.py (ADAPT_MIN_CYCLES default)",
+      "why": "terrapinelf (6c1aab65-128b-4b28-b266-d7ad07a5a256, de4975c1-0182-4fe4-8a7f-70ac7e5f8af1): i34-9's low-acceptance rule decides after 2 counted cycles (was 4) past its 4-cycle burn-in; carried byte for byte. MTP_ADAPT5_MIN_CYCLES=4 restores the record's rule."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_kernels.py (DEPTH_THETA default)",
+      "why": "terrapinelf (6c1aab65-128b-4b28-b266-d7ad07a5a256): the depth gate's cumulative-confidence threshold for the first four drafts defaults to 0.51 (was 0.5); carried byte for byte. MTP_DEPTH_THETA=0.5 restores it."
+    },
+    {
+      "file": "vllm/v1/spec_decode/llm_base_proposer.py (_mtp_step_prefetch, L2PF_DRAFT_STEP_EH)",
+      "why": "ercumentyildirim: the single-row draft step's gated step-start L2 prefetch (drafter3, l2pf side stream, skipped on the device once the depth gate stopped the loop) also covers the start projection's BF16 hidden half eh_w_h (13.8 MB, l2pf DRAFT_NEXT \"eh_bf16\"), which the step reads first. Prefetch only: moves no value, same kernels and arithmetic. L2PF_DRAFT_STEP_EH=0 restores the record."
+    },
+    {
+      "file": "harness/kernels/marlinx (MARLINX_SU6)",
+      "why": "ercumentyildirim: the lm_head's unit-major scale copy (MARLINX_SU, the SU staging of the Marlin-exact NVFP4 GEMM) is stored as 6-bit codes into the tensor's sorted 64-value table (48 bytes per 64-scale row instead of 64) when the tensor holds at most 64 distinct scale bytes; the kernel's staging loop looks every code up and stages the same bytes in shared memory, so the main loop and every output bit are unchanged. The load-time check decodes every byte back. MARLINX_SU6=0 keeps the byte copy."
+    },
+    {
+      "file": "harness/kernels/build.sh (concurrent package builds)",
+      "why": "ercumentyildirim: the kernel packages build concurrently, at most KERNELS_JOBS at a time (default: the CPU count). Each package's build.sh writes only $KERNELS_OUT/<name>; its output is printed whole and in package order once all have finished, and a failing package still fails the build. Build only: the same package scripts and compiler commands. KERNELS_JOBS=1 builds one package at a time."
+    },
+    {
+      "file": "vllm/v1/spec_decode/nemotron_compound_loop.py, nemotron_decode_plan.py, nemotron_step_cond.py (compound draft loop and plan bank at depth 5)",
+      "why": "e-man07 20b82be6 (also inside c1795752), carried byte for byte by ercumentyildirim: the record's native plan bank and captured compound draft loop (jacklightChen 581daccd lineage), gated on num_speculative_tokens == 4 in the record, generalised to any depth of 2 or more so that they run at the record's depth 5, with the per-pass use of the conditional step, the guard handling at depth 5 and the stage-kernel warp-race fix (both values read before a barrier). Boot-admitted as before; when an admission declines, the record's path runs. NEMO_MTP_COMPOUND_LOOP=0 / NEMO_MTP_NATIVE_PLAN_BANK=0 disable them."
+    },
+    {
+      "file": "vllm/env_override.py (Inductor row reductions: whole-row configuration only, INDUCTOR_ROW_REDUCTION_PIN)",
+      "why": "ercumentyildirim: an INNER row reduction for which Inductor also generates its whole-row configuration (add_persistent_rblock, R0_BLOCK up to 4096) is given that configuration only, instead of both candidates (it and the looped configuration) being timed at the kernel's first call and the faster one kept for every later shape. The whole-row configuration is one of the two the timed choice picks from, so every generated kernel and its results are ones the original code can produce. INDUCTOR_ROW_REDUCTION_PIN=0 restores the timed choice."
     }
   ]
 }

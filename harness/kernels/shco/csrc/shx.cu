@@ -566,6 +566,10 @@ __global__ void __launch_bounds__(128, 4) gemm2_kernel(const Params2 q) {
   }
 }
 
+#ifndef SHX_NO_PAIR
+#include "shx_pair.cuh"
+#endif
+
 }  // namespace shx
 
 extern "C" {
@@ -595,6 +599,20 @@ int shx2_attrs(int relu2, int* out) {
   out[3] = static_cast<int>(a.localSizeBytes);
   return 0;
 }
+
+#ifndef SHX_NO_PAIR
+int shx2_pair_attrs(int relu2, int* out) {
+  cudaFuncAttributes a;
+  cudaError_t e = relu2 ? cudaFuncGetAttributes(&a, shx::gemm2_pair_kernel<true>)
+                        : cudaFuncGetAttributes(&a, shx::gemm2_pair_kernel<false>);
+  if (e != cudaSuccess) return static_cast<int>(e);
+  out[0] = a.numRegs;
+  out[1] = static_cast<int>(a.sharedSizeBytes);
+  out[2] = a.maxThreadsPerBlock;
+  out[3] = static_cast<int>(a.localSizeBytes);
+  return 0;
+}
+#endif
 
 // C[M, N] = Marlin NVFP4 GEMM of A[M, K] for the units of py/__init__.py marlin_units.
 int shx_gemm(const void* A, long long lda, int M, const void* B, const void* S, const void* GS, void* C,
@@ -654,5 +672,40 @@ int shx2_gemm(const void* A, long long lda, int M, const void* B, const void* S,
     shx::gemm2_kernel<false><<<grid, 128, 0, st>>>(q);
   return static_cast<int>(cudaGetLastError());
 }
+
+// Narrow paired entry: host tables contain only row0=0/128, nrows=64, one full
+// K segment; each record owns row0 and row0+64 at the same 128-column feature tile.
+#ifndef SHX_NO_PAIR
+int shx2_pair_gemm(const void* A, long long lda, int M, const void* B, const void* S, const void* GS, void* C,
+                   long long ldc, int N, int K, const void* units, int n_units, void* scratch, int grid, int relu2,
+                   void* work, int hint, void* stream) {
+  if (M != 496 || !((N == 3712 && K == 2688) || (N == 2688 && K == 3712)) ||
+      lda < K || lda % 8 || ldc != N || grid < 1 || n_units != 2 * (N / 128)) return -2;
+  if ((reinterpret_cast<uintptr_t>(A) | reinterpret_cast<uintptr_t>(B) |
+       reinterpret_cast<uintptr_t>(S) | reinterpret_cast<uintptr_t>(C) |
+       reinterpret_cast<uintptr_t>(scratch)) & 15) return -4;
+  shx::Params2 q;
+  shx::Params& p = q.p;
+  p.A = static_cast<const __nv_bfloat16*>(A);
+  p.lda = lda;
+  p.M = M;
+  p.B = static_cast<const uint4*>(B);
+  p.S = static_cast<const uint8_t*>(S);
+  p.GS = static_cast<const float*>(GS);
+  p.C = static_cast<__nv_bfloat16*>(C);
+  p.ldc = ldc;
+  p.N = N;
+  p.K = K;
+  p.units = static_cast<const int*>(units);
+  p.n_units = n_units;
+  p.scratch = static_cast<float*>(scratch);
+  q.work = static_cast<int*>(work);
+  q.hint = hint;
+  auto st = static_cast<cudaStream_t>(stream);
+  if (relu2) shx::gemm2_pair_kernel<true><<<grid, 256, 0, st>>>(q);
+  else shx::gemm2_pair_kernel<false><<<grid, 256, 0, st>>>(q);
+  return static_cast<int>(cudaGetLastError());
+}
+#endif
 
 }  // extern "C"

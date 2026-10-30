@@ -45,7 +45,7 @@ def available() -> bool:
     return ENABLED and _load() is not None
 
 
-# configs reading humming's 64-row prefill layout as 32-row halves (pzskip.cu case 369)
+# configs reading humming's 64-row prefill layout as 32-row halves (pzskip_smem5.cu case 369)
 HALF64 = (369, 379)
 # 379: 369 reading the 6-bit swap scale plane (zskip to_s6_swap)
 S6_CONFIGS = (379,)

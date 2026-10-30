@@ -880,3 +880,46 @@ if os.environ.get("VLLM_TRITON_FORCE_FIRST_CONFIG", "0").strip().lower() in (
     )
 
     _install_force_first_config()
+
+# ============================================================
+# Inductor row reductions: the whole-row configuration only
+# ============================================================
+# LOCAL PATCH (cudafast-nemotron35): an INNER (row) reduction for which Inductor
+# also generates its whole-row configuration (add_persistent_rblock; R0_BLOCK up
+# to 4096) gets that configuration only, instead of both candidates being timed at
+# the kernel's first call and the faster one kept for every later shape. The
+# whole-row configuration is one the timed choice picks from, so every kernel and
+# result is one the original code can produce. INDUCTOR_ROW_REDUCTION_PIN=0
+# restores the timed choice.
+def _patch_inductor_row_reduction_configs() -> None:
+    try:
+        from torch._inductor.runtime import triton_heuristics as _th
+    except ImportError:
+        return
+
+    original = getattr(_th, "_reduction_configs", None)
+    if original is None or getattr(original, "_vllm_patched", False):
+        return
+
+    def _reduction_configs(**kwargs):
+        configs = original(**kwargs)
+        meta = kwargs.get("inductor_meta") or {}
+        if (
+            len(configs) == 2
+            and meta.get("add_persistent_rblock")
+            and meta.get("reduction_hint") == _th.ReductionHint.INNER
+            and not (meta.get("max_autotune") or meta.get("max_autotune_pointwise"))
+            and "y" not in (kwargs.get("size_hints") or {})
+        ):
+            whole, looped = configs
+            whole_r = whole.kwargs.get("R0_BLOCK", 0)
+            if looped.kwargs.get("R0_BLOCK", 0) < whole_r <= 4096:
+                return [whole]
+        return configs
+
+    _reduction_configs._vllm_patched = True
+    _th._reduction_configs = _reduction_configs
+
+
+if os.environ.get("INDUCTOR_ROW_REDUCTION_PIN", "1") != "0":
+    _patch_inductor_row_reduction_configs()

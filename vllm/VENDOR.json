@@ -690,6 +690,50 @@
     {
       "file": "vllm/vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
       "why": "i34-9: ZSKIP_S6 defaults to on (the lean paired decode routed down reads the 6-bit scale plane, config 663, under its load-time bitwise check), as in kaankolcu's 778d1d36-5adf-497f-babb-832df9b0f24b and e-man07's a4b5cd6b-f239-4842-b66d-b1b3c20a58cd. ZSKIP_S6=0 keeps config 653 on the 8-bit plane. Measurement 2 (code identical)."
+    },
+    {
+      "file": "vllm/vllm/v1/spec_decode/nemotron_step_cond.py (ENABLED default)",
+      "why": "NEMO_MTP_STEP_COND defaults to 0 on the current record 5677c186-ecd4-4152-9f0a-081d64d44273, so the drafter loop takes the record's per-pass path (the full-step graph where it is built, otherwise the regular model call and screen) instead of the conditional single-draft graph. The depth, the verify rows and the acceptance rule are the record's. One default changes; no other line of code differs. The change follows the earlier submission 1faceed1-7860-4e8d-b734-96600d6629aa, which set the same default on an earlier record."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_attn_packed.py (ATTN_PACK12_PDL8)",
+      "why": "The attention pack12 per-shape chooser now also offers the eight-deep-ring programmatic-dependency variant of its CUDA kernel: it is bit-checked against the reference linear layer exactly like the ordinary and four-deep variants, and only the fastest bit-equal candidate is used for each shape. ATTN_PACK12_PDL8=0 keeps the previous menu."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_kernels.py (ADAPT_MIN_CYCLES default)",
+      "why": "On the record 5677c186-ecd4-4152-9f0a-081d64d44273, the low-acceptance draft rule decides after 2 counted cycles (was 4) past its 4-cycle burn-in; the 1.8 / 2.0 thresholds and the per-cycle cap are unchanged, as in submission de4975c1-0182-4fe4-8a7f-70ac7e5f8af1. Drafts only; the target verifies every committed token. MTP_ADAPT5_MIN_CYCLES=4 restores the record's rule."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_kernels.py (DEPTH_THETA default)",
+      "why": "On the record 5677c186-ecd4-4152-9f0a-081d64d44273, the depth gate's cumulative top-1 confidence floor for keeping the early drafts defaults to 0.51 (was 0.5), as in submission 6c1aab65-128b-4b28-b266-d7ad07a5a256. Drafts only; the target verifies every committed token. MTP_DEPTH_THETA=0.5 restores the record's threshold."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_kernels.py (DEPTH_THETA default)",
+      "why": "terrapinelf (6c1aab65-128b-4b28-b266-d7ad07a5a256): the depth gate's cumulative-confidence threshold for the first four drafts defaults to 0.51 (was 0.5); carried byte for byte (the low-acceptance rule keeps the record's 4 counted cycles). MTP_DEPTH_THETA=0.5 restores it."
+    },
+    {
+      "file": "harness/kernels/marlinx (MARLINX_SU6)",
+      "why": "ercumentyildirim: the lm_head's unit-major scale copy (MARLINX_SU, the SU staging of the Marlin-exact NVFP4 GEMM) is stored as 6-bit codes into the tensor's sorted 64-value table (48 bytes per 64-scale row instead of 64) when the tensor holds at most 64 distinct scale bytes; the kernel's staging loop looks every code up and stages the same bytes in shared memory, so the main loop and every output bit are unchanged. The load-time check decodes every byte back. MARLINX_SU6=0 keeps the byte copy."
+    },
+    {
+      "file": "vllm/VENDOR.json (annotation only)",
+      "why": "Repeat official measurement of our 10678c8c-c54f-40c4-84c4-756e5e8faba1: the code is byte-identical to that submission; this entry only records the repeat (draw 2, requested 2026-10-30T07:01Z)."
+    },
+    {
+      "file": "vllm/VENDOR.json (annotation only)",
+      "why": "Repeat official measurement of our d82ed640-eff6-4568-81eb-7072f5048f7a: the code is byte-identical to that submission; this entry only records the repeat (draw 3, requested 2026-10-30T07:24Z)."
+    },
+    {
+      "file": "vllm/VENDOR.json (annotation only)",
+      "why": "Repeat official measurement of our 7f5a8225-4679-4f8e-84f2-d984b44b7900: the code is byte-identical to that submission; this entry only records the repeat (draw 4, requested 2026-10-30T07:47Z)."
+    },
+    {
+      "file": "vllm/VENDOR.json (annotation only)",
+      "why": "Repeat official measurement of our 34516adb-81c3-4245-8f8f-c24356ada714: the code is byte-identical to that submission; this entry only records the repeat (draw 5, requested 2026-10-30T08:10Z)."
+    },
+    {
+      "file": "vllm/VENDOR.json (annotation only)",
+      "why": "Repeat official measurement of our b028f5d8-4e11-453a-a006-3a1939c7f8a1: the code is byte-identical to that submission; this entry only records the repeat (draw 6, requested 2026-10-30T08:33Z)."
     }
   ]
 }

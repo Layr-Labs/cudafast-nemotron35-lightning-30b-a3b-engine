@@ -278,7 +278,26 @@ def _prepare(p, saved, restore):
     p._nemo_step = SimpleNamespace(
         graph=graph, hidden=hidden, screen=screen, padded=padded, signature=signature,
         inputs=inputs, live=live, owners=(kwargs, metadata, zero_row, stream, slots),
-        token=token, timing=timing)
+        token=token, timing=timing, body=body)
+
+
+def capture_pass(p, gate):
+    """Emit one conditional pass (the admitted step graph's exact construct: arm,
+    IF(live){forward + gated screen}, clear) into the graph being captured on the
+    current stream. Returns (hidden, token) like maybe_run."""
+    s = p._nemo_step
+    stream = torch.cuda.current_stream()
+    _arm[(1,)](gate, s.live, s.screen._out, s.token)
+    current = torch.cuda.CUDAGraph.get_currently_capturing_graph()
+    current.begin_capture_to_if_node(s.live)
+    try:
+        torch.cuda.set_stream(torch.cuda.current_stream())
+        hidden = s.body()
+    finally:
+        current.end_capture_to_conditional_node()
+        torch.cuda.set_stream(stream)
+    _clear[(1,)](s.live, hidden, N=hidden.numel(), BLOCK=1024)
+    return hidden, s.screen._out.clone()
 
 
 _PROBE = r"""

@@ -14,6 +14,7 @@ import time
 from importlib.metadata import PackageNotFoundError, version
 
 logger = logging.getLogger(__name__)
+GUARD = os.environ.get("NEMO_MTP_PLAN_BANK_GUARD", "1") != "0"
 _SCALARS = ("_q_len_per_req", "_pos_encoding_mode", "_window_left", "_logits_soft_cap",
             "_sm_scale", "_rope_scale", "_rope_theta")
 
@@ -154,7 +155,7 @@ def _eligible(p):
         package_ok = False
     return (os.environ.get("NEMO_MTP_NATIVE_PLAN_BANK", "1") != "0" and package_ok
             and type(p.model).__name__ == "NemotronHMTP" and p.method == "mtp"
-            and p.speculative_config.num_speculative_tokens == 4
+            and p.speculative_config.num_speculative_tokens >= 2
             and not p.speculative_config.enforce_eager
             and not p.parallel_drafting and not p.constant_draft_positions
             and not p.needs_extra_input_slots and p.pass_hidden_states_to_model
@@ -406,10 +407,16 @@ def prepare(p):
                     if pages <= timed_pages:
                         ratios.append((case, cached_time / original_time))
                     trial += 1
-        if (not ratios or statistics.median([r for _, r in ratios]) >= 0.98
+        logger.info("Native MTP plan bank guard ratios (cached/original): all %.4f live %.4f stopped %.4f",
+                    statistics.median([r for _, r in ratios]) if ratios else -1,
+                    statistics.median([r for c, r in ratios if c != 2]) if ratios else -1,
+                    statistics.median([r for c, r in ratios if c == 2]) if ratios else -1)
+        slow = (not ratios or statistics.median([r for _, r in ratios]) >= 0.98
                 or statistics.median([r for case, r in ratios if case != 2]) >= 0.99
-                or statistics.median([r for case, r in ratios if case == 2]) >= 0.99):
+                or statistics.median([r for case, r in ratios if case == 2]) >= 0.99)
+        if slow and GUARD and int(p.num_speculative_tokens) < 5:
             raise ValueError("native plan restore did not reduce guarded model-step latency")
+        bank.guard_failed = bool(slow and GUARD)
         bank.private_speed_ratios = tuple(ratios)
         admitted = True
     except Exception as exc:

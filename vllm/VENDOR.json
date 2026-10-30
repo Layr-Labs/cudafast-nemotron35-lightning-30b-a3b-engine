@@ -5,7 +5,7 @@
   "subtree": "vllm",
   "container_image": "docker.io/vllm/vllm-openai:v0.27.1",
   "container_digest_arm64": "sha256:1c8e60a0841b333c700488cb029d3664807249da0c071e862191b00fe34b228c",
-  "note": "Upstream Python package at the tag. The compiled extensions (csrc) come from the pinned container's install of the same tag; tools/stage-vllm-overlay.sh layers this tree over that install. vllm/vllm/config/fault_tolerance.py is stored LF-normalized (upstream has CRLF). Draw 4. Draw 1.",
+  "note": "Upstream Python package at the tag. The compiled extensions (csrc) come from the pinned container's install of the same tag; tools/stage-vllm-overlay.sh layers this tree over that install. vllm/vllm/config/fault_tolerance.py is stored LF-normalized (upstream has CRLF). Draw 4. Draw 1. Draw 084345.",
   "local_patches": [
     {
       "file": "vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py",
@@ -690,6 +690,50 @@
     {
       "file": "vllm/vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
       "why": "i34-9: ZSKIP_S6 defaults to on (the lean paired decode routed down reads the 6-bit scale plane, config 663, under its load-time bitwise check), as in kaankolcu's 778d1d36-5adf-497f-babb-832df9b0f24b and e-man07's a4b5cd6b-f239-4842-b66d-b1b3c20a58cd. ZSKIP_S6=0 keeps config 653 on the 8-bit plane. Measurement 2 (code identical)."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_kernels.py (ADAPT_MIN_CYCLES default)",
+      "why": "terrapinelf (6c1aab65-128b-4b28-b266-d7ad07a5a256, de4975c1-0182-4fe4-8a7f-70ac7e5f8af1): i34-9's low-acceptance rule decides after 2 counted cycles (was 4) past its 4-cycle burn-in; carried byte for byte. MTP_ADAPT5_MIN_CYCLES=4 restores the record's rule."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_kernels.py (DEPTH_THETA default)",
+      "why": "terrapinelf (6c1aab65-128b-4b28-b266-d7ad07a5a256): the depth gate's cumulative-confidence threshold for the first four drafts defaults to 0.51 (was 0.5); carried byte for byte. MTP_DEPTH_THETA=0.5 restores it."
+    },
+    {
+      "file": "vllm/v1/spec_decode/llm_base_proposer.py (_mtp_step_prefetch, L2PF_DRAFT_STEP_EH)",
+      "why": "ercumentyildirim: the single-row draft step's gated step-start L2 prefetch (drafter3, l2pf side stream, skipped on the device once the depth gate stopped the loop) also covers the start projection's BF16 hidden half eh_w_h (13.8 MB, l2pf DRAFT_NEXT \"eh_bf16\"), which the step reads first. Prefetch only: moves no value, same kernels and arithmetic. L2PF_DRAFT_STEP_EH=0 restores the record."
+    },
+    {
+      "file": "harness/kernels/marlinx (MARLINX_SU6)",
+      "why": "ercumentyildirim: the lm_head's unit-major scale copy (MARLINX_SU, the SU staging of the Marlin-exact NVFP4 GEMM) is stored as 6-bit codes into the tensor's sorted 64-value table (48 bytes per 64-scale row instead of 64) when the tensor holds at most 64 distinct scale bytes; the kernel's staging loop looks every code up and stages the same bytes in shared memory, so the main loop and every output bit are unchanged. The load-time check decodes every byte back. MARLINX_SU6=0 keeps the byte copy."
+    },
+    {
+      "file": "harness/kernels/build.sh (concurrent package builds)",
+      "why": "ercumentyildirim: the kernel packages build concurrently, at most KERNELS_JOBS at a time (default: the CPU count). Each package's build.sh writes only $KERNELS_OUT/<name>; its output is printed whole and in package order once all have finished, and a failing package still fails the build. Build only: the same package scripts and compiler commands. KERNELS_JOBS=1 builds one package at a time."
+    },
+    {
+      "file": "vllm/v1/spec_decode/nemotron_compound_loop.py, nemotron_decode_plan.py, nemotron_step_cond.py (compound draft loop and plan bank at depth 5)",
+      "why": "e-man07 20b82be6 (also inside c1795752), carried byte for byte by ercumentyildirim: the record's native plan bank and captured compound draft loop (jacklightChen 581daccd lineage), gated on num_speculative_tokens == 4 in the record, generalised to any depth of 2 or more so that they run at the record's depth 5, with the per-pass use of the conditional step, the guard handling at depth 5 and the stage-kernel warp-race fix (both values read before a barrier). Boot-admitted as before; when an admission declines, the record's path runs. NEMO_MTP_COMPOUND_LOOP=0 / NEMO_MTP_NATIVE_PLAN_BANK=0 disable them."
+    },
+    {
+      "file": "vllm/env_override.py (Inductor row reductions: whole-row configuration only, INDUCTOR_ROW_REDUCTION_PIN)",
+      "why": "ercumentyildirim: an INNER row reduction for which Inductor also generates its whole-row configuration (add_persistent_rblock, R0_BLOCK up to 4096) is given that configuration only, instead of both candidates (it and the looped configuration) being timed at the kernel's first call and the faster one kept for every later shape. The whole-row configuration is one of the two the timed choice picks from, so every generated kernel and its results are ones the original code can produce. INDUCTOR_ROW_REDUCTION_PIN=0 restores the timed choice."
+    },
+    {
+      "file": "vllm/v1/spec_decode/nemotron_compound_loop.py (boot latency comparison attempts, NEMO_MTP_COMPOUND_TIMING_TRIES)",
+      "why": "ercumentyildirim: the compound loop's boot-time latency comparison (e-man07's 20b82be6 file, carried byte for byte otherwise) is made again, at most NEMO_MTP_COMPOUND_TIMING_TRIES times (default 3), when an attempt misses its latency criteria; every attempt repeats the complete private-state comparison and the criteria are unchanged, so the loop is admitted only when an attempt meets them and any state difference still keeps the original path. NEMO_MTP_COMPOUND_TIMING_TRIES=1 restores a single attempt."
+    },
+    {
+      "file": "harness/kernels/pkslots (128-column CTA: 32 adjacent output columns per thread, PKSLOTS_TILE)",
+      "why": "ercumentyildirim: the drafter's packed MoE down slot kernel gives each thread 32 adjacent output columns (a 128-column CTA, grid 21 x slots) instead of 16 (64-column CTA): every thread keeps the same rows (row = 32 * rep + 8 * warp + lr of each 64-row chunk) and every output column is formed by the same fp32 multiplies and adds in the same order (the chunks in order, rep 0 + rep 1, the xor butterfly 16, 8, 4, then (w0 + w2) + (w1 + w3)), so the fp32 words are unchanged; a row's weights are gathered as 32-byte sign/mantissa and 16-byte exponent-code pieces instead of 16 and 8. Admitted by the same load-time bitwise comparison with _slots. PKSLOTS_TILE=64 runs the 64-column CTA."
+    },
+    {
+      "file": "harness/kernels/zskip/build.sh + csrc split (zskip.cuh, zskip_launch.cuh, zskip.cu, zskip_v3.cu, zskip_v4a..e.cu, zskip_v5..8.cu, zskip_pair.cu, zskip_lean.cu): device code compiled as parallel translation units",
+      "why": "ercumentyildirim: zskip's device code is compiled as several translation units instead of one. The kernels and config lists move unchanged to csrc/zskip.cuh, the per-config launch and attribute-query functions to csrc/zskip_launch.cuh, and each zskip_<part>.cu instantiates them for its part of the config lists (ZSKIP4_CONFIGS is the concatenation of its parts A..E in the same order); zskip.cu keeps the C ABI and its dispatch by config id, the prep_kernel instances, c3lpt_order_kernel and the probes. build.sh compiles every csrc/*.cu concurrently, at most KERNELS_JOBS nvcc processes at a time (default: the CPU count), with the same nvcc flags, and links them into the one libzskip.so; every attempt of the -DZSKIP_NO_PDL / -DZSKIP_NO_FUSED / -DZSKIP_NO_PAIR fallback loop applies its flags to every unit and fails when a unit or the link fails. Build only: each kernel is instantiated once, from the same source, kernels that share a device function's __shared__ variable are compiled in the same unit (so its placement and their shared memory layout are as before), and the exported symbols are unchanged."
+    },
+    {
+      "file": "harness/kernels/pzskip/build.sh + csrc split (pzskip.cuh, pzskip.cu, pzskip_smem.cu, pzskip_smem5.cu, pzskip_down64.cu, pzskip_down32.cu): device code compiled as parallel translation units",
+      "why": "ercumentyildirim: pzskip's device code is compiled as several translation units instead of one. The kernels and their launchers move unchanged to csrc/pzskip.cuh; the cases of pzskip_down's two switches move unchanged into per-unit dispatch functions (pzskip_smem.cu: smem4_kernel and smem_kernel configs, which share the extern __shared__ smem_raw and so stay in one unit; pzskip_smem5.cu: configs 356/357/369/379 with prep2_kernel; pzskip_down64.cu / pzskip_down32.cu: the down_kernel configs), and pzskip_down keeps its parameter setup and calls them in the original order: the first switch's units, then the shared prep_kernel launch and its error check, then the second switch's units, -5 for an unknown id. The prep_kernel instances stay in pzskip.cu and launch_smem4 launches them there. build.sh compiles every csrc/*.cu concurrently, at most KERNELS_JOBS nvcc processes at a time (default: the CPU count), with the same nvcc flags, links them into the one libpzskip.so and keeps the -DPZSKIP_NO_CACHE_POLICY fallback for every unit. Build only: each kernel is instantiated once, from the same source, and the exported symbols are unchanged."
     }
   ]
 }

@@ -9,6 +9,10 @@ row reps, the xor butterfly 16, 8, 4 over the row lanes, then (w0 + w2) + (w1 + 
 warps), so its fp32 output words are _slots'. The drafter admits it only after a load-time
 bitwise comparison with _slots (nemotron_h_mtp_down_packed.prepare). MTP_DOWN_PKSLOTS=0 keeps
 _slots.
+
+By default each CTA covers 128 output columns (32 adjacent columns per thread, the same rows per
+thread): the same per-column operations in the same order, from half as many row gathers per
+byte. PKSLOTS_TILE=64 runs the 64-column CTA (16 columns per thread).
 """
 
 import ctypes
@@ -18,6 +22,8 @@ from pathlib import Path
 import torch
 
 ENABLED = os.environ.get("MTP_DOWN_PKSLOTS", "1") != "0"
+# Columns per CTA: 128 (32 adjacent columns per thread) or 64 (16, the (64, 4) tile); the same fp32 words.
+TILE = 64 if os.environ.get("PKSLOTS_TILE", "128") == "64" else 128
 H, I = 2688, 1856
 _lib = None
 _load_failed = False
@@ -29,7 +35,7 @@ def _load():
         return _lib
     try:
         lib = ctypes.CDLL(str(Path(__file__).with_name("libpkslots.so")))
-        lib.pkslots_run.argtypes = [ctypes.c_void_p] * 15 + [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+        lib.pkslots_run.argtypes = [ctypes.c_void_p] * 15 + [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
         lib.pkslots_run.restype = ctypes.c_int
         _lib = lib
     except OSError:
@@ -56,7 +62,7 @@ def run(indices, values, counts, routed_planes, shared_planes, ids, part, pdl: b
         return False
     rc = _lib.pkslots_run(indices.data_ptr(), values.data_ptr(), counts.data_ptr(),
                           *(p.data_ptr() for p in planes), ids.data_ptr(), part.data_ptr(),
-                          topk, int(bool(pdl)), torch.cuda.current_stream(part.device).cuda_stream)
+                          topk, int(bool(pdl)), TILE, torch.cuda.current_stream(part.device).cuda_stream)
     if rc != 0:
         raise RuntimeError(f"pkslots_run failed: {rc}")
     return True

@@ -99,6 +99,7 @@ FIRST_PLAN_SIDE = os.environ.get("MTP_FIRST_PLAN_SIDE", "0") != "0"
 # the ALT table is built switched off, for in-process A/B of a second size).
 STEP_PF_MB = float(os.environ.get("L2PF_DRAFT_STEP_MB", "0"))
 STEP_PF_ALT_MB = float(os.environ.get("L2PF_DRAFT_STEP_ALT_MB", "0"))
+STEP_PF_EH = os.environ.get("L2PF_DRAFT_STEP_EH", "1") != "0"
 
 
 class SpecDecodeBaseProposer:
@@ -1055,8 +1056,15 @@ class SpecDecodeBaseProposer:
             except ImportError:
                 l2pf = None
             planes = getattr(l2pf, "DRAFT_NEXT", {}).get("qkv") if l2pf is not None else None
-            if (planes is not None and hasattr(l2pf, "GatedTable")
-                    and not torch.cuda.is_current_stream_capturing()):
+            capturing = torch.cuda.is_current_stream_capturing()
+            if (STEP_PF_EH):
+                eh_planes = getattr(l2pf, "DRAFT_NEXT", {}).get("eh_bf16") if l2pf is not None else None
+                if (eh_planes is not None and hasattr(l2pf, "GatedTable") and not capturing
+                        and len(eh_planes) > 0 and isinstance(eh_planes[0], torch.Tensor)):
+                    t = l2pf.GatedTable([(eh_planes[0], 1 << 30)], gate.device, name="step_eh", mode=2)
+                    if t.nranges:
+                        tables.append(t)
+            if (planes is not None and hasattr(l2pf, "GatedTable") and not capturing):
                 for name, mb, mode in (("stepq", STEP_PF_MB, 2), ("stepq_alt", STEP_PF_ALT_MB, 0)):
                     if mb > 0:
                         t = l2pf.GatedTable(l2pf.packed_ranges(planes, int(mb * (1 << 20))),

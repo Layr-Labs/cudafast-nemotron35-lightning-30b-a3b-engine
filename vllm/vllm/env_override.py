@@ -880,3 +880,28 @@ if os.environ.get("VLLM_TRITON_FORCE_FIRST_CONFIG", "0").strip().lower() in (
     )
 
     _install_force_first_config()
+
+
+_INDUCTOR_ROW_REDUCTION_PIN = os.environ.get("INDUCTOR_ROW_REDUCTION_PIN", "1") != "0"
+if _INDUCTOR_ROW_REDUCTION_PIN:
+    try:
+        import torch._inductor.runtime.triton_heuristics as _thrr
+        _orig_reduction_configs = getattr(_thrr, "_reduction_configs", None)
+        if _orig_reduction_configs is not None and not getattr(_orig_reduction_configs, "_cudafast_pinned", False):
+            def _pinned_reduction_configs(*args, **kwargs):
+                cfgs = _orig_reduction_configs(*args, **kwargs)
+                if isinstance(cfgs, (list, tuple)) and len(cfgs) == 2:
+                    c0, c1 = cfgs[0], cfgs[1]
+                    kw0 = getattr(c0, "kwargs", {}) or {}
+                    kw1 = getattr(c1, "kwargs", {}) or {}
+                    r0 = kw0.get("R0_BLOCK", 0)
+                    r1 = kw1.get("R0_BLOCK", 0)
+                    if (isinstance(r0, int) and isinstance(r1, int) and r0 > r1
+                            and 0 < r0 <= 4096):
+                        return [c0]
+                return cfgs
+
+            _pinned_reduction_configs._cudafast_pinned = True
+            _thrr._reduction_configs = _pinned_reduction_configs
+    except Exception:
+        pass

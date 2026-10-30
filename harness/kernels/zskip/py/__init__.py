@@ -51,9 +51,9 @@ CONFIGS4.update({500: (2, 2, 4, 32), 501: (6, 2, 4, 32), 502: (6, 4, 4, 32), 503
 CONFIGS4[108] = (2, 4, 1, 16)
 # swap2 decode pairs: 113/118 (unfused/fused prep) and their empty-half dequant skips 114/119
 # lean paired decode (csrc/zskip_lean.cuh): config -> (warps per CTA, ring depth, flags); default 653
-LEAN_CONFIGS = {604: (1, 2, 260), 613: (1, 2, 2820), 616: (1, 2, 2824), 630: (1, 2, 0), 640: (1, 3, 272), 645: (1, 4, 272), 653: (1, 3, 274), 656: (1, 4, 274), 658: (1, 2, 274), 663: (1, 3, 306)}
+LEAN_CONFIGS = {604: (1, 2, 260), 613: (1, 2, 2820), 616: (1, 2, 2824), 630: (1, 2, 0), 640: (1, 3, 272), 645: (1, 4, 272), 653: (1, 3, 274), 656: (1, 4, 274), 658: (1, 2, 274), 663: (1, 3, 306), 667: (3, 3, 8498)}
 # 663: config 653 reading the 6-bit scale plane of to_s6() (S6_BASE must match csrc/zskip_lean.cuh)
-S6_CONFIGS = (663,)
+S6_CONFIGS = (663, 667)
 S6_BASE = 62
 PAIR_CONFIGS = (113, 114, 118, 119) + tuple(LEAN_CONFIGS)
 COMPUTEONLY = 5     # timing probe (lean configs): no weight/scale/activation loads
@@ -378,6 +378,12 @@ def down(a: torch.Tensor, sorted_ids: torch.Tensor, expert_ids: torch.Tensor, nu
         # use ordinary launches from now on and redo this call.
         lib.zskip_set_pdl(0)
         _pdl_on = False
+        if config == 667:
+            # The alternate launch mode has not necessarily been qualified.
+            # Retry the known 663 rather than the cooperative configuration.
+            args = list(args)
+            args[20] = 663
+            args = tuple(args)
         rc = launch(*args)
     if rc != 0:
         raise RuntimeError(f"zskip_down failed: {rc} (config={config})")

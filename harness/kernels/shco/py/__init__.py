@@ -48,6 +48,14 @@ def _load():
         lib.shx2_attrs.restype = ci
         lib.shx2_gemm.argtypes = [vp, cll, ci, vp, vp, vp, vp, cll, ci, ci, vp, ci, vp, ci, ci, vp, ci, vp]
         lib.shx2_gemm.restype = ci
+        # Older successfully built libraries still retain the original complete SHX path.
+        try:
+            lib.shx2_pair_attrs.argtypes = [ci, vp]
+            lib.shx2_pair_attrs.restype = ci
+            lib.shx2_pair_gemm.argtypes = list(lib.shx2_gemm.argtypes)
+            lib.shx2_pair_gemm.restype = ci
+        except AttributeError:
+            pass
         lib.shco_version()
         _lib = lib
     except OSError as e:
@@ -183,6 +191,31 @@ def units_tensor(units, device) -> torch.Tensor:
     return torch.tensor(rows, dtype=torch.int32, device=device).contiguous()
 
 
+def _split_pair_units(units, n: int, k: int):
+    """Host geometry only. The first four bands must all have the same full segment.
+
+    At SM48/M496 the up's unsplit g<144 and down's g<96 include all features
+    of bands 0..3. Refuse any unexpected table rather than changing a split fold.
+    """
+    if (n, k) not in ((3712, 2688), (2688, 3712)) or len(units) != 8 * (n // 128):
+        return None
+    by_key = {(r, f): (r, nr, f, segs) for r, nr, f, segs in units}
+    if len(by_key) != len(units):
+        return None
+    paired, single = [], []
+    for f in range(0, n, 128):
+        for r in (0, 64, 128, 192):
+            if by_key.get((r, f)) != (r, 64, f, [(0, k // 64)]):
+                return None
+        paired.extend((by_key[(0, f)], by_key[(128, f)]))
+    for u in units:
+        if u[0] not in (0, 64, 128, 192):
+            single.append(u)
+    if len(single) != 4 * (n // 128):
+        return None
+    return paired, single
+
+
 def shx_attrs(relu2: bool) -> dict:
     lib = _load()
     assert lib is not None, _load_error
@@ -256,13 +289,95 @@ class Shx:
         # every later device address) is the same with HPF_SHX on or off.
         self.scratch = torch.empty(lib.shx_scratch_floats(max(grid, sms)), dtype=torch.float32, device=device)
         self.work = torch.zeros(2, dtype=torch.int32, device=device)
+        self.pair_ready = False
+        self.pair_stream = None
+        # All ownership/storage is installed outside capture. Preserve the original
+        # tables/scratch/counter for every refusal, including the lite final-layer tail.
+        props = torch.cuda.get_device_properties(device)
+        if (PAIR_ENABLED and self.version == 2 and m == 496 and sms == 48
+                and (props.major, props.minor) == (12, 1) and grid >= 2 and grid % 2 == 0
+                and hasattr(lib, "shx2_pair_gemm") and hasattr(lib, "shx2_pair_attrs")):
+            splits = (_split_pair_units(up, 3712, 2688), _split_pair_units(dn, 2688, 3712))
+            resource_ok = all(s is not None for s in splits)
+            # This is a resource refusal, not a numerical/performance admission.
+            # The new CTA has eight warps; never copy the old (128,4) launch bound.
+            for relu2 in (0, 1):
+                attrs = (ctypes.c_int * 4)()
+                rc = lib.shx2_pair_attrs(relu2, attrs)
+                resource_ok = resource_ok and (
+                    rc == 0 and 0 < attrs[0] <= 128 and attrs[2] >= 256 and attrs[3] == 0
+                    and 0 < attrs[1] <= getattr(props, "shared_memory_per_block", 0)
+                )
+            if resource_ok:
+                (up_pair, up_single), (dn_pair, dn_single) = splits
+                # Half the original workers keeps the aggregate warp budget unchanged:
+                # 18*8 vs 36*4 for the present default. Residency/latency remain unmeasured.
+                pair_grid = grid // 2
+                # No production launch has started. Publish no partial owner on a
+                # recoverable optional allocation refusal; all old storage already exists.
+                try:
+                    tables = tuple(units_tensor(u, device) for u in (up_pair, up_single, dn_pair, dn_single))
+                    scratch = torch.empty(
+                        2 * lib.shx_scratch_floats(pair_grid), dtype=torch.float32, device=device)
+                    work = torch.zeros(2, dtype=torch.int32, device=device)
+                except torch.OutOfMemoryError:
+                    return
+                (self.units_up_pair, self.units_up_single,
+                 self.units_dn_pair, self.units_dn_single) = tables
+                self.pair_grid = pair_grid
+                self.pair_scratch, self.pair_work = scratch, work
+                self.pair_ready = True
+
+    def _pair_run(self, x, layer, out, relu2, tail):
+        if not self.pair_ready or tail:
+            return False
+        tensors = (layer.weight, layer.weight_scale, layer.weight_global_scale)
+        n, k = out.shape[1], x.shape[1]
+        if (not x.is_contiguous() or not out.is_contiguous() or x.shape[0] != 496
+                or x.dtype != torch.bfloat16 or out.dtype != torch.bfloat16
+                or (n, k) not in SHAPES or any(t.device != x.device or not t.is_contiguous() for t in tensors)
+                or layer.weight.dtype != torch.int32 or tuple(layer.weight.shape) != (k // 16, 2 * n)
+                or layer.weight_scale.dtype != torch.float8_e4m3fn
+                or tuple(layer.weight_scale.shape) != (k // 16, n)
+                or layer.weight_global_scale.dtype != torch.float32 or layer.weight_global_scale.numel() != 1
+                or any(t.data_ptr() % 16 for t in (x, out, *tensors))):
+            return False
+        stream = torch.cuda.current_stream(x.device).cuda_stream
+        if self.pair_stream is None:
+            if torch.cuda.is_current_stream_capturing():
+                return False
+            self.pair_stream = stream
+        if stream != self.pair_stream:
+            return False
+        # Shx.up(..., relu2=False) is a valid public call. Geometry, rather than
+        # activation selection, determines the unit tables and their K segments.
+        is_up = (n, k) == (3712, 2688)
+        pair = self.units_up_pair if is_up else self.units_dn_pair
+        single = self.units_up_single if is_up else self.units_dn_single
+        lib = _load()
+        rc = lib.shx2_pair_gemm(
+            x.data_ptr(), x.stride(0), x.shape[0], layer.weight.data_ptr(), layer.weight_scale.data_ptr(),
+            layer.weight_global_scale.data_ptr(), out.data_ptr(), out.stride(0), n, k,
+            pair.data_ptr(), pair.shape[0], self.pair_scratch.data_ptr(), self.pair_grid,
+            int(relu2), self.pair_work.data_ptr(), int(self.hint), stream)
+        if rc != 0:
+            raise RuntimeError(f"shx2_pair_gemm failed: {rc}; no partial-launch retry")
+        # The same stream completes both disjoint output sets before down or a consumer.
+        # A failure here also surfaces; never replay the full operation after a partial launch.
+        shx_gemm(x, *tensors, out, single, self.scratch, relu2=relu2,
+                 grid=self.grid, version=2, work=self.work, hint=self.hint)
+        return True
 
     def up(self, x, layer, out, relu2=True, tail=False):
+        if self._pair_run(x, layer, out, relu2, tail):
+            return
         shx_gemm(x, layer.weight, layer.weight_scale, layer.weight_global_scale, out,
                  self.units_up_tail if tail else self.units_up,
                  self.scratch, relu2=relu2, grid=self.grid, version=self.version, work=self.work, hint=self.hint)
 
     def down(self, a, layer, out, tail=False):
+        if self._pair_run(a, layer, out, False, tail):
+            return
         shx_gemm(a, layer.weight, layer.weight_scale, layer.weight_global_scale, out,
                  self.units_dn_tail if tail else self.units_dn,
                  self.scratch, grid=self.grid, version=self.version, work=self.work, hint=self.hint)
@@ -277,6 +392,7 @@ def _tail_units(units, m: int, n: int):
 # ------------------------------------------------------------------------- engine entry points
 # SHCO=0 disables everything below (the engine then runs stock Marlin on the main stream).
 ENABLED = os.environ.get("SHCO", "1") != "0"
+PAIR_ENABLED = os.environ.get("SHX_PAIR", "1") != "0"
 SHX_M = 496  # the prefill row count whose Marlin trees shx reproduces
 SHAPES = frozenset({(3712, 2688), (2688, 3712)})  # (N, K): shared expert up, down
 _ctx: dict[int, Shx] = {}

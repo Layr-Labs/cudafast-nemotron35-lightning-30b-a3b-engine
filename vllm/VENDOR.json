@@ -690,6 +690,38 @@
     {
       "file": "vllm/vllm/model_executor/layers/fused_moe/experts/humming_zskip.py",
       "why": "i34-9: ZSKIP_S6 defaults to on (the lean paired decode routed down reads the 6-bit scale plane, config 663, under its load-time bitwise check), as in kaankolcu's 778d1d36-5adf-497f-babb-832df9b0f24b and e-man07's a4b5cd6b-f239-4842-b66d-b1b3c20a58cd. ZSKIP_S6=0 keeps config 653 on the 8-bit plane. Measurement 2 (code identical)."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_kernels.py (ADAPT_MIN_CYCLES default)",
+      "why": "terrapinelf: i34-9's low-acceptance rule decides after 2 counted cycles (was 4) past its 4-cycle burn-in; thresholds 1.8 / 2.0 and the per-cycle cap are unchanged. Drafts only; the target verifies every committed token. MTP_ADAPT5_MIN_CYCLES=4 restores the record's rule."
+    },
+    {
+      "file": "model_executor/models/nemotron_h_mtp_kernels.py (DEPTH_THETA default)",
+      "why": "terrapinelf: the depth gate's cumulative-confidence threshold for the first four drafts defaults to 0.51 (was 0.5); MTP_DEPTH_THETA=0.5 restores it."
+    },
+    {
+      "file": "(composition)",
+      "why": "terrapinelf on the record 5677c186-ecd4-4152-9f0a-081d64d44273 (i34-9: d6651a3d with ercumentyildirim's bf16ws and the decode 6-bit scale plane): the record byte for byte, plus the low-acceptance rule's minimum cycle count at 2 and the depth gate's threshold at 0.51. No new arithmetic. Measurement #8."
+    },
+    {
+      "file": "harness/kernels/marlinx/csrc/head_pair.cuh, csrc/marlinx.cu optional head-pair ABI; py/head_pair.py; py/__init__.py lookup; build.sh optional fallback; model_executor/models/nemotron_h.py final post-load hook",
+      "why": "GPT 6.1 Sol ultra / Codex: controlled unverified c41 overlay pairing the original target MarlinX lm_head h0/h1 N64 chains in one original four-warp CTA, sharing only their identical activation ring. Original stripe, two B/S/MMA/acc/R/fold chains, BF16 full output and current provider retained. Actual existing SU, M5/6, sm121/48/P8, fixed immutable single-worker owner/configuration gates; official-only real-weight full-output raw-bit, changed-input private-graph, resource and kernel-speed admission; rejection keeps original kernel, production launch errors never retry. Material original kernel 100549d4-51c4-4f56-b3ca-2604731ab8a4, SU c3e16bbb-c76b-42e2-84d6-3a7260e3d478, PDL carrier 3d51cab6-7079-4fb2-98e4-f2a238077897, A-sharing idea/negative e7f42e20-4e1b-4a8e-80b5-8c2c49369615, private admission lessons 110cff4b-d86d-4fe9-ae30-f6ce550d005f, 77f74985-a845-4963-bf29-b860e8daa7ef and 8e0a3de6-17c7-4667-8804-ee17507eb41a. All their regressed whole bundles excluded. M6 31.5MiB is only a source A-request bound; no weight/HBM or speed claim, actual hit/build/resources/score unobserved. Complete details/dependencies in HEAD_PAIR_EXPERIMENT.md and HEAD_PAIR_DEPENDENCIES.json. No local candidate execution."
+    },
+    {
+      "file": "harness/kernels/shco/csrc/shx.cu; harness/kernels/shco/csrc/shx_pair.cuh; harness/kernels/shco/py/__init__.py; harness/kernels/shco/build.sh",
+      "why": "Unverified SHX prefill pair experiment on ENTIRE c41fc629-8c06-4bf2-8cb8-cad0edea9875. Only sm121/48SM/M496/v2/non-tail with checked original full-segment unit tables: pair row bands (0,64) and (128,192) at the same 128-feature tile. Two independent original four-warp MMA/rounding/scratch chains share one immutable NVFP4 weight/FP8-scale stage, with eight-warp barriers. Keep old kernel/tables/counters and stock stream DAG; shape/stream/resource refusal uses original full SHX. Build-only SHX_NO_PAIR fallback preserves original library if the new TU fails; no production launch retry. Source material: adab284a-bf1d-4ce2-8e90-6720fa0f5435 original SHCO, 1e1c2581-e506-4ca4-9341-5f08ffceec86 retained BF16x2 epilogue. 02e9c4c3-32f2-4091-87a3-ed19a12a5d04 twin-band weight sharing is credited as negative design context, not adopted whole. Resource checks are not numerical/performance admission. All compilation/execution/validation remote only; no gain or activation claimed. See harness/kernels/shco/PAIR_DESIGN.md."
+    },
+    {
+      "file": "vllm/VENDOR.json (annotation only)",
+      "why": "Repeat official measurement of our a3a6eb2d-c27d-4531-a208-d2425325a95f: the code is byte-identical to that submission; this entry only records the repeat (draw 2)."
+    },
+    {
+      "file": "vllm/VENDOR.json (annotation only)",
+      "why": "Repeat official measurement of our 1ea763a4-df6d-4b5c-ad5a-2924c486517d: the code is byte-identical to that submission; this entry only records the repeat (draw 3)."
+    },
+    {
+      "file": "vllm/VENDOR.json (annotation only)",
+      "why": "Repeat official measurement of our bbd06c49-3edd-4990-a563-9f53a373f974: the code is byte-identical to that submission; this entry only records the repeat (draw 4)."
     }
   ]
 }

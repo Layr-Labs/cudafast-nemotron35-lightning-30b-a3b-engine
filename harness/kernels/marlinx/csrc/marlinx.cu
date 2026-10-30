@@ -474,6 +474,8 @@ __global__ void __launch_bounds__(128) gemm_kernel(const Params p) {
 }
 
 // ---------------------------------------------------------------------------
+#include "head_pair.cuh"
+
 // MARLINX_LEAN: the shared expert projections (up 2688->3712, down 3712->2688) with
 // gemm_kernel's CTA, grid, warp chains, segment folds, MMA operands and epilogue,
 // and a shorter instruction stream per k16 block:
@@ -1011,6 +1013,82 @@ int marlinx_gemm_su(const void* A, long long lda, int M, const void* B, const vo
   return marlinx_gemm_impl(A, lda, M, B, S, GS, C, ldc, N, K, sms, depth, stream, relu2 != 0, Z,
                            pdl != 0, SU);
 }
+
+#ifndef MARLINX_NO_HEAD_PAIR
+// Optional ABI, never called by the original launch/init chain. attrs is host
+// memory: numRegs, localSizeBytes, static shared bytes, resident CTAs per SM.
+int marlinx_head_pair_info(int pdl, int* attrs) {
+  if (!attrs) return -1;
+#ifdef MARLINX_NO_PDL
+  if (pdl) return -10;
+#endif
+  cudaFuncAttributes a;
+  int blocks = 0;
+  cudaError_t rc;
+#ifndef MARLINX_NO_PDL
+  if (pdl) {
+    rc = cudaFuncGetAttributes(&a, marlinx::head_pair_kernel<true>);
+    if (rc != cudaSuccess) return (int)rc;
+    rc = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks, marlinx::head_pair_kernel<true>, 128, 21504);
+  } else
+#endif
+  {
+    rc = cudaFuncGetAttributes(&a, marlinx::head_pair_kernel<false>);
+    if (rc != cudaSuccess) return (int)rc;
+    rc = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks, marlinx::head_pair_kernel<false>, 128, 21504);
+  }
+  if (rc != cudaSuccess) return (int)rc;
+  if (a.maxThreadsPerBlock < 128) return -12;
+  attrs[0] = a.numRegs;
+  attrs[1] = (int)a.localSizeBytes;
+  attrs[2] = (int)a.sharedSizeBytes;
+  attrs[3] = blocks;
+  return 0;
+}
+
+// Same 13-argument prefix as marlinx_gemm, then SU and PDL. Only the admitted
+// actual head shape is supported. Rejection before launch has no GPU writes.
+int marlinx_head_pair(const void* A, long long lda, int M, const void* B, const void* S,
+                      const void* GS, void* C, long long ldc, int N, int K, int sms,
+                      int depth, void* stream, const void* SU, int pdl) {
+#ifdef MARLINX_NO_PDL
+  if (pdl) return -10;
+#endif
+  if ((M != 5 && M != 6) || N != 131072 || K != 2688 || sms != 48 || depth != 8)
+    return -20;
+  if (!A || !B || !S || !GS || !C || !SU || lda != K || ldc != N) return -21;
+  if ((reinterpret_cast<uintptr_t>(A) | reinterpret_cast<uintptr_t>(B) |
+       reinterpret_cast<uintptr_t>(S) | reinterpret_cast<uintptr_t>(C) |
+       reinterpret_cast<uintptr_t>(SU)) & 15) return -22;
+  marlinx::Params p;
+  p.A = static_cast<const __nv_bfloat16*>(A);
+  p.lda = lda;
+  p.M = M;
+  p.B = static_cast<const uint4*>(B);
+  p.S = static_cast<const uint2*>(S);
+  p.GS = static_cast<const float*>(GS);
+  p.C = static_cast<__nv_bfloat16*>(C);
+  p.ldc = ldc;
+  p.N = N;
+  p.K = K;
+  p.n_tiles = N / 128;
+  p.k_tiles = K / 128;
+  p.Z = nullptr;
+  p.SU = static_cast<const uint2*>(SU);
+  p.vrows = nullptr;
+  // ORIGINAL Marlin stripe partition: do not substitute the reduced CTA grid.
+  int part2 = p.n_tiles;
+  if (p.n_tiles > sms) {
+    part2 = p.n_tiles % sms;
+    if (part2 * 3 <= sms) part2 += sms;
+  }
+  p.part1_cols = p.n_tiles - part2;
+  p.iters = (p.k_tiles * part2 + sms - 1) / sms;
+  return marlinx::launch_head_pair(p, static_cast<cudaStream_t>(stream), pdl != 0);
+}
+#endif
 
 // Streams nbytes from src with blocks x threads, reserving smem bytes of
 // shared memory per CTA. Returns 0 or a cudaError_t value.

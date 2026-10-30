@@ -216,7 +216,7 @@ def can_add_residual(residual, y, routed_scale, topk):
             and residual.is_contiguous() and y.is_contiguous())
 
 
-def maybe_down(h, packed, ids, weights, y, routed_scale, residual=None):
+def maybe_down(h, packed, ids, weights, y, routed_scale, residual=None, combine_norm=None):
     """Reuse the existing finite, exact BF16 transpose prepared before capture."""
     if not _ENABLED:
         return False
@@ -239,6 +239,10 @@ def maybe_down(h, packed, ids, weights, y, routed_scale, residual=None):
         or not all(t.device == h.device for t in (w2, sd, ids, weights, y))
     ):
         return False
+    if combine_norm is not None:
+        from .nemotron_h_mtp_combine_norm import can_combine
+        if not _SLOTS or not can_combine(combine_norm, y, residual, routed_scale, topk):
+            return False
     indices = torch.empty(h.shape, dtype=torch.int32, device=h.device)
     values = torch.empty_like(h)
     counts = torch.empty(slots, dtype=torch.int32, device=h.device)
@@ -257,6 +261,10 @@ def maybe_down(h, packed, ids, weights, y, routed_scale, residual=None):
                 H=2688, I=1856, TOPK=topk, BN=_BF16_BN, BK=64, num_warps=4, num_stages=3,
                 launch_pdl=mtp_pdl(),
             )
+        if combine_norm is not None:
+            from .nemotron_h_mtp_combine_norm import launch
+            launch(combine_norm, part, weights, residual, y, mtp_pdl())
+            return True
         _down_combine[(triton.cdiv(2688, 256),)](
             part, weights, y, M=y.shape[0], H=2688, ROUTED_SCALE=routed_scale,
             TOPK=topk, S=2, BN=256, num_warps=4, launch_pdl=mtp_pdl(),

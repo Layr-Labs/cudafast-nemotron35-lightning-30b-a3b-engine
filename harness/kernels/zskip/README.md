@@ -83,9 +83,16 @@ blocks per layer; bytes: dense 46.1 MB, zskip 8.2 MB, routed_sparse sectors 17.5
 
 ## Files
 
-- `csrc/zskip.cu`: `prep_kernel`, `down4_kernel` (production), `down3_kernel` (cp.async
-  staging variant, configs 0..9), the probes; C ABI `zskip_down`, `zskip_init`,
-  `zskip_config`, `zskip_probe`, `zskip_epi`.
+- `csrc/zskip.cuh`: the kernels (`prep_kernel`, `down4_kernel` (production), `down3_kernel`
+  (cp.async staging variant, configs 0..9), ...), the config lists and the declarations of the
+  per-config entry points; `csrc/zskip_launch.cuh`: the entry points (launches, attribute
+  queries).
+- `csrc/zskip.cu`: C ABI `zskip_down`, `zskip_init`, `zskip_config`, `zskip_probe`,
+  `zskip_epi`; the `prep_kernel` instances, `c3lpt_order_kernel` and the probes.
+- `csrc/zskip_v3.cu`, `zskip_v4a.cu` .. `zskip_v4e.cu`, `zskip_v5.cu` .. `zskip_v8.cu`,
+  `zskip_pair.cu`, `zskip_lean.cu`: each instantiates the entry points and kernels of its part
+  of the config lists. `build.sh` compiles every `csrc/*.cu` as its own translation unit,
+  concurrently (at most `KERNELS_JOBS` nvcc processes), and links them into `libzskip.so`.
 - `csrc/gather.cu`: gather-rate probe (`tests/gather_bench.py`).
 - `py/__init__.py`: `repack`, `down`, `init`, `scratch`, probes.
 - `tests/zskip_exact.py`: probe, epilogue, capture, exactness and timing phases;

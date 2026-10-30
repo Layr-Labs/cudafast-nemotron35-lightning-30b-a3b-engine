@@ -417,6 +417,14 @@ def maybe_apply(layer, x: torch.Tensor) -> torch.Tensor | None:
     if not _ready and not _init():
         return None
     n = layer.output_size_per_partition
+    # Optional post-load-admitted head experiment. A declined lookup has no
+    # allocation/qualification and continues through the exact original path.
+    if (m in (5, 6) and (n, k) == (131072, 2688)
+            and getattr(layer, "_marlinx_head_pair", None) is not None):
+        from .head_pair import maybe_apply as _maybe_head_pair
+        paired = _maybe_head_pair(layer, x2)
+        if paired is not None:
+            return paired.reshape(*x.shape[:-1], n)
     vrows = _live_rows(layer, x2) if m in (5, 6) else None
     out = gemm(x2, layer.weight, layer.weight_scale, layer.weight_global_scale, n, k,
                zs=getattr(layer, "_marlinx_zs", None), su=getattr(layer, "_marlinx_su", None),

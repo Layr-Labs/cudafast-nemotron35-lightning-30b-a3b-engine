@@ -87,6 +87,7 @@ BACKUP_ZERO_COPY = os.environ.get("VLLM_MTP_BACKUP_ZERO_COPY", "1") != "0"
 # copies are recorded into one copy batch flushed right after the build
 # (VLLM_DRAFT_FIRST_PLAN_BATCH=0 issues them one by one).
 FIRST_PLAN_BATCH = os.environ.get("VLLM_DRAFT_FIRST_PLAN_BATCH", "1") != "0"
+NOWAIT = os.environ.get("VLLM_MTP_NOWAIT", "1") != "0"
 # LOCAL PATCH (cudafast-nemotron35): the first pass's rejected counts reach
 # their pinned host buffer by a kernel store (VLLM_MTP_REJECTED_ZERO_COPY=0:
 # device-to-host copy).
@@ -794,6 +795,7 @@ class SpecDecodeBaseProposer:
         # (i.e., not the first proposal).
         order_draft_plans = False
         seq_lens_after_rejection = False
+        nowait_tokens = None
         if self.num_speculative_tokens > 1 and num_rejected_tokens_gpu is not None:
             seq_lens_cpu = common_attn_metadata._seq_lens_cpu
             common_attn_metadata.seq_lens -= num_rejected_tokens_gpu
@@ -807,8 +809,27 @@ class SpecDecodeBaseProposer:
             # side stream. Prefer that earlier event to the later main-stream
             # rejected-count copy. Per-step staging sets independently own the
             # pinned H2D buffers; retain the old fence when sets are unavailable.
+            if (
+                NOWAIT
+                and getattr(self, "hb1_nowait_ok", True)
+                and seq_lens_cpu is not None
+                and fused_first is not None
+                and depth_gate is not None
+                and draft_probs_list is None
+                and getattr(self, "_nemo_compound_loop", None) is not None
+            ):
+                from vllm.v1.spec_decode.nemotron_compound_loop import maybe_run_nowait
+                nowait_tokens = maybe_run_nowait(
+                    self, seq_lens_cpu, common_attn_metadata, draft_token_ids,
+                    fused_first, depth_gate, sampling_metadata, input_batch_size,
+                    batch_size,
+                    None if set_moe_row_src is None
+                    else (lambda: set_moe_row_src(input_batch_size, self._moe_row_zero)),
+                )
             host_seq_lens = None
-            if seq_lens_cpu is not None and self._hostfast_draft_sets() is not None:
+            if nowait_tokens is not None:
+                pass
+            elif seq_lens_cpu is not None and self._hostfast_draft_sets() is not None:
                 host_seq_lens = self._hostfast_draft_seq_lens(
                     seq_lens_cpu, batch_size, common_attn_metadata.seq_lens
                 )
@@ -835,10 +856,14 @@ class SpecDecodeBaseProposer:
         budget_drafts = self._emit_budget_drafts(
             depth_gate, batch_size, common_attn_metadata, seq_lens_after_rejection
         )
-        if set_moe_row_src is not None:
+        if set_moe_row_src is not None and nowait_tokens is None:
             # Padded rows of the single-token steps copy row 0.
             set_moe_row_src(input_batch_size, self._moe_row_zero)
-        for token_index in range(self.num_speculative_tokens - 1):
+        if nowait_tokens is not None:
+            draft_token_ids_list.extend(nowait_tokens)
+        for token_index in range(
+            0 if nowait_tokens is not None else self.num_speculative_tokens - 1
+        ):
             if budget_drafts is not None and token_index + 2 > budget_drafts:
                 break
             if depth_gate is not None:

@@ -1056,6 +1056,16 @@ class NemotronHForCausalLM(
 
         return hidden_states
 
+    def process_weights_after_loading(self) -> None:
+        # Final model-level hook, after every quant method has finalized the
+        # actual head. No provider changes or second SU repack. Private probes
+        # are startup work only; graph/capture and production never qualify.
+        try:
+            from marlinx.head_pair import prepare as prepare_head_pair
+        except ImportError:
+            return
+        prepare_head_pair(self.lm_head, self.vllm_config)
+
     def compute_logits(
         self,
         hidden_states: torch.Tensor,

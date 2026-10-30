@@ -87,6 +87,7 @@ BACKUP_ZERO_COPY = os.environ.get("VLLM_MTP_BACKUP_ZERO_COPY", "1") != "0"
 # copies are recorded into one copy batch flushed right after the build
 # (VLLM_DRAFT_FIRST_PLAN_BATCH=0 issues them one by one).
 FIRST_PLAN_BATCH = os.environ.get("VLLM_DRAFT_FIRST_PLAN_BATCH", "1") != "0"
+NOWAIT = os.environ.get("VLLM_MTP_NOWAIT", "1") != "0"
 # LOCAL PATCH (cudafast-nemotron35): the first pass's rejected counts reach
 # their pinned host buffer by a kernel store (VLLM_MTP_REJECTED_ZERO_COPY=0:
 # device-to-host copy).
@@ -99,6 +100,7 @@ FIRST_PLAN_SIDE = os.environ.get("MTP_FIRST_PLAN_SIDE", "0") != "0"
 # the ALT table is built switched off, for in-process A/B of a second size).
 STEP_PF_MB = float(os.environ.get("L2PF_DRAFT_STEP_MB", "0"))
 STEP_PF_ALT_MB = float(os.environ.get("L2PF_DRAFT_STEP_ALT_MB", "0"))
+STEP_PF_EH = os.environ.get("L2PF_DRAFT_STEP_EH", "1") != "0"
 
 
 class SpecDecodeBaseProposer:
@@ -794,6 +796,7 @@ class SpecDecodeBaseProposer:
         # (i.e., not the first proposal).
         order_draft_plans = False
         seq_lens_after_rejection = False
+        nowait_tokens = None
         if self.num_speculative_tokens > 1 and num_rejected_tokens_gpu is not None:
             seq_lens_cpu = common_attn_metadata._seq_lens_cpu
             common_attn_metadata.seq_lens -= num_rejected_tokens_gpu
@@ -807,8 +810,27 @@ class SpecDecodeBaseProposer:
             # side stream. Prefer that earlier event to the later main-stream
             # rejected-count copy. Per-step staging sets independently own the
             # pinned H2D buffers; retain the old fence when sets are unavailable.
+            if (
+                NOWAIT
+                and getattr(self, "hb1_nowait_ok", True)
+                and seq_lens_cpu is not None
+                and fused_first is not None
+                and depth_gate is not None
+                and draft_probs_list is None
+                and getattr(self, "_nemo_compound_loop", None) is not None
+            ):
+                from vllm.v1.spec_decode.nemotron_compound_loop import maybe_run_nowait
+                nowait_tokens = maybe_run_nowait(
+                    self, seq_lens_cpu, common_attn_metadata, draft_token_ids,
+                    fused_first, depth_gate, sampling_metadata, input_batch_size,
+                    batch_size,
+                    None if set_moe_row_src is None
+                    else (lambda: set_moe_row_src(input_batch_size, self._moe_row_zero)),
+                )
             host_seq_lens = None
-            if seq_lens_cpu is not None and self._hostfast_draft_sets() is not None:
+            if nowait_tokens is not None:
+                pass
+            elif seq_lens_cpu is not None and self._hostfast_draft_sets() is not None:
                 host_seq_lens = self._hostfast_draft_seq_lens(
                     seq_lens_cpu, batch_size, common_attn_metadata.seq_lens
                 )
@@ -835,10 +857,14 @@ class SpecDecodeBaseProposer:
         budget_drafts = self._emit_budget_drafts(
             depth_gate, batch_size, common_attn_metadata, seq_lens_after_rejection
         )
-        if set_moe_row_src is not None:
+        if set_moe_row_src is not None and nowait_tokens is None:
             # Padded rows of the single-token steps copy row 0.
             set_moe_row_src(input_batch_size, self._moe_row_zero)
-        for token_index in range(self.num_speculative_tokens - 1):
+        if nowait_tokens is not None:
+            draft_token_ids_list.extend(nowait_tokens)
+        for token_index in range(
+            0 if nowait_tokens is not None else self.num_speculative_tokens - 1
+        ):
             if budget_drafts is not None and token_index + 2 > budget_drafts:
                 break
             if depth_gate is not None:
@@ -1046,7 +1072,10 @@ class SpecDecodeBaseProposer:
         glue, the start projection (eh_w_h, L2-resident) and a norm, all leaving DRAM
         idle; queue an L2 prefetch of the head of the packed qkv the step reads next,
         on l2pf's side stream (eager, no join: it moves no value). Skipped on the device
-        once the depth gate stopped the loop. L2PF_DRAFT_STEP_MB=0 disables."""
+        once the depth gate stopped the loop. L2PF_DRAFT_STEP_MB=0 disables.
+        LOCAL PATCH (cudafast-nemotron35): the same gated launch first prefetches the
+        start projection's BF16 hidden half eh_w_h (registered as l2pf DRAFT_NEXT
+        "eh_bf16"), which the step reads first. L2PF_DRAFT_STEP_EH=0 disables."""
         tables = self._step_pf_tables
         if tables is None:
             tables = []
@@ -1054,6 +1083,13 @@ class SpecDecodeBaseProposer:
                 import l2pf
             except ImportError:
                 l2pf = None
+            eh = getattr(l2pf, "DRAFT_NEXT", {}).get("eh_bf16") if l2pf is not None else None
+            if (STEP_PF_EH and eh is not None and hasattr(l2pf, "GatedTable")
+                    and not torch.cuda.is_current_stream_capturing()):
+                t = l2pf.GatedTable([(eh[0], eh[0].numel() * eh[0].element_size())],
+                                    gate.device, name="stepeh", mode=2)
+                if t.nranges:
+                    tables.append(t)
             planes = getattr(l2pf, "DRAFT_NEXT", {}).get("qkv") if l2pf is not None else None
             if (planes is not None and hasattr(l2pf, "GatedTable")
                     and not torch.cuda.is_current_stream_capturing()):

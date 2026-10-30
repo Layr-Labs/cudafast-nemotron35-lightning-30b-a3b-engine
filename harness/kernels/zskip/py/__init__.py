@@ -2,7 +2,7 @@
 
 libzskip.so (ctypes, static cudart) computes, for the Nemotron-3.5 routed experts' w2
 (NVFP4 W4A16, N=2688, K=1856, 128 experts) at <= 4 tokens, exactly what humming 0.1.10's
-batch-invariant indexed GEMM computes (csrc/zskip.cu documents the chain), from a k-row-major
+batch-invariant indexed GEMM computes (csrc/zskip.cuh documents the chain), from a k-row-major
 repack of the checkpoint tensors (repack()). In SKIP mode it does not load the k rows whose
 activations are zero in every row routed to the expert.
 
@@ -38,7 +38,7 @@ LOADONLY = 2        # timing probe: SKIP's loads, no math (output garbage)
 LOADONLY_DENSE = 3  # timing probe: DENSE's loads, no math
 SETUPONLY = 4       # timing probe: masks and lists only
 # config id -> (warps, RB rows per row stage, NR row stages, QB groups per group stage, NQ group stages);
-# must match ZSKIP_CONFIGS in csrc/zskip.cu
+# must match ZSKIP_CONFIGS in csrc/zskip.cuh
 CONFIGS = {0: (4, 32, 4, 8, 6), 1: (4, 32, 3, 8, 4), 2: (2, 32, 4, 8, 6), 3: (2, 32, 3, 8, 4),
            4: (6, 32, 4, 8, 6), 5: (6, 32, 3, 8, 4), 6: (12, 32, 3, 8, 4), 7: (4, 16, 6, 8, 6),
            8: (7, 32, 3, 8, 4), 9: (3, 32, 4, 8, 6)}

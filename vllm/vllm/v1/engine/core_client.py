@@ -316,6 +316,7 @@ class InprocClient(EngineCoreClient):
 
     def __init__(self, *args, **kwargs):
         self.engine_core = EngineCore(*args, **kwargs)
+        self.engine_core._defer_sample_ok = True
 
     def _hostfast_idle_if_finished(self) -> None:
         # In-process EngineCore has no EngineCoreProc busy loop. Preserve the
